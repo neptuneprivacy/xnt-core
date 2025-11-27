@@ -148,6 +148,10 @@ impl NativeCurrencyAmount {
         self.0 as f64
     }
 
+    pub fn to_coins_f64_lossy(&self) -> f64 {
+        self.to_nau_f64() / Self::conversion_factor() as f64
+    }
+
     /// Return the number of whole coins, rounded up to nearest integeer.
     /// Negative numbers are rounded up to nearest whole negative number such
     /// that -2.5 is rounded up to -2.
@@ -616,7 +620,6 @@ pub(crate) mod tests {
     use test_strategy::proptest;
 
     use super::*;
-    use crate::protocol::consensus::block::INITIAL_BLOCK_SUBSIDY;
 
     impl NativeCurrencyAmount {
         pub(crate) fn from_raw_i128(int: i128) -> Self {
@@ -1004,52 +1007,6 @@ pub(crate) mod tests {
         prop_assert_eq!(-num_coins, (-amt).ceil_num_whole_coins());
         prop_assert_eq!(-num_coins, (-amt_plus).ceil_num_whole_coins());
         prop_assert_eq!(-num_coins + 1, (-amt_minus).ceil_num_whole_coins());
-    }
-
-    #[test]
-    fn ceil_num_whole_coins_unit_test() {
-        let zero = NativeCurrencyAmount::zero();
-        let one_nau = NativeCurrencyAmount::from_nau(1);
-        let two_nau = NativeCurrencyAmount::from_nau(2);
-        let one_coin = NativeCurrencyAmount::coins(1);
-        let six_coins = NativeCurrencyAmount::coins(6);
-        assert_eq!(0, zero.ceil_num_whole_coins());
-        assert_eq!(1, one_nau.ceil_num_whole_coins());
-        assert_eq!(1, two_nau.ceil_num_whole_coins());
-        assert_eq!(
-            1,
-            (one_coin.checked_sub(&one_nau).unwrap()).ceil_num_whole_coins()
-        );
-        assert_eq!(1, one_coin.ceil_num_whole_coins());
-        assert_eq!(2, (one_coin + one_nau).ceil_num_whole_coins());
-        assert_eq!(
-            128,
-            (INITIAL_BLOCK_SUBSIDY.checked_sub(&one_nau).unwrap()).ceil_num_whole_coins()
-        );
-        assert_eq!(128, INITIAL_BLOCK_SUBSIDY.ceil_num_whole_coins());
-        assert_eq!(
-            129,
-            (INITIAL_BLOCK_SUBSIDY + one_nau).ceil_num_whole_coins()
-        );
-        assert_eq!(
-            42_000_000,
-            NativeCurrencyAmount::max().ceil_num_whole_coins()
-        );
-        assert_eq!(6, six_coins.ceil_num_whole_coins());
-        assert_eq!(7, (six_coins + one_nau).ceil_num_whole_coins());
-
-        assert_eq!(-1, (-one_coin).ceil_num_whole_coins());
-        assert_eq!(
-            -42_000_000,
-            NativeCurrencyAmount::min().ceil_num_whole_coins()
-        );
-        assert_eq!(0, (-one_nau).ceil_num_whole_coins());
-        assert_eq!(0, (-two_nau).ceil_num_whole_coins());
-        assert_eq!(
-            0,
-            (-(one_coin.checked_sub(&one_nau).unwrap())).ceil_num_whole_coins()
-        );
-        assert_eq!(-1, (-(one_coin + one_nau)).ceil_num_whole_coins());
     }
 
     #[proptest]

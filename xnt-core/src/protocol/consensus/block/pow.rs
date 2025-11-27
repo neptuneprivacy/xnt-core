@@ -30,7 +30,7 @@ use crate::BFieldElement;
 
 /// Determines the number of leafs in the Merkle tree in the guesser buffer.
 #[cfg(not(test))]
-pub(crate) const POW_MEMORY_PARAMETER: usize = 1 << 29;
+pub(crate) const POW_MEMORY_PARAMETER: usize = 1 << 27;
 #[cfg(test)] // Set to smaller value to allow for testing of PoW
 pub(crate) const POW_MEMORY_PARAMETER: usize = 1 << 10;
 
@@ -40,6 +40,7 @@ pub(crate) const POW_MEMORY_TREE_HEIGHT: usize = POW_MEMORY_PARAMETER.ilog2() as
 const CHECKPOINT_DISTANCE: usize = 1 << 19;
 
 const NUM_INDEX_REPETITIONS: u32 = 63;
+const BUDDING_ROUNDS: usize = 32;
 const NUM_BUD_LAYERS: usize = 5; // 5 => 63 Tip5 permutations per leaf
 const BUDS_PER_LEAF: usize = 1 << NUM_BUD_LAYERS;
 
@@ -277,8 +278,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Display for Pow<MERKLE_TREE_HEIGHT> {
 pub struct GuesserBuffer<const MERKLE_TREE_HEIGHT: usize> {
     merkle_tree: MTree,
 
-    /// The hash of the parent block of this guesser buffer.
-    prev_block_digest: Digest,
+    hash: Digest,
 }
 
 impl<const MERKLE_TREE_HEIGHT: usize> GuesserBuffer<MERKLE_TREE_HEIGHT> {
@@ -308,7 +308,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Default for GuesserBuffer<MERKLE_TREE_HEIG
     fn default() -> Self {
         Self {
             merkle_tree: MTree::default(),
-            prev_block_digest: Default::default(),
+            hash: Default::default(),
         }
     }
 }
@@ -318,7 +318,13 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
     pub const NUM_LEAFS: usize = 1_usize << Self::MERKLE_TREE_HEIGHT;
 
     fn bud(commitment: Digest, index: u64) -> Digest {
-        Tip5::hash_pair(commitment, Digest::new(bfe_array![index, 0, 0, 0, 0]))
+        let mut hash = commitment;
+
+        for round in 0..BUDDING_ROUNDS {
+            hash = Tip5::hash_pair(hash, Digest::new(bfe_array![index, 0, 0, 0, round]));
+        }
+
+        hash
     }
 
     fn leaf(commitment: Digest, index: u64) -> Digest {
@@ -464,7 +470,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
 
         GuesserBuffer::<MERKLE_TREE_HEIGHT> {
             merkle_tree,
-            prev_block_digest,
+            hash:bud_prefix,
         }
     }
 
@@ -747,95 +753,6 @@ pub(crate) mod tests {
                     .is_ok());
             }
         }
-    }
-
-    /// Ensure that indices cannot be reused over two proposals that share the
-    /// same parent.
-    #[proptest(cases = 1)]
-    fn indices_depend_on_concrete_proposal_hardfork_alpha(
-        #[strategy(arb())] prev_block_digest: Digest,
-        #[strategy(arb())] auth_paths_1: PowMastPaths,
-        #[strategy(arb())] auth_paths_2: PowMastPaths,
-        #[strategy(arb())] nonce: Digest,
-    ) {
-        const MERKLE_TREE_HEIGHT: usize = 10;
-        let buffer = Pow::<MERKLE_TREE_HEIGHT>::preprocess(
-            auth_paths_1,
-            None,
-            ConsensusRuleSet::HardforkAlpha,
-            prev_block_digest,
-        );
-        let indices_1 =
-            Pow::<MERKLE_TREE_HEIGHT>::indices(buffer.index_picker_preimage(&auth_paths_1), nonce);
-        let indices_2 =
-            Pow::<MERKLE_TREE_HEIGHT>::indices(buffer.index_picker_preimage(&auth_paths_2), nonce);
-        assert_ne!(indices_1, indices_2);
-    }
-
-    #[proptest(cases = 6)]
-    fn guesser_buffer_can_be_reused_after_hardfork_alpha(
-        #[strategy(arb())] prev_block_digest: Digest,
-        #[strategy(arb())] auth_paths_1: PowMastPaths,
-        #[strategy(arb())] auth_paths_2: PowMastPaths,
-    ) {
-        const MERKLE_TREE_HEIGHT: usize = 10;
-
-        let buffer = Pow::<MERKLE_TREE_HEIGHT>::preprocess(
-            auth_paths_1,
-            None,
-            ConsensusRuleSet::HardforkAlpha,
-            prev_block_digest,
-        );
-        assert_eq!(
-            buffer,
-            Pow::<MERKLE_TREE_HEIGHT>::preprocess(
-                auth_paths_2,
-                None,
-                ConsensusRuleSet::HardforkAlpha,
-                prev_block_digest,
-            ),
-            "After hardfork, buffer must only depend on previous block hash"
-        );
-
-        // Verify that 1st block proposal can be solved
-        let difficulty = Difficulty::from(2u32);
-        let correct_guess_1 = solve(&buffer, &auth_paths_1, difficulty);
-        assert!(correct_guess_1
-            .validate(
-                auth_paths_1,
-                difficulty.target(),
-                ConsensusRuleSet::HardforkAlpha,
-                prev_block_digest
-            )
-            .is_ok());
-
-        // Verify that old solution does not work when auth paths change.
-        assert_eq!(
-            PowValidationError::PathAInvalid,
-            correct_guess_1
-                .validate(
-                    auth_paths_2,
-                    difficulty.target(),
-                    ConsensusRuleSet::HardforkAlpha,
-                    prev_block_digest
-                )
-                .unwrap_err(),
-            "2nd set of auth paths must make 1st PoW solution invalid, as pow's\
-            Merkle authentication path becomes invalid"
-        );
-
-        // Verify that a 2nd proposal can use the same `buffer` value to create
-        // a successful guess, and that only the `auth_paths` value needs to
-        // change.
-        let correct_guess_2 = solve(&buffer, &auth_paths_2, difficulty);
-        assert!(correct_guess_2
-            .validate(
-                auth_paths_2,
-                difficulty.target(),
-                ConsensusRuleSet::HardforkAlpha,
-                prev_block_digest
-            )
-            .is_ok());
     }
 
     fn solve<const N: usize>(

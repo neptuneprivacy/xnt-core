@@ -100,9 +100,12 @@ impl ConsensusProgram for NativeCurrency {
         ));
         let u128_lt = library.import(Box::new(tasm_lib::arithmetic::u128::lt::Lt));
         let i128_lt = library.import(Box::new(tasm_lib::arithmetic::i128::lt::Lt));
+        /*
+        // Not used anymore
         let shift_right_one_u128 = library.import(Box::new(
             tasm_lib::arithmetic::u128::shift_right_static::ShiftRightStatic::<1>,
         ));
+        */
         let coinbase_pointer_to_amount = library.import(Box::new(CoinbaseAmount));
         let audit_preloaded_data = library.import(Box::new(VerifyNdSiIntegrity::<
             NativeCurrencyWitnessMemory,
@@ -177,37 +180,32 @@ impl ConsensusProgram for NativeCurrency {
             // _ *salted_utxos
         };
 
-        let assert_half_output_amount_timelocked_label =
-            "neptune_core_native_currency_assert_half_output_amount_timelocked";
-        let assert_half_output_amount_timelocked = triton_asm! {
-            {assert_half_output_amount_timelocked_label}:
+        let assert_locked_coins_zero_label = "neptune_core_native_currency_assert_locked_coins_zero";
+
+        let assert_locked_coins_zero = triton_asm! {
+            {assert_locked_coins_zero_label}:
             // _ [total_output] [timelocked_amount]
 
-            dup 7
-            dup 7
-            dup 7
-            dup 7
-            // _ [total_output] [timelocked_amount] [total_output]
+            dup 3
+            dup 3
+            dup 3
+            dup 3
 
-            call {shift_right_one_u128}
-            // _ [total_output] [timelocked_amount] [total_output / 2]
+            // _ [total_output] [timelocked_amount] [timelocked_amount]
 
-            dup 7
-            dup 7
-            dup 7
-            dup 7
-            // _ [total_output] [timelocked_amount] [total_output / 2] [timelocked_amount]
-
-            call {u128_lt}
-            // _ [total_output] [timelocked_amount] (total_output / 2 > timelocked_amount)
-
-            push 0
-            eq
-            // _ [total_output] [timelocked_amount] (total_output / 2 <= timelocked_amount)
-
+            push 0 eq
             assert error_id {Self::COINBASE_TIMELOCK_INSUFFICIENT}
-            // _ [total_output] [timelocked_amount]
 
+            push 0 eq
+            assert error_id {Self::COINBASE_TIMELOCK_INSUFFICIENT}
+
+            push 0 eq
+            assert error_id {Self::COINBASE_TIMELOCK_INSUFFICIENT}
+
+            push 0 eq
+            assert error_id {Self::COINBASE_TIMELOCK_INSUFFICIENT}
+            
+            // _ [total_output] [timelocked_amount]
             return
         };
 
@@ -541,7 +539,7 @@ impl ConsensusProgram for NativeCurrency {
             // _ [txkmh] *ncw *fee [total_input] [total_output] [timelocked_amount] (coinbase > 0)
 
             skiz
-                call {assert_half_output_amount_timelocked_label}
+                call {assert_locked_coins_zero_label}
             // _ [txkmh] *ncw *fee [total_input] [total_output] [timelocked_amount]
 
             pop {coin_size}
@@ -610,7 +608,7 @@ impl ConsensusProgram for NativeCurrency {
 
         let code = triton_asm!(
             {&main_code}
-            {&assert_half_output_amount_timelocked}
+            {&assert_locked_coins_zero}
             {&imports}
         );
 
