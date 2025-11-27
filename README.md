@@ -79,7 +79,7 @@ Windows should just work out-of-the-box with cargo build etc.
 - Or simply start the node — a wallet will be automatically created if one doesn’t exist.
 - Run xnt-core daemon: `xnt-core` with flags
     - `--peer [ip_address:port]` to connect to a given peer, for instance
-      `--peer 161.97.150.88:9898` or `--peer [TO_BE_COMPLETED]`
+      `--peer 161.97.150.88:9898` or `--peer 199.127.60.95:9898`
     - `--compose` to become a composer — generate blocks for miners and earn fees from them
     - `--guess` to mine — if you want to generate coins
     - `--help` to get a list of available command-line arguments
