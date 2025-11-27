@@ -50,8 +50,8 @@ impl Network {
     }
 
     pub fn launch_date(&self) -> Timestamp {
-        // Wednesday, 26 November 2025 23:22:07
-        Timestamp(BFieldElement::new(1764199327000))
+        // 28 November 2025 00:00:00 UTC
+        Timestamp(BFieldElement::new(1764288000000))
     }
 
     /// indicates if the network uses mock proofs

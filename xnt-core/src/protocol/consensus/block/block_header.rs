@@ -92,12 +92,13 @@ impl BlockHeader {
             timestamp: network.launch_date(),
 
             pow: Pow {
-                // Bitcoin block at height 908766
+                // Bitcoin block at height 925482
+                // hash: 00000000000000000000127f0812cc7da9ba2d80d59978e7dfe441ddbd44b1b2
                 nonce: Digest::new(bfe_array![
                     0x0000000000000000u64,
-                    0x0000fcefca46c809u64,
-                    0xda3f97528a19e8c3u64,
-                    0xf3a1a10f3888004du64,
+                    0x0000127f0812cc7du64,
+                    0xa9ba2d80d59978e7u64,
+                    0xdfe441ddbd44b1b2u64,
                     0
                 ]),
                 path_a: [Digest::default(); BlockPow::MERKLE_TREE_HEIGHT],
