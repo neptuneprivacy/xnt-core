@@ -76,12 +76,12 @@ impl CoinbaseDistribution {
             "Output fractions must sum to 1000 ‰."
         );
         ensure!(
-            500 <= outputs
+            0 == outputs
                 .iter()
                 .filter(|x| x.timelocked)
                 .map(|x| x.fraction_in_promille)
                 .sum::<u32>(),
-            "At least half of output must be timelocked."
+            "Timelocked amount must be 0."
         );
         ensure!(
             outputs.iter().any(|x| !x.timelocked),
@@ -95,10 +95,9 @@ impl CoinbaseDistribution {
 
     /// The coinbase distribution for solo mining
     pub(crate) fn solo(reward_address: ReceivingAddress) -> Self {
-        let liquid = CoinbaseOutput::liquid(reward_address.clone(), 500);
-        let timelocked = CoinbaseOutput::timelocked(reward_address.clone(), 500);
+        let liquid = CoinbaseOutput::liquid(reward_address.clone(), 1000);
 
-        Self::try_new(vec![liquid, timelocked]).unwrap()
+        Self::try_new(vec![liquid]).unwrap()
     }
 }
 
@@ -126,7 +125,7 @@ mod tests {
             recipient: dummy_address.into(),
             timelocked: false,
         };
-        assert!(CoinbaseDistribution::try_new(vec![whole_liquid]).is_err());
+        assert!(CoinbaseDistribution::try_new(vec![whole_liquid]).is_ok()); // timelock requirement deleted
 
         let whole_timelocked = CoinbaseOutput {
             fraction_in_promille: 1000,
@@ -141,6 +140,6 @@ mod tests {
             timelocked: false,
         };
 
-        assert!(CoinbaseDistribution::try_new(vec![whole_timelocked, empty_liquid]).is_ok());
+        assert!(CoinbaseDistribution::try_new(vec![whole_timelocked, empty_liquid]).is_err());
     }
 }

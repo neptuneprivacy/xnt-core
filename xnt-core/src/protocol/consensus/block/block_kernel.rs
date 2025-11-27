@@ -1,6 +1,5 @@
 use get_size2::GetSize;
 use itertools::Itertools;
-use num_traits::CheckedSub;
 use serde::Deserialize;
 use serde::Serialize;
 use strum::EnumCount;
@@ -13,7 +12,6 @@ use super::block_appendix::BlockAppendix;
 use super::block_body::BlockBody;
 use super::block_header::BlockHeader;
 use crate::api::export::AdditionRecord;
-use crate::api::export::Timestamp;
 use crate::api::export::Utxo;
 use crate::protocol::consensus::block::block_validation_error::BlockValidationError;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
@@ -45,25 +43,18 @@ impl BlockKernel {
     ///
     /// The genesis block does not have a guesser reward.
     pub fn guesser_fee_utxos(&self) -> Result<Vec<Utxo>, BlockValidationError> {
-        const MINER_REWARD_TIME_LOCK_PERIOD: Timestamp = Timestamp::years(3);
-
         if self.header.height.is_genesis() {
             return Ok(vec![]);
         }
 
-        let total_guesser_reward = self.body.total_guesser_reward()?;
-        let mut value_timelocked = total_guesser_reward;
-        value_timelocked.div_two();
-        let value_unlocked = total_guesser_reward.checked_sub(&value_timelocked).unwrap();
+        // Without locking for miners
 
-        let coins_unlocked = value_unlocked.to_native_coins();
-        let coins_timelocked = value_timelocked.to_native_coins();
+        let total_guesser_reward = self.body.total_guesser_reward()?;
+        let coins_unlocked = total_guesser_reward.to_native_coins();
         let lock_script_hash = self.header.guesser_receiver_data.lock_script_hash;
         let unlocked_utxo = Utxo::new(lock_script_hash, coins_unlocked);
-        let locked_utxo = Utxo::new(lock_script_hash, coins_timelocked)
-            .with_time_lock(self.header.timestamp + MINER_REWARD_TIME_LOCK_PERIOD);
 
-        Ok(vec![locked_utxo, unlocked_utxo])
+        Ok(vec![unlocked_utxo])
     }
 
     /// Compute the addition records that correspond to the UTXOs generated for

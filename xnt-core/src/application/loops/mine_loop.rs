@@ -1512,10 +1512,8 @@ pub(crate) mod tests {
             .to_address()
             .into();
         let coinbase_distribution = vec![
-            CoinbaseOutput::timelocked(address.clone(), 400),
-            CoinbaseOutput::liquid(address.clone(), 300),
-            CoinbaseOutput::liquid(address.clone(), 200),
-            CoinbaseOutput::timelocked(address.clone(), 100),
+            CoinbaseOutput::liquid(address.clone(), 600),
+            CoinbaseOutput::liquid(address.clone(), 400),
         ];
         let coinbase_distribution = CoinbaseDistribution::try_new(coinbase_distribution).unwrap();
 
@@ -1966,14 +1964,14 @@ pub(crate) mod tests {
             .unwrap();
 
             let expected_number_of_expected_utxos = match notification_policy {
-                FeeNotificationPolicy::OffChain => 2,
+                FeeNotificationPolicy::OffChain => 1,
                 FeeNotificationPolicy::OnChainSymmetric
                 | FeeNotificationPolicy::OnChainGeneration => 0,
             };
             assert_eq!(
-                2,
+                1,
                 transaction.kernel.outputs.len(),
-                "Expected two outputs in coinbase tx"
+                "Expected one output in coinbase tx"
             );
             assert_eq!(
                 expected_number_of_expected_utxos,
@@ -1987,8 +1985,8 @@ pub(crate) mod tests {
                         .iter()
                         .filter(|x| x.utxo.release_date().is_some())
                         .count()
-                        .is_one(),
-                    "Expected one timelocked coinbase UTXO"
+                        .is_zero(),
+                    "Expected zero timelocked coinbase UTXO"
                 );
                 assert!(
                     coinbase_utxo_info
@@ -2005,9 +2003,9 @@ pub(crate) mod tests {
                     .wallet_state
                     .scan_for_utxos_announced_to_known_keys(&transaction.kernel)
                     .collect_vec();
-                assert_eq!(2, announced_outputs.len());
+                assert_eq!(1, announced_outputs.len());
                 assert_eq!(
-                    1,
+                    0,
                     announced_outputs
                         .iter()
                         .filter(|x| x.utxo.release_date().is_some())
@@ -2057,7 +2055,7 @@ pub(crate) mod tests {
         );
         let composer_outputs =
             composer_parameters.tx_outputs(NativeCurrencyAmount::coins(1), Timestamp::now());
-        assert_eq!(2, composer_outputs.len());
+        assert_eq!(1, composer_outputs.len()); // solo distribution has only one output, because locked tx doesn't exist anymore
     }
 
     #[test]
@@ -2065,7 +2063,7 @@ pub(crate) mod tests {
         let mut rng = rand::rng();
         let address = GenerationReceivingAddress::derive_from_seed(rng.random());
         let coinbase_distribution = vec![
-            CoinbaseOutput::timelocked(address.into(), 500),
+            CoinbaseOutput::liquid(address.into(), 500),
             CoinbaseOutput::liquid(address.into(), 251),
             CoinbaseOutput::liquid(address.into(), 249),
         ];
@@ -2085,7 +2083,7 @@ pub(crate) mod tests {
 
     #[traced_test]
     #[tokio::test]
-    async fn coinbase_tx_has_two_outputs_or_zero_outputs() {
+    async fn coinbase_tx_has_one_outputs_or_zero_outputs() {
         for guesser_fraction in [0.6, 1.0] {
             for notification_policy in [
                 FeeNotificationPolicy::OffChain,
@@ -2116,8 +2114,8 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-                // Verify zero outputs if guesser gets it all, otherwise two outputs.
-                let num_expected_outputs = if guesser_fraction == 1.0 { 0 } else { 2 };
+                // Verify zero outputs if guesser gets it all, otherwise 1 output.
+                let num_expected_outputs = if guesser_fraction == 1.0 { 0 } else { 1 };
                 assert_eq!(num_expected_outputs, transaction.kernel.outputs.len());
 
                 // Verify that the public notifications/expected UTXOs match

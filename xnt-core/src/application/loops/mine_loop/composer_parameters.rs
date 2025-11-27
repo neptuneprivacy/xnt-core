@@ -119,11 +119,11 @@ impl ComposerParameters {
         if distributed < total_composer_amount {
             // Add correction to timelocked output
             let correction = total_composer_amount.checked_sub(&distributed).unwrap();
-            let first_timelocked = ret
+            let first_liquid = ret
                 .iter_mut()
-                .find(|x| x.is_timelocked())
-                .expect("Must have at least one timelocked output");
-            *first_timelocked = first_timelocked.clone().add_to_amount(correction);
+                .find(|x| !x.is_timelocked())
+                .expect("Must have at least one liquid output");
+            *first_liquid = first_liquid.clone().add_to_amount(correction);
         } else {
             // Subtract correction from liquid output
             let correction = distributed.checked_sub(&total_composer_amount).unwrap();
