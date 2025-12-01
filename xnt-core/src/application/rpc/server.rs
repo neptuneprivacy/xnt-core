@@ -5548,6 +5548,7 @@ mod tests {
             .is_err());
     }
 
+    #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn coinbase_distribution_happy_path() {
         let network = Network::Main;

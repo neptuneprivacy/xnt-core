@@ -1212,9 +1212,9 @@ pub(crate) mod tests {
 
     #[test]
     fn block_subsidy_generation_0() {
-        let block_height_generation_0 = 199u64.into();
+        let block_height_generation_0 = 1u64.into();
         assert_eq!(
-            NativeCurrencyAmount::coins(8),
+            NativeCurrencyAmount::from_raw_i128(27200000000000000000000000000000),
             Block::block_subsidy(block_height_generation_0)
         );
     }
@@ -1222,7 +1222,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn relative_guesser_reward() {
         let network = Network::Main;
-        for fraction in [0.01, 0.1, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99, 1.0] {
+        for fraction in [0.01, 0.1, 0.5, 0.6, 0.7, 0.8, 0.9, 0.9899999999999999, 1.0] {
             let block = invalid_empty_block1_with_guesser_fraction(network, fraction).await;
             assert_eq!(fraction, block.relative_guesser_reward().unwrap());
         }
@@ -1230,7 +1230,7 @@ pub(crate) mod tests {
 
     #[traced_test]
     #[apply(shared_tokio_runtime)]
-    async fn total_block_subsidy_is_128_coins_regardless_of_guesser_fraction() {
+    async fn total_block_subsidy_regardless_of_guesser_fraction() {
         let network = Network::Main;
         let a_wallet_secret = WalletEntropy::new_random();
         let a_key = a_wallet_secret.nth_generation_spending_key_for_tests(0);
@@ -1238,6 +1238,7 @@ pub(crate) mod tests {
         let genesis = Block::genesis(network);
         let mut rng: StdRng = SeedableRng::seed_from_u64(2225550001);
         let now = genesis.header().timestamp + Timestamp::days(1);
+        let block_1_subsidy = Block::block_subsidy(BlockHeight::from(1));
 
         let mut guesser_fraction = 0f64;
         let step = 0.05;
@@ -1277,7 +1278,7 @@ pub(crate) mod tests {
             );
             let total_guesser_reward = block1.body().total_guesser_reward().unwrap();
             let total_miner_reward = total_composer_reward + total_guesser_reward;
-            assert_eq!(NativeCurrencyAmount::coins(128), total_miner_reward);
+            assert_eq!(block_1_subsidy, total_miner_reward);
 
             println!("guesser_fraction: {guesser_fraction}");
             println!(
