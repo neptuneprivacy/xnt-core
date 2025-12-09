@@ -288,4 +288,8 @@ impl SymmetricKey {
         // nsk: xnt-symmetric-key
         format!("xsymk{}", common::network_hrp_char(network))
     }
+
+    pub(super) fn flag(&self) -> BFieldElement {
+        SYMMETRIC_KEY_FLAG
+    }
 }
