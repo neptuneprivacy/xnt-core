@@ -1,10 +1,20 @@
 use async_trait::async_trait;
+use tracing::debug;
 
-use crate::application::json_rpc::core::api::rpc::RpcApi;
-use crate::application::json_rpc::core::api::rpc::RpcResult;
+use crate::api::export::ReceivingAddress;
+use crate::api::export::Timestamp;
+use crate::api::export::Transaction;
+use crate::application::json_rpc::core::api::rpc::*;
 use crate::application::json_rpc::core::model::block::RpcBlock;
 use crate::application::json_rpc::core::model::message::*;
+use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplate;
+use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplateMetadata;
+use crate::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipSnapshot;
 use crate::application::json_rpc::server::rpc::RpcServer;
+use crate::application::loops::channel::RPCServerToMain;
+use crate::protocol::consensus::block::block_selector::BlockSelector;
+use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
 
 #[async_trait]
 impl RpcApi for RpcServer {
@@ -18,7 +28,7 @@ impl RpcApi for RpcServer {
         let state = self.state.lock_guard().await;
 
         Ok(HeightResponse {
-            height: state.chain.light_state().kernel.header.height.into(),
+            height: state.chain.light_state().kernel.header.height,
         })
     }
 
@@ -99,7 +109,7 @@ impl RpcApi for RpcServer {
                 .transaction_kernel()
                 .announcements
                 .iter()
-                .map(|a| a.message.clone().into())
+                .map(|a| a.clone().into())
                 .collect(),
         })
     }
@@ -278,7 +288,7 @@ impl RpcApi for RpcServer {
                         .transaction_kernel()
                         .announcements
                         .iter()
-                        .map(|a| a.message.clone().into())
+                        .map(|a| a.clone().into())
                         .collect::<Vec<_>>()
                 }),
             None => None,
@@ -335,6 +345,202 @@ impl RpcApi for RpcServer {
             block: block.map(|block| block.hash()),
         })
     }
+
+    async fn get_blocks_call(&self, request: GetBlocksRequest) -> RpcResult<GetBlocksResponse> {
+        // Reverse get_blocks is not supported yet.
+        // Might be reconsidered after "succinctness" as it might give it a purpose.
+        if request.to_height < request.from_height {
+            return Ok(GetBlocksResponse { blocks: Vec::new() });
+        }
+
+        let max_blocks = if self.unrestricted { usize::MAX } else { 100 };
+
+        let state = self.state.lock_guard().await;
+        let mut blocks = Vec::new();
+        let mut height = request.from_height;
+
+        while height <= request.to_height && blocks.len() < max_blocks {
+            let block_selector = BlockSelector::Height(height);
+            let Some(digest) = block_selector.as_digest(&state).await else {
+                break;
+            };
+            let Some(block) = state
+                .chain
+                .archival_state()
+                .get_block(digest)
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+
+            blocks.push((&block).into());
+            height = height.next();
+        }
+
+        Ok(GetBlocksResponse { blocks })
+    }
+
+    async fn restore_membership_proof_call(
+        &self,
+        request: RestoreMembershipProofRequest,
+    ) -> RpcResult<RestoreMembershipProofResponse> {
+        if request.absolute_index_sets.len() > 256 && !self.unrestricted {
+            return Err(RpcError::RestoreMembershipProof(
+                RestoreMembershipProofError::ExceedsAllowed,
+            ));
+        }
+
+        let state = self.state.lock_guard().await;
+        let ams = state.chain.archival_state().archival_mutator_set.ams();
+        let mut membership_proofs = Vec::with_capacity(request.absolute_index_sets.len());
+
+        for (index, set) in request.absolute_index_sets.into_iter().enumerate() {
+            match ams.restore_membership_proof_privacy_preserving(set).await {
+                Ok(msmp) => membership_proofs.push(msmp.into()),
+                Err(err) => {
+                    debug!("Failed to restore MSMP for {index}: {err}");
+                    return Err(RpcError::RestoreMembershipProof(
+                        RestoreMembershipProofError::Failed(index),
+                    ));
+                }
+            }
+        }
+
+        let current_tip = state.chain.light_state();
+        let tip_mutator_set = current_tip
+            .mutator_set_accumulator_after()
+            .expect("Tip must have valid MSA after");
+        let snapshot = RpcMsMembershipSnapshot {
+            synced_height: current_tip.header().height.into(),
+            synced_hash: current_tip.hash(),
+            membership_proofs,
+            synced_mutator_set: (&tip_mutator_set).into(),
+        };
+
+        Ok(RestoreMembershipProofResponse { snapshot })
+    }
+
+    async fn submit_transaction_call(
+        &self,
+        request: SubmitTransactionRequest,
+    ) -> RpcResult<SubmitTransactionResponse> {
+        let transaction: Transaction = request.transaction.into();
+        let network = self.state.cli().network;
+        let consensus_rule_set = self.state.lock_guard().await.consensus_rule_set();
+
+        if !transaction.is_valid(network, consensus_rule_set).await {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::InvalidTransaction,
+            ));
+        }
+
+        if transaction.kernel.coinbase.is_some() {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::CoinbaseTransaction,
+            ));
+        }
+
+        if transaction.kernel.fee.is_negative() {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::FeeNegative,
+            ));
+        }
+
+        let timestamp = transaction.kernel.timestamp;
+        let now = Timestamp::now();
+        if timestamp >= now + FUTUREDATING_LIMIT {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::FutureDated,
+            ));
+        }
+
+        let msa = self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .mutator_set_accumulator_after()
+            .expect("Tip block must have mutator set");
+        if !transaction.is_confirmable_relative_to(&msa) {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::NotConfirmable,
+            ));
+        }
+
+        let response = self
+            .to_main_tx
+            .send(RPCServerToMain::SubmitTx(Box::new(transaction)))
+            .await;
+
+        Ok(SubmitTransactionResponse {
+            success: response.is_ok(),
+        })
+    }
+
+    async fn get_block_template_call(
+        &self,
+        request: GetBlockTemplateRequest,
+    ) -> RpcResult<GetBlockTemplateResponse> {
+        let (maybe_proposal, tip) = {
+            let global_state = self.state.lock_guard().await;
+            let proposal = global_state.mining_state.block_proposal.map(|p| p.clone());
+            let tip = *global_state.chain.light_state().header();
+
+            (proposal, tip)
+        };
+
+        let Some(mut proposal) = maybe_proposal else {
+            return Ok(GetBlockTemplateResponse { template: None });
+        };
+
+        let address =
+            ReceivingAddress::from_bech32m(&request.guesser_address, self.state.cli().network)
+                .map_err(|_| RpcError::InvalidAddress)?;
+        proposal.set_header_guesser_address(address);
+
+        let template = RpcBlockTemplate {
+            block: RpcBlock::from(&proposal),
+            metadata: RpcBlockTemplateMetadata::new(&proposal, tip.difficulty),
+        };
+
+        Ok(GetBlockTemplateResponse {
+            template: Some(template),
+        })
+    }
+
+    async fn submit_block_call(
+        &self,
+        request: SubmitBlockRequest,
+    ) -> RpcResult<SubmitBlockResponse> {
+        let mut template: Block = request.template.into();
+
+        // Since block comes from external source, we need to check validity.
+        let tip = self.state.lock_guard().await.chain.light_state().clone();
+        if !template
+            .is_valid(&tip, Timestamp::now(), self.state.cli().network)
+            .await
+        {
+            return Err(RpcError::SubmitBlock(SubmitBlockError::InvalidBlock));
+        }
+
+        template.set_header_pow(request.pow.into());
+
+        if !template.has_proof_of_work(self.state.cli().network, template.header()) {
+            return Err(RpcError::SubmitBlock(SubmitBlockError::InsufficientWork));
+        }
+
+        // No time to waste! Inform main_loop!
+        let solution = Box::new(template);
+        let success = self
+            .to_main_tx
+            .send(RPCServerToMain::ProofOfWorkSolution(solution))
+            .await
+            .is_ok();
+
+        Ok(SubmitBlockResponse { success })
+    }
 }
 
 #[cfg(test)]
@@ -344,31 +550,40 @@ pub mod tests {
 
     use macro_rules_attr::apply;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::prelude::Tip5;
 
+    use crate::api::export::Announcement;
+    use crate::api::export::KeyType;
+    use crate::api::export::NativeCurrencyAmount;
     use crate::api::export::Network;
+    use crate::api::export::OutputFormat;
+    use crate::api::export::Timestamp;
+    use crate::api::export::TxProvingCapability;
     use crate::application::config::cli_args;
     use crate::application::json_rpc::core::api::rpc::RpcApi;
+    use crate::application::json_rpc::core::api::rpc::RpcError;
     use crate::application::json_rpc::core::model::common::RpcBlockSelector;
+    use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplate;
     use crate::application::json_rpc::server::rpc::RpcServer;
     use crate::protocol::consensus::block::block_height::BlockHeight;
+    use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
     use crate::protocol::consensus::transaction::Transaction;
     use crate::protocol::consensus::transaction::TransactionProof;
+    use crate::state::mining::block_proposal::BlockProposal;
+    use crate::state::transaction::tx_creation_config::TxCreationConfig;
     use crate::state::wallet::wallet_entropy::WalletEntropy;
+    use crate::tests::shared::blocks::fake_valid_deterministic_successor;
     use crate::tests::shared::blocks::invalid_block_with_transaction;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
     use crate::tests::shared::strategies::txkernel;
     use crate::tests::shared_tokio_runtime;
-    use crate::twenty_first::bfe;
-    use crate::BFieldElement;
     use crate::Block;
 
     pub async fn test_rpc_server() -> RpcServer {
-        let global_state_lock = mock_genesis_global_state(
-            2,
-            WalletEntropy::new_random(),
-            cli_args::Args::default_with_network(Network::Main),
-        )
-        .await;
+        let mut cli = cli_args::Args::default_with_network(Network::Main);
+        cli.tx_proving_capability = Some(TxProvingCapability::ProofCollection);
+        let global_state_lock =
+            mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
 
         RpcServer::new(global_state_lock, None)
     }
@@ -382,7 +597,10 @@ pub mod tests {
     #[apply(shared_tokio_runtime)]
     async fn height_is_correct() {
         let rpc_server = test_rpc_server().await;
-        assert_eq!(bfe!(0), rpc_server.height().await.unwrap().height);
+        assert_eq!(
+            BlockHeight::genesis(),
+            rpc_server.height().await.unwrap().height
+        );
     }
 
     #[test_strategy::proptest(async = "tokio", cases = 5)]
@@ -470,7 +688,7 @@ pub mod tests {
                 .header
                 .expect("header should exist");
             assert_eq!(kernel.header, header);
-            assert_eq!(header.height, height.into());
+            assert_eq!(header.height, height);
 
             let body = rpc_server
                 .get_block_body(selector)
@@ -615,5 +833,179 @@ pub mod tests {
                 "origin block mismatch for utxo {utxo_index}"
             );
         }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn off_node_wallets_behave_correctly() {
+        let mut rpc_server = test_rpc_server().await;
+        let network = rpc_server.state.cli().network;
+
+        // Prepare a transaction to our wallet coming from devnet wallet.
+        let mut devnet_node = mock_genesis_global_state(
+            0,
+            WalletEntropy::devnet_wallet(),
+            rpc_server.state.cli().clone(),
+        )
+        .await;
+
+        let rpc_address = rpc_server
+            .state
+            .api()
+            .wallet()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let mock_amount = NativeCurrencyAmount::coins_from_str("1").unwrap();
+        let devnet_artifacts = devnet_node
+            .api_mut()
+            .tx_sender_mut()
+            .send(
+                vec![OutputFormat::AddressAndAmount(rpc_address, mock_amount)],
+                Default::default(),
+                mock_amount,
+                network.launch_date() + Timestamp::months(3),
+            )
+            .await
+            .unwrap();
+
+        // Pass transaction into rpc_server network.
+        let block_1 = invalid_block_with_transaction(
+            &Block::genesis(network),
+            devnet_artifacts.transaction().clone(),
+        );
+        rpc_server.state.set_new_tip(block_1.clone()).await.unwrap();
+
+        // Fetch genesis and tip and ensure announcement (on tip) matches after de/serialization.
+        let blocks = rpc_server
+            .get_blocks(BlockHeight::genesis(), BlockHeight::genesis().next())
+            .await
+            .unwrap()
+            .blocks;
+        assert_eq!(blocks.len(), 2);
+
+        let announcement: Announcement = blocks[1].kernel.body.transaction_kernel.announcements[0]
+            .clone()
+            .into();
+        let expected_announcement = devnet_artifacts.details().announcements()[0].clone();
+        assert_eq!(announcement, expected_announcement);
+
+        // Try restoring MSMP thru RPC and ensure it matches the one maintained by our wallet.
+        let msa = rpc_server
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .mutator_set_accumulator_after()
+            .unwrap();
+        let wallet_status = rpc_server
+            .state
+            .lock_guard()
+            .await
+            .wallet_state
+            .get_wallet_status(block_1.hash(), &msa)
+            .await;
+
+        let (utxo, msmp) = &wallet_status.synced_unspent[0];
+        let item = Tip5::hash(&utxo.utxo);
+
+        let msmp_snapshot = rpc_server
+            .restore_membership_proof(vec![msmp.compute_indices(item)])
+            .await
+            .expect("restore to succeed")
+            .snapshot;
+        let extracted_msmp = msmp_snapshot.membership_proofs[0]
+            .clone()
+            .extract_ms_membership_proof(
+                utxo.aocl_leaf_index,
+                msmp.sender_randomness,
+                msmp.receiver_preimage,
+            )
+            .unwrap();
+        assert_eq!(msmp, &extracted_msmp);
+
+        // Try submitting a valid transaction (ProofCollection) by RPC.
+        let tx_creation_config = TxCreationConfig::default()
+            .with_prover_capability(TxProvingCapability::ProofCollection);
+        let artifacts = rpc_server
+            .state
+            .api()
+            .tx_initiator_internal()
+            .create_transaction(
+                Default::default(),
+                mock_amount,
+                network.launch_date() + Timestamp::months(3) + Timestamp::minutes(3),
+                tx_creation_config,
+                ConsensusRuleSet::infer_from(network, block_1.header().height),
+            )
+            .await
+            .unwrap();
+        let rpc_transaction = artifacts.transaction().clone().into();
+        let submit_tx_response = rpc_server
+            .submit_transaction(rpc_transaction)
+            .await
+            .expect("submission to succeed");
+
+        assert!(submit_tx_response.success);
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn mining_scenarios_validated_properly() {
+        use crate::application::json_rpc::core::api::rpc::SubmitBlockError;
+
+        let mut rpc_server = test_rpc_server().await;
+        let network = rpc_server.state.cli().network;
+
+        let genesis = Block::genesis(network);
+        let block1 = fake_valid_deterministic_successor(&genesis, network).await;
+        rpc_server
+            .state
+            .lock_mut(|x| {
+                x.mining_state.block_proposal = BlockProposal::ForeignComposition(block1.clone())
+            })
+            .await;
+        let guesser_address = rpc_server
+            .state
+            .lock_guard_mut()
+            .await
+            .wallet_state
+            .next_unused_spending_key(KeyType::Generation)
+            .await
+            .to_address();
+
+        let RpcBlockTemplate { block, metadata } = rpc_server
+            .get_block_template(guesser_address.to_bech32m(network).unwrap())
+            .await
+            .unwrap()
+            .template
+            .unwrap();
+
+        assert_eq!(
+            rpc_server
+                .submit_block(block.clone(), block.kernel.header.pow.clone())
+                .await
+                .unwrap_err(),
+            RpcError::SubmitBlock(SubmitBlockError::InsufficientWork)
+        );
+
+        let solution = metadata.solve(ConsensusRuleSet::default());
+        assert!(
+            rpc_server
+                .submit_block(block.clone(), solution.clone())
+                .await
+                .unwrap()
+                .success,
+            "Node must accept valid new tip."
+        );
+
+        let mut bad_proposal = block;
+        bad_proposal.proof = None;
+        assert_eq!(
+            rpc_server
+                .submit_block(bad_proposal.clone(), solution)
+                .await
+                .unwrap_err(),
+            RpcError::SubmitBlock(SubmitBlockError::InvalidBlock)
+        );
     }
 }

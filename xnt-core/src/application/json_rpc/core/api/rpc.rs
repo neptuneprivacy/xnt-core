@@ -5,15 +5,70 @@ use tasm_lib::prelude::Digest;
 use tasm_lib::triton_vm::prelude::BFieldElement;
 use thiserror::Error;
 
+use crate::application::json_rpc::core::model::block::header::RpcBlockHeight;
+use crate::application::json_rpc::core::model::block::header::RpcBlockPow;
+use crate::application::json_rpc::core::model::block::transaction_kernel::RpcAbsoluteIndexSet;
 use crate::application::json_rpc::core::model::block::transaction_kernel::RpcAdditionRecord;
+use crate::application::json_rpc::core::model::block::RpcBlock;
 use crate::application::json_rpc::core::model::common::RpcBlockSelector;
 use crate::application::json_rpc::core::model::json::JsonError;
 use crate::application::json_rpc::core::model::message::*;
+use crate::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
+
+#[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RestoreMembershipProofError {
+    #[error("Failed for index {0}")]
+    Failed(usize),
+
+    #[error("Exceeds the allowed limit")]
+    ExceedsAllowed,
+}
+
+#[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SubmitTransactionError {
+    #[error("Invalid transaction")]
+    InvalidTransaction,
+
+    #[error("Coinbase transactions are not allowed")]
+    CoinbaseTransaction,
+
+    #[error("Transaction fee is negative")]
+    FeeNegative,
+
+    #[error("Transaction is future-dated")]
+    FutureDated,
+
+    #[error("Transaction not confirmable relative to the mutator set")]
+    NotConfirmable,
+}
+
+#[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SubmitBlockError {
+    #[error("Invalid block")]
+    InvalidBlock,
+
+    #[error("The block's proof-of-work does not meet the required target")]
+    InsufficientWork,
+}
 
 #[derive(Debug, Clone, Error, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RpcError {
     #[error("JSON-RPC server error: {0}")]
     Server(JsonError),
+
+    // Call-specific errors
+    #[error("Failed to restore membership proof: {0}")]
+    RestoreMembershipProof(RestoreMembershipProofError),
+
+    #[error("Failed to submit transaction: {0}")]
+    SubmitTransaction(SubmitTransactionError),
+
+    #[error("Failed to submit block: {0}")]
+    SubmitBlock(SubmitBlockError),
+
+    // Common case errors
+    #[error("Invalid address provided in arguments")]
+    InvalidAddress,
 }
 
 pub type RpcResult<T> = Result<T, RpcError>;
@@ -212,4 +267,72 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: FindUtxoOriginRequest,
     ) -> RpcResult<FindUtxoOriginResponse>;
+
+    /* Wallet */
+
+    async fn get_blocks(
+        &self,
+        from_height: RpcBlockHeight,
+        to_height: RpcBlockHeight,
+    ) -> RpcResult<GetBlocksResponse> {
+        self.get_blocks_call(GetBlocksRequest {
+            from_height,
+            to_height,
+        })
+        .await
+    }
+    async fn get_blocks_call(&self, request: GetBlocksRequest) -> RpcResult<GetBlocksResponse>;
+
+    async fn restore_membership_proof(
+        &self,
+        absolute_index_sets: Vec<RpcAbsoluteIndexSet>,
+    ) -> RpcResult<RestoreMembershipProofResponse> {
+        self.restore_membership_proof_call(RestoreMembershipProofRequest {
+            absolute_index_sets,
+        })
+        .await
+    }
+    async fn restore_membership_proof_call(
+        &self,
+        request: RestoreMembershipProofRequest,
+    ) -> RpcResult<RestoreMembershipProofResponse>;
+
+    async fn submit_transaction(
+        &self,
+        transaction: RpcTransaction,
+    ) -> RpcResult<SubmitTransactionResponse> {
+        self.submit_transaction_call(SubmitTransactionRequest { transaction })
+            .await
+    }
+    async fn submit_transaction_call(
+        &self,
+        request: SubmitTransactionRequest,
+    ) -> RpcResult<SubmitTransactionResponse>;
+
+    /* Mining */
+
+    async fn get_block_template(
+        &self,
+        guesser_address: String,
+    ) -> RpcResult<GetBlockTemplateResponse> {
+        self.get_block_template_call(GetBlockTemplateRequest { guesser_address })
+            .await
+    }
+    async fn get_block_template_call(
+        &self,
+        request: GetBlockTemplateRequest,
+    ) -> RpcResult<GetBlockTemplateResponse>;
+
+    async fn submit_block(
+        &self,
+        template: RpcBlock,
+        pow: RpcBlockPow,
+    ) -> RpcResult<SubmitBlockResponse> {
+        self.submit_block_call(SubmitBlockRequest { template, pow })
+            .await
+    }
+    async fn submit_block_call(
+        &self,
+        request: SubmitBlockRequest,
+    ) -> RpcResult<SubmitBlockResponse>;
 }

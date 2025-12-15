@@ -1737,9 +1737,9 @@ impl MainLoopHandler {
                     let own_handshake_data: HandshakeData = state.get_own_handshakedata();
                     let global_state_lock = self.global_state_lock.clone(); // bump arc refcount.
                     let incoming_peer_task_handle = tokio::task::spawn(async move {
-                        // permit gets dropped at end of scope, to release slot.
-                        let _permit = permit;
-
+                        // Permit is passed to answer_peer and released after handshake,
+                        // not when the connection closes. This prevents semaphore
+                        // starvation attacks.
                         match answer_peer(
                             stream,
                             global_state_lock,
@@ -1747,6 +1747,7 @@ impl MainLoopHandler {
                             main_to_peer_broadcast_rx_clone,
                             peer_task_to_main_tx_clone,
                             own_handshake_data,
+                            Some(permit),
                         ).await {
                             Ok(()) => (),
                             Err(err) => debug!("Got result: {:?}", err),
@@ -2065,6 +2066,30 @@ impl MainLoopHandler {
 
                 // shut down
                 Ok(true)
+            }
+            RPCServerToMain::SubmitTx(transaction) => {
+                // Technically RPC is not supposed/capable to handle ProofWitness but just in case
+                // Until a decision is made. (As this might get used by api too.)
+                let notification: Option<TransactionNotification> =
+                    transaction.as_ref().try_into().ok();
+
+                {
+                    let mut state = self.global_state_lock.lock_guard_mut().await;
+
+                    state
+                        .mempool_insert(*transaction, UpgradePriority::Critical)
+                        .await;
+                }
+
+                // If transaction can be sent thru P2P, submit instantly.
+                // This might be mempools responsibility but for now...
+                // We know upgraded transactions gets announced but not sure about new entries, might get moved into mempool too.
+                if let Some(notification) = notification {
+                    let pmsg = MainToPeerTask::TransactionNotification(notification);
+                    self.main_to_peer_broadcast(pmsg);
+                }
+
+                Ok(false)
             }
         }
     }
@@ -3089,6 +3114,7 @@ mod tests {
                     main_to_peer_rx_mock,
                     peer_to_main_tx_clone,
                     own_handshake,
+                    None, // No semaphore permit in test
                 )
                 .await
                 {

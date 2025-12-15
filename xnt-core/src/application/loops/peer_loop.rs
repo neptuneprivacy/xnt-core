@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use anyhow::bail;
 use anyhow::Result;
+use bincode::Options;
 use futures::sink::Sink;
 use futures::sink::SinkExt;
 use futures::stream::TryStream;
@@ -63,6 +64,25 @@ use crate::util_types::mutator_set::removal_record::RemovalRecordValidityError;
 const STANDARD_BLOCK_BATCH_SIZE: usize = 35;
 const MAX_PEER_LIST_LENGTH: usize = 10;
 const MINIMUM_BLOCK_BATCH_SIZE: usize = 2;
+
+/// Maximum size in bytes for a single block during fork reconciliation. Blocks
+/// larger than this are rejected to prevent RAM exhaustion attacks.
+///
+/// This constant is defined for the peer to heuristically enforce a safe upper
+/// bound as a matter of policy, and does not have to determine which consensus
+/// rule set we are on to get an exact value. Note that this policy is only
+/// enforced during fork reconciliation -- in particular, it does not contribute
+/// to block (in)validity as defined in [`Block::validate`].
+const MAX_BLOCK_SIZE_IN_FORK_RECONCILIATION: usize =
+    2 * 8 * ConsensusRuleSet::HardforkAlpha.max_block_size();
+
+/// Maximum size of a single announcement, in BFieldElements. Typical encrypted
+/// UTXO notifications are ~400 BFEs. This limit provides headroom while
+/// preventing DoS via oversized announcements.
+///
+/// Note that this limit is enforced as a policy for relaying transactions, and
+/// not affect block (in)validity.
+pub(crate) const MAX_ANNOUNCEMENT_MESSAGE_SIZE: usize = 4096;
 
 const KEEP_CONNECTION_ALIVE: bool = false;
 const DISCONNECT_CONNECTION: bool = true;
@@ -418,6 +438,23 @@ impl PeerLoopHandler {
         <S as Sink<PeerMessage>>::Error: std::error::Error + Sync + Send + 'static,
         <S as TryStream>::Error: std::error::Error,
     {
+        // Check block size to prevent RAM exhaustion attacks.
+        // We estimate size using bincode serialization which matches network format.
+        let block_size = bincode::DefaultOptions::new()
+            .serialized_size(received_block.as_ref())
+            .unwrap_or(usize::MAX as u64) as usize;
+
+        // Reject individual blocks that are too large
+        if block_size > MAX_BLOCK_SIZE_IN_FORK_RECONCILIATION {
+            warn!(
+                "Received oversized block during fork reconciliation: {} bytes (max: {} bytes)",
+                block_size, MAX_BLOCK_SIZE_IN_FORK_RECONCILIATION
+            );
+            self.punish(NegativePeerSanction::OversizedBlock).await?;
+            peer_state.fork_reconciliation_blocks.clear();
+            return Ok(());
+        }
+
         // Does the received block match the fork reconciliation list?
         let received_block_matches_fork_reconciliation_list = if let Some(successor) =
             peer_state.fork_reconciliation_blocks.last()
@@ -1248,6 +1285,20 @@ impl PeerLoopHandler {
             }
             PeerMessage::Transaction(transaction) => {
                 log_slow_scope!(fn_name!() + "::PeerMessage::Transaction");
+
+                // Early check for oversized announcements to prevent DoS
+                for announcement in &transaction.kernel.announcements {
+                    if announcement.message.len() > MAX_ANNOUNCEMENT_MESSAGE_SIZE {
+                        warn!(
+                            "Received transaction with oversized announcement: {} BFEs (max: {})",
+                            announcement.message.len(),
+                            MAX_ANNOUNCEMENT_MESSAGE_SIZE
+                        );
+                        self.punish(NegativePeerSanction::OversizedAnnouncement)
+                            .await?;
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                }
 
                 let num_inputs: u64 = transaction.kernel.inputs.len().try_into().unwrap();
                 debug!(
