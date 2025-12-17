@@ -32,7 +32,7 @@ impl WalletEntropy {
 
     /// Create a `WalletEntropy` object with a fixed digest
     pub fn devnet_wallet() -> Self {
-        let secret_seed = SecretKeyMaterial(BField32Bytes::from([
+        let secret_seed = SecretKeyMaterial::V1(BField32Bytes::from([
             12063201067205522823_u64,
             1529663126377206632_u64,
             2090171368883726200_u64,
@@ -73,7 +73,7 @@ impl WalletEntropy {
         // in case you don't know with what counter you made the address
         let key_seed = Tip5::hash_varlen(
             &[
-                self.secret_seed.0.encode(),
+                self.encoded_secret_seed(),
                 bfe_vec![generation_address::GENERATION_FLAG, index],
             ]
             .concat(),
@@ -90,7 +90,7 @@ impl WalletEntropy {
     pub fn nth_symmetric_key(&self, index: u64) -> symmetric_key::SymmetricKey {
         let key_seed = Tip5::hash_varlen(
             &[
-                self.secret_seed.0.encode(),
+                self.encoded_secret_seed(),
                 bfe_vec![symmetric_key::SYMMETRIC_KEY_FLAG, index],
             ]
             .concat(),
@@ -128,7 +128,7 @@ impl WalletEntropy {
         const SEED_FLAG: u64 = 0x2315439570c4a85fu64;
         Tip5::hash_varlen(
             &[
-                self.secret_seed.0.encode(),
+                self.encoded_secret_seed(),
                 bfe_vec![SEED_FLAG, block_height],
             ]
             .concat(),
@@ -153,7 +153,7 @@ impl WalletEntropy {
         const SENDER_RANDOMNESS_FLAG: u64 = 0x5e116e1270u64;
         Tip5::hash_varlen(
             &[
-                self.secret_seed.0.encode(),
+                self.encoded_secret_seed(),
                 bfe_vec![SENDER_RANDOMNESS_FLAG, block_height],
                 receiver_digest.encode(),
             ]
@@ -166,6 +166,13 @@ impl WalletEntropy {
     pub fn from_phrase(phrase: &[String]) -> Result<Self> {
         let key = SecretKeyMaterial::from_phrase(phrase)?;
         Ok(Self::new(key))
+    }
+    
+    pub fn encoded_secret_seed(&self) -> Vec<BFieldElement> {
+        match &self.secret_seed {
+            SecretKeyMaterial::V0(sk) => sk.encode(),
+            SecretKeyMaterial::V1(sk) => sk.encode()
+        }
     }
 }
 
@@ -202,7 +209,7 @@ mod tests {
         pub(crate) fn new_pseudorandom(seed: [u8; 32]) -> Self {
             let mut rng: rand::rngs::StdRng = rand::SeedableRng::from_seed(seed);
             Self {
-                secret_seed: SecretKeyMaterial(rand::Rng::random(&mut rng)),
+                secret_seed: SecretKeyMaterial::V1(rand::Rng::random(&mut rng)),
             }
         }
     }
