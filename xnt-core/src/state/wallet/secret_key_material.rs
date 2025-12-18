@@ -82,12 +82,14 @@ pub enum ShamirSecretSharingError {
 }
 
 impl SecretKeyMaterial {
+    /// The version of the secret key material.
     pub fn version(&self) -> u8 {
         match self {
             SecretKeyMaterial::V0(_) => 0, // mnemonic with 18 words
             SecretKeyMaterial::V1(_) => 1, // mnemonic with 24 words
         }
     }
+
     /// Split the secret across n shares such that combining any t of them
     /// yields the secret again.
     ///
@@ -255,7 +257,7 @@ impl SecretKeyMaterial {
     /// Convert a seed phrase into [`SecretKeyMaterial`].
     ///
     /// The returned secret key material is wrapped in a `Result`, which is
-    /// `Err` if the words are not 24 valid BIP-39 words.
+    /// `Err` if the words are not 24 or 18 valid BIP-39 words.
     pub fn from_phrase(phrase: &[String]) -> Result<Self> {
         let mnemonic = Mnemonic::from_phrase(&phrase.join(" "), bip39::Language::English)?;
         match MnemonicType::for_word_count(phrase.len())? {

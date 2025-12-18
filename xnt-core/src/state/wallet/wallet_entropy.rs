@@ -161,17 +161,17 @@ impl WalletEntropy {
         )
     }
 
-    /// Convert a secret seed phrase (list of 24 valid BIP-39 words) to a
+    /// Convert a secret seed phrase (list of 18 or 24 valid BIP-39 words) to a
     /// [`WalletEntropy`] object
     pub fn from_phrase(phrase: &[String]) -> Result<Self> {
         let key = SecretKeyMaterial::from_phrase(phrase)?;
         Ok(Self::new(key))
     }
-    
+
     pub fn encoded_secret_seed(&self) -> Vec<BFieldElement> {
         match &self.secret_seed {
             SecretKeyMaterial::V0(sk) => sk.encode(),
-            SecretKeyMaterial::V1(sk) => sk.encode()
+            SecretKeyMaterial::V1(sk) => sk.encode(),
         }
     }
 }
