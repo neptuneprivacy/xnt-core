@@ -19,6 +19,8 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::generate;
 use clap_complete::Shell;
+use dialoguer::Select;
+use dialoguer::theme::ColorfulTheme;
 use itertools::Itertools;
 use neptune_privacy::api::export::TransactionKernelId;
 use neptune_privacy::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
@@ -184,13 +186,13 @@ enum Command {
         max_num_blocks: Option<usize>,
     },
 
-    /// Show biggest block interval in the specified range.
+    /// Show the biggest block interval in the specified range.
     MaxBlockInterval {
         last_block: BlockSelector,
         max_num_blocks: Option<usize>,
     },
 
-    /// Show smallest block interval in the specified range.
+    /// Show the smallest block interval in the specified range.
     MinBlockInterval {
         last_block: BlockSelector,
         max_num_blocks: Option<usize>,
@@ -202,7 +204,7 @@ enum Command {
         max_num_blocks: Option<usize>,
     },
 
-    /// Show largest difficulty in the specified range.
+    /// Show the largest difficulty in the specified range.
     MaxBlockDifficulty {
         last_block: BlockSelector,
         max_num_blocks: Option<usize>,
@@ -269,7 +271,7 @@ enum Command {
         #[clap(value_parser = NativeCurrencyAmount::coins_from_str)]
         fee: NativeCurrencyAmount,
 
-        release_after_seconds: u64
+        release_after_seconds: u64,
     },
 
     /// send a payment to one or more recipients
@@ -315,7 +317,7 @@ enum Command {
     /// block proposals, and new transactions from being received.
     Freeze,
 
-    /// If state updates have been paused, resumes them. Otherwise does nothing.
+    /// If state updates have been paused, resumes them. Otherwise, does nothing.
     Unfreeze,
 
     /// pause mining
@@ -567,12 +569,12 @@ async fn main() -> Result<()> {
 
             // prompt user for all shares
             let mut shares = vec![];
-            let capture_integers = Regex::new(r"^(\d+)\/(\d+)$").unwrap();
+            let capture_integers = Regex::new(r"^(\d+)\/(\d+)$")?;
             while shares.len() != *t {
                 println!("Enter share index (\"i/n\"): ");
 
                 let mut buffer = "".to_string();
-                std::io::stdin()
+                io::stdin()
                     .read_line(&mut buffer)
                     .expect("Cannot accept user input.");
                 let buffer = buffer.trim();
@@ -740,7 +742,7 @@ async fn main() -> Result<()> {
     }
 
     // all other operations need a connection to the server
-    let server_socket = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
+    let server_socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
     let Ok(transport) = tarpc::serde_transport::tcp::connect(server_socket, Json::default).await
     else {
         eprintln!("This command requires a connection to `xnt-core`, but that connection could not be established. Is `xnt-core` running?");
@@ -917,7 +919,7 @@ async fn main() -> Result<()> {
             let receiving_address = client
                 .next_receiving_address(ctx, token, KeyType::Generation)
                 .await??;
-            println!("{}", receiving_address.to_display_bech32m(network).unwrap())
+            println!("{}", receiving_address.to_display_bech32m(network)?)
         }
         Command::MempoolTxCount => {
             let count: usize = client.mempool_tx_count(ctx, token).await??;
@@ -967,7 +969,7 @@ async fn main() -> Result<()> {
             }
             let intervals = intervals.unwrap();
 
-            let num_samples: u64 = intervals.len().try_into().unwrap();
+            let num_samples: u64 = intervals.len().try_into()?;
             let mut acc = 0;
             let mut acc_squared = 0;
             for (_height, interval) in intervals {
@@ -1167,17 +1169,14 @@ async fn main() -> Result<()> {
             address,
             amount,
             fee,
-            release_after_seconds
+            release_after_seconds,
         } => {
             // Parse on client
-            let receiver_tag = String::from_str("").unwrap();
+            let receiver_tag = String::from_str("")?;
 
             let receiving_address = ReceivingAddress::from_bech32m(&address, network)?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let release_time = now + (release_after_seconds as u128) * 1000;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            let release_time = now + u128::from(release_after_seconds) * 1000;
             let release_timestamp = Timestamp(BFieldElement::new(release_time as u64));
 
             // abort early on negative fee
@@ -1195,7 +1194,10 @@ async fn main() -> Result<()> {
                         amount,
                         release_timestamp,
                     )],
-                    ChangePolicy::recover_to_next_unused_key(KeyType::Symmetric, UtxoNotificationMedium::OnChain),
+                    ChangePolicy::recover_to_next_unused_key(
+                        KeyType::Symmetric,
+                        UtxoNotificationMedium::OnChain,
+                    ),
                     fee,
                 )
                 .await?;
@@ -1406,8 +1408,8 @@ async fn main() -> Result<()> {
 //
 // Otherwise, we call cookie_hint() RPC to obtain data-dir.
 // But the API might be disabled, which we detect and fallback to the default data-dir.
-async fn get_cookie_hint(client: &RPCClient, args: &Config) -> anyhow::Result<auth::CookieHint> {
-    async fn fallback(client: &RPCClient, args: &Config) -> anyhow::Result<auth::CookieHint> {
+async fn get_cookie_hint(client: &RPCClient, args: &Config) -> Result<auth::CookieHint> {
+    async fn fallback(client: &RPCClient, args: &Config) -> Result<auth::CookieHint> {
         let network = client.network(context::current()).await??;
         let data_directory = DataDirectory::get(args.data_dir.clone(), network)?;
         Ok(auth::CookieHint {
@@ -1490,7 +1492,7 @@ fn process_utxo_notifications(
     network: Network,
     private_notifications: Vec<PrivateNotificationData>,
     receiver_tag: Option<String>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let data_dir = root_data_dir.utxo_transfer_directory_path();
 
     if !private_notifications.is_empty() {
@@ -1502,10 +1504,7 @@ fn process_utxo_notifications(
 
     // TODO: It would be better if this timestamp was read from the created
     // transaction.
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
     // write out one UtxoTransferEntry in a json file, per output
     let mut wrote_file_cnt = 0usize;
@@ -1535,7 +1534,7 @@ fn process_utxo_notifications(
         let file_path = file_dir.join(&file_name);
         println!("creating file: {}", file_path.display());
         let file = std::fs::File::create_new(&file_path)?;
-        let mut writer = std::io::BufWriter::new(file);
+        let mut writer = io::BufWriter::new(file);
         serde_json::to_writer_pretty(&mut writer, &entry)?;
         writer.flush()?;
 
@@ -1565,13 +1564,20 @@ or use equivalent claim functionality of your chosen wallet software.
 }
 
 fn enter_seed_phrase_dialog() -> Result<SecretKeyMaterial> {
+    let mnemonic_length_list = [18, 24];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Choose your mnemonic length")
+        .default(0)
+        .items(mnemonic_length_list)
+        .interact()?;
+    let mnemonic_length = mnemonic_length_list[selection];
     let mut phrase = vec![];
     let mut i = 1;
     loop {
         print!("{i}. ");
-        io::stdout().flush()?;
+        stdout().flush()?;
         let mut buffer = "".to_string();
-        std::io::stdin()
+        io::stdin()
             .read_line(&mut buffer)
             .expect("Cannot accept user input.");
         let word = buffer.trim();
@@ -1582,7 +1588,7 @@ fn enter_seed_phrase_dialog() -> Result<SecretKeyMaterial> {
         {
             phrase.push(word.to_string());
             i += 1;
-            if i > 18 {
+            if i > mnemonic_length {
                 break;
             }
         } else {
