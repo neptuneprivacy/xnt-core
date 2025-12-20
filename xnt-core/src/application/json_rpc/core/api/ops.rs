@@ -95,6 +95,30 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Archival)]
     FindUtxoOrigin,
+
+    #[namespace(Namespace::Wallet)]
+    GetBlocks,
+
+    #[namespace(Namespace::Wallet)]
+    RestoreMembershipProof,
+
+    #[namespace(Namespace::Wallet)]
+    SubmitTransaction,
+
+    #[namespace(Namespace::Mining)]
+    GetBlockTemplate,
+
+    #[namespace(Namespace::Mining)]
+    SubmitBlock,
+
+    #[namespace(Namespace::Mempool)]
+    Transactions,
+
+    #[namespace(Namespace::Mempool)]
+    GetTransactionKernel,
+
+    #[namespace(Namespace::Mempool)]
+    GetTransactionProof,
 }
 
 #[cfg(test)]

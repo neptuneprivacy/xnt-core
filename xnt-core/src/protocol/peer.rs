@@ -87,6 +87,9 @@ pub enum NegativePeerSanction {
     TransactionWithNegativeFee,
     DoubleSpendingTransaction,
     CannotApplyTransactionToMutatorSet,
+    OversizedAnnouncement,
+    /// Block exceeds size limit during fork reconciliation (RAM exhaustion attack)
+    OversizedBlock,
 
     InvalidBlockMmrAuthentication,
 
@@ -146,6 +149,8 @@ impl Display for NegativePeerSanction {
             NegativePeerSanction::CannotApplyTransactionToMutatorSet => {
                 "cannot apply tx to mutator set"
             }
+            NegativePeerSanction::OversizedAnnouncement => "oversized announcement",
+            NegativePeerSanction::OversizedBlock => "oversized block",
             NegativePeerSanction::NonMinedTransactionHasCoinbase => {
                 "non-mined transaction has coinbase"
             }
@@ -237,6 +242,8 @@ impl Sanction for NegativePeerSanction {
             NegativePeerSanction::TransactionWithNegativeFee => -22,
             NegativePeerSanction::DoubleSpendingTransaction => -14,
             NegativePeerSanction::CannotApplyTransactionToMutatorSet => -3,
+            NegativePeerSanction::OversizedAnnouncement => -10,
+            NegativePeerSanction::OversizedBlock => -50,
             NegativePeerSanction::NonMinedTransactionHasCoinbase => -10,
             NegativePeerSanction::NoStandingFoundMaybeCrash => -10,
             NegativePeerSanction::BlockProposalNotFound => -1,
@@ -1019,6 +1026,10 @@ impl rand::distr::Distribution<NegativePeerSanction> for rand::distr::StandardUn
 
             33 => NegativePeerSanction::ReceivedSyncChallenge,
             34 => NegativePeerSanction::UnrelayableTransaction,
+
+            35 => NegativePeerSanction::OversizedAnnouncement,
+            36 => NegativePeerSanction::OversizedBlock,
+
             _ => unreachable!(),
         }
     }
@@ -1065,7 +1076,8 @@ impl rand::distr::Distribution<PeerStanding> for rand::distr::StandardUniform {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use macro_rules_attr::apply;
-    use rand::{random, rng};
+    use rand::random;
+    use rand::rng;
 
     use super::*;
     use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;

@@ -10,6 +10,11 @@ use crate::application::json_rpc::core::model::block::header::*;
 use crate::application::json_rpc::core::model::block::transaction_kernel::*;
 use crate::application::json_rpc::core::model::block::*;
 use crate::application::json_rpc::core::model::common::*;
+use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplate;
+use crate::application::json_rpc::core::model::wallet::block::*;
+use crate::application::json_rpc::core::model::wallet::mutator_set::*;
+use crate::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
+use crate::application::json_rpc::core::model::wallet::transaction::RpcTransactionProof;
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
 #[serde(rename_all = "camelCase")]
@@ -28,7 +33,7 @@ pub struct HeightRequest {}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeightResponse {
-    pub height: BFieldElement,
+    pub height: RpcBlockHeight,
 }
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
@@ -108,7 +113,7 @@ pub struct TipAnnouncementsRequest {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TipAnnouncementsResponse {
-    pub announcements: Vec<RpcBFieldElements>,
+    pub announcements: Vec<RpcAnnouncement>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
@@ -216,7 +221,7 @@ pub struct GetBlockAnnouncementsRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetBlockAnnouncementsResponse {
-    pub announcements: Option<Vec<RpcBFieldElements>>,
+    pub announcements: Option<Vec<RpcAnnouncement>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
@@ -256,4 +261,100 @@ pub struct FindUtxoOriginRequest {
 #[serde(rename_all = "camelCase")]
 pub struct FindUtxoOriginResponse {
     pub block: Option<Digest>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBlocksRequest {
+    pub from_height: RpcBlockHeight,
+    pub to_height: RpcBlockHeight,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBlocksResponse {
+    pub blocks: Vec<RpcWalletBlock>,
+}
+
+#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreMembershipProofRequest {
+    pub absolute_index_sets: Vec<RpcAbsoluteIndexSet>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreMembershipProofResponse {
+    pub snapshot: RpcMsMembershipSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitTransactionRequest {
+    pub transaction: RpcTransaction,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitTransactionResponse {
+    pub success: bool,
+}
+
+#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBlockTemplateRequest {
+    pub guesser_address: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBlockTemplateResponse {
+    pub template: Option<RpcBlockTemplate>,
+}
+
+#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitBlockRequest {
+    pub template: RpcBlock,
+    pub pow: RpcBlockPow,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitBlockResponse {
+    pub success: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionsRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionsResponse {
+    pub transactions: Vec<RpcTransactionKernelId>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionKernelRequest {
+    pub id: RpcTransactionKernelId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionKernelResponse {
+    pub kernel: Option<RpcTransactionKernel>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionProofRequest {
+    pub id: RpcTransactionKernelId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionProofResponse {
+    pub proof: Option<RpcTransactionProof>,
 }

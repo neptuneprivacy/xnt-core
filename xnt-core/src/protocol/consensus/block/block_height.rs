@@ -170,6 +170,9 @@ mod tests {
     use macro_rules_attr::apply;
     use num_traits::CheckedAdd;
     use num_traits::CheckedSub;
+    use proptest::prop_assert;
+    use proptest::prop_assume;
+    use test_strategy::proptest;
     use tracing_test::traced_test;
 
     use super::*;
@@ -201,5 +204,15 @@ mod tests {
             "target halving time must be within 1 % of 30 days. Got:\n\
             thirty days = {thirty_days}ms\n calculated_halving_time = {calculated_halving_time}ms"
         );
+    }
+
+    #[proptest]
+    fn arithmetic_mean_of_block_heights_is_always_in_between_arguments(low: u64, up: u64) {
+        prop_assume!(low <= up);
+        let lower = BlockHeight::from(low);
+        let upper = BlockHeight::from(up);
+        let mean = BlockHeight::arithmetic_mean(lower, upper);
+        prop_assert!(low <= mean.value());
+        prop_assert!(mean.value() <= up);
     }
 }
