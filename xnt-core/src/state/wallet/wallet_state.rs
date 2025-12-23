@@ -1823,10 +1823,12 @@ impl WalletState {
     ///     + that are timelocked in the future
     ///     + that are unspendable (no spending key)
     ///     + that are already spent in the mempool
-    pub(crate) fn spendable_inputs(
+    ///     + that are already spent in sent transactions
+    pub(crate) async fn spendable_inputs(
         &self,
         wallet_status: WalletStatus,
         timestamp: Timestamp,
+        recent_tips: &HashSet<Digest>,
     ) -> impl IntoIterator<Item = TxInput> + use<'_> {
         // Build a hashset of all tx inputs presently in the mempool.
         let index_sets_of_inputs_in_mempool_txs: HashSet<AbsoluteIndexSet> = self
@@ -1835,6 +1837,35 @@ impl WalletState {
             .flat_map(|(_txkid, tx_inputs)| tx_inputs.keys())
             .copied()
             .collect();
+
+        // Build a hashset of aocl indices from recent sent transactions.
+        // Only filter UTXOs from transactions sent within the last 3 blocks.
+        // After 3 blocks, if the transaction hasn't confirmed, UTXOs become spendable again.
+        let sent_tx_aocl_indices: HashSet<u64> = {
+            let sent_txs = self.wallet_db.sent_transactions();
+            let total_len = sent_txs.len().await;
+            let start = total_len.saturating_sub(1000);
+            let stream = sent_txs.stream_many_values(start..total_len);
+            pin_mut!(stream);
+
+            // Collect and sort by timestamp descending (newest first)
+            let mut recent_txs = Vec::new();
+            while let Some(sent_tx) = stream.next().await {
+                recent_txs.push(sent_tx);
+            }
+            recent_txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+            let mut indices = HashSet::new();
+            for sent_tx in recent_txs {
+                // Only filter UTXOs from transactions sent within recent blocks
+                if recent_tips.contains(&sent_tx.tip_when_sent) {
+                    for (aocl_index, _utxo) in sent_tx.tx_inputs {
+                        indices.insert(aocl_index);
+                    }
+                }
+            }
+            indices
+        };
 
         // filter spendable inputs.
         wallet_status.synced_unspent.into_iter().filter_map(
@@ -1848,6 +1879,15 @@ impl WalletState {
                 let absolute_index_set =
                     membership_proof.compute_indices(Tip5::hash(&wallet_status_element.utxo));
                 if index_sets_of_inputs_in_mempool_txs.contains(&absolute_index_set) {
+                    return None;
+                }
+
+                // filter out inputs that are already spent in sent transactions.
+                if sent_tx_aocl_indices.contains(&wallet_status_element.aocl_leaf_index) {
+                    println!(
+                        "UTXO {} is already spent in sent transactions",
+                        wallet_status_element.aocl_leaf_index
+                    );
                     return None;
                 }
 
@@ -1873,68 +1913,6 @@ impl WalletState {
                 )
             },
         )
-    }
-
-    /// Returns spendable inputs sufficient to cover the requested amount.
-    ///
-    /// Similar to `spendable_inputs` but stops early once sufficient funds
-    /// are accumulated.
-    pub(crate) fn spendable_inputs_by_amount(
-        &self,
-        wallet_status: WalletStatus,
-        timestamp: Timestamp,
-        spend_amount: NativeCurrencyAmount,
-    ) -> Vec<TxInput> {
-        // Build a hashset of all tx inputs presently in the mempool.
-        let index_sets_of_inputs_in_mempool_txs: HashSet<AbsoluteIndexSet> = self
-            .mempool_spent_utxos
-            .iter()
-            .flat_map(|(_txkid, tx_inputs)| tx_inputs.keys())
-            .copied()
-            .collect();
-
-        let mut input_funds = vec![];
-        let mut accumulated = NativeCurrencyAmount::zero();
-
-        for (wallet_status_element, membership_proof) in wallet_status.synced_unspent {
-            if accumulated >= spend_amount {
-                break;
-            }
-
-            // filter out UTXOs that are still timelocked.
-            if !wallet_status_element.utxo.can_spend_at(timestamp) {
-                continue;
-            }
-
-            // filter out inputs that are already spent by txs in mempool.
-            let absolute_index_set =
-                membership_proof.compute_indices(Tip5::hash(&wallet_status_element.utxo));
-            if index_sets_of_inputs_in_mempool_txs.contains(&absolute_index_set) {
-                continue;
-            }
-
-            // filter out inputs that we can't spend
-            let Some(spending_key) = self.find_spending_key_for_utxo(&wallet_status_element.utxo)
-            else {
-                warn!(
-                    "spending key not found for utxo: {:?}",
-                    wallet_status_element.utxo
-                );
-                continue;
-            };
-
-            accumulated += wallet_status_element.utxo.get_native_currency_amount();
-            input_funds.push(
-                UnlockedUtxo::unlock(
-                    wallet_status_element.utxo.clone(),
-                    spending_key.lock_script_and_witness(),
-                    membership_proof.clone(),
-                )
-                .into(),
-            );
-        }
-
-        input_funds
     }
 
     /// Allocate sufficient UTXOs to generate a transaction.
@@ -1976,7 +1954,12 @@ impl WalletState {
         let mut input_funds = vec![];
         let mut allocated_amount = NativeCurrencyAmount::zero();
 
-        for input in self.spendable_inputs(wallet_status, timestamp) {
+        // For tests, use empty recent_tips (no sent tx filtering)
+        let recent_tips = HashSet::new();
+        for input in self
+            .spendable_inputs(wallet_status, timestamp, &recent_tips)
+            .await
+        {
             // Don't allocate more than needed
             if allocated_amount >= total_spend {
                 break;

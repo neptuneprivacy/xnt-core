@@ -172,8 +172,18 @@ impl<'a> Wallet<'a> {
     /// present.
     ///
     /// the order of returned inputs is undefined.
-    pub async fn spendable_inputs(&self, timestamp: Timestamp) -> TxInputList {
-        state_lock_call_async!(&self.state_lock, worker::spendable_inputs, timestamp).await
+    pub async fn spendable_inputs(
+        &self,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+    ) -> TxInputList {
+        state_lock_call_async!(
+            &self.state_lock,
+            worker::spendable_inputs,
+            timestamp,
+            exclude_recent_blocks
+        )
+        .await
     }
 }
 
@@ -196,9 +206,13 @@ mod worker {
         WalletBalances::from_global_state(gs, timestamp).await
     }
 
-    pub async fn spendable_inputs(gs: &GlobalState, timestamp: Timestamp) -> TxInputList {
+    pub async fn spendable_inputs(
+        gs: &GlobalState,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+    ) -> TxInputList {
         // sadly we have to collect here because we can't hold ref after lock guard is dropped.
-        gs.wallet_spendable_inputs(timestamp)
+        gs.wallet_spendable_inputs(timestamp, exclude_recent_blocks)
             .await
             .into_iter()
             .into()

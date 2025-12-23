@@ -494,13 +494,17 @@ pub struct ValidateAddressResponse {
     pub address: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UnspentUtxosRequest {}
+pub struct UnspentUtxosRequest {
+    #[serde(default)]
+    pub exclude_recent_blocks: usize,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnspentUtxo {
+    pub leaf_index: u64,
     pub lock_script_hash: Digest,
     pub amount: String,
 }
@@ -512,6 +516,8 @@ pub type UnspentUtxosResponse = Vec<UnspentUtxo>;
 pub struct SelectSpendableInputsRequest {
     pub amount: String,
     pub fee: String,
+    #[serde(default)]
+    pub exclude_recent_blocks: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -587,6 +593,8 @@ pub struct SendTxRequest {
     pub amount: String,
     pub fee: String,
     pub to_address: String,
+    #[serde(default)]
+    pub exclude_recent_blocks: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

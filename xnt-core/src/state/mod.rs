@@ -1244,18 +1244,32 @@ impl GlobalState {
         send_transactions
     }
 
-    /// retrieves spendable inputs sufficient to cover the requested amount.
+    /// Returns the digests of the last `count` blocks (including current tip).
     ///
-    /// Similar to `wallet_spendable_inputs` but stops early once sufficient
-    /// funds are accumulated.
-    pub async fn wallet_spendable_inputs_by_amount(
-        &self,
-        timestamp: Timestamp,
-        spend_amount: NativeCurrencyAmount,
-    ) -> Vec<TxInput> {
-        let wallet_status = self.get_wallet_status_for_tip().await;
-        self.wallet_state
-            .spendable_inputs_by_amount(wallet_status, timestamp, spend_amount)
+    /// Used to determine which sent transactions are still "recent" and should
+    /// have their UTXOs blocked from spending.
+    async fn get_recent_tips(&self, count: usize) -> HashSet<Digest> {
+        let mut tips = HashSet::new();
+        let mut current_digest = self.chain.light_state().hash();
+
+        for _ in 0..count {
+            tips.insert(current_digest);
+
+            // Try to get parent block
+            let Ok(Some(block)) = self.chain.archival_state().get_block(current_digest).await
+            else {
+                break;
+            };
+
+            current_digest = block.header().prev_block_digest;
+
+            // Stop at genesis (prev_block_digest points to itself)
+            if current_digest == block.hash() {
+                break;
+            }
+        }
+
+        tips
     }
 
     /// retrieves all spendable inputs in the wallet as of the present tip.
@@ -1264,15 +1278,22 @@ impl GlobalState {
     ///   + that are timelocked in the future
     ///   + that are unspendable (no spending key)
     ///   + that are already spent in the mempool
+    ///   + that are already spent in sent transactions (within last `recent_tips_count` blocks)
     ///
     /// note: ordering of the returned `TxInput` is insertion order into the
     /// wallet.
     pub async fn wallet_spendable_inputs(
         &self,
         timestamp: Timestamp,
-    ) -> impl IntoIterator<Item = TxInput> + use<'_> {
+        exclude_recent_blocks: usize,
+    ) -> impl IntoIterator<Item = TxInput> {
         let wallet_status = self.get_wallet_status_for_tip().await;
-        self.wallet_state.spendable_inputs(wallet_status, timestamp)
+        let recent_tips = self.get_recent_tips(exclude_recent_blocks).await;
+        self.wallet_state
+            .spendable_inputs(wallet_status, timestamp, &recent_tips)
+            .await
+            .into_iter()
+            .collect::<Vec<_>>()
     }
 
     pub(crate) fn get_own_handshakedata(&self) -> HandshakeData {
@@ -2795,7 +2816,7 @@ mod tests {
             let inputs = sender
                 .api()
                 .tx_initiator()
-                .select_spendable_inputs(InputSelectionPolicy::ByProvidedOrder, amount, timestamp)
+                .select_spendable_inputs(InputSelectionPolicy::ByProvidedOrder, amount, timestamp, 3)
                 .await
                 .into_iter()
                 .collect_vec();

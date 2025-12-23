@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use num_traits::CheckedSub;
 use rand::distr::Alphanumeric;
 use rand::distr::SampleString;
 use rand::Rng;
+use tasm_lib::prelude::Digest;
 use tokio::sync::mpsc;
 
 use crate::api::export::GlobalStateLock;
@@ -121,8 +123,13 @@ pub async fn next_block_incoming_utxos(
 
     outputs.push((recipient.clone(), change_amt));
 
+    // For benchmarks, use empty recent_tips (no sent tx filtering)
+    let recent_tips: HashSet<Digest> = HashSet::new();
     let mut input_funds: Vec<TxInput> = vec![];
-    for input in sender.spendable_inputs(wallet_status, timestamp) {
+    for input in sender
+        .spendable_inputs(wallet_status, timestamp, &recent_tips)
+        .await
+    {
         input_funds.push(input);
     }
 

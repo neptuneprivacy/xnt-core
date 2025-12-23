@@ -21,6 +21,7 @@ use crate::api::tx_initiation::builder::transaction_proof_builder::TransactionPr
 use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
 use crate::api::tx_initiation::builder::tx_artifacts_builder::TxCreationArtifactsBuilder;
 use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
+use crate::api::tx_initiation::builder::tx_input_list_builder::SortOrder;
 use crate::api::tx_initiation::builder::tx_input_list_builder::TxInputListBuilder;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
 use crate::api::tx_initiation::builder::tx_output_list_builder::TxOutputListBuilder;
@@ -56,31 +57,18 @@ impl TransactionInitiator {
     /// returns all spendable inputs in the wallet.
     ///
     /// the order of inputs is undefined.
-    pub async fn spendable_inputs(&self, timestamp: Timestamp) -> TxInputList {
+    pub async fn spendable_inputs(
+        &self,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+    ) -> TxInputList {
         // sadly we have to collect here because we can't hold ref after lock guard is dropped.
         self.global_state_lock
             .lock_guard()
             .await
-            .wallet_spendable_inputs(timestamp)
+            .wallet_spendable_inputs(timestamp, exclude_recent_blocks)
             .await
             .into_iter()
-            .into()
-    }
-
-    /// returns spendable inputs sufficient to cover the requested amount.
-    ///
-    /// This is an optimized version that stops early once sufficient funds
-    /// are accumulated, avoiding processing all UTXOs.
-    pub async fn spendable_inputs_by_amount(
-        &self,
-        spend_amount: NativeCurrencyAmount,
-        timestamp: Timestamp,
-    ) -> TxInputList {
-        self.global_state_lock
-            .lock_guard()
-            .await
-            .wallet_spendable_inputs_by_amount(timestamp, spend_amount)
-            .await
             .into()
     }
 
@@ -94,31 +82,10 @@ impl TransactionInitiator {
         policy: InputSelectionPolicy,
         spend_amount: NativeCurrencyAmount,
         timestamp: Timestamp,
+        exclude_recent_blocks: usize,
     ) -> impl IntoIterator<Item = TxInput> {
         TxInputListBuilder::new()
-            .spendable_inputs(self.spendable_inputs(timestamp).await.into())
-            .policy(policy)
-            .spend_amount(spend_amount)
-            .build()
-    }
-
-    /// retrieve spendable inputs sufficient to cover spend_amount by applying selection policy.
-    ///
-    /// see [InputSelectionPolicy] for a description of available policies.
-    ///
-    /// see [TxInputListBuilder] for details.
-    pub async fn select_spendable_inputs_by_amount(
-        &self,
-        policy: InputSelectionPolicy,
-        spend_amount: NativeCurrencyAmount,
-        timestamp: Timestamp,
-    ) -> impl IntoIterator<Item = TxInput> {
-        TxInputListBuilder::new()
-            .spendable_inputs(
-                self.spendable_inputs_by_amount(spend_amount, timestamp)
-                    .await
-                    .into(),
-            )
+            .spendable_inputs(self.spendable_inputs(timestamp, exclude_recent_blocks).await.into())
             .policy(policy)
             .spend_amount(spend_amount)
             .build()
@@ -279,8 +246,9 @@ impl TransactionInitiator {
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
+        exclude_recent_blocks: usize,
     ) -> Result<TxCreationArtifacts, error::SendError> {
-        self.send_inner(outputs, change_policy, fee, timestamp, false)
+        self.send_inner(outputs, change_policy, fee, timestamp, false, exclude_recent_blocks)
             .await
     }
 
@@ -296,8 +264,9 @@ impl TransactionInitiator {
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
+        exclude_recent_blocks: usize,
     ) -> Result<TxCreationArtifacts, error::SendError> {
-        self.send_inner(outputs, change_policy, fee, timestamp, true)
+        self.send_inner(outputs, change_policy, fee, timestamp, true, exclude_recent_blocks)
             .await
     }
 
@@ -315,6 +284,7 @@ impl TransactionInitiator {
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
         transparent: bool,
+        exclude_recent_blocks: usize,
     ) -> Result<TxCreationArtifacts, error::SendError> {
         self.private().check_proceed_with_send(fee).await?;
 
@@ -331,9 +301,9 @@ impl TransactionInitiator {
 
         // select inputs
         let spend_amount = tx_outputs.total_native_coins() + fee;
-        let policy = InputSelectionPolicy::Random;
+        let policy = InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Descending);
         let tx_inputs = self
-            .select_spendable_inputs(policy, spend_amount, timestamp)
+            .select_spendable_inputs(policy, spend_amount, timestamp, exclude_recent_blocks)
             .await
             .into_iter()
             .collect::<Vec<_>>();

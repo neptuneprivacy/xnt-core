@@ -1379,7 +1379,10 @@ pub trait RPC {
     /// todo: docs.
     ///
     /// meanwhile see [tx_initiation::initiator::TransactionInitiator::spendable_inputs()]
-    async fn spendable_inputs(token: auth::Token) -> RpcResult<TxInputList>;
+    async fn spendable_inputs(
+        token: auth::Token,
+        exclude_recent_blocks: usize,
+    ) -> RpcResult<TxInputList>;
 
     /// retrieve spendable inputs sufficient to cover spend_amount by applying selection policy.
     ///
@@ -1398,6 +1401,7 @@ pub trait RPC {
         token: auth::Token,
         policy: InputSelectionPolicy,
         spend_amount: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxInputList>;
 
     /// generate tx outputs from list of OutputFormat.
@@ -1688,6 +1692,7 @@ pub trait RPC {
         outputs: Vec<OutputFormat>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxCreationArtifacts>;
 
     /// Like `send` but the resulting transaction is *transparent*. No privacy.
@@ -1702,6 +1707,7 @@ pub trait RPC {
         outputs: Vec<OutputFormat>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxCreationArtifacts>;
 
     /// Upgrade a proof for a transaction found in the mempool. If the
@@ -3151,6 +3157,7 @@ impl RPC for NeptuneRPCServer {
         outputs: Vec<OutputFormat>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxCreationArtifacts> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
@@ -3159,7 +3166,13 @@ impl RPC for NeptuneRPCServer {
             .state
             .api_mut()
             .tx_sender_mut()
-            .send(outputs, change_policy, fee, Timestamp::now())
+            .send(
+                outputs,
+                change_policy,
+                fee,
+                Timestamp::now(),
+                exclude_recent_blocks,
+            )
             .await?)
     }
 
@@ -3171,6 +3184,7 @@ impl RPC for NeptuneRPCServer {
         outputs: Vec<OutputFormat>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxCreationArtifacts> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
@@ -3179,7 +3193,13 @@ impl RPC for NeptuneRPCServer {
             .state
             .api_mut()
             .tx_initiator_mut()
-            .send_transparent(outputs, change_policy, fee, Timestamp::now())
+            .send_transparent(
+                outputs,
+                change_policy,
+                fee,
+                Timestamp::now(),
+                exclude_recent_blocks,
+            )
             .await?)
     }
 
@@ -3810,6 +3830,7 @@ impl RPC for NeptuneRPCServer {
         self,
         _: context::Context,
         token: auth::Token,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxInputList> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
@@ -3818,7 +3839,7 @@ impl RPC for NeptuneRPCServer {
             .state
             .api()
             .tx_initiator()
-            .spendable_inputs(Timestamp::now())
+            .spendable_inputs(Timestamp::now(), exclude_recent_blocks)
             .await)
     }
 
@@ -3829,6 +3850,7 @@ impl RPC for NeptuneRPCServer {
         token: auth::Token,
         policy: InputSelectionPolicy,
         spend_amount: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
     ) -> RpcResult<TxInputList> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
@@ -3837,7 +3859,12 @@ impl RPC for NeptuneRPCServer {
             .state
             .api()
             .tx_initiator()
-            .select_spendable_inputs(policy, spend_amount, Timestamp::now())
+            .select_spendable_inputs(
+                policy,
+                spend_amount,
+                Timestamp::now(),
+                exclude_recent_blocks,
+            )
             .await
             .into())
     }
@@ -4483,7 +4510,7 @@ mod tests {
             .unwrap();
         let _ = rpc_server
             .clone()
-            .spendable_inputs(ctx, token)
+            .spendable_inputs(ctx, token, 0)
             .await
             .unwrap();
         let _ = rpc_server
@@ -4493,6 +4520,7 @@ mod tests {
                 token,
                 InputSelectionPolicy::Random,
                 NativeCurrencyAmount::coins(5),
+                0,
             )
             .await;
         let _ = rpc_server
@@ -4572,6 +4600,7 @@ mod tests {
                 vec![output],
                 ChangePolicy::ExactChange,
                 NativeCurrencyAmount::one_nau(),
+                0,
             )
             .await;
         let _ = rpc_server
@@ -4590,6 +4619,7 @@ mod tests {
                 vec![my_output],
                 ChangePolicy::ExactChange,
                 NativeCurrencyAmount::one_nau(),
+                0,
             )
             .await;
 
@@ -4699,7 +4729,7 @@ mod tests {
         let ctx = context::current();
         let spendable_inputs = rpc_server
             .clone()
-            .spendable_inputs(ctx, token)
+            .spendable_inputs(ctx, token, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -4716,6 +4746,7 @@ mod tests {
                 token,
                 InputSelectionPolicy::Random,
                 NativeCurrencyAmount::coins(19),
+                0,
             )
             .await
             .unwrap();
@@ -5531,7 +5562,8 @@ mod tests {
                 token,
                 vec![output],
                 ChangePolicy::ExactChange,
-                NativeCurrencyAmount::zero()
+                NativeCurrencyAmount::zero(),
+                0,
             )
             .await
             .is_err());
@@ -5604,7 +5636,7 @@ mod tests {
             .state
             .lock_guard()
             .await
-            .wallet_spendable_inputs(Timestamp::now())
+            .wallet_spendable_inputs(Timestamp::now(), 0)
             .await
             .into_iter()
             .collect_vec()[0]
@@ -6121,6 +6153,7 @@ mod tests {
                                 UtxoNotificationMedium::OffChain,
                             ),
                             fee,
+                            0,
                         )
                         .await
                         .unwrap();
@@ -6292,6 +6325,7 @@ mod tests {
                             UtxoNotificationMedium::OffChain,
                         ),
                         fee,
+                        0,
                     )
                     .await
                     .unwrap();
@@ -6327,6 +6361,7 @@ mod tests {
                                 vec![output],
                                 ChangePolicy::exact_change(),
                                 NativeCurrencyAmount::zero(),
+                                0,
                             )
                             .await
                             .unwrap();
@@ -6454,6 +6489,7 @@ mod tests {
                         outputs.clone().take(i).collect(),
                         ChangePolicy::ExactChange,
                         fee,
+                        0,
                     )
                     .await;
                 assert!(result.is_ok());
@@ -6505,7 +6541,7 @@ mod tests {
             for i in 0..10 {
                 let result = rpc_server
                     .clone()
-                    .send(ctx, token, outputs.clone(), ChangePolicy::Burn, fee)
+                    .send(ctx, token, outputs.clone(), ChangePolicy::Burn, fee, 0)
                     .await;
 
                 // any attempts after the 2nd send should result in RateLimit error.
@@ -6669,6 +6705,7 @@ mod tests {
                             UtxoNotificationMedium::OffChain,
                         ),
                         fee,
+                        0,
                     )
                     .await;
 

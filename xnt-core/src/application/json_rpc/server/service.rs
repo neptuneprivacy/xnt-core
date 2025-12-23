@@ -6,6 +6,7 @@ use crate::api::export::Timestamp;
 use crate::api::export::Transaction;
 use crate::api::export::TransactionProof;
 use crate::api::export::{BlockHeight, NativeCurrencyAmount, TxInput};
+use crate::api::tx_initiation::builder::tx_input_list_builder::SortOrder;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
 use crate::api::tx_initiation::send::TransactionSender;
 use crate::api::wallet::Wallet;
@@ -953,7 +954,13 @@ impl RpcApi for RpcServer {
 
         let mut tx_sender = TransactionSender::from(self.state.clone());
         let resp = tx_sender
-            .send(outputs, change_policy, valid_fee, Timestamp::now())
+            .send(
+                outputs,
+                change_policy,
+                valid_fee,
+                Timestamp::now(),
+                request.exclude_recent_blocks,
+            )
             .await
             .map_err(|e| {
                 RpcError::Server(JsonError::Custom {
@@ -990,16 +997,19 @@ impl RpcApi for RpcServer {
 
     async fn unspent_utxos_call(
         &self,
-        _request: UnspentUtxosRequest,
+        request: UnspentUtxosRequest,
     ) -> RpcResult<UnspentUtxosResponse> {
         use crate::api::tx_initiation::initiator::TransactionInitiator;
 
         let tx_initiator = TransactionInitiator::from(self.state.clone());
-        let spendable_inputs = tx_initiator.spendable_inputs(Timestamp::now()).await;
+        let spendable_inputs = tx_initiator
+            .spendable_inputs(Timestamp::now(), request.exclude_recent_blocks)
+            .await;
 
         let utxos: Vec<UnspentUtxo> = spendable_inputs
             .iter()
             .map(|input| UnspentUtxo {
+                leaf_index: input.mutator_set_mp().aocl_leaf_index,
                 lock_script_hash: input.utxo.lock_script_hash(),
                 amount: input.native_currency_amount().to_string(),
             })
@@ -1035,10 +1045,11 @@ impl RpcApi for RpcServer {
 
         let tx_initiator = TransactionInitiator::from(self.state.clone());
         let selected_inputs: Vec<TxInput> = tx_initiator
-            .select_spendable_inputs_by_amount(
-                InputSelectionPolicy::Random,
+            .select_spendable_inputs(
+                InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Descending),
                 target_amount,
                 Timestamp::now(),
+                request.exclude_recent_blocks,
             )
             .await
             .into_iter()
@@ -1052,6 +1063,7 @@ impl RpcApi for RpcServer {
         let selected_utxos: Vec<UnspentUtxo> = selected_inputs
             .into_iter()
             .map(|input| UnspentUtxo {
+                leaf_index: input.mutator_set_mp().aocl_leaf_index,
                 lock_script_hash: input.utxo.lock_script_hash(),
                 amount: input.utxo.get_native_currency_amount().to_string(),
             })
@@ -1457,6 +1469,7 @@ pub mod tests {
                 Default::default(),
                 mock_amount,
                 network.launch_date() + Timestamp::months(3),
+                0,
             )
             .await
             .unwrap();

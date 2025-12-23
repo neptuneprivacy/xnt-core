@@ -157,6 +157,7 @@ impl SendScreen {
                     UtxoNotificationMedium::OnChain,
                 ),
                 valid_fee,
+                0, // exclude_recent_blocks
             )
             .await
             .unwrap();

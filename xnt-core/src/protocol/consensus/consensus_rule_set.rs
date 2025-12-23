@@ -30,7 +30,7 @@ pub enum ConsensusRuleSet {
     Reboot,
     HardforkAlpha,
     #[default]
-    Xnt
+    Xnt,
 }
 
 impl ConsensusRuleSet {
@@ -183,7 +183,7 @@ pub(crate) mod tests {
                 state
                     .lock_guard()
                     .await
-                    .wallet_spendable_inputs(timestamp)
+                    .wallet_spendable_inputs(timestamp, 0)
                     .await
                     .into_iter()
                     .collect(),
@@ -343,7 +343,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             blocks_to_mine,
-            bob.api().wallet().spendable_inputs(now).await.len(),
+            bob.api().wallet().spendable_inputs(now, 0).await.len(),
             "Bob must have {blocks_to_mine} spendable inputs after mining {blocks_to_mine} blocks"
         );
 
