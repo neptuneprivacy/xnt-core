@@ -2617,12 +2617,13 @@ mod tests {
             ) = get_test_genesis_setup(network, 0, cli_args::Args::default()).await?;
             let peer_address = get_dummy_socket_address(0);
 
-            let (without_any_pow, with_valid_mock_pow, with_valid_xnt_pow) =
+            // neptune ignores reboot_pow and ConsensusRuleSet::Reboot same as ConsensusRuleSet::Xnt in `pow_related_blocks`
+            // https://github.com/Neptune-Crypto/neptune-core/blob/5c1c6ef2ca1e282a05c7dc5300e742c92758fbfb/neptune-core/src/application/loops/peer_loop.rs#L2583
+            let (without_any_pow, with_valid_mock_pow, _) =
                 pow_related_blocks(network, &Block::genesis(network)).await;
             for block_without_valid_pow in [
                 without_any_pow,
                 with_valid_mock_pow,
-                with_valid_xnt_pow
             ] {
                 // Sending an invalid block will not necessarily result in a ban. This depends on the peer
                 // tolerance that is set in the client. For this reason, we include a "Bye" here.
