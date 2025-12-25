@@ -1166,63 +1166,6 @@ impl RpcApi for RpcServer {
 
         Ok(utxos)
     }
-
-    async fn select_spendable_inputs_call(
-        &self,
-        request: SelectSpendableInputsRequest,
-    ) -> RpcResult<SelectSpendableInputsResponse> {
-        use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
-        use crate::api::tx_initiation::initiator::TransactionInitiator;
-
-        let Ok(amount) = NativeCurrencyAmount::coins_from_str(&request.amount) else {
-            return Err(RpcError::Server(JsonError::Custom {
-                code: -32602,
-                message: "Invalid amount format".to_string(),
-                data: None,
-            }));
-        };
-
-        let Ok(fee) = NativeCurrencyAmount::coins_from_str(&request.fee) else {
-            return Err(RpcError::Server(JsonError::Custom {
-                code: -32602,
-                message: "Invalid fee format".to_string(),
-                data: None,
-            }));
-        };
-
-        let target_amount = amount + fee;
-
-        let tx_initiator = TransactionInitiator::from(self.state.clone());
-        let selected_inputs: Vec<TxInput> = tx_initiator
-            .select_spendable_inputs(
-                InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending),
-                target_amount,
-                Timestamp::now(),
-                request.exclude_recent_blocks,
-            )
-            .await
-            .into_iter()
-            .collect();
-
-        let total_selected_amount: NativeCurrencyAmount = selected_inputs
-            .iter()
-            .map(|input| input.utxo.get_native_currency_amount())
-            .sum();
-
-        let selected_utxos: Vec<UnspentUtxo> = selected_inputs
-            .into_iter()
-            .map(|input| UnspentUtxo {
-                leaf_index: input.mutator_set_mp().aocl_leaf_index,
-                lock_script_hash: input.utxo.lock_script_hash(),
-                amount: input.utxo.get_native_currency_amount().to_string(),
-            })
-            .collect();
-
-        Ok(SelectSpendableInputsResponse {
-            selected_utxos,
-            total_selected_amount: total_selected_amount.to_string(),
-        })
-    }
 }
 
 #[cfg(test)]

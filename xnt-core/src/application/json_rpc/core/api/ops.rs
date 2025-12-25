@@ -153,9 +153,6 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Wallet)]
     UnspentUtxos,
-
-    #[namespace(Namespace::Wallet)]
-    SelectSpendableInputs,
 }
 
 #[cfg(test)]

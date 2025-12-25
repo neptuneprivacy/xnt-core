@@ -580,22 +580,6 @@ pub type UnspentUtxosResponse = Vec<UnspentUtxo>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SelectSpendableInputsRequest {
-    pub amount: String,
-    pub fee: String,
-    #[serde(default)]
-    pub exclude_recent_blocks: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SelectSpendableInputsResponse {
-    pub selected_utxos: Vec<UnspentUtxo>,
-    pub total_selected_amount: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApiUtxo {
     pub lock_script_hash: Digest,
     pub amount: String,

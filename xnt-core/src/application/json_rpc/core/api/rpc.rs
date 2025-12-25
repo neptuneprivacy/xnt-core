@@ -451,15 +451,4 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: UnspentUtxosRequest,
     ) -> RpcResult<UnspentUtxosResponse>;
-
-    async fn select_spendable_inputs(
-        &self,
-        request: SelectSpendableInputsRequest,
-    ) -> RpcResult<SelectSpendableInputsResponse> {
-        self.select_spendable_inputs_call(request).await
-    }
-    async fn select_spendable_inputs_call(
-        &self,
-        request: SelectSpendableInputsRequest,
-    ) -> RpcResult<SelectSpendableInputsResponse>;
 }
