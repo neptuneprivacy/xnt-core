@@ -159,6 +159,15 @@ pub struct Args {
     #[clap(long, alias = "notx")]
     pub(crate) no_transaction_initiation: bool,
 
+    /// Height until which transaction rate limiting is enforced.
+    ///
+    /// Rate limiting restricts each wallet to sending at most 2 transactions
+    /// per block. Set this to 0 to disable rate limiting entirely, or to a
+    /// specific block height to control when rate limiting should stop.
+    /// Example: 25000 (approximately 5.6 months after launch).
+    #[clap(long, default_value = "0")]
+    pub(crate) rate_limit_until_height: u64,
+
     /// Specify environment variables for Triton VM for a given (log2 of) the
     /// padded height. Can be used to control the environment variables
     /// `TVM_LDE_TRACE` and `RAYON_NUM_THREADS` as a function of the proof's
