@@ -93,11 +93,18 @@ pub(crate) const MINING_REWARD_TIME_LOCK_PERIOD: Timestamp = Timestamp::years(0)
 
 pub(crate) const GENERATION_FOR_TAIL_EMISSION_START: i32 = 72;
 pub(crate) const BLOCK_SUBSIDY_SCALED: [u64; GENERATION_FOR_TAIL_EMISSION_START as usize] = [
-    6800000,6655636,6511273,6366909,6222545,6078182,5933818,5789455,5645091,5500727,5356364,5212000,5168444,5124889,5081333,5037778,4994222,4950667,4907111,4863556,4820000,4776444,4732889,4689333,4645778,4602222,4558667,4515111,4471556,4428000,4384444,4340889,4297333,4253778,4210222,4166667,4123110,4079556,4035999,3992444,3948889,3905333,3861778,3818222,3774667,3731111,3687556,3644000,3533833,3423667,3313500,3203333,3093167,2983000,2872833,2762667,2652500,2542333,2432167,2322000,2211833,2101667,1991500,1881333,1771167,1661000,1550833,1440667,1330500,1220333,1110167,1000000
+    6800000, 6655636, 6511273, 6366909, 6222545, 6078182, 5933818, 5789455, 5645091, 5500727,
+    5356364, 5212000, 5168444, 5124889, 5081333, 5037778, 4994222, 4950667, 4907111, 4863556,
+    4820000, 4776444, 4732889, 4689333, 4645778, 4602222, 4558667, 4515111, 4471556, 4428000,
+    4384444, 4340889, 4297333, 4253778, 4210222, 4166667, 4123110, 4079556, 4035999, 3992444,
+    3948889, 3905333, 3861778, 3818222, 3774667, 3731111, 3687556, 3644000, 3533833, 3423667,
+    3313500, 3203333, 3093167, 2983000, 2872833, 2762667, 2652500, 2542333, 2432167, 2322000,
+    2211833, 2101667, 1991500, 1881333, 1771167, 1661000, 1550833, 1440667, 1330500, 1220333,
+    1110167, 1000000,
 ];
 pub(crate) const TAIL_EMISSION_BLOCK_SUBSIDY: NativeCurrencyAmount = NativeCurrencyAmount::coins(1);
 
-/* 
+/*
 pub(crate) const CURVE_DECAY_DENOMINATOR: i32 = 36;
 pub(crate) const CURVE_EXPONENT: u32 = 2;
 */
@@ -401,7 +408,7 @@ impl Block {
         let units_one_coin = one_coin.to_nau();
         let scaled_subsidy = BLOCK_SUBSIDY_SCALED[generation as usize];
         // Safe from overflow, max subsidy is 6.8
-        let (units_scaled,overflow) = units_one_coin.overflowing_mul(scaled_subsidy as i128);
+        let (units_scaled, overflow) = units_one_coin.overflowing_mul(scaled_subsidy as i128);
         assert!(!overflow, "Block subsidy calculation overflowed");
         let units_divided = units_scaled / 1_000_000;
         let final_nau_i128 = units_divided;
@@ -1176,12 +1183,15 @@ pub(crate) mod tests {
         let mut block_height = 0;
         for generation in 0..100 {
             let subsidy = Block::block_subsidy(block_height.into());
-            println!("Generation {generation}: Block height {block_height}, Subsidy: {}", subsidy.to_coins_f64_lossy());
+            println!(
+                "Generation {generation}: Block height {block_height}, Subsidy: {}",
+                subsidy.to_coins_f64_lossy()
+            );
             block_height += BLOCKS_PER_GENERATION;
         }
     }
     //Generation 72: Block start height 622080, Subsidy: 1, Supply so far: 2463281.26272
-    // 
+    //
     #[test]
     fn print_block_subsidy_per_generation_and_total_supply_mined() {
         let mut block_height = 0;

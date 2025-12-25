@@ -245,7 +245,8 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
     if global_state_lock.cli().rest_api_enable == true {
         if let Some(rest_port) = global_state_lock.cli().rest_port {
             if let Some(rest_listening_address) = &global_state_lock.cli().rest_listening_address {
-                let rest_listener = TcpListener::bind(format!("{}:{}", rest_listening_address, rest_port)).await?;
+                let rest_listener =
+                    TcpListener::bind(format!("{}:{}", rest_listening_address, rest_port)).await?;
 
                 let rpc_state_lock = global_state_lock.clone();
 
@@ -272,7 +273,10 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
                         .expect("Error in REST server task");
                 });
                 task_join_handles.push(rpc_join_handle);
-                info!("Started REST server on {}:{}",rest_listening_address,rest_port);
+                info!(
+                    "Started REST server on {}:{}",
+                    rest_listening_address, rest_port
+                );
             }
         }
     }

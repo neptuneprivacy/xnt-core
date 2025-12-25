@@ -374,7 +374,9 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
         consensus_rule_set: ConsensusRuleSet,
         prev_block_digest: Digest,
     ) -> GuesserBuffer<MERKLE_TREE_HEIGHT> {
-        let bud_prefix = if consensus_rule_set == ConsensusRuleSet::Reboot || consensus_rule_set == ConsensusRuleSet::Xnt {
+        let bud_prefix = if consensus_rule_set == ConsensusRuleSet::Reboot
+            || consensus_rule_set == ConsensusRuleSet::Xnt
+        {
             // Commitment to all the fields in the block that are not pow
             mast_auth_paths.commit()
         } else {
@@ -454,7 +456,9 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
             (outs, ins)
         };
 
-        if consensus_rule_set != ConsensusRuleSet::Reboot && consensus_rule_set != ConsensusRuleSet::Xnt {
+        if consensus_rule_set != ConsensusRuleSet::Reboot
+            && consensus_rule_set != ConsensusRuleSet::Xnt
+        {
             // The index swapping could be done here, or in each guess. Since
             // we're optimizing for fast guessing, the index swapping is done
             // here.
@@ -470,7 +474,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
 
         GuesserBuffer::<MERKLE_TREE_HEIGHT> {
             merkle_tree,
-            hash:bud_prefix,
+            hash: bud_prefix,
         }
     }
 
@@ -527,7 +531,9 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
         let index_picker_preimage = Tip5::hash_pair(self.root, auth_paths.commit());
         let (index_a, index_b) = Self::indices(index_picker_preimage, self.nonce);
 
-        let (leaf_a, leaf_b) = if consensus_rule_set == ConsensusRuleSet::Reboot || consensus_rule_set == ConsensusRuleSet::Xnt {
+        let (leaf_a, leaf_b) = if consensus_rule_set == ConsensusRuleSet::Reboot
+            || consensus_rule_set == ConsensusRuleSet::Xnt
+        {
             (
                 Self::leaf(leaf_prefix, index_a),
                 Self::leaf(leaf_prefix, index_b),

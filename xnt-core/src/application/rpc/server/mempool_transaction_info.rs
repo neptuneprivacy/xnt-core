@@ -85,13 +85,9 @@ impl rand::distr::Distribution<MempoolTransactionInfo> for rand::distr::Standard
             id: rng.random(),
             proof_type: rng.random(),
             num_inputs: rng.random_range(0..10),
-            inputs: (0..5)
-                .map(|_| rng.random::<Digest>().to_hex())
-                .collect(),
+            inputs: (0..5).map(|_| rng.random::<Digest>().to_hex()).collect(),
             num_outputs: rng.random_range(0..10),
-            outputs: (0..5)
-                .map(|_| rng.random::<Digest>().to_hex())
-                .collect(),
+            outputs: (0..5).map(|_| rng.random::<Digest>().to_hex()).collect(),
             positive_balance_effect: rng
                 .random::<NativeCurrencyAmount>()
                 .lossy_f64_fraction_mul(0.0001),

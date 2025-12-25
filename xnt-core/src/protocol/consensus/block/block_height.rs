@@ -57,9 +57,7 @@ impl BlockHeight {
     }
 
     pub fn get_generation(&self) -> u64 {
-        self.0
-            .value()
-            / BLOCKS_PER_GENERATION
+        self.0.value() / BLOCKS_PER_GENERATION
     }
 
     pub fn next(&self) -> Self {

@@ -180,7 +180,8 @@ impl ConsensusProgram for NativeCurrency {
             // _ *salted_utxos
         };
 
-        let assert_locked_coins_zero_label = "neptune_core_native_currency_assert_locked_coins_zero";
+        let assert_locked_coins_zero_label =
+            "neptune_core_native_currency_assert_locked_coins_zero";
 
         let assert_locked_coins_zero = triton_asm! {
             {assert_locked_coins_zero_label}:
@@ -204,7 +205,7 @@ impl ConsensusProgram for NativeCurrency {
 
             push 0 eq
             assert error_id {Self::COINBASE_TIMELOCK_INSUFFICIENT}
-            
+
             // _ [total_output] [timelocked_amount]
             return
         };
