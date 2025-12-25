@@ -73,14 +73,19 @@ impl TransactionInitiatorPrivate {
     }
 
     // check if send would exceed the send rate-limit (per block)
+    // send rate limiting only applies below the configured height
+    // which is approx 5.6 months after launch by default.
+    // after that, the training wheel come off.
+    // Set rate_limit_until_height to 0 to disable rate limiting entirely.
     pub(super) async fn check_rate_limit(&self) -> Result<(), error::SendError> {
-        // send rate limiting only applies below height 25000
-        // which is approx 5.6 months after launch.
-        // after that, the training wheel come off.
-        const RATE_LIMIT_UNTIL_HEIGHT: u64 = 25000;
+        let rate_limit_until_height = self.global_state_lock.cli().rate_limit_until_height;
+        if rate_limit_until_height == 0 {
+            return Ok(());
+        }
+
         let state = self.global_state_lock.lock_guard().await;
 
-        if state.chain.light_state().header().height < RATE_LIMIT_UNTIL_HEIGHT.into() {
+        if state.chain.light_state().header().height < rate_limit_until_height.into() {
             const RATE_LIMIT: usize = 2;
             let tip_digest = state.chain.light_state().hash();
             let send_count_at_tip = state

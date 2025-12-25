@@ -2528,7 +2528,7 @@ mod tests {
             (
                 invalid_pow,
                 block_with_valid_mock_pow,
-                block_with_valid_xnt_pow
+                block_with_valid_xnt_pow,
             )
         }
 
@@ -2593,7 +2593,6 @@ mod tests {
                     .unwrap(),
                 "Must return Some(1) on valid Pow"
             );
-
         }
 
         #[traced_test]
@@ -2615,7 +2614,7 @@ mod tests {
 
             let (without_any_pow, with_valid_mock_pow, with_valid_xnt_pow) =
                 pow_related_blocks(network, &Block::genesis(network)).await;
-            for block_without_valid_pow in 
+            for block_without_valid_pow in
                 [without_any_pow, with_valid_mock_pow, with_valid_xnt_pow]
             {
                 // Sending an invalid block will not necessarily result in a ban. This depends on the peer

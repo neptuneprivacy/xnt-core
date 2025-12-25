@@ -66,7 +66,13 @@ impl TransactionSender {
         TransactionInitiator {
             global_state_lock: self.global_state_lock.clone(),
         }
-        .send(outputs, change_policy, fee, timestamp, exclude_recent_blocks)
+        .send(
+            outputs,
+            change_policy,
+            fee,
+            timestamp,
+            exclude_recent_blocks,
+        )
         .await
     }
 }
