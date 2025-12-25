@@ -25,7 +25,18 @@ The RPC server allows other programs to interact with a `xnt-core` node includin
 
 ## RPC Methods
 
-The RPC server provides several methods that allow clients to interact with the node. The list of methods and examples are provided on the [`neptune-privacy` crate documentation](https://docs.rs/neptune-privacy/latest/neptune_privacy/server/trait.RPC.html).
+The RPC server provides several methods that allow clients to interact with the node. Methods are organized by namespace:
+
+| Namespace | Description | Documentation |
+|-----------|-------------|---------------|
+| node | Node information | [node.md](rpc/node.md) |
+| chain | Blockchain state and tip | [chain.md](rpc/chain.md) |
+| archival | Historical block and UTXO data | [archival.md](rpc/archival.md) |
+| mining | Block template and submission | [mining.md](rpc/mining.md) |
+| mempool | Pending transactions | [mempool.md](rpc/mempool.md) |
+| wallet | Wallet operations | [wallet.md](rpc/wallet.md) |
+
+Methods follow the pattern: `{namespace}_{methodName}` (e.g., `chain_height`, `wallet_sendTx`).
 
 ## RPC consistency guarantees
 State that can be queried via RPCs is guaranteed to be at least up-to-date with the chain state immediately prior to the call's execution.

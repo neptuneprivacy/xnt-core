@@ -19,6 +19,7 @@ The official documentation from ([Neptune](https://github.com/Neptune-Crypto/nep
   - [Keys and Addresses](./neptune-core/keys.md)
   - [Utxo Notification](./neptune-core/utxo_notification.md)
   - [RPC](./neptune-core/rpc.md)
+  - [Exchange Integration](./neptune-core/exchange-integration.md)
 - [User Guides](./user-guides.md)
   - [Installation](./user-guides/installation.md)
   - [Managing Secret Seeds](./user-guides/managing-secret-seeds.md)

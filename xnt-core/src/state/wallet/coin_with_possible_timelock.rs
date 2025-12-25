@@ -58,7 +58,7 @@ impl CoinWithPossibleTimeLock {
         let confirmed_padding = " ".repeat(confirmed_total_length - confirmed.len());
         let release_date = "release_date";
         let release_date_padding = " ".repeat(release_total_length - release_date.len());
-        let amount = "amount (NPT)";
+        let amount = "amount (XNT)";
         let amount_padding = " ".repeat(amount_total_length - amount.len());
         let heading_with_release = format!("{confirmed}{confirmed_padding} {release_date}{release_date_padding} {amount_padding}{amount}");
         let heading_without_release = format!(
@@ -91,7 +91,7 @@ impl CoinWithPossibleTimeLock {
             .filter(|c| c.release_date.is_none())
             .map(|c| c.amount)
             .sum::<NativeCurrencyAmount>();
-        result = format!("{result}total available: {total_available} NPT\n");
+        result = format!("{result}total available: {total_available} XNT\n");
 
         let total_timelocked = coins
             .iter()
@@ -99,7 +99,7 @@ impl CoinWithPossibleTimeLock {
             .map(|c| c.amount)
             .sum::<NativeCurrencyAmount>();
         if !total_timelocked.is_zero() {
-            result = format!("{result}total time-locked: {total_timelocked} NPT\n");
+            result = format!("{result}total time-locked: {total_timelocked} XNT\n");
         }
         result
     }
