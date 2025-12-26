@@ -412,7 +412,7 @@ For wallet-known outputs, includes: `senderRandomness`, `receivingAddress`, `rec
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"wallet_blockInfo","params":{"selector":{"height":100}},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"wallet_blockInfo","params":{"selector":100},"id":1}'
 
 // Result
 {

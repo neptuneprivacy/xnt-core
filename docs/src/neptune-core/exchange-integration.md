@@ -74,7 +74,7 @@ Poll new blocks using `wallet_blockInfo` and check for deposits to your addresse
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"wallet_blockInfo","params":{"selector":{"height":1000}},"id":1}' \
+  --data '{"jsonrpc":"2.0","method":"wallet_blockInfo","params":{"selector": 1000},"id":1}' \
   http://localhost:9799
 ```
 
@@ -197,7 +197,7 @@ Poll new blocks using `wallet_blockInfo` and check for your withdrawal's `utxoDi
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"wallet_blockInfo","params":{"selector":{"height":1000}},"id":1}' \
+  --data '{"jsonrpc":"2.0","method":"wallet_blockInfo","params":{"selector":1000},"id":1}' \
   http://localhost:9799
 ```
 
@@ -303,7 +303,7 @@ Monitor `chain_tipDigest` for changes:
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"chain_tipDigest","params":{},"id":1}' \
+  --data '{"jsonrpc":"2.0","method":"chain_tipDigest","params":[],"id":1}' \
   http://localhost:9799
 ```
 

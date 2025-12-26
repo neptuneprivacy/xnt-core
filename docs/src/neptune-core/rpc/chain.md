@@ -20,7 +20,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_height","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_height","params":[],"id":1}'
 
 // Result
 {
@@ -50,7 +50,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipDigest","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipDigest","params":[],"id":1}'
 
 // Result
 {
@@ -80,7 +80,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tip","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tip","params":[],"id":1}'
 
 // Result
 {
@@ -110,7 +110,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipProof","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipProof","params":[],"id":1}'
 
 // Result
 {
@@ -140,7 +140,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipKernel","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipKernel","params":[],"id":1}'
 
 // Result
 {
@@ -170,7 +170,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipHeader","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipHeader","params":[],"id":1}'
 
 // Result
 {
@@ -200,7 +200,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipBody","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipBody","params":[],"id":1}'
 
 // Result
 {
@@ -230,7 +230,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipTransactionKernel","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipTransactionKernel","params":[],"id":1}'
 
 // Result
 {
@@ -265,7 +265,7 @@ None
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipAnnouncements","params":{},"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"chain_tipAnnouncements","params":[],"id":1}'
 
 // Result
 {
