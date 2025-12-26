@@ -2,9 +2,13 @@ use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
+use axum::http::header::AUTHORIZATION;
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Json;
 use axum::Router;
+use base64::prelude::*;
 use tokio::net::TcpListener;
 
 use crate::application::json_rpc::core::api::ops::RpcMethods;
@@ -13,7 +17,14 @@ use crate::application::json_rpc::core::api::server::router::RpcRouter;
 use crate::application::json_rpc::core::model::json::JsonError;
 use crate::application::json_rpc::core::model::json::JsonRequest;
 use crate::application::json_rpc::core::model::json::JsonResponse;
+use crate::application::json_rpc::server::rpc::RpcAuth;
 use crate::application::json_rpc::server::rpc::RpcServer;
+
+#[derive(Clone)]
+struct AppState {
+    router: Arc<RpcRouter>,
+    auth: Option<RpcAuth>,
+}
 
 impl RpcServer {
     /// Starts the HTTP RPC server.
@@ -26,9 +37,14 @@ impl RpcServer {
         let namespaces = self.enabled_namespaces().await;
         let router = RpcMethods::new_router(api, namespaces);
 
+        let state = AppState {
+            router: Arc::new(router),
+            auth: self.rpc_auth.clone(),
+        };
+
         let app = Router::new()
             .route("/", post(Self::rpc_handler))
-            .with_state(Arc::new(router));
+            .with_state(state);
 
         axum::serve(listener, app).await.unwrap();
     }
@@ -96,21 +112,58 @@ impl RpcServer {
     /// }
     /// ```
     async fn rpc_handler(
-        State(router): State<Arc<RpcRouter>>,
+        State(state): State<AppState>,
+        headers: HeaderMap,
         // An optimization to avoid deserializing 2 times
         body: Result<Json<JsonRequest>, JsonRejection>,
-    ) -> Json<JsonResponse> {
+    ) -> Result<Json<JsonResponse>, StatusCode> {
+        // Check authentication if configured
+        if let Some(ref expected_auth) = state.auth {
+            if !Self::verify_basic_auth(&headers, expected_auth) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+
         let Ok(Json(request)) = body else {
-            return Json(JsonResponse::error(None, JsonError::ParseError));
+            return Ok(Json(JsonResponse::error(None, JsonError::ParseError)));
         };
 
-        let res = router.dispatch(&request.method, request.params).await;
+        let res = state.router.dispatch(&request.method, request.params).await;
         let response = match res {
             Ok(result) => JsonResponse::success(request.id, result),
             Err(error) => JsonResponse::error(request.id, error),
         };
 
-        Json(response)
+        Ok(Json(response))
+    }
+
+    /// Verifies HTTP Basic Authentication credentials.
+    fn verify_basic_auth(headers: &HeaderMap, expected: &RpcAuth) -> bool {
+        let Some(auth_header) = headers.get(AUTHORIZATION) else {
+            return false;
+        };
+
+        let Ok(auth_str) = auth_header.to_str() else {
+            return false;
+        };
+
+        let Some(encoded) = auth_str.strip_prefix("Basic ") else {
+            return false;
+        };
+
+        let Ok(decoded) = BASE64_STANDARD.decode(encoded) else {
+            return false;
+        };
+
+        let Ok(credentials) = String::from_utf8(decoded) else {
+            return false;
+        };
+
+        let Some((username, password)) = credentials.split_once(':') else {
+            return false;
+        };
+
+        username == expected.username && password == expected.password
     }
 }
 
@@ -120,13 +173,14 @@ mod tests {
     use std::sync::Arc;
 
     use axum::extract::State;
+    use axum::http::HeaderMap;
     use axum::Json;
     use macro_rules_attr::apply;
     use serde_json::json;
 
+    use super::AppState;
     use crate::application::json_rpc::core::api::ops::Namespace;
     use crate::application::json_rpc::core::api::ops::RpcMethods;
-    use crate::application::json_rpc::core::api::server::router::RpcRouter;
     use crate::application::json_rpc::core::model::json::JsonError;
     use crate::application::json_rpc::core::model::json::JsonRequest;
     use crate::application::json_rpc::core::model::json::JsonResponse;
@@ -134,10 +188,11 @@ mod tests {
     use crate::application::json_rpc::server::service::tests::test_rpc_server;
     use crate::tests::shared_tokio_runtime;
 
-    async fn test_router() -> Arc<RpcRouter> {
+    async fn test_state() -> AppState {
         let api = Arc::new(test_rpc_server().await);
+        let router = Arc::new(RpcMethods::new_router(api, [Namespace::Node].into()));
 
-        Arc::new(RpcMethods::new_router(api, [Namespace::Node].into()))
+        AppState { router, auth: None }
     }
 
     #[apply(shared_tokio_runtime)]
@@ -145,7 +200,8 @@ mod tests {
         const TEST_METHOD: &str = "node_network";
         const UNKNOWN_TEST_METHOD: &str = "node_crash";
 
-        let router = test_router().await;
+        let state = test_state().await;
+        let headers = HeaderMap::new();
 
         // 1. Valid -> Success
         let valid_req = JsonRequest {
@@ -155,7 +211,9 @@ mod tests {
             id: Some(json!(1)),
         };
         let Json(valid_res) =
-            RpcServer::rpc_handler(State(router.clone()), Ok(Json(valid_req))).await;
+            RpcServer::rpc_handler(State(state.clone()), headers.clone(), Ok(Json(valid_req)))
+                .await
+                .unwrap();
         assert!(
             matches!(valid_res, JsonResponse::Success { id: Some(id), result, .. }
                 if id == json!(1) && result.is_object() // shouldn't be null
@@ -169,7 +227,10 @@ mod tests {
             params: json!([1, "x"]),
             id: Some(json!(2)),
         };
-        let Json(bad_res) = RpcServer::rpc_handler(State(router.clone()), Ok(Json(bad_req))).await;
+        let Json(bad_res) =
+            RpcServer::rpc_handler(State(state.clone()), headers.clone(), Ok(Json(bad_req)))
+                .await
+                .unwrap();
         assert!(
             matches!(bad_res, JsonResponse::Error { id: Some(id), error: JsonError::InvalidParams, .. }
                 if id == json!(2)
@@ -183,7 +244,9 @@ mod tests {
             params: json!([]),
             id: Some(json!(3)),
         };
-        let Json(unknown_res) = RpcServer::rpc_handler(State(router), Ok(Json(unknown_req))).await;
+        let Json(unknown_res) = RpcServer::rpc_handler(State(state), headers, Ok(Json(unknown_req)))
+            .await
+            .unwrap();
         assert!(
             matches!(unknown_res, JsonResponse::Error { id: Some(id), error: JsonError::MethodNotFound, .. }
                 if id == json!(3)

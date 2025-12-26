@@ -2162,6 +2162,7 @@ dependencies = [
  "async-trait",
  "axum 0.8.6",
  "axum-extra",
+ "base64 0.22.1",
  "bech32",
  "bincode",
  "blake3",

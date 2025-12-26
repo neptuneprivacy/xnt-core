@@ -26,7 +26,7 @@ Neptune is a privacy-focused cryptocurrency using zero-knowledge proofs. Key con
 ### Configuration
 
 ```bash
-neptune-core --listen-rpc 127.0.0.1:9897 --rpc-modules Node,Chain,Wallet,Archival
+neptune-core --listen-rpc 127.0.0.1:9897 --rpc-modules Node,Chain,Wallet,Archival --rpc-username <username> --rpc-password <password>
 ```
 
 ### Health Check
@@ -36,6 +36,8 @@ curl -X POST -H "Content-Type: application/json" \
   --data '{"jsonrpc":"2.0","method":"node_network","params":[],"id":1}' \
   http://localhost:9799
 ```
+
+**Note:** The `-u` flag provides HTTP Basic Authentication credentials. All examples below assume authentication is configured.
 
 ---
 
@@ -47,8 +49,9 @@ Generate a unique address for each user/deposit:
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
+  -u "<username>:<password>" \
   --data '{"jsonrpc":"2.0","method":"wallet_generateAddress","params":{},"id":1}' \
-  http://localhost:9799
+  http://localhost:9897
 ```
 
 Response:
@@ -346,7 +349,9 @@ curl -X POST -H "Content-Type: application/json" \
 
 ### RPC Security
 
-- Use authentication for RPC endpoints
+- **Authentication is required** when Wallet module is enabled via `--rpc-modules`
+  - Use `--rpc-username` and `--rpc-password` flags
+  - The node will refuse to start without credentials when Wallet is enabled
 - Bind RPC to localhost only (`127.0.0.1`)
 - Use TLS for remote connections
 - Implement rate limiting

@@ -12,17 +12,34 @@ pub struct RpcServer {
     pub(crate) state: GlobalStateLock,
     pub(crate) to_main_tx: mpsc::Sender<RPCServerToMain>,
     pub(crate) unrestricted: bool,
+    pub(crate) rpc_auth: Option<RpcAuth>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RpcAuth {
+    pub username: String,
+    pub password: String,
 }
 
 impl RpcServer {
     pub fn new(state: GlobalStateLock, unrestricted: Option<bool>) -> Self {
-        let unrestricted = unrestricted.unwrap_or(state.cli().unsafe_rpc);
+        let cli = state.cli();
+        let unrestricted = unrestricted.unwrap_or(cli.unsafe_rpc);
         let to_main_tx = state.rpc_server_to_main_tx();
+
+        let rpc_auth = match (&cli.rpc_username, &cli.rpc_password) {
+            (Some(username), Some(password)) => Some(RpcAuth {
+                username: username.clone(),
+                password: password.clone(),
+            }),
+            _ => None,
+        };
 
         Self {
             state,
             to_main_tx,
             unrestricted,
+            rpc_auth,
         }
     }
 

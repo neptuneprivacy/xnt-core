@@ -575,10 +575,20 @@ pub struct Args {
         long,
         value_parser = clap::value_parser!(Namespace),
         use_value_delimiter = true,
-        default_value = "Node,Chain,Wallet",
+        default_value = "Node,Chain",
         value_name = "NAMESPACES"
     )]
     pub rpc_modules: Vec<Namespace>,
+
+    /// RPC authentication username.
+    /// Required when Wallet module is enabled in --rpc-modules.
+    #[clap(long, value_name = "USERNAME")]
+    pub rpc_username: Option<String>,
+
+    /// RPC authentication password.
+    /// Required when Wallet module is enabled in --rpc-modules.
+    #[clap(long, value_name = "PASSWORD")]
+    pub rpc_password: Option<String>,
 
     /// Enable unsafe RPC methods over all transports (e.g., HTTP).
     ///
@@ -688,6 +698,21 @@ impl Args {
     /// Whether to engage in mining (composing or guessing or both)
     pub(crate) fn mine(&self) -> bool {
         self.guess || self.compose
+    }
+
+    /// Validates RPC authentication settings.
+    /// Returns an error if Wallet module is enabled but credentials are missing.
+    pub fn validate_rpc_auth(&self) -> Result<(), String> {
+        if self.listen_rpc.is_some() && self.rpc_modules.contains(&Namespace::Wallet) {
+            if self.rpc_username.is_none() || self.rpc_password.is_none() {
+                return Err(
+                    "RPC authentication required: --rpc-username and --rpc-password must be \
+                     provided when Wallet module is enabled in --rpc-modules"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn proof_job_options(

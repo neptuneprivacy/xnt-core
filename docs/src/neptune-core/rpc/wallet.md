@@ -2,6 +2,23 @@
 
 Wallet operations for managing funds and transactions.
 
+## Authentication
+
+**Authentication is required** for all Wallet RPC methods. When starting the node with `--rpc-modules` including `Wallet`, you must provide credentials:
+
+```bash
+neptune-core --listen-rpc 127.0.0.1:9897 --rpc-modules Node,Chain,Wallet --rpc-username <username> --rpc-password <password>
+```
+
+All requests must include HTTP Basic Authentication:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -u "<username>:<password>" \
+  --data '{"jsonrpc":"2.0","method":"wallet_getBalance","params":{},"id":1}' \
+  http://localhost:9897
+```
+
 ---
 
 ## wallet_generateAddress

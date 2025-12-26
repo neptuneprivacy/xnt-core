@@ -19,6 +19,11 @@ pub fn main() -> Result<()> {
         // Fetch the CLI arguments
         let args = cli_args::Args::parse();
 
+        // Validate RPC authentication settings
+        if let Err(e) = args.validate_rpc_auth() {
+            anyhow::bail!(e);
+        }
+
         #[cfg(not(feature = "tokio-console"))]
         {
             use std::io::Write;
