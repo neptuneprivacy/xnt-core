@@ -46,6 +46,7 @@ pub struct BlockInfo {
     pub sibling_blocks: Vec<Digest>, // blocks at same height
     pub txid: TransactionKernelId,
     pub guesser_digest: Digest,
+    pub guesser_fee_utxo_digests: Vec<String>,
     pub nonce: String,
 }
 
@@ -79,6 +80,7 @@ impl std::fmt::Display for BlockInfo {
             )
             + &format!("txid: {:?}\n", self.txid,)
             + &format!("guesser_digest: {}\n", self.guesser_digest.to_hex())
+            + &format!("guesser_fee_utxo_digests: {}\n", self.guesser_fee_utxo_digests.join(","))
             + &format!("nonce: {}\n", self.nonce);
 
         write!(f, "{}", buf)
@@ -127,6 +129,15 @@ impl BlockInfo {
             sibling_blocks,
             txid: block.kernel.body.transaction_kernel.txid(),
             guesser_digest: block.header().guesser_receiver_data.receiver_digest,
+            guesser_fee_utxo_digests: block
+                .guesser_fee_addition_records()
+                .map(|records| {
+                    records
+                        .iter()
+                        .map(|r| r.canonical_commitment.to_hex())
+                        .collect()
+                })
+                .unwrap_or_default(),
             nonce: block.header().pow.nonce.to_hex(),
         }
     }
@@ -176,6 +187,10 @@ impl Distribution<BlockInfo> for StandardUniform {
                 .collect_vec(),
             txid: TransactionKernelId::from_str("0").unwrap(),
             guesser_digest: rng.random(),
+            guesser_fee_utxo_digests: (0..rng.random_range(0..2))
+                .map(|_| rng.random())
+                .map(|d: Digest| d.to_hex())
+                .collect_vec(),
             nonce: rng.random::<Digest>().to_hex(),
         }
     }
