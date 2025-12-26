@@ -26,7 +26,7 @@ SELECTOR can be:
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockDigest","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockDigest","params":[100],"id":1}'
 
 // Result
 {
@@ -86,7 +86,7 @@ Returns a full block by selector.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlock","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlock","params":[100],"id":1}'
 
 // Result
 {
@@ -123,7 +123,7 @@ Returns block proof by selector.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockProof","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockProof","params":[100],"id":1}'
 
 // Result
 {
@@ -153,7 +153,7 @@ Returns block kernel by selector.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockKernel","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockKernel","params":[100],"id":1}'
 
 // Result
 {
@@ -183,7 +183,7 @@ Returns block header by selector.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockHeader","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockHeader","params":[100],"id":1}'
 
 // Result
 {
@@ -213,7 +213,7 @@ Returns block body by selector.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockBody","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockBody","params":[100],"id":1}'
 
 // Result
 {
@@ -243,7 +243,7 @@ Returns transaction kernel from a block.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockTransactionKernel","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockTransactionKernel","params":[100],"id":1}'
 
 // Result
 {
@@ -273,7 +273,7 @@ Returns announcements from a block.
 
 ```
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockAnnouncements","params":[{"height":100}],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getBlockAnnouncements","params":[100],"id":1}'
 
 // Result
 {
