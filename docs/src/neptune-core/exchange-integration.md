@@ -33,7 +33,7 @@ neptune-core --listen-rpc 127.0.0.1:9897 --rpc-modules Node,Chain,Wallet,Archiva
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"node_info","params":{},"id":1}' \
+  --data '{"jsonrpc":"2.0","method":"node_network","params":[],"id":1}' \
   http://localhost:9799
 ```
 
@@ -58,7 +58,7 @@ Response:
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "address": "npt1qxyz..."
+    "address": "xntnwm1..."
   }
 }
 ```
@@ -88,7 +88,7 @@ Response:
     "outputs": [
       {
         "utxoDigest": "a1b2c3d4e5f6...",
-        "receivingAddress": "npt1qxyz...",
+        "receivingAddress": "xntnwm1...",
         "utxo": {
           "lockScriptHash": "...",
           "amount": "100.0"
