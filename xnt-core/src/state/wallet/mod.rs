@@ -11,7 +11,7 @@ pub mod secret_key_material;
 pub mod sent_transaction;
 pub mod transaction_input;
 pub mod transaction_output;
-pub(crate) mod unlocked_utxo;
+pub mod unlocked_utxo;
 pub mod utxo_notification;
 pub(crate) mod wallet_configuration;
 pub(crate) mod wallet_db_tables;
