@@ -115,7 +115,7 @@ Get current chain height and calculate confirmations:
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"chain_height","params":{},"id":1}' \
+  --data '{"jsonrpc":"2.0","method":"chain_height","params":[],"id":1}' \
   http://localhost:9799
 ```
 
