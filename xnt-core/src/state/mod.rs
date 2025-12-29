@@ -3745,9 +3745,8 @@ mod tests {
     }
 
     mod rescan_wallet {
-        use crate::tests::shared::blocks::invalid_empty_block1_with_guesser_fraction;
-
         use super::*;
+        use crate::tests::shared::blocks::invalid_empty_block1_with_guesser_fraction;
 
         /// Build a block with the specified outputs. Includes change outputs if
         /// balance exceeds output value.
