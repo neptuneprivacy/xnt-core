@@ -1014,7 +1014,7 @@ impl GlobalState {
     /// Retrieve wallet balance history
     pub async fn get_balance_history(
         &self,
-    ) -> Vec<(Digest, Timestamp, BlockHeight, NativeCurrencyAmount)> {
+    ) -> Vec<(Digest, Timestamp, BlockHeight, NativeCurrencyAmount, u64)> {
         let current_tip_digest = self.chain.light_state().hash();
         let current_msa = self
             .chain
@@ -1037,11 +1037,13 @@ impl GlobalState {
             let (confirming_block, confirmation_timestamp, confirmation_height) =
                 monitored_utxo.confirmed_in_block;
             let amount = monitored_utxo.utxo.get_native_currency_amount();
+            let payment_id = monitored_utxo.payment_id.value();
             history.push((
                 confirming_block,
                 confirmation_timestamp,
                 confirmation_height,
                 amount,
+                payment_id,
             ));
 
             if let Some((spending_block, spending_timestamp, spending_height)) =
@@ -1049,7 +1051,7 @@ impl GlobalState {
             {
                 let actually_spent = !current_msa.verify(Tip5::hash(&monitored_utxo.utxo), msmp);
                 if actually_spent {
-                    history.push((spending_block, spending_timestamp, spending_height, -amount));
+                    history.push((spending_block, spending_timestamp, spending_height, -amount, payment_id));
                 }
             }
         }
@@ -1268,6 +1270,7 @@ impl GlobalState {
                 incoming_utxo.aocl_index,
                 restored_msmp.sender_randomness,
                 restored_msmp.receiver_preimage,
+                incoming_utxo.payment_id,
                 (
                     confirming_block_digest,
                     confirming_block_header.timestamp,

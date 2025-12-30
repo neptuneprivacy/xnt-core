@@ -139,6 +139,18 @@ enum Command {
     /// Get next unused generation receiving address
     NextReceivingAddress,
 
+    /// Generate a subaddress from the latest generation address with a payment_id
+    GenerateSubaddress {
+        /// The payment ID to use for generating the subaddress
+        payment_id: u64,
+    },
+
+    /// Validate a subaddress and show its components (base address + payment_id)
+    ValidateSubaddress {
+        /// The subaddress bech32m string to validate
+        subaddress: String,
+    },
+
     /// Get the nth generation receiving address.
     ///
     /// Ignoring the ones that have been generated in the past; re-generate them
@@ -926,6 +938,27 @@ async fn main() -> Result<()> {
                 .next_receiving_address(ctx, token, KeyType::Generation)
                 .await??;
             println!("{}", receiving_address.to_display_bech32m(network).unwrap())
+        }
+        Command::GenerateSubaddress { payment_id } => {
+            let subaddress = client
+                .generate_subaddress(ctx, token, payment_id)
+                .await??;
+            println!("{subaddress}")
+        }
+        Command::ValidateSubaddress { subaddress } => {
+            let result = client
+                .validate_subaddress(ctx, token, subaddress.clone(), network)
+                .await??;
+            match result {
+                Some((base_address, payment_id)) => {
+                    println!("Valid subaddress!");
+                    println!("Base address: {base_address}");
+                    println!("Payment ID: {payment_id}");
+                }
+                None => {
+                    println!("Invalid subaddress: {subaddress}");
+                }
+            }
         }
         Command::MempoolTxCount => {
             let count: usize = client.mempool_tx_count(ctx, token).await??;

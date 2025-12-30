@@ -61,6 +61,9 @@ pub enum EncryptError {
 pub(super) const SYMMETRIC_KEY_FLAG_U8: u8 = 80;
 pub const SYMMETRIC_KEY_FLAG: BFieldElement = BFieldElement::new(SYMMETRIC_KEY_FLAG_U8 as u64);
 
+pub(super) const SYMMETRIC_SUBADDR_FLAG_U8: u8 = 90;
+pub const SYMMETRIC_SUBADDR_FLAG: BFieldElement = BFieldElement::new(SYMMETRIC_SUBADDR_FLAG_U8 as u64);
+
 /// represents an AES 256 bit symmetric key
 ///
 /// this is an opaque type.  all fields are read-only via accessor methods.

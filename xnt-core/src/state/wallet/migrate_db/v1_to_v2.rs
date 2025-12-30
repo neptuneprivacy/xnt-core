@@ -7,7 +7,6 @@ use tracing::trace;
 
 use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 use crate::application::database::storage::storage_vec::traits::*;
-use crate::state::wallet::monitored_utxo::MonitoredUtxo;
 use crate::state::wallet::wallet_db_tables::StrongUtxoKey;
 use crate::state::wallet::wallet_db_tables::WalletDbTables;
 
@@ -53,9 +52,17 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
     // reset the schema again, to prepare for loading v2 schema.
     storage.reset_schema();
 
-    // load v2 schema tables
+    // Create v2 monitored_utxos table with schema_v2::MonitoredUtxo (without payment_id)
+    // This ensures v2 data is written without payment_id field.
+    storage.schema.table_count = WalletDbTables::monitored_utxos_table_count();
+    let mut mutxos_v2 = storage
+        .schema
+        .new_vec::<migration::schema_v2::MonitoredUtxo>("monitored_utxos")
+        .await;
+
+    // Load remaining tables from WalletDbTables for index lookups
+    storage.reset_schema();
     let mut tables = WalletDbTables::load_schema_in_order(storage).await;
-    let mutxos_v2 = &mut tables.monitored_utxos;
     let strong_key_to_mutxo = &mut tables.strong_key_to_mutxo;
     let index_set_to_mutxo = &mut tables.index_set_to_mutxo;
 
@@ -89,7 +96,7 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
 
         let aocl_leaf_index = msmp.aocl_leaf_index;
         let utxo = mutxo_v1.utxo;
-        let mutxo_v2 = MonitoredUtxo {
+        let mutxo_v2 = migration::schema_v2::MonitoredUtxo {
             utxo: utxo.clone(),
             aocl_leaf_index,
             sender_randomness: msmp.sender_randomness,
@@ -201,7 +208,7 @@ mod migration {
 
         use crate::api::export::BlockHeight;
         use crate::protocol::consensus::transaction::utxo::Utxo;
-        use crate::state::Timestamp;
+        use crate::protocol::proof_abstractions::timestamp::Timestamp;
         use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
 
         // this is a copy of MonitoredUtxo as it was in v1 schema.
@@ -213,6 +220,56 @@ mod migration {
             pub spent_in_block: Option<(Digest, Timestamp, BlockHeight)>,
             pub confirmed_in_block: Option<(Digest, Timestamp, BlockHeight)>,
             pub abandoned_at: Option<(Digest, Timestamp, BlockHeight)>,
+        }
+    }
+
+    pub(super) mod schema_v2 {
+        use std::collections::VecDeque;
+
+        use serde::Deserialize;
+        use serde::Serialize;
+        use tasm_lib::prelude::Digest;
+        use tasm_lib::prelude::Tip5;
+
+        use crate::api::export::BlockHeight;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::protocol::proof_abstractions::timestamp::Timestamp;
+        use crate::util_types::mutator_set::addition_record::AdditionRecord;
+        use crate::util_types::mutator_set::commit;
+        use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
+        use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+
+        // this is a copy of MonitoredUtxo as it was in v2 schema (without payment_id).
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub(in super::super) struct MonitoredUtxo {
+            pub utxo: Utxo,
+            pub aocl_leaf_index: u64,
+            pub sender_randomness: Digest,
+            pub receiver_preimage: Digest,
+            pub blockhash_to_membership_proof: VecDeque<(Digest, MsMembershipProof)>,
+            pub number_of_mps_per_utxo: usize,
+            pub spent_in_block: Option<(Digest, Timestamp, BlockHeight)>,
+            pub confirmed_in_block: (Digest, Timestamp, BlockHeight),
+            pub abandoned_at: Option<(Digest, Timestamp, BlockHeight)>,
+        }
+
+        impl MonitoredUtxo {
+            /// Return the addition record associated with this UTXO.
+            pub(in super::super) fn addition_record(&self) -> AdditionRecord {
+                let item = Tip5::hash(&self.utxo);
+                commit(item, self.sender_randomness, self.receiver_preimage.hash())
+            }
+
+            /// Return the absolute index set associated with this mined UTXO.
+            pub(in super::super) fn absolute_indices(&self) -> AbsoluteIndexSet {
+                let item = Tip5::hash(&self.utxo);
+                AbsoluteIndexSet::compute(
+                    item,
+                    self.sender_randomness,
+                    self.receiver_preimage,
+                    self.aocl_leaf_index,
+                )
+            }
         }
     }
 }

@@ -28,6 +28,27 @@ pub enum KeyType {
 
     /// [symmetric_key] built on aes-256-gcm
     Symmetric = symmetric_key::SYMMETRIC_KEY_FLAG_U8,
+
+    /// [generation_address] subaddress with payment_id
+    GenerationSubAddr = generation_address::GENERATION_SUBADDR_FLAG_U8,
+
+    /// [symmetric_key] subaddress with payment_id
+    SymmetricSubAddr = symmetric_key::SYMMETRIC_SUBADDR_FLAG_U8,
+}
+
+impl KeyType {
+    /// Returns true if this key type uses subaddress format (has payment_id)
+    pub fn is_subaddress(&self) -> bool {
+        matches!(self, Self::GenerationSubAddr | Self::SymmetricSubAddr)
+    }
+
+    /// Returns the base key type (without subaddress)
+    pub fn base_type(&self) -> Self {
+        match self {
+            Self::Generation | Self::GenerationSubAddr => Self::Generation,
+            Self::Symmetric | Self::SymmetricSubAddr => Self::Symmetric,
+        }
+    }
 }
 
 impl std::fmt::Display for KeyType {
@@ -35,6 +56,8 @@ impl std::fmt::Display for KeyType {
         match self {
             Self::Generation => write!(f, "Generation"),
             Self::Symmetric => write!(f, "Symmetric"),
+            Self::GenerationSubAddr => write!(f, "GenerationSubAddr"),
+            Self::SymmetricSubAddr => write!(f, "SymmetricSubAddr"),
         }
     }
 }
@@ -44,6 +67,7 @@ impl From<&ReceivingAddress> for KeyType {
         match addr {
             ReceivingAddress::Generation(_) => Self::Generation,
             ReceivingAddress::Symmetric(_) => Self::Symmetric,
+            ReceivingAddress::GenerationSubAddr(_) => Self::GenerationSubAddr,
         }
     }
 }
@@ -70,6 +94,8 @@ impl TryFrom<&Announcement> for KeyType {
         match common::key_type_from_announcement(pa) {
             Ok(kt) if kt == Self::Generation.into() => Ok(Self::Generation),
             Ok(kt) if kt == Self::Symmetric.into() => Ok(Self::Symmetric),
+            Ok(kt) if kt == Self::GenerationSubAddr.into() => Ok(Self::GenerationSubAddr),
+            Ok(kt) if kt == Self::SymmetricSubAddr.into() => Ok(Self::SymmetricSubAddr),
             _ => bail!("encountered Announcement of unknown type"),
         }
     }
@@ -78,7 +104,7 @@ impl TryFrom<&Announcement> for KeyType {
 impl KeyType {
     /// returns all available `AddressableKeyType`
     pub fn all_types() -> Vec<KeyType> {
-        vec![Self::Generation, Self::Symmetric]
+        vec![Self::Generation, Self::Symmetric, Self::GenerationSubAddr, Self::SymmetricSubAddr]
     }
 }
 
@@ -221,7 +247,7 @@ impl SpendingKey {
             .announcements
             .iter()
 
-            // ... that are marked as encrypted to our key type
+            // ... that are marked as encrypted to our key type (including subaddress types)
             .filter(|pa| self.matches_announcement_key_type(pa))
 
             // ... that match the receiver_id of this key
@@ -229,14 +255,21 @@ impl SpendingKey {
                 matches!(common::receiver_identifier_from_announcement(pa), Ok(r) if r == receiver_identifier)
             })
 
-            // ... that have a ciphertext field
-            .filter_map(|pa| self.ok_warn(common::ciphertext_from_announcement(pa)))
+            // ... extract ciphertext and payment_id together
+            .filter_map(|pa| {
+                let ciphertext = self.ok_warn(common::ciphertext_from_announcement(pa))?;
+                let payment_id = common::payment_id_from_announcement(pa).unwrap_or(BFieldElement::new(0));
+                Some((ciphertext, payment_id))
+            })
 
             // ... which can be decrypted with this key
-            .filter_map(|c| self.ok_warn(self.decrypt(&c)))
+            .filter_map(|(c, payment_id)| {
+                let (utxo, sender_randomness) = self.ok_warn(self.decrypt(&c))?;
+                Some((utxo, sender_randomness, payment_id))
+            })
 
             // ... map to IncomingUtxo
-            .map(move |(utxo, sender_randomness)| {
+            .map(move |(utxo, sender_randomness, payment_id)| {
                 // and join those with the receiver digest to get a commitment
                 // Note: the commitment is computed in the same way as in the mutator set.
                 IncomingUtxo {
@@ -244,6 +277,7 @@ impl SpendingKey {
                     sender_randomness,
                     receiver_preimage,
                     is_guesser_fee: false,
+                    payment_id,
                 }
             }).collect()
     }
@@ -260,7 +294,17 @@ impl SpendingKey {
     }
 
     /// returns true if the [Announcement] has a type-flag that matches the type of this key
+    ///
+    /// A spending key matches both base address announcements AND subaddress announcements
+    /// of the same underlying key type (e.g., Generation key matches both Generation and
+    /// GenerationSubAddr announcements).
     pub(super) fn matches_announcement_key_type(&self, pa: &Announcement) -> bool {
-        matches!(KeyType::try_from(pa), Ok(kt) if kt == KeyType::from(self))
+        let Ok(announcement_kt) = KeyType::try_from(pa) else {
+            return false;
+        };
+        let my_kt = KeyType::from(self);
+
+        // Match if the base types are the same
+        announcement_kt.base_type() == my_kt.base_type()
     }
 }

@@ -9,6 +9,7 @@ use serde::Serialize;
 use tasm_lib::triton_vm::prelude::Digest;
 
 use super::generation_address;
+use super::generation_address::GenerationSubAddress;
 use super::symmetric_key;
 use crate::api::export::KeyType;
 use crate::application::config::network::Network;
@@ -36,6 +37,9 @@ pub enum ReceivingAddress {
 
     /// a [symmetric_key] acting as an address.
     Symmetric(symmetric_key::SymmetricKey),
+
+    /// a [generation_address] subaddress with payment_id
+    GenerationSubAddr(GenerationSubAddress),
 }
 
 impl From<generation_address::GenerationReceivingAddress> for ReceivingAddress {
@@ -62,6 +66,12 @@ impl From<&symmetric_key::SymmetricKey> for ReceivingAddress {
     }
 }
 
+impl From<GenerationSubAddress> for ReceivingAddress {
+    fn from(a: GenerationSubAddress) -> Self {
+        Self::GenerationSubAddr(a)
+    }
+}
+
 impl TryFrom<ReceivingAddress> for generation_address::GenerationReceivingAddress {
     type Error = anyhow::Error;
 
@@ -80,6 +90,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(a) => a.receiver_identifier(),
             Self::Symmetric(a) => a.receiver_identifier(),
+            Self::GenerationSubAddr(a) => a.receiver_identifier(),
         }
     }
 
@@ -103,6 +114,9 @@ impl ReceivingAddress {
             ReceivingAddress::Symmetric(symmetric_key) => {
                 symmetric_key.generate_announcement(&utxo_notification_payload)
             }
+            ReceivingAddress::GenerationSubAddr(subaddr) => {
+                subaddr.generate_announcement(&utxo_notification_payload)
+            }
         }
     }
 
@@ -119,6 +133,11 @@ impl ReceivingAddress {
             ReceivingAddress::Symmetric(symmetric_key) => {
                 symmetric_key.private_utxo_notification(&utxo_notification_payload, network)
             }
+            ReceivingAddress::GenerationSubAddr(subaddr) => {
+                // Use the base address's private notification for now
+                subaddr.base_address()
+                    .private_utxo_notification(&utxo_notification_payload, network)
+            }
         }
     }
 
@@ -127,6 +146,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(a) => a.spending_lock(),
             Self::Symmetric(k) => k.lock_after_image(),
+            Self::GenerationSubAddr(a) => a.base_address().spending_lock(),
         }
     }
 
@@ -136,6 +156,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(a) => a.receiver_postimage(),
             Self::Symmetric(k) => k.receiver_postimage(),
+            Self::GenerationSubAddr(a) => a.base_address().receiver_postimage(),
         }
     }
 
@@ -148,6 +169,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(a) => a.encrypt(utxo_notification_payload),
             Self::Symmetric(a) => a.encrypt(utxo_notification_payload),
+            Self::GenerationSubAddr(a) => a.encrypt(utxo_notification_payload),
         }
     }
 
@@ -165,6 +187,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(k) => k.to_bech32m(network),
             Self::Symmetric(k) => k.to_bech32m(network),
+            Self::GenerationSubAddr(k) => k.to_bech32m(network),
         }
     }
 
@@ -202,6 +225,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(k) => k.to_bech32m(network),
             Self::Symmetric(k) => k.to_display_bech32m(network),
+            Self::GenerationSubAddr(k) => k.to_bech32m(network),
         }
     }
 
@@ -236,17 +260,21 @@ impl ReceivingAddress {
 
     /// parses an address from its bech32m encoding
     pub fn from_bech32m(encoded: &str, network: Network) -> Result<Self> {
+        // Try subaddress first (prefix: xntsa)
+        if let Ok(subaddr) = GenerationSubAddress::from_bech32m(encoded, network) {
+            return Ok(subaddr.into());
+        }
+
+        // Try generation address
         if let Ok(addr) =
             generation_address::GenerationReceivingAddress::from_bech32m(encoded, network)
         {
             return Ok(addr.into());
         }
 
+        // Try symmetric key
         let key = symmetric_key::SymmetricKey::from_bech32m(encoded, network)?;
         Ok(key.into())
-
-        // when future addr types are supported, we would attempt each type in
-        // turn.
     }
 
     /// returns human-readable-prefix (hrp) for a given network
@@ -254,6 +282,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(_) => generation_address::GenerationReceivingAddress::get_hrp(network),
             Self::Symmetric(_) => symmetric_key::SymmetricKey::get_hrp(network).to_string(),
+            Self::GenerationSubAddr(_) => GenerationSubAddress::get_hrp(network),
         }
     }
 
@@ -264,6 +293,7 @@ impl ReceivingAddress {
         match self {
             Self::Generation(x) => x.lock_script().hash(),
             Self::Symmetric(x) => x.lock_script().hash(),
+            Self::GenerationSubAddr(x) => x.base_address().lock_script().hash(),
         }
     }
 

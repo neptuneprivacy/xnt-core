@@ -2,7 +2,9 @@ use std::hash::Hash;
 
 #[cfg(any(test, feature = "arbitrary-impls"))]
 use arbitrary::Arbitrary;
+use num_traits::ConstZero;
 use tasm_lib::prelude::Digest;
+use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 
 use super::expected_utxo::UtxoNotifier;
 use super::utxo_notification::UtxoNotificationPayload;
@@ -32,6 +34,9 @@ pub(crate) struct IncomingUtxo {
     /// messages and wallet info. Does not affect how the ability to claim the
     /// UTXO.
     pub(crate) is_guesser_fee: bool,
+
+    /// Payment ID from subaddress announcement. Zero for base address announcements.
+    pub(crate) payment_id: BFieldElement,
 }
 
 impl PartialEq for IncomingUtxo {
@@ -65,6 +70,9 @@ impl From<&ExpectedUtxo> for IncomingUtxo {
             // An expected UTXO is always assumed to refer to something we're
             // receiving, not to a successful PoW guess.
             is_guesser_fee: false,
+
+            // Expected UTXOs don't have payment_id tracking
+            payment_id: BFieldElement::ZERO,
         }
     }
 }
@@ -90,6 +98,7 @@ impl IncomingUtxo {
             sender_randomness: payload.sender_randomness,
             receiver_preimage,
             is_guesser_fee: false,
+            payment_id: BFieldElement::ZERO,
         }
     }
 

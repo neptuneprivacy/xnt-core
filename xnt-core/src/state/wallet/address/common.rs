@@ -1,6 +1,7 @@
 use anyhow::bail;
 use anyhow::ensure;
 use anyhow::Result;
+use num_traits::ConstZero;
 use sha3::digest::ExtendableOutput;
 use sha3::digest::Update;
 use sha3::Shake256;
@@ -11,6 +12,9 @@ use tasm_lib::twenty_first::tip5::digest::Digest;
 use crate::application::config::network::Network;
 use crate::protocol::consensus::transaction::announcement::Announcement;
 use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
+
+use super::generation_address::{GENERATION_SUBADDR_FLAG_U8};
+use super::symmetric_key::{SYMMETRIC_SUBADDR_FLAG_U8};
 
 /// returns human-readable-prefix for the given network
 pub(crate) fn network_hrp_char(network: Network) -> char {
@@ -55,16 +59,37 @@ pub fn key_type_from_announcement(announcement: &Announcement) -> Result<BFieldE
     }
 }
 
+/// Returns true if the announcement uses subaddress format (has payment_id)
+pub fn is_subaddress_announcement(announcement: &Announcement) -> bool {
+    match announcement.message.first() {
+        Some(key_type) => {
+            let kt = key_type.value() as u8;
+            kt == GENERATION_SUBADDR_FLAG_U8 || kt == SYMMETRIC_SUBADDR_FLAG_U8
+        }
+        None => false,
+    }
+}
+
 /// retrieves ciphertext field from a [Announcement]
 ///
-/// returns an error if the input is too short
+/// Handles both base address format: [key_type, receiver_id, ciphertext...]
+/// and subaddress format: [key_type, receiver_id, payment_id, ciphertext...]
 pub fn ciphertext_from_announcement(announcement: &Announcement) -> Result<Vec<BFieldElement>> {
-    ensure!(
-        announcement.message.len() > 2,
-        "announcement does not contain ciphertext.",
-    );
-
-    Ok(announcement.message[2..].to_vec())
+    if is_subaddress_announcement(announcement) {
+        // Subaddress format: [key_type, receiver_id, payment_id, ciphertext...]
+        ensure!(
+            announcement.message.len() > 3,
+            "subaddress announcement does not contain ciphertext.",
+        );
+        Ok(announcement.message[3..].to_vec())
+    } else {
+        // Base address format: [key_type, receiver_id, ciphertext...]
+        ensure!(
+            announcement.message.len() > 2,
+            "announcement does not contain ciphertext.",
+        );
+        Ok(announcement.message[2..].to_vec())
+    }
 }
 
 /// retrieves receiver identifier field from a [Announcement]
@@ -74,6 +99,22 @@ pub fn receiver_identifier_from_announcement(announcement: &Announcement) -> Res
     match announcement.message.get(1) {
         Some(id) => Ok(*id),
         None => bail!("announcement does not contain receiver ID"),
+    }
+}
+
+/// retrieves payment_id field from a [Announcement]
+///
+/// Returns ZERO for base address announcements (no payment_id)
+/// Returns the payment_id for subaddress announcements
+pub fn payment_id_from_announcement(announcement: &Announcement) -> Result<BFieldElement> {
+    if is_subaddress_announcement(announcement) {
+        match announcement.message.get(2) {
+            Some(id) => Ok(*id),
+            None => bail!("subaddress announcement does not contain payment ID"),
+        }
+    } else {
+        // Base address - no payment_id, return zero
+        Ok(BFieldElement::ZERO)
     }
 }
 

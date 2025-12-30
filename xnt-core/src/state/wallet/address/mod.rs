@@ -14,6 +14,7 @@ pub mod symmetric_key;
 pub use addressable_key::KeyType;
 pub use addressable_key::SpendingKey;
 pub use receiving_address::ReceivingAddress;
+pub use generation_address::GenerationSubAddress;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
