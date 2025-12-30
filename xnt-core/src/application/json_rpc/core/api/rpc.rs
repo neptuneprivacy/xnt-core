@@ -250,6 +250,11 @@ pub trait RpcApi: Sync + Send {
         request: IsBlockCanonicalRequest,
     ) -> RpcResult<IsBlockCanonicalResponse>;
 
+    async fn get_utxo_digest(&self, leaf_index: u64) -> RpcResult<GetUtxoDigestResponse> {
+        self.get_utxo_digest_call(GetUtxoDigestRequest { leaf_index })
+            .await
+    }
+
     async fn get_utxo_digest_call(
         &self,
         request: GetUtxoDigestRequest,
