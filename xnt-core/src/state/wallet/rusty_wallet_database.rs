@@ -118,6 +118,14 @@ impl RustyWalletDatabase {
                         // vector lengths, e.g. due to deduplication.
                         storage.reset_schema();
                         tables = WalletDbTables::load_schema_in_order(&mut storage).await;
+
+                        // Update schema version to reflect successful migration
+                        tables.schema_version.set(WALLET_DB_SCHEMA_VERSION).await;
+                        storage.persist().await;
+                        tracing::info!(
+                            "Migration complete. Updated wallet database schema version to v{}",
+                            WALLET_DB_SCHEMA_VERSION
+                        );
                     } else {
                         return Err(WalletDbConnectError::SchemaVersionTooLow {
                             found: schema_version,

@@ -71,8 +71,7 @@ impl From<&ExpectedUtxo> for IncomingUtxo {
             // receiving, not to a successful PoW guess.
             is_guesser_fee: false,
 
-            // Expected UTXOs don't have payment_id tracking
-            payment_id: BFieldElement::ZERO,
+            payment_id: eu.payment_id,
         }
     }
 }
@@ -108,6 +107,7 @@ impl IncomingUtxo {
             self.sender_randomness,
             self.receiver_preimage,
             received_from,
+            self.payment_id,
         )
     }
 }

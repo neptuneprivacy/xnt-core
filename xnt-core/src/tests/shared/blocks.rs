@@ -272,6 +272,7 @@ pub(crate) async fn make_mock_block_with_puts_and_guesser_preimage_and_guesser_f
                 txo.sender_randomness(),
                 composer_key.receiver_preimage(),
                 crate::state::wallet::expected_utxo::UtxoNotifier::OwnMinerComposeBlock,
+                BFieldElement::ZERO,
             )
         })
         .collect();

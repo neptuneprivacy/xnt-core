@@ -399,6 +399,7 @@ impl WalletState {
                                 Block::premine_sender_randomness(configuration.network()),
                                 premine_key.privacy_preimage(),
                                 UtxoNotifier::Premine,
+                                BFieldElement::ZERO,
                             ))
                             .await;
                     }
@@ -484,6 +485,7 @@ impl WalletState {
                     tx_output.sender_randomness(),
                     spending_key.privacy_preimage(),
                     notifier,
+                    BFieldElement::ZERO,
                 )
             })
             .collect_vec()
@@ -704,6 +706,7 @@ impl WalletState {
                 expected_utxo.sender_randomness,
                 expected_utxo.receiver_preimage,
                 expected_utxo.received_from,
+                expected_utxo.payment_id,
             ))
             .await;
         }
@@ -3913,6 +3916,7 @@ pub(crate) mod tests {
                     sender_randomness,
                     receiver_preimage,
                     UtxoNotifier::Myself,
+                    BFieldElement::ZERO,
                 ))
                 .await;
             assert!(!wallet.wallet_db.expected_utxos().is_empty().await);
@@ -3963,6 +3967,7 @@ pub(crate) mod tests {
                     rand::random(),
                     rand::random(),
                     UtxoNotifier::Myself,
+                    BFieldElement::ZERO,
                 );
                 addition_records.push(eutxo.addition_record);
                 wallet.add_expected_utxo(eutxo).await;
@@ -4070,6 +4075,7 @@ pub(crate) mod tests {
                         rand::random(),
                         rand::random(),
                         UtxoNotifier::Myself,
+                        BFieldElement::ZERO,
                     ))
                     .await;
 

@@ -47,7 +47,7 @@ use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
 pub(super) const GENERATION_FLAG_U8: u8 = 79;
 pub const GENERATION_FLAG: BFieldElement = BFieldElement::new(GENERATION_FLAG_U8 as u64);
 
-pub(super) const GENERATION_SUBADDR_FLAG_U8: u8 = 89;
+pub(super) const GENERATION_SUBADDR_FLAG_U8: u8 = 179;
 pub const GENERATION_SUBADDR_FLAG: BFieldElement = BFieldElement::new(GENERATION_SUBADDR_FLAG_U8 as u64);
 
 // note: we serde(skip) fields that can be computed from the seed in order to
@@ -204,20 +204,24 @@ impl GenerationSubAddress {
         self.base.encryption_key
     }
 
-    /// Encrypt a UTXO notification payload using the base address encryption key
-    pub fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
-        self.base.encrypt(payload)
-    }
-
-    /// Generate an announcement for this subaddress (includes payment_id)
+    /// Generate an announcement for this subaddress.
+    /// The payment_id is encrypted inside the ciphertext for privacy.
+    /// Format: [flag, receiver_id, ciphertext...] (same as base address but with subaddr flag)
     pub fn generate_announcement(
         &self,
         utxo_notification_payload: &UtxoNotificationPayload,
     ) -> Announcement {
-        // Subaddress format: [flag, receiver_id, payment_id, ciphertext...]
-        let ciphertext = self.encrypt(utxo_notification_payload);
+        // Create payload with payment_id included
+        let payload_with_id = UtxoNotificationPayload::with_payment_id(
+            utxo_notification_payload.utxo.clone(),
+            utxo_notification_payload.sender_randomness,
+            self.payment_id,
+        );
+
+        // Encrypt - payment_id is now inside ciphertext for privacy
+        let ciphertext = self.base.encrypt(&payload_with_id);
         let message = [
-            vec![GENERATION_SUBADDR_FLAG, self.receiver_identifier(), self.payment_id],
+            vec![GENERATION_SUBADDR_FLAG, self.receiver_identifier()],
             ciphertext,
         ]
         .concat();
@@ -313,7 +317,9 @@ impl GenerationSpendingKey {
     }
 
     /// Decrypt a Generation Address ciphertext
-    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest)> {
+    /// Returns (utxo, sender_randomness, payment_id)
+    /// payment_id is 0 for base addresses, non-zero for subaddresses
+    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest, BFieldElement)> {
         // parse ciphertext
         ensure!(
             ciphertext.len() > CIPHERTEXT_SIZE_IN_BFES,
@@ -339,8 +345,9 @@ impl GenerationSpendingKey {
             .decrypt(nonce, ciphertext_bytes.as_ref())
             .map_err(|_| anyhow!("Failed to decrypt symmetric payload."))?;
 
-        // convert plaintext to utxo and digest
-        Ok(bincode::deserialize(&plaintext)?)
+        // convert plaintext to UtxoNotificationPayload (includes payment_id)
+        let payload: UtxoNotificationPayload = bincode::deserialize(&plaintext)?;
+        Ok((payload.utxo, payload.sender_randomness, payload.payment_id))
     }
 
     fn generate_spending_lock(&self) -> Digest {

@@ -3964,6 +3964,7 @@ mod tests {
                 change_output.sender_randomness(),
                 genesis_key.privacy_preimage(),
                 UtxoNotifier::Myself,
+                BFieldElement::ZERO,
             ))
             .await;
 
@@ -4036,6 +4037,7 @@ mod tests {
                             expected_utxo.sender_randomness,
                             genesis_spending_key.receiver_preimage(),
                             UtxoNotifier::OwnMinerComposeBlock,
+                            BFieldElement::ZERO,
                         )
                     })
                     .collect_vec(),

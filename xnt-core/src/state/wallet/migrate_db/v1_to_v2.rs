@@ -9,6 +9,7 @@ use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 use crate::application::database::storage::storage_vec::traits::*;
 use crate::state::wallet::wallet_db_tables::StrongUtxoKey;
 use crate::state::wallet::wallet_db_tables::WalletDbTables;
+use crate::util_types::mutator_set::addition_record::AdditionRecord;
 
 /// migrates wallet db with schema-version v1 to v2
 ///
@@ -58,6 +59,14 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
     let mut mutxos_v2 = storage
         .schema
         .new_vec::<migration::schema_v2::MonitoredUtxo>("monitored_utxos")
+        .await;
+
+    // Load expected UTXOs using v2 schema (same as v1, without payment_id)
+    storage.reset_schema();
+    storage.schema.table_count = WalletDbTables::expected_utxo_table_count();
+    let eutxos_v2_read = storage
+        .schema
+        .new_vec::<migration::schema_v2::ExpectedUtxo>("expected_utxos")
         .await;
 
     // Load remaining tables from WalletDbTables for index lookups
@@ -148,22 +157,30 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
     // I don't have a reasonable expectation that expected UTXOs are *not*
     // duplicated in many real databases out there. So to create the index,
     // we must clear the expected UTXO list and build it again.
-    let all_eutxos = tables.expected_utxos.get_all().await;
+    let all_eutxos = eutxos_v2_read.get_all().await;
     debug!("Found {} expected UTXOs for migration", all_eutxos.len());
-    tables.expected_utxos.clear().await;
+
+    // Create v2 expected_utxos table for writing
+    storage.reset_schema();
+    storage.schema.table_count = WalletDbTables::expected_utxo_table_count();
+    let mut eutxos_v2_write = storage
+        .schema
+        .new_vec::<migration::schema_v2::ExpectedUtxo>("expected_utxos")
+        .await;
+    eutxos_v2_write.clear().await;
     tables.addition_record_to_expected_utxo.clear().await;
 
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<AdditionRecord> = HashSet::new();
     for eutxo in all_eutxos {
         let addition_record = eutxo.addition_record;
         if !seen.contains(&addition_record) {
-            let list_index = tables.expected_utxos.len().await;
+            let list_index = eutxos_v2_write.len().await;
             tables
                 .addition_record_to_expected_utxo
                 .insert(addition_record, list_index)
                 .await;
 
-            tables.expected_utxos.push(eutxo).await;
+            eutxos_v2_write.push(eutxo).await;
 
             seen.insert(addition_record);
 
@@ -172,14 +189,14 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
     }
     trace!(
         "Length after deduplication (expected_utxos): {}",
-        tables.expected_utxos.len().await
+        eutxos_v2_write.len().await
     );
     trace!(
         "Length after deduplication (addition_record_to_expected_utxo): {}",
         tables.addition_record_to_expected_utxo.len().await
     );
 
-    let num_eutxos = tables.expected_utxos.len().await;
+    let num_eutxos = eutxos_v2_write.len().await;
     let num_eutxo_indices = tables.addition_record_to_expected_utxo.len().await;
     let num_seen: u64 = seen.len().try_into().unwrap();
     assert_eq!(
@@ -234,12 +251,13 @@ mod migration {
         use crate::api::export::BlockHeight;
         use crate::protocol::consensus::transaction::utxo::Utxo;
         use crate::protocol::proof_abstractions::timestamp::Timestamp;
+        use crate::state::wallet::expected_utxo::UtxoNotifier;
         use crate::util_types::mutator_set::addition_record::AdditionRecord;
         use crate::util_types::mutator_set::commit;
         use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
         use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
 
-        // this is a copy of MonitoredUtxo as it was in v2 schema (without payment_id).
+        // this is a copy of MonitoredUtxo as it was in v2 schema.
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub(in super::super) struct MonitoredUtxo {
             pub utxo: Utxo,
@@ -271,6 +289,18 @@ mod migration {
                 )
             }
         }
+
+        // This is ExpectedUtxo as it was in v1/v2/v3 schema (without payment_id).
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub(in super::super) struct ExpectedUtxo {
+            pub utxo: Utxo,
+            pub addition_record: AdditionRecord,
+            pub sender_randomness: Digest,
+            pub receiver_preimage: Digest,
+            pub received_from: UtxoNotifier,
+            pub notification_received: Timestamp,
+            pub mined_in_block: Option<(Digest, Timestamp)>,
+        }
     }
 }
 
@@ -282,6 +312,7 @@ mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::triton_vm::prelude::BFieldElement;
     use tasm_lib::twenty_first::prelude::MmrMembershipProof;
 
     use super::*;
@@ -340,6 +371,7 @@ mod tests {
                 Digest::default(),
                 Digest::default(),
                 UtxoNotifier::Myself,
+                BFieldElement::ZERO,
             )
         }
 

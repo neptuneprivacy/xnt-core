@@ -499,10 +499,15 @@ impl RpcApi for RpcServer {
                 let utxo_digest = ar.canonical_commitment;
 
                 if let Some(incoming) = known_outputs.get(&utxo_digest) {
-                    let receiving_address = state
+                    let spending_key = state
                         .wallet_state
-                        .find_spending_key_for_utxo(&incoming.utxo)
+                        .find_spending_key_for_utxo(&incoming.utxo);
+                    let receiving_address = spending_key
+                        .as_ref()
                         .and_then(|key| key.to_address().to_bech32m(network).ok());
+                    let receiver_identifier = spending_key
+                        .as_ref()
+                        .map(|key| key.receiver_identifier().value());
 
                     BlockInfoOutput {
                         n,
@@ -511,6 +516,7 @@ impl RpcApi for RpcServer {
                         sender_randomness: Some(incoming.sender_randomness),
                         receiving_address,
                         receiver_digest: Some(incoming.receiver_preimage),
+                        receiver_identifier,
                         utxo: Some(ApiUtxo::new(&incoming.utxo)),
                     }
                 } else {
@@ -521,6 +527,7 @@ impl RpcApi for RpcServer {
                         sender_randomness: None,
                         receiving_address: None,
                         receiver_digest: None,
+                        receiver_identifier: None,
                         utxo: None,
                     }
                 }
@@ -1070,6 +1077,17 @@ impl RpcApi for RpcServer {
                 data: None,
             }));
         };
+
+        // Debug logging to see what address type is being used
+        tracing::info!(
+            "send_tx: parsed address as {:?}, receiver_id: {}",
+            match &to_address {
+                ReceivingAddress::Generation(_) => "Generation",
+                ReceivingAddress::Symmetric(_) => "Symmetric",
+                ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
+            },
+            to_address.receiver_identifier()
+        );
 
         let outputs: Vec<OutputFormat> = vec![OutputFormat::AddressAndAmountAndMedium(
             to_address,

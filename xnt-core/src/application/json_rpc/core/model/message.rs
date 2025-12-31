@@ -319,6 +319,8 @@ pub struct BlockInfoOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_digest: Option<Digest>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_identifier: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub utxo: Option<ApiUtxo>,
 }
 

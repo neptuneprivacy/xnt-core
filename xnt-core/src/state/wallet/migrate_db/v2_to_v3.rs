@@ -5,7 +5,6 @@ use tracing::debug;
 
 use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 use crate::application::database::storage::storage_vec::traits::*;
-use crate::state::wallet::monitored_utxo::MonitoredUtxo;
 use crate::state::wallet::wallet_db_tables::WalletDbTables;
 
 /// migrates wallet db with schema-version v2 to v3
@@ -34,16 +33,19 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
     // reset the schema again, to prepare for loading v3 schema.
     storage.reset_schema();
 
-    // load v3 schema tables
-    let mut tables = WalletDbTables::load_schema_in_order(storage).await;
-    let mutxos_v3 = &mut tables.monitored_utxos;
+    // add a DbtVec<MonitoredUtxoV3> to the schema at the correct position
+    storage.schema.table_count = WalletDbTables::monitored_utxos_table_count();
+    let mut mutxos_v3 = storage
+        .schema
+        .new_vec::<migration::schema_v3::MonitoredUtxo>("monitored_utxos")
+        .await;
 
     /* Migrate monitored UTXOs - add payment_id field */
     let mutxo_stream = mutxos_v2.stream().await;
     pin_mut!(mutxo_stream); // needed for iteration
 
     while let Some((list_index, mutxo_v2)) = mutxo_stream.next().await {
-        let mutxo_v3 = MonitoredUtxo {
+        let mutxo_v3 = migration::schema_v3::MonitoredUtxo {
             utxo: mutxo_v2.utxo,
             aocl_leaf_index: mutxo_v2.aocl_leaf_index,
             sender_randomness: mutxo_v2.sender_randomness,
@@ -85,6 +87,35 @@ mod migration {
             pub aocl_leaf_index: u64,
             pub sender_randomness: Digest,
             pub receiver_preimage: Digest,
+            pub blockhash_to_membership_proof: VecDeque<(Digest, MsMembershipProof)>,
+            pub number_of_mps_per_utxo: usize,
+            pub spent_in_block: Option<(Digest, Timestamp, BlockHeight)>,
+            pub confirmed_in_block: (Digest, Timestamp, BlockHeight),
+            pub abandoned_at: Option<(Digest, Timestamp, BlockHeight)>,
+        }
+    }
+
+    pub(super) mod schema_v3 {
+        use std::collections::VecDeque;
+
+        use serde::Deserialize;
+        use serde::Serialize;
+        use tasm_lib::prelude::Digest;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::api::export::BlockHeight;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::protocol::proof_abstractions::timestamp::Timestamp;
+        use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
+
+        // This is MonitoredUtxo as it is in v3 schema (with payment_id).
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub(in super::super) struct MonitoredUtxo {
+            pub utxo: Utxo,
+            pub aocl_leaf_index: u64,
+            pub sender_randomness: Digest,
+            pub receiver_preimage: Digest,
+            pub payment_id: BFieldElement,
             pub blockhash_to_membership_proof: VecDeque<(Digest, MsMembershipProof)>,
             pub number_of_mps_per_utxo: usize,
             pub spent_in_block: Option<(Digest, Timestamp, BlockHeight)>,

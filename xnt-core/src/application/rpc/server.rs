@@ -1983,13 +1983,13 @@ pub trait RPC {
 
     /// Validate and decode a subaddress string.
     ///
-    /// Returns the subaddress components (base address as bech32m, payment_id) if valid,
+    /// Returns the subaddress components (base address as bech32m, payment_id, receiver_identifier) if valid,
     /// or None if the string is not a valid subaddress.
     async fn validate_subaddress(
         token: auth::Token,
         subaddress: String,
         network: Network,
-    ) -> RpcResult<Option<(String, u64)>>;
+    ) -> RpcResult<Option<(String, u64, u64)>>;
 
     /// Gracious shutdown.
     ///
@@ -4247,21 +4247,23 @@ impl RPC for NeptuneRPCServer {
         token: auth::Token,
         subaddress: String,
         network: Network,
-    ) -> RpcResult<Option<(String, u64)>> {
+    ) -> RpcResult<Option<(String, u64, u64)>> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
         match GenerationSubAddress::from_bech32m(&subaddress, network) {
             Ok(sub_addr) => {
                 let (base_addr, payment_id) = sub_addr.split();
+                let receiver_identifier = sub_addr.receiver_identifier();
                 let base_encoded = base_addr
                     .to_bech32m(network)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(Some((base_encoded, payment_id.value())))
+                Ok(Some((base_encoded, payment_id.value(), receiver_identifier.value())))
             }
             Err(_) => Ok(None),
         }
     }
+
 }
 
 pub mod error {

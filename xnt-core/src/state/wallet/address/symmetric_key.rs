@@ -61,7 +61,7 @@ pub enum EncryptError {
 pub(super) const SYMMETRIC_KEY_FLAG_U8: u8 = 80;
 pub const SYMMETRIC_KEY_FLAG: BFieldElement = BFieldElement::new(SYMMETRIC_KEY_FLAG_U8 as u64);
 
-pub(super) const SYMMETRIC_SUBADDR_FLAG_U8: u8 = 90;
+pub(super) const SYMMETRIC_SUBADDR_FLAG_U8: u8 = 180;
 pub const SYMMETRIC_SUBADDR_FLAG: BFieldElement = BFieldElement::new(SYMMETRIC_SUBADDR_FLAG_U8 as u64);
 
 /// represents an AES 256 bit symmetric key
@@ -140,7 +140,7 @@ impl SymmetricKey {
     pub fn decrypt(
         &self,
         ciphertext_bfes: &[BFieldElement],
-    ) -> Result<(Utxo, Digest), DecryptError> {
+    ) -> Result<(Utxo, Digest, BFieldElement), DecryptError> {
         const NONCE_LEN: usize = 1;
 
         // 1. separate nonce from ciphertext.
@@ -158,8 +158,9 @@ impl SymmetricKey {
         let cipher = Aes256Gcm::new(&self.secret_key());
         let plaintext = cipher.decrypt(nonce, ciphertext_bytes.as_ref())?;
 
-        // 4. deserialize plaintext into (utxo, sender_randomness)
-        Ok(bincode::deserialize(&plaintext)?)
+        // 4. deserialize plaintext into UtxoNotificationPayload (includes payment_id)
+        let payload: UtxoNotificationPayload = bincode::deserialize(&plaintext)?;
+        Ok((payload.utxo, payload.sender_randomness, payload.payment_id))
     }
 
     /// encrypts utxo secrets (utxo, sender_randomness) into ciphertext

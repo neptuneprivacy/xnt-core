@@ -218,7 +218,10 @@ impl SpendingKey {
     ///  - `None` if this spending key has no associated receiving address.
     ///  - `Some(Err(..))` if decryption failed.
     ///  - `Some(Ok(..))` if decryption succeeds.
-    pub fn decrypt(&self, ciphertext_bfes: &[BFieldElement]) -> Result<(Utxo, Digest)> {
+    ///
+    /// Returns (utxo, sender_randomness, payment_id)
+    /// payment_id is 0 for base addresses, non-zero for subaddresses
+    pub fn decrypt(&self, ciphertext_bfes: &[BFieldElement]) -> Result<(Utxo, Digest, BFieldElement)> {
         match self {
             Self::Generation(k) => k.decrypt(ciphertext_bfes),
             Self::Symmetric(k) => k.decrypt(ciphertext_bfes).map_err(anyhow::Error::new),
@@ -255,16 +258,14 @@ impl SpendingKey {
                 matches!(common::receiver_identifier_from_announcement(pa), Ok(r) if r == receiver_identifier)
             })
 
-            // ... extract ciphertext and payment_id together
+            // ... extract ciphertext
             .filter_map(|pa| {
-                let ciphertext = self.ok_warn(common::ciphertext_from_announcement(pa))?;
-                let payment_id = common::payment_id_from_announcement(pa).unwrap_or(BFieldElement::new(0));
-                Some((ciphertext, payment_id))
+                self.ok_warn(common::ciphertext_from_announcement(pa))
             })
 
-            // ... which can be decrypted with this key
-            .filter_map(|(c, payment_id)| {
-                let (utxo, sender_randomness) = self.ok_warn(self.decrypt(&c))?;
+            // ... which can be decrypted with this key (payment_id is now inside ciphertext)
+            .filter_map(|c| {
+                let (utxo, sender_randomness, payment_id) = self.ok_warn(self.decrypt(&c))?;
                 Some((utxo, sender_randomness, payment_id))
             })
 

@@ -151,6 +151,12 @@ enum Command {
         subaddress: String,
     },
 
+    /// Validate any address and show its type and receiver identifier
+    ValidateAddress {
+        /// The address bech32m string to validate
+        address: String,
+    },
+
     /// Get the nth generation receiving address.
     ///
     /// Ignoring the ones that have been generated in the past; re-generate them
@@ -950,13 +956,43 @@ async fn main() -> Result<()> {
                 .validate_subaddress(ctx, token, subaddress.clone(), network)
                 .await??;
             match result {
-                Some((base_address, payment_id)) => {
+                Some((base_address, payment_id, receiver_identifier)) => {
                     println!("Valid subaddress!");
                     println!("Base address: {base_address}");
                     println!("Payment ID: {payment_id}");
+                    println!("Receiver Identifier: {receiver_identifier}");
                 }
                 None => {
                     println!("Invalid subaddress: {subaddress}");
+                }
+            }
+        }
+        Command::ValidateAddress { address } => {
+            let result = client
+                .validate_address(ctx, token, address.clone(), network)
+                .await??;
+            match result {
+                Some(addr) => {
+                    let address_type = match &addr {
+                        ReceivingAddress::Generation(_) => "Generation",
+                        ReceivingAddress::Symmetric(_) => "Symmetric",
+                        ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
+                    };
+                    println!("Valid address!");
+                    println!("Address type: {address_type}");
+                    println!("Receiver Identifier: {}", addr.receiver_identifier());
+
+                    // If subaddress, also show base address and payment_id
+                    if let ReceivingAddress::GenerationSubAddr(subaddr) = &addr {
+                        let (base_addr, payment_id) = subaddr.split();
+                        if let Ok(base_encoded) = base_addr.to_bech32m(network) {
+                            println!("Base address: {base_encoded}");
+                        }
+                        println!("Payment ID: {}", payment_id.value());
+                    }
+                }
+                None => {
+                    println!("Invalid address: {address}");
                 }
             }
         }

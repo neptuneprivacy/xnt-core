@@ -107,6 +107,18 @@ impl ReceivingAddress {
         &self,
         utxo_notification_payload: UtxoNotificationPayload,
     ) -> Announcement {
+        let (key_type_name, key_flag) = match self {
+            ReceivingAddress::Generation(_) => ("Generation", 79u8),
+            ReceivingAddress::Symmetric(_) => ("Symmetric", 80u8),
+            ReceivingAddress::GenerationSubAddr(_) => ("GenerationSubAddr", 89u8),
+        };
+        tracing::info!(
+            "generate_announcement: using {} address (flag {}), receiver_id: {}",
+            key_type_name,
+            key_flag,
+            self.receiver_identifier()
+        );
+
         match self {
             ReceivingAddress::Generation(generation_receiving_address) => {
                 generation_receiving_address.generate_announcement(&utxo_notification_payload)
