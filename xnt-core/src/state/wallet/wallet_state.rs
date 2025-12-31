@@ -524,6 +524,7 @@ impl WalletState {
 
                 let own_utxos = announced_utxos_from_announcements
                     .chain(own_utxos_from_expected_utxos)
+                    .unique_by(|iu| iu.addition_record())
                     .collect_vec();
 
                 let tx_id = tx_kernel.txid();
