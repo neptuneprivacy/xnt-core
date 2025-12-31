@@ -14,8 +14,8 @@ use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
 
 /// Trait for subaddress types that wrap a base address with a payment_id.
 ///
-/// This trait provides a common interface for both `GenerationSubAddress`
-/// and `SymmetricSubAddress`, reducing code duplication.
+/// This trait provides a common interface for subaddress types like
+/// `GenerationSubAddress`, reducing code duplication.
 pub trait SubAddress: Sized {
     /// The base address/key type
     type Base;

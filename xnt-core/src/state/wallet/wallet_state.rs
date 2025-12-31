@@ -1001,7 +1001,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 Box::new(self.get_known_generation_spending_keys())
             }
-            KeyType::Symmetric | KeyType::SymmetricSubAddr => {
+            KeyType::Symmetric => {
                 Box::new(self.get_known_symmetric_keys())
             }
         }
@@ -1016,7 +1016,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 Box::new(self.get_known_generation_spending_keys())
             }
-            KeyType::Symmetric | KeyType::SymmetricSubAddr => {
+            KeyType::Symmetric => {
                 Box::new(self.get_known_symmetric_keys())
             }
         }
@@ -1058,7 +1058,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 self.next_unused_generation_spending_key().await.into()
             }
-            KeyType::Symmetric | KeyType::SymmetricSubAddr => {
+            KeyType::Symmetric => {
                 self.next_unused_symmetric_key().await.into()
             }
         }
@@ -1078,7 +1078,7 @@ impl WalletState {
                         self.known_generation_keys.push(key);
                     }
                 }
-                KeyType::Symmetric | KeyType::SymmetricSubAddr => {
+                KeyType::Symmetric => {
                     self.wallet_db.set_symmetric_key_counter(new_counter).await;
 
                     for idx in current_counter..new_counter {
@@ -1096,7 +1096,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 self.wallet_db.get_generation_key_counter()
             }
-            KeyType::Symmetric | KeyType::SymmetricSubAddr => {
+            KeyType::Symmetric => {
                 self.wallet_db.get_symmetric_key_counter()
             }
         }
@@ -1109,7 +1109,7 @@ impl WalletState {
                 .wallet_entropy
                 .nth_generation_spending_key(index)
                 .into(),
-            KeyType::Symmetric | KeyType::SymmetricSubAddr => {
+            KeyType::Symmetric => {
                 self.wallet_entropy.nth_symmetric_key(index).into()
             }
         }

@@ -119,7 +119,6 @@ use crate::state::wallet::address::encrypted_utxo_notification::EncryptedUtxoNot
 use crate::state::wallet::address::GenerationSubAddress;
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::address::ReceivingAddress;
-use crate::state::wallet::address::SymmetricSubAddress;
 use crate::state::wallet::address::SpendingKey;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::coin_with_possible_timelock::CoinWithPossibleTimeLock;
@@ -4222,7 +4221,7 @@ impl RPC for NeptuneRPCServer {
             .ok_or(RpcError::WalletKeyCounterIsZero)?;
         let spending_key = state.wallet_state.nth_spending_key(key_type, index);
 
-        // Get the receiving address and create the appropriate subaddress type
+        // Get the receiving address and create the subaddress (only Generation addresses supported)
         let receiving_address = spending_key.to_address();
         let encoded = match receiving_address {
             ReceivingAddress::Generation(gen_addr) => {
@@ -4230,14 +4229,9 @@ impl RPC for NeptuneRPCServer {
                     GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id));
                 subaddress.to_bech32m(network)
             }
-            ReceivingAddress::Symmetric(sym_key) => {
-                let subaddress =
-                    SymmetricSubAddress::new(sym_key, BFieldElement::new(payment_id));
-                subaddress.to_bech32m(network)
-            }
             _ => {
                 return Err(RpcError::Failed(
-                    "Subaddresses not supported for this key type".to_string(),
+                    "Subaddresses are only supported for Generation addresses".to_string(),
                 ))
             }
         }

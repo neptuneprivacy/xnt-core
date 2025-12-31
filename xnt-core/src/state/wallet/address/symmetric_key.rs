@@ -61,9 +61,6 @@ pub enum EncryptError {
 pub(super) const SYMMETRIC_KEY_FLAG_U8: u8 = 80;
 pub const SYMMETRIC_KEY_FLAG: BFieldElement = BFieldElement::new(SYMMETRIC_KEY_FLAG_U8 as u64);
 
-pub(super) const SYMMETRIC_SUBADDR_FLAG_U8: u8 = 180;
-pub const SYMMETRIC_SUBADDR_FLAG: BFieldElement = BFieldElement::new(SYMMETRIC_SUBADDR_FLAG_U8 as u64);
-
 /// represents an AES 256 bit symmetric key
 ///
 /// this is an opaque type.  all fields are read-only via accessor methods.
@@ -291,77 +288,5 @@ impl SymmetricKey {
     pub(super) fn get_hrp(network: Network) -> String {
         // nsk: xnt-symmetric-key
         format!("xsymk{}", common::network_hrp_char(network))
-    }
-
-    /// Create a subaddress with a payment_id
-    pub fn with_payment_id(&self, payment_id: BFieldElement) -> SymmetricSubAddress {
-        SymmetricSubAddress::new(*self, payment_id)
-    }
-
-    /// Create a subaddress with an index-derived payment_id
-    pub fn subaddress(&self, index: u64) -> SymmetricSubAddress {
-        SymmetricSubAddress::from_index(*self, index)
-    }
-}
-
-/// A symmetric key subaddress with a payment_id for tracking purposes.
-///
-/// The subaddress can be converted to/from (key, payment_id) pair.
-/// When encoded as bech32m, it includes both the base key and payment_id.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "arbitrary-impls"), derive(Arbitrary))]
-pub struct SymmetricSubAddress {
-    /// The base symmetric key
-    base: SymmetricKey,
-
-    /// The payment identifier for this subaddress
-    payment_id: BFieldElement,
-}
-
-impl SymmetricSubAddress {
-    /// Create a new subaddress from a base key and payment_id
-    pub fn new(base: SymmetricKey, payment_id: BFieldElement) -> Self {
-        Self { base, payment_id }
-    }
-
-    /// Create a subaddress with an index-derived payment_id
-    pub fn from_index(base: SymmetricKey, index: u64) -> Self {
-        Self::new(base, BFieldElement::new(index))
-    }
-}
-
-// Use macro for bech32m serialization (get_hrp, to_bech32m, from_bech32m)
-crate::impl_subaddress_bech32m!(SymmetricSubAddress, "xntss");
-
-impl common::SubAddress for SymmetricSubAddress {
-    type Base = SymmetricKey;
-
-    fn base(&self) -> &Self::Base {
-        &self.base
-    }
-
-    fn payment_id(&self) -> BFieldElement {
-        self.payment_id
-    }
-
-    fn receiver_identifier(&self) -> BFieldElement {
-        self.base.receiver_identifier()
-    }
-
-    fn split(self) -> (Self::Base, BFieldElement) {
-        (self.base, self.payment_id)
-    }
-
-    fn flag() -> BFieldElement {
-        SYMMETRIC_SUBADDR_FLAG
-    }
-
-    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
-        let payload_with_id = UtxoNotificationPayload::with_payment_id(
-            payload.utxo.clone(),
-            payload.sender_randomness,
-            self.payment_id,
-        );
-        self.base.encrypt(&payload_with_id)
     }
 }

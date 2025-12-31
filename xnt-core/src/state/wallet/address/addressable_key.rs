@@ -31,22 +31,19 @@ pub enum KeyType {
 
     /// [generation_address] subaddress with payment_id
     GenerationSubAddr = generation_address::GENERATION_SUBADDR_FLAG_U8,
-
-    /// [symmetric_key] subaddress with payment_id
-    SymmetricSubAddr = symmetric_key::SYMMETRIC_SUBADDR_FLAG_U8,
 }
 
 impl KeyType {
     /// Returns true if this key type uses subaddress format (has payment_id)
     pub fn is_subaddress(&self) -> bool {
-        matches!(self, Self::GenerationSubAddr | Self::SymmetricSubAddr)
+        matches!(self, Self::GenerationSubAddr)
     }
 
     /// Returns the base key type (without subaddress)
     pub fn base_type(&self) -> Self {
         match self {
             Self::Generation | Self::GenerationSubAddr => Self::Generation,
-            Self::Symmetric | Self::SymmetricSubAddr => Self::Symmetric,
+            Self::Symmetric => Self::Symmetric,
         }
     }
 }
@@ -57,7 +54,6 @@ impl std::fmt::Display for KeyType {
             Self::Generation => write!(f, "Generation"),
             Self::Symmetric => write!(f, "Symmetric"),
             Self::GenerationSubAddr => write!(f, "GenerationSubAddr"),
-            Self::SymmetricSubAddr => write!(f, "SymmetricSubAddr"),
         }
     }
 }
@@ -68,7 +64,6 @@ impl From<&ReceivingAddress> for KeyType {
             ReceivingAddress::Generation(_) => Self::Generation,
             ReceivingAddress::Symmetric(_) => Self::Symmetric,
             ReceivingAddress::GenerationSubAddr(_) => Self::GenerationSubAddr,
-            ReceivingAddress::SymmetricSubAddr(_) => Self::SymmetricSubAddr,
         }
     }
 }
@@ -96,7 +91,6 @@ impl TryFrom<&Announcement> for KeyType {
             Ok(kt) if kt == Self::Generation.into() => Ok(Self::Generation),
             Ok(kt) if kt == Self::Symmetric.into() => Ok(Self::Symmetric),
             Ok(kt) if kt == Self::GenerationSubAddr.into() => Ok(Self::GenerationSubAddr),
-            Ok(kt) if kt == Self::SymmetricSubAddr.into() => Ok(Self::SymmetricSubAddr),
             _ => bail!("encountered Announcement of unknown type"),
         }
     }
@@ -105,7 +99,7 @@ impl TryFrom<&Announcement> for KeyType {
 impl KeyType {
     /// returns all available `AddressableKeyType`
     pub fn all_types() -> Vec<KeyType> {
-        vec![Self::Generation, Self::Symmetric, Self::GenerationSubAddr, Self::SymmetricSubAddr]
+        vec![Self::Generation, Self::Symmetric, Self::GenerationSubAddr]
     }
 }
 

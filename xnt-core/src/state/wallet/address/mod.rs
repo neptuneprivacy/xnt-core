@@ -16,7 +16,6 @@ pub use addressable_key::SpendingKey;
 pub use common::SubAddress;
 pub use receiving_address::ReceivingAddress;
 pub use generation_address::GenerationSubAddress;
-pub use symmetric_key::SymmetricSubAddress;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
