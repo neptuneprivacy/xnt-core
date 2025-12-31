@@ -118,6 +118,7 @@ use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
 use crate::state::wallet::address::encrypted_utxo_notification::EncryptedUtxoNotification;
 use crate::state::wallet::address::GenerationSubAddress;
 use crate::state::wallet::address::KeyType;
+use crate::state::wallet::address::SubAddress;
 use crate::state::wallet::address::ReceivingAddress;
 use crate::state::wallet::address::SpendingKey;
 use crate::state::wallet::change_policy::ChangePolicy;

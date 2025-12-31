@@ -68,6 +68,7 @@ impl From<&ReceivingAddress> for KeyType {
             ReceivingAddress::Generation(_) => Self::Generation,
             ReceivingAddress::Symmetric(_) => Self::Symmetric,
             ReceivingAddress::GenerationSubAddr(_) => Self::GenerationSubAddr,
+            ReceivingAddress::SymmetricSubAddr(_) => Self::SymmetricSubAddr,
         }
     }
 }

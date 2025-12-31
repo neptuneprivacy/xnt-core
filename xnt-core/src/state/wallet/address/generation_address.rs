@@ -179,91 +179,45 @@ impl GenerationSubAddress {
         Self::new(base, BFieldElement::new(index))
     }
 
-    /// Split the subaddress into (base_address, payment_id)
-    pub fn split(self) -> (GenerationReceivingAddress, BFieldElement) {
-        (self.base, self.payment_id)
-    }
-
-    /// Get the base address
-    pub fn base_address(&self) -> &GenerationReceivingAddress {
-        &self.base
-    }
-
-    /// Get the payment_id
-    pub fn payment_id(&self) -> BFieldElement {
-        self.payment_id
-    }
-
-    /// Get the receiver_identifier (same as base address)
-    pub fn receiver_identifier(&self) -> BFieldElement {
-        self.base.receiver_identifier
-    }
-
     /// Get the encryption key (same as base address)
     pub fn encryption_key(&self) -> lattice::kem::PublicKey {
         self.base.encryption_key
     }
+}
 
-    /// Generate an announcement for this subaddress.
-    /// The payment_id is encrypted inside the ciphertext for privacy.
-    /// Format: [flag, receiver_id, ciphertext...] (same as base address but with subaddr flag)
-    pub fn generate_announcement(
-        &self,
-        utxo_notification_payload: &UtxoNotificationPayload,
-    ) -> Announcement {
-        // Create payload with payment_id included
+// Use macro for bech32m serialization
+crate::impl_subaddress_bech32m!(GenerationSubAddress, "xntsa");
+
+impl common::SubAddress for GenerationSubAddress {
+    type Base = GenerationReceivingAddress;
+
+    fn base(&self) -> &Self::Base {
+        &self.base
+    }
+
+    fn payment_id(&self) -> BFieldElement {
+        self.payment_id
+    }
+
+    fn receiver_identifier(&self) -> BFieldElement {
+        self.base.receiver_identifier
+    }
+
+    fn split(self) -> (Self::Base, BFieldElement) {
+        (self.base, self.payment_id)
+    }
+
+    fn flag() -> BFieldElement {
+        GENERATION_SUBADDR_FLAG
+    }
+
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
         let payload_with_id = UtxoNotificationPayload::with_payment_id(
-            utxo_notification_payload.utxo.clone(),
-            utxo_notification_payload.sender_randomness,
+            payload.utxo.clone(),
+            payload.sender_randomness,
             self.payment_id,
         );
-
-        // Encrypt - payment_id is now inside ciphertext for privacy
-        let ciphertext = self.base.encrypt(&payload_with_id);
-        let message = [
-            vec![GENERATION_SUBADDR_FLAG, self.receiver_identifier()],
-            ciphertext,
-        ]
-        .concat();
-        Announcement::new(message)
-    }
-
-    /// returns human readable prefix (hrp) for subaddress.
-    pub(super) fn get_hrp(network: Network) -> String {
-        // XNTSA: XNT SubAddress
-        let mut hrp = "xntsa".to_string();
-        let network_byte = network_hrp_char(network);
-        hrp.push(network_byte);
-        hrp
-    }
-
-    /// Encode subaddress as bech32m string
-    pub fn to_bech32m(&self, network: Network) -> Result<String> {
-        let hrp = Self::get_hrp(network);
-        let payload = bincode::serialize(self)?;
-        match bech32::encode(&hrp, payload.to_base32(), bech32::Variant::Bech32m) {
-            Ok(enc) => Ok(enc),
-            Err(e) => bail!("Could not encode subaddress as bech32m: {e}"),
-        }
-    }
-
-    /// Decode subaddress from bech32m string
-    pub fn from_bech32m(encoded: &str, network: Network) -> Result<Self> {
-        let expected_hrp = Self::get_hrp(network);
-        let (hrp, data, variant) = bech32::decode(encoded)?;
-
-        ensure!(
-            variant == bech32::Variant::Bech32m,
-            "Can only decode bech32m subaddresses.",
-        );
-        ensure!(
-            hrp == expected_hrp,
-            "Invalid prefix for subaddress. Expected: {expected_hrp}, got: {hrp}",
-        );
-
-        let payload = Vec::<u8>::from_base32(&data)?;
-        bincode::deserialize(&payload)
-            .map_err(|e| anyhow!("Could not decode bech32m subaddress: {e}"))
+        self.base.encrypt(&payload_with_id)
     }
 }
 

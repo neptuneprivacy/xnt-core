@@ -1085,6 +1085,7 @@ impl RpcApi for RpcServer {
                 ReceivingAddress::Generation(_) => "Generation",
                 ReceivingAddress::Symmetric(_) => "Symmetric",
                 ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
+                ReceivingAddress::SymmetricSubAddr(_) => "SymmetricSubAddr",
             },
             to_address.receiver_identifier()
         );
