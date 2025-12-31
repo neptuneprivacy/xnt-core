@@ -10,9 +10,7 @@ use tasm_lib::triton_vm::prelude::Digest;
 
 use super::common::SubAddress;
 use super::generation_address;
-use super::generation_address::GenerationSubAddress;
 use super::symmetric_key;
-use super::symmetric_key::SymmetricSubAddress;
 use crate::api::export::KeyType;
 use crate::application::config::network::Network;
 use crate::protocol::consensus::transaction::announcement::Announcement;
@@ -41,10 +39,10 @@ pub enum ReceivingAddress {
     Symmetric(symmetric_key::SymmetricKey),
 
     /// a [generation_address] subaddress with payment_id
-    GenerationSubAddr(GenerationSubAddress),
+    GenerationSubAddr(generation_address::GenerationSubAddress),
 
     /// a [symmetric_key] subaddress with payment_id
-    SymmetricSubAddr(SymmetricSubAddress),
+    SymmetricSubAddr(symmetric_key::SymmetricSubAddress),
 }
 
 impl From<generation_address::GenerationReceivingAddress> for ReceivingAddress {
@@ -71,14 +69,14 @@ impl From<&symmetric_key::SymmetricKey> for ReceivingAddress {
     }
 }
 
-impl From<GenerationSubAddress> for ReceivingAddress {
-    fn from(a: GenerationSubAddress) -> Self {
+impl From<generation_address::GenerationSubAddress> for ReceivingAddress {
+    fn from(a: generation_address::GenerationSubAddress) -> Self {
         Self::GenerationSubAddr(a)
     }
 }
 
-impl From<SymmetricSubAddress> for ReceivingAddress {
-    fn from(a: SymmetricSubAddress) -> Self {
+impl From<symmetric_key::SymmetricSubAddress> for ReceivingAddress {
+    fn from(a: symmetric_key::SymmetricSubAddress) -> Self {
         Self::SymmetricSubAddr(a)
     }
 }
@@ -299,12 +297,12 @@ impl ReceivingAddress {
     /// parses an address from its bech32m encoding
     pub fn from_bech32m(encoded: &str, network: Network) -> Result<Self> {
         // Try generation subaddress first (prefix: xntsa)
-        if let Ok(subaddr) = GenerationSubAddress::from_bech32m(encoded, network) {
+        if let Ok(subaddr) = generation_address::GenerationSubAddress::from_bech32m(encoded, network) {
             return Ok(subaddr.into());
         }
 
         // Try symmetric subaddress (prefix: xntss)
-        if let Ok(subaddr) = SymmetricSubAddress::from_bech32m(encoded, network) {
+        if let Ok(subaddr) = symmetric_key::SymmetricSubAddress::from_bech32m(encoded, network) {
             return Ok(subaddr.into());
         }
 
@@ -325,8 +323,8 @@ impl ReceivingAddress {
         match self {
             Self::Generation(_) => generation_address::GenerationReceivingAddress::get_hrp(network),
             Self::Symmetric(_) => symmetric_key::SymmetricKey::get_hrp(network).to_string(),
-            Self::GenerationSubAddr(_) => GenerationSubAddress::get_hrp(network),
-            Self::SymmetricSubAddr(_) => SymmetricSubAddress::get_hrp(network),
+            Self::GenerationSubAddr(_) => generation_address::GenerationSubAddress::get_hrp(network),
+            Self::SymmetricSubAddr(_) => symmetric_key::SymmetricSubAddress::get_hrp(network),
         }
     }
 

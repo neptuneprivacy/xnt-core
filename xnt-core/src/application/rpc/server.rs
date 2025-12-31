@@ -118,8 +118,8 @@ use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
 use crate::state::wallet::address::encrypted_utxo_notification::EncryptedUtxoNotification;
 use crate::state::wallet::address::GenerationSubAddress;
 use crate::state::wallet::address::KeyType;
-use crate::state::wallet::address::SubAddress;
 use crate::state::wallet::address::ReceivingAddress;
+use crate::state::wallet::address::SymmetricSubAddress;
 use crate::state::wallet::address::SpendingKey;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::coin_with_possible_timelock::CoinWithPossibleTimeLock;
@@ -1970,15 +1970,18 @@ pub trait RPC {
 
     /******** SUBADDRESS ********/
 
-    /// Generate a subaddress from the latest generation address with a given payment_id.
+    /// Generate a subaddress from the latest address of the given key type with a payment_id.
     ///
     /// The payment_id is a unique identifier that can be used to track payments
     /// to the same underlying address. The subaddress uses the same encryption
     /// key as the base address, so all payments can be scanned with a single key.
     ///
+    /// Supported key types: Generation, Symmetric
+    ///
     /// Returns the subaddress as a bech32m-encoded string.
     async fn generate_subaddress(
         token: auth::Token,
+        key_type: KeyType,
         payment_id: u64,
     ) -> RpcResult<String>;
 
@@ -4203,6 +4206,7 @@ impl RPC for NeptuneRPCServer {
         self,
         _context: ::tarpc::context::Context,
         token: auth::Token,
+        key_type: KeyType,
         payment_id: u64,
     ) -> RpcResult<String> {
         log_slow_scope!(fn_name!());
@@ -4211,22 +4215,33 @@ impl RPC for NeptuneRPCServer {
         let state = self.state.lock_guard().await;
         let network = state.cli().network;
 
-        // Get the latest generation spending key
-        let current_counter = state.wallet_state.spending_key_counter(KeyType::Generation);
-        let index = current_counter.checked_sub(1).ok_or(RpcError::WalletKeyCounterIsZero)?;
-        let spending_key = state.wallet_state.nth_spending_key(KeyType::Generation, index);
+        // Get the latest spending key of the specified type
+        let current_counter = state.wallet_state.spending_key_counter(key_type);
+        let index = current_counter
+            .checked_sub(1)
+            .ok_or(RpcError::WalletKeyCounterIsZero)?;
+        let spending_key = state.wallet_state.nth_spending_key(key_type, index);
 
-        // Get the receiving address and create subaddress
+        // Get the receiving address and create the appropriate subaddress type
         let receiving_address = spending_key.to_address();
-        let base_address = match receiving_address {
-            ReceivingAddress::Generation(gen_addr) => *gen_addr,
-            _ => return Err(RpcError::Failed("Expected generation address".to_string())),
-        };
-
-        let subaddress = GenerationSubAddress::new(base_address, BFieldElement::new(payment_id));
-        let encoded = subaddress
-            .to_bech32m(network)
-            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let encoded = match receiving_address {
+            ReceivingAddress::Generation(gen_addr) => {
+                let subaddress =
+                    GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id));
+                subaddress.to_bech32m(network)
+            }
+            ReceivingAddress::Symmetric(sym_key) => {
+                let subaddress =
+                    SymmetricSubAddress::new(sym_key, BFieldElement::new(payment_id));
+                subaddress.to_bech32m(network)
+            }
+            _ => {
+                return Err(RpcError::Failed(
+                    "Subaddresses not supported for this key type".to_string(),
+                ))
+            }
+        }
+        .map_err(|e| RpcError::Failed(e.to_string()))?;
 
         Ok(encoded)
     }

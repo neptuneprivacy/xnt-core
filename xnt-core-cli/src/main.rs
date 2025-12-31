@@ -56,6 +56,18 @@ use crate::models::utxo_transfer_entry::UtxoTransferEntry;
 use crate::parser::beneficiary::Beneficiary;
 use crate::parser::hex_digest::HexDigest;
 
+/// Parse key_type from string for CLI arguments
+fn parse_key_type(s: &str) -> Result<KeyType, String> {
+    match s.to_lowercase().as_str() {
+        "generation" | "gen" => Ok(KeyType::Generation),
+        "symmetric" | "sym" => Ok(KeyType::Symmetric),
+        _ => Err(format!(
+            "Invalid key type '{}'. Use 'generation' or 'symmetric'",
+            s
+        )),
+    }
+}
+
 const SELF: &str = "self";
 const ANONYMOUS: &str = "anonymous";
 
@@ -140,8 +152,11 @@ enum Command {
     /// Get next unused generation receiving address
     NextReceivingAddress,
 
-    /// Generate a subaddress from the latest generation address with a payment_id
+    /// Generate a subaddress from the latest address of the given key type with a payment_id
     GenerateSubaddress {
+        /// The key type: "generation" or "symmetric"
+        #[clap(value_parser = parse_key_type)]
+        key_type: KeyType,
         /// The payment ID to use for generating the subaddress
         payment_id: u64,
     },
@@ -940,9 +955,9 @@ async fn main() -> Result<()> {
                 .await??;
             println!("{}", receiving_address.to_display_bech32m(network).unwrap())
         }
-        Command::GenerateSubaddress { payment_id } => {
+        Command::GenerateSubaddress { key_type, payment_id } => {
             let subaddress = client
-                .generate_subaddress(ctx, token, payment_id)
+                .generate_subaddress(ctx, token, key_type, payment_id)
                 .await??;
             println!("{subaddress}")
         }
