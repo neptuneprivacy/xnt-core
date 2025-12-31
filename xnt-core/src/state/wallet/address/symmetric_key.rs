@@ -128,16 +128,19 @@ impl SymmetricKey {
         common::derive_receiver_id(self.seed)
     }
 
-    /// decrypt a ciphertext into utxo secrets (utxo, sender_randomness)
+    /// decrypt a ciphertext into utxo secrets (utxo, sender_randomness, payment_id)
     ///
     /// The ciphertext_bfes param must contain the nonce in the first
     /// field and the ciphertext in the remaining fields.
     ///
     /// The output of `encrypt()` should be used as the input to `decrypt()`.
+    ///
+    /// Note: For symmetric keys, payment_id will always be 0 since symmetric
+    /// keys do not support subaddresses (only Generation keys support subaddresses).
     pub fn decrypt(
         &self,
         ciphertext_bfes: &[BFieldElement],
-    ) -> Result<(Utxo, Digest), DecryptError> {
+    ) -> Result<(Utxo, Digest, BFieldElement), DecryptError> {
         const NONCE_LEN: usize = 1;
 
         // 1. separate nonce from ciphertext.
@@ -155,8 +158,10 @@ impl SymmetricKey {
         let cipher = Aes256Gcm::new(&self.secret_key());
         let plaintext = cipher.decrypt(nonce, ciphertext_bytes.as_ref())?;
 
-        // 4. deserialize plaintext into (utxo, sender_randomness)
-        Ok(bincode::deserialize(&plaintext)?)
+        // 4. deserialize plaintext into UtxoNotificationPayload
+        // payment_id will always be 0 for symmetric keys (no subaddress support)
+        let payload: UtxoNotificationPayload = bincode::deserialize(&plaintext)?;
+        Ok((payload.utxo, payload.sender_randomness, payload.payment_id))
     }
 
     /// encrypts utxo secrets (utxo, sender_randomness) into ciphertext

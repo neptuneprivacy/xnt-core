@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
+use tasm_lib::triton_vm::prelude::BFieldElement;
 use tasm_lib::twenty_first::prelude::MerkleTree;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
@@ -816,6 +817,7 @@ async fn incentivized_proof_collection_transaction(
         tx.sender_randomness,
         reward_key.receiver_preimage(),
         UtxoNotifier::FeeGobbler,
+        BFieldElement::ZERO,
     );
     state.wallet_state.add_expected_utxo(upgrade_reward).await;
 

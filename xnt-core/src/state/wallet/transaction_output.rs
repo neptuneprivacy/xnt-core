@@ -3,8 +3,10 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
+use num_traits::ConstZero;
 use serde::Deserialize;
 use serde::Serialize;
+use tasm_lib::triton_vm::prelude::BFieldElement;
 
 use super::utxo_notification::UtxoNotificationMethod;
 use crate::application::config::network::Network;
@@ -61,10 +63,7 @@ impl TxOutput {
     }
 
     fn notification_payload(&self) -> UtxoNotificationPayload {
-        UtxoNotificationPayload {
-            utxo: self.utxo(),
-            sender_randomness: self.sender_randomness(),
-        }
+        UtxoNotificationPayload::new(self.utxo(), self.sender_randomness())
     }
 
     /// automatically generates [TxOutput] using some heuristics
@@ -420,7 +419,7 @@ impl TxOutput {
         );
         let utxo = self.utxo();
         let sender_randomness = self.sender_randomness();
-        ExpectedUtxo::new(utxo, sender_randomness, receiver_preimage, notifier)
+        ExpectedUtxo::new(utxo, sender_randomness, receiver_preimage, notifier, BFieldElement::ZERO)
     }
 
     pub(crate) fn utxo_triple(&self) -> UtxoTriple {

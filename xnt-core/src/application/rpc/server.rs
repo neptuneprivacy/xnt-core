@@ -65,6 +65,7 @@ use serde::Serialize;
 use systemstat::Platform;
 use systemstat::System;
 use tarpc::context;
+use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 use tasm_lib::twenty_first::prelude::Mmr;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 use tracing::debug;
@@ -115,6 +116,7 @@ use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
 use crate::state::wallet::address::encrypted_utxo_notification::EncryptedUtxoNotification;
+use crate::state::wallet::address::GenerationSubAddress;
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::address::ReceivingAddress;
 use crate::state::wallet::address::SpendingKey;
@@ -798,7 +800,7 @@ pub trait RPC {
     /// ```
     async fn history(
         token: auth::Token,
-    ) -> RpcResult<Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount)>>;
+    ) -> RpcResult<Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount, u64)>>;
 
     /// Return information about funds in the wallet
     ///
@@ -1965,6 +1967,23 @@ pub trait RPC {
     /// canonical chain.
     async fn set_tip(token: auth::Token, indicated_tip: Digest) -> RpcResult<()>;
 
+    /******** SUBADDRESS ********/
+
+    /// Generate a subaddress from the latest address of the given key type with a payment_id.
+    ///
+    /// The payment_id is a unique identifier that can be used to track payments
+    /// to the same underlying address. The subaddress uses the same encryption
+    /// key as the base address, so all payments can be scanned with a single key.
+    ///
+    /// Supported key types: Generation, Symmetric
+    ///
+    /// Returns the subaddress as a bech32m-encoded string.
+    async fn generate_subaddress(
+        token: auth::Token,
+        key_type: KeyType,
+        payment_id: u64,
+    ) -> RpcResult<String>;
+
     /// Gracious shutdown.
     ///
     /// ```no_run
@@ -2176,6 +2195,7 @@ impl NeptuneRPCServer {
                     msmp.aocl_leaf_index,
                     msmp.sender_randomness,
                     msmp.receiver_preimage,
+                    incoming_utxo.payment_id,
                     &block,
                 );
                 monitored_utxo.add_membership_proof_for_tip(tip_digest, msmp.clone());
@@ -2969,17 +2989,17 @@ impl RPC for NeptuneRPCServer {
         self,
         _context: tarpc::context::Context,
         token: auth::Token,
-    ) -> RpcResult<Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount)>> {
+    ) -> RpcResult<Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount, u64)>> {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
         let history = self.state.lock_guard().await.get_balance_history().await;
 
         // sort
-        let mut display_history: Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount)> =
+        let mut display_history: Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount, u64)> =
             history
                 .iter()
-                .map(|(h, t, bh, a)| (*h, *bh, *t, *a))
+                .map(|(h, t, bh, a, payment_id)| (*h, *bh, *t, *a, *payment_id))
                 .collect::<Vec<_>>();
         display_history.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
@@ -4178,6 +4198,46 @@ impl RPC for NeptuneRPCServer {
             .get(tx_kernel_id)
             .map(|tx| &tx.kernel)
             .cloned())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn generate_subaddress(
+        self,
+        _context: ::tarpc::context::Context,
+        token: auth::Token,
+        key_type: KeyType,
+        payment_id: u64,
+    ) -> RpcResult<String> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let state = self.state.lock_guard().await;
+        let network = state.cli().network;
+
+        // Get the latest spending key of the specified type
+        let current_counter = state.wallet_state.spending_key_counter(key_type);
+        let index = current_counter
+            .checked_sub(1)
+            .ok_or(RpcError::WalletKeyCounterIsZero)?;
+        let spending_key = state.wallet_state.nth_spending_key(key_type, index);
+
+        // Get the receiving address and create the subaddress (only Generation addresses supported)
+        let receiving_address = spending_key.to_address();
+        let encoded = match receiving_address {
+            ReceivingAddress::Generation(gen_addr) => {
+                let subaddress =
+                    GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id));
+                subaddress.to_bech32m(network)
+            }
+            _ => {
+                return Err(RpcError::Failed(
+                    "Subaddresses are only supported for Generation addresses".to_string(),
+                ))
+            }
+        }
+        .map_err(|e| RpcError::Failed(e.to_string()))?;
+
+        Ok(encoded)
     }
 }
 

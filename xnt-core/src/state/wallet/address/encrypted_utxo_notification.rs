@@ -117,7 +117,9 @@ impl EncryptedUtxoNotification {
     ) -> Result<UtxoNotificationPayload> {
         spending_key
             .decrypt(&self.ciphertext)
-            .map(|(utxo, sender_randomness)| UtxoNotificationPayload::new(utxo, sender_randomness))
+            .map(|(utxo, sender_randomness, payment_id)| {
+                UtxoNotificationPayload::with_payment_id(utxo, sender_randomness, payment_id)
+            })
     }
 }
 

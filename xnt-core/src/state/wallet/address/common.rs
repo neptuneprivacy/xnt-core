@@ -12,6 +12,88 @@ use crate::application::config::network::Network;
 use crate::protocol::consensus::transaction::announcement::Announcement;
 use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
 
+/// Trait for subaddress types that wrap a base address with a payment_id.
+///
+/// This trait provides a common interface for subaddress types like
+/// `GenerationSubAddress`, reducing code duplication.
+pub trait SubAddress: Sized {
+    /// The base address/key type
+    type Base;
+
+    /// Get a reference to the base address/key
+    fn base(&self) -> &Self::Base;
+
+    /// Get the payment_id
+    fn payment_id(&self) -> BFieldElement;
+
+    /// Get the receiver_identifier (derived from base)
+    fn receiver_identifier(&self) -> BFieldElement;
+
+    /// Split into (base, payment_id)
+    fn split(self) -> (Self::Base, BFieldElement)
+    where
+        Self::Base: Sized;
+
+    /// Get the flag for this subaddress type
+    fn flag() -> BFieldElement;
+
+    /// Encrypt a payload with payment_id included
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement>;
+
+    /// Generate an announcement for this subaddress (default implementation)
+    fn generate_announcement(&self, payload: &UtxoNotificationPayload) -> Announcement {
+        let ciphertext = self.encrypt(payload);
+        let message = [
+            vec![Self::flag(), self.receiver_identifier()],
+            ciphertext,
+        ]
+        .concat();
+        Announcement::new(message)
+    }
+}
+
+/// Macro to implement bech32m serialization for subaddress types
+#[macro_export]
+macro_rules! impl_subaddress_bech32m {
+    ($type:ty, $hrp_prefix:literal) => {
+        impl $type {
+            /// Returns human readable prefix (hrp) for this subaddress type
+            pub(super) fn get_hrp(network: Network) -> String {
+                format!("{}{}", $hrp_prefix, $crate::state::wallet::address::common::network_hrp_char(network))
+            }
+
+            /// Encode subaddress as bech32m string
+            pub fn to_bech32m(&self, network: Network) -> Result<String> {
+                let hrp = Self::get_hrp(network);
+                let payload = bincode::serialize(self)?;
+                match bech32::encode(&hrp, payload.to_base32(), bech32::Variant::Bech32m) {
+                    Ok(enc) => Ok(enc),
+                    Err(e) => anyhow::bail!("Could not encode subaddress as bech32m: {e}"),
+                }
+            }
+
+            /// Decode subaddress from bech32m string
+            pub fn from_bech32m(encoded: &str, network: Network) -> Result<Self> {
+                let expected_hrp = Self::get_hrp(network);
+                let (hrp, data, variant) = bech32::decode(encoded)?;
+
+                anyhow::ensure!(
+                    variant == bech32::Variant::Bech32m,
+                    "Can only decode bech32m subaddresses.",
+                );
+                anyhow::ensure!(
+                    hrp == expected_hrp,
+                    "Invalid prefix for subaddress. Expected: {expected_hrp}, got: {hrp}",
+                );
+
+                let payload = Vec::<u8>::from_base32(&data)?;
+                bincode::deserialize(&payload)
+                    .map_err(|e| anyhow::anyhow!("Could not decode bech32m subaddress: {e}"))
+            }
+        }
+    };
+}
+
 /// returns human-readable-prefix for the given network
 pub(crate) fn network_hrp_char(network: Network) -> char {
     match network {
@@ -57,13 +139,14 @@ pub fn key_type_from_announcement(announcement: &Announcement) -> Result<BFieldE
 
 /// retrieves ciphertext field from a [Announcement]
 ///
-/// returns an error if the input is too short
+/// All announcement formats use: [key_type, receiver_id, ciphertext...]
+/// For subaddresses, the payment_id is encrypted inside the ciphertext for privacy.
 pub fn ciphertext_from_announcement(announcement: &Announcement) -> Result<Vec<BFieldElement>> {
+    // All formats: [key_type, receiver_id, ciphertext...]
     ensure!(
         announcement.message.len() > 2,
         "announcement does not contain ciphertext.",
     );
-
     Ok(announcement.message[2..].to_vec())
 }
 

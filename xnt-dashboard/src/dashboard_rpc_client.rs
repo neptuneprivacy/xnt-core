@@ -116,7 +116,7 @@ impl DashboardRpcClient {
         ctx: ::tarpc::context::Context,
         token: auth::Token,
     ) -> ::core::result::Result<
-        RpcResult<Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount)>>,
+        RpcResult<Vec<(Digest, BlockHeight, Timestamp, NativeCurrencyAmount, u64)>>,
         ::tarpc::client::RpcError,
     > {
         match self {

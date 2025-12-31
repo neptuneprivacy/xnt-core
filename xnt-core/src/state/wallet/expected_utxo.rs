@@ -3,6 +3,7 @@ use arbitrary::Arbitrary;
 use get_size2::GetSize;
 use serde::Deserialize;
 use serde::Serialize;
+use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 
 use crate::protocol::consensus::transaction::utxo::Utxo;
@@ -53,6 +54,9 @@ pub struct ExpectedUtxo {
     pub received_from: UtxoNotifier,
     pub notification_received: Timestamp,
     pub mined_in_block: Option<(Digest, Timestamp)>,
+    /// Payment ID from subaddress announcement. Zero for base address.
+    #[serde(default)]
+    pub payment_id: BFieldElement,
 }
 
 impl ExpectedUtxo {
@@ -61,6 +65,7 @@ impl ExpectedUtxo {
         sender_randomness: Digest,
         receiver_preimage: Digest,
         received_from: UtxoNotifier,
+        payment_id: BFieldElement,
     ) -> Self {
         Self {
             addition_record: UtxoTriple {
@@ -75,6 +80,7 @@ impl ExpectedUtxo {
             received_from,
             notification_received: Timestamp::now(),
             mined_in_block: None,
+            payment_id,
         }
     }
 }

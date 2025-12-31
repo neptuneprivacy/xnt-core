@@ -35,6 +35,7 @@ use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::
 use neptune_privacy::protocol::proof_abstractions::timestamp::Timestamp;
 use neptune_privacy::state::wallet::address::KeyType;
 use neptune_privacy::state::wallet::address::ReceivingAddress;
+use neptune_privacy::state::wallet::address::SubAddress;
 use neptune_privacy::state::wallet::change_policy::ChangePolicy;
 use neptune_privacy::state::wallet::coin_with_possible_timelock::CoinWithPossibleTimeLock;
 use neptune_privacy::state::wallet::secret_key_material::SecretKeyMaterial;
@@ -54,6 +55,18 @@ use crate::models::claim_utxo::ClaimUtxoFormat;
 use crate::models::utxo_transfer_entry::UtxoTransferEntry;
 use crate::parser::beneficiary::Beneficiary;
 use crate::parser::hex_digest::HexDigest;
+
+/// Parse key_type from string for CLI arguments
+fn parse_key_type(s: &str) -> Result<KeyType, String> {
+    match s.to_lowercase().as_str() {
+        "generation" | "gen" => Ok(KeyType::Generation),
+        "symmetric" | "sym" => Ok(KeyType::Symmetric),
+        _ => Err(format!(
+            "Invalid key type '{}'. Use 'generation' or 'symmetric'",
+            s
+        )),
+    }
+}
 
 const SELF: &str = "self";
 const ANONYMOUS: &str = "anonymous";
@@ -138,6 +151,21 @@ enum Command {
 
     /// Get next unused generation receiving address
     NextReceivingAddress,
+
+    /// Generate a subaddress from the latest address of the given key type with a payment_id
+    GenerateSubaddress {
+        /// The key type: "generation" or "symmetric"
+        #[clap(value_parser = parse_key_type)]
+        key_type: KeyType,
+        /// The payment ID to use for generating the subaddress
+        payment_id: u64,
+    },
+
+    /// Validate any address and show its type and receiver identifier
+    ValidateAddress {
+        /// The address bech32m string to validate
+        address: String,
+    },
 
     /// Get the nth generation receiving address.
     ///
@@ -926,6 +954,41 @@ async fn main() -> Result<()> {
                 .next_receiving_address(ctx, token, KeyType::Generation)
                 .await??;
             println!("{}", receiving_address.to_display_bech32m(network).unwrap())
+        }
+        Command::GenerateSubaddress { key_type, payment_id } => {
+            let subaddress = client
+                .generate_subaddress(ctx, token, key_type, payment_id)
+                .await??;
+            println!("{subaddress}")
+        }
+        Command::ValidateAddress { address } => {
+            let result = client
+                .validate_address(ctx, token, address.clone(), network)
+                .await??;
+            match result {
+                Some(addr) => {
+                    let address_type = match &addr {
+                        ReceivingAddress::Generation(_) => "Generation",
+                        ReceivingAddress::Symmetric(_) => "Symmetric",
+                        ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
+                    };
+                    println!("Valid address!");
+                    println!("Address type: {address_type}");
+                    println!("Receiver Identifier: {}", addr.receiver_identifier());
+
+                    // If subaddress, also show base address and payment_id
+                    if let ReceivingAddress::GenerationSubAddr(subaddr) = &addr {
+                        let (base_addr, payment_id) = subaddr.clone().split();
+                        if let Ok(base_encoded) = base_addr.to_bech32m(network) {
+                            println!("Base address: {base_encoded}");
+                        }
+                        println!("Payment ID: {}", payment_id.value());
+                    }
+                }
+                None => {
+                    println!("Invalid address: {address}");
+                }
+            }
         }
         Command::MempoolTxCount => {
             let count: usize = client.mempool_tx_count(ctx, token).await??;

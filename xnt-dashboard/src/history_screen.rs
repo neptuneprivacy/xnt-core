@@ -41,6 +41,7 @@ type BalanceUpdate = (
     Timestamp,
     NativeCurrencyAmount,
     NativeCurrencyAmount,
+    u64, // payment_id
 );
 type BalanceUpdateArc = Arc<std::sync::Mutex<Vec<BalanceUpdate>>>;
 type DashboardEventArc = Arc<std::sync::Mutex<Option<DashboardEvent>>>;
@@ -169,10 +170,10 @@ impl HistoryScreen {
                     let bh = rpc_client.history(context::current(), token).await.unwrap().unwrap();
                     let mut history_builder = Vec::with_capacity(bh.len());
                     let initial_balance = NativeCurrencyAmount::zero();
-                    let updates = bh.iter().map(|(_,_,_, delta)| *delta);
+                    let updates = bh.iter().map(|(_, _, _, delta, _)| *delta);
                     let balances = NativeCurrencyAmount::scan_balance(&updates, initial_balance);
-                    for ((_, block_height, timestamp, amount), balance) in bh.iter().zip(balances) {
-                        history_builder.push((*block_height, *timestamp, *amount, balance));
+                    for ((_, block_height, timestamp, amount, payment_id), balance) in bh.iter().zip(balances) {
+                        history_builder.push((*block_height, *timestamp, *amount, balance, *payment_id));
                     }
                     *balance_updates.lock().unwrap() = history_builder;
 
@@ -271,7 +272,7 @@ impl Widget for HistoryScreen {
         // table
         let style = Style::default().fg(self.fg).bg(self.bg);
         let selected_style = style.add_modifier(Modifier::REVERSED);
-        let header = vec!["height", "date", " ", "amount", "balance after"];
+        let header = vec!["height", "date", " ", "amount", "balance after", "payment_id"];
 
         let matrix = self
             .data
@@ -280,13 +281,14 @@ impl Widget for HistoryScreen {
             .iter()
             .rev()
             .map(|bu| {
-                let (height, timestamp, amount, balance) = *bu;
+                let (height, timestamp, amount, balance, payment_id) = *bu;
                 vec![
                     height.to_string(),
                     timestamp.standard_format(),
                     if amount.is_negative() { "⭷" } else { "⭸" }.to_string(),
                     amount.to_string(),
                     balance.to_string(),
+                    if payment_id == 0 { "-".to_string() } else { payment_id.to_string() },
                 ]
             })
             .collect_vec();

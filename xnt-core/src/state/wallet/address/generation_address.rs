@@ -47,6 +47,9 @@ use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
 pub(super) const GENERATION_FLAG_U8: u8 = 79;
 pub const GENERATION_FLAG: BFieldElement = BFieldElement::new(GENERATION_FLAG_U8 as u64);
 
+pub(super) const GENERATION_SUBADDR_FLAG_U8: u8 = 179;
+pub const GENERATION_SUBADDR_FLAG: BFieldElement = BFieldElement::new(GENERATION_SUBADDR_FLAG_U8 as u64);
+
 // note: we serde(skip) fields that can be computed from the seed in order to
 // keep the serialized (including bech32m) representation small.
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize)]
@@ -150,6 +153,74 @@ impl<'a> Arbitrary<'a> for GenerationReceivingAddress {
     }
 }
 
+/// A subaddress combining a base address with a payment_id.
+///
+/// SubAddress = GenerationReceivingAddress + payment_id
+///
+/// The subaddress can be converted to/from (address, payment_id) pair.
+/// When encoded as bech32m, it includes both the base address and payment_id.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationSubAddress {
+    /// The base receiving address
+    base: GenerationReceivingAddress,
+
+    /// The payment identifier for this subaddress
+    payment_id: BFieldElement,
+}
+
+impl GenerationSubAddress {
+    /// Create a new subaddress from a base address and payment_id
+    pub fn new(base: GenerationReceivingAddress, payment_id: BFieldElement) -> Self {
+        Self { base, payment_id }
+    }
+
+    /// Create a subaddress with an index-derived payment_id
+    pub fn from_index(base: GenerationReceivingAddress, index: u64) -> Self {
+        Self::new(base, BFieldElement::new(index))
+    }
+
+    /// Get the encryption key (same as base address)
+    pub fn encryption_key(&self) -> lattice::kem::PublicKey {
+        self.base.encryption_key
+    }
+}
+
+// Use macro for bech32m serialization
+crate::impl_subaddress_bech32m!(GenerationSubAddress, "xntsa");
+
+impl common::SubAddress for GenerationSubAddress {
+    type Base = GenerationReceivingAddress;
+
+    fn base(&self) -> &Self::Base {
+        &self.base
+    }
+
+    fn payment_id(&self) -> BFieldElement {
+        self.payment_id
+    }
+
+    fn receiver_identifier(&self) -> BFieldElement {
+        self.base.receiver_identifier
+    }
+
+    fn split(self) -> (Self::Base, BFieldElement) {
+        (self.base, self.payment_id)
+    }
+
+    fn flag() -> BFieldElement {
+        GENERATION_SUBADDR_FLAG
+    }
+
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
+        let payload_with_id = UtxoNotificationPayload::with_payment_id(
+            payload.utxo.clone(),
+            payload.sender_randomness,
+            self.payment_id,
+        );
+        self.base.encrypt(&payload_with_id)
+    }
+}
+
 impl GenerationSpendingKey {
     pub fn to_address(&self) -> GenerationReceivingAddress {
         let randomness: [u8; 32] = common::shake256::<32>(&bincode::serialize(&self.seed).unwrap());
@@ -200,7 +271,9 @@ impl GenerationSpendingKey {
     }
 
     /// Decrypt a Generation Address ciphertext
-    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest)> {
+    /// Returns (utxo, sender_randomness, payment_id)
+    /// payment_id is 0 for base addresses, non-zero for subaddresses
+    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest, BFieldElement)> {
         // parse ciphertext
         ensure!(
             ciphertext.len() > CIPHERTEXT_SIZE_IN_BFES,
@@ -226,8 +299,9 @@ impl GenerationSpendingKey {
             .decrypt(nonce, ciphertext_bytes.as_ref())
             .map_err(|_| anyhow!("Failed to decrypt symmetric payload."))?;
 
-        // convert plaintext to utxo and digest
-        Ok(bincode::deserialize(&plaintext)?)
+        // convert plaintext to UtxoNotificationPayload (includes payment_id)
+        let payload: UtxoNotificationPayload = bincode::deserialize(&plaintext)?;
+        Ok((payload.utxo, payload.sender_randomness, payload.payment_id))
     }
 
     fn generate_spending_lock(&self) -> Digest {
@@ -422,6 +496,16 @@ impl GenerationReceivingAddress {
     /// returns the `spending_lock`
     pub fn spending_lock(&self) -> Digest {
         self.lock_postimage
+    }
+
+    /// Create a subaddress with the given payment_id
+    pub fn with_payment_id(&self, payment_id: BFieldElement) -> GenerationSubAddress {
+        GenerationSubAddress::new(*self, payment_id)
+    }
+
+    /// Create a subaddress with an index-derived payment_id
+    pub fn subaddress(&self, index: u64) -> GenerationSubAddress {
+        GenerationSubAddress::from_index(*self, index)
     }
 }
 
