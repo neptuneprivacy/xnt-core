@@ -601,7 +601,23 @@ pub(crate) async fn create_block_transaction_from(
             proof,
         };
 
-        transactions_to_merge = vec![nop];
+        // Try to find a nop-tx in the mempool.  If found, use that instead.
+        transactions_to_merge =match &tx_merge_origin {
+            TxMergeOrigin::Mempool => global_state_lock
+                .lock_guard()
+                .await
+                .mempool
+                .get_transactions_for_block_composition(
+                    block_capacity_for_transactions,
+                    Some(max_num_mergers),
+                ),
+            #[cfg(test)]
+            TxMergeOrigin::ExplicitList(transactions) => transactions.to_owned(),
+        };
+
+        if transactions_to_merge.is_empty() {
+            transactions_to_merge = vec![nop];
+        }
     }
 
     let num_merges = transactions_to_merge.len();
