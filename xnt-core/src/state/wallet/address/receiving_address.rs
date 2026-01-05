@@ -147,7 +147,8 @@ impl ReceivingAddress {
             }
             ReceivingAddress::GenerationSubAddr(subaddr) => {
                 // Use the base address's private notification for now
-                subaddr.base()
+                subaddr
+                    .base()
                     .private_utxo_notification(&utxo_notification_payload, network)
             }
         }
@@ -273,7 +274,9 @@ impl ReceivingAddress {
     /// parses an address from its bech32m encoding
     pub fn from_bech32m(encoded: &str, network: Network) -> Result<Self> {
         // Try generation subaddress first (prefix: xntsa)
-        if let Ok(subaddr) = generation_address::GenerationSubAddress::from_bech32m(encoded, network) {
+        if let Ok(subaddr) =
+            generation_address::GenerationSubAddress::from_bech32m(encoded, network)
+        {
             return Ok(subaddr.into());
         }
 
@@ -294,7 +297,9 @@ impl ReceivingAddress {
         match self {
             Self::Generation(_) => generation_address::GenerationReceivingAddress::get_hrp(network),
             Self::Symmetric(_) => symmetric_key::SymmetricKey::get_hrp(network).to_string(),
-            Self::GenerationSubAddr(_) => generation_address::GenerationSubAddress::get_hrp(network),
+            Self::GenerationSubAddr(_) => {
+                generation_address::GenerationSubAddress::get_hrp(network)
+            }
         }
     }
 

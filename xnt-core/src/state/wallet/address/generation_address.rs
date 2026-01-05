@@ -188,6 +188,15 @@ impl GenerationSubAddress {
 // Use macro for bech32m serialization
 crate::impl_subaddress_bech32m!(GenerationSubAddress, "xntsa");
 
+#[cfg(any(test, feature = "arbitrary-impls"))]
+impl<'a> Arbitrary<'a> for GenerationSubAddress {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let base = GenerationReceivingAddress::arbitrary(u)?;
+        let payment_id = BFieldElement::arbitrary(u)?;
+        Ok(Self::new(base, payment_id))
+    }
+}
+
 impl common::SubAddress for GenerationSubAddress {
     type Base = GenerationReceivingAddress;
 

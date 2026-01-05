@@ -1001,9 +1001,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 Box::new(self.get_known_generation_spending_keys())
             }
-            KeyType::Symmetric => {
-                Box::new(self.get_known_symmetric_keys())
-            }
+            KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
         }
     }
 
@@ -1016,9 +1014,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 Box::new(self.get_known_generation_spending_keys())
             }
-            KeyType::Symmetric => {
-                Box::new(self.get_known_symmetric_keys())
-            }
+            KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
         }
     }
 
@@ -1058,9 +1054,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 self.next_unused_generation_spending_key().await.into()
             }
-            KeyType::Symmetric => {
-                self.next_unused_symmetric_key().await.into()
-            }
+            KeyType::Symmetric => self.next_unused_symmetric_key().await.into(),
         }
     }
 
@@ -1096,9 +1090,7 @@ impl WalletState {
             KeyType::Generation | KeyType::GenerationSubAddr => {
                 self.wallet_db.get_generation_key_counter()
             }
-            KeyType::Symmetric => {
-                self.wallet_db.get_symmetric_key_counter()
-            }
+            KeyType::Symmetric => self.wallet_db.get_symmetric_key_counter(),
         }
     }
 
@@ -1109,9 +1101,7 @@ impl WalletState {
                 .wallet_entropy
                 .nth_generation_spending_key(index)
                 .into(),
-            KeyType::Symmetric => {
-                self.wallet_entropy.nth_symmetric_key(index).into()
-            }
+            KeyType::Symmetric => self.wallet_entropy.nth_symmetric_key(index).into(),
         }
     }
 
@@ -1832,7 +1822,11 @@ impl WalletState {
                 // since been reorganized away.
                 let spent = !mutator_set_accumulator.verify(Tip5::hash(&mutxo.utxo), &mp);
                 if spent {
-                    synced_spent.push(WalletStatusElement::new(mp.aocl_leaf_index, utxo, payment_id));
+                    synced_spent.push(WalletStatusElement::new(
+                        mp.aocl_leaf_index,
+                        utxo,
+                        payment_id,
+                    ));
                 } else {
                     synced_unspent.push((
                         WalletStatusElement::new(mp.aocl_leaf_index, utxo, payment_id),
@@ -1841,7 +1835,11 @@ impl WalletState {
                 }
             } else {
                 let any_mp = &mutxo.blockhash_to_membership_proof.iter().next().unwrap().1;
-                unsynced.push(WalletStatusElement::new(any_mp.aocl_leaf_index, utxo, payment_id));
+                unsynced.push(WalletStatusElement::new(
+                    any_mp.aocl_leaf_index,
+                    utxo,
+                    payment_id,
+                ));
             }
         }
 
@@ -4648,6 +4646,7 @@ pub(crate) mod tests {
                     sender_randomness,
                     receiver_preimage,
                     is_guesser_fee: false,
+                    payment_id: BFieldElement::ZERO,
                 };
 
                 let addition_record = incoming_utxo.addition_record();

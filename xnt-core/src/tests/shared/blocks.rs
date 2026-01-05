@@ -1,4 +1,5 @@
 use futures::channel::oneshot;
+use num_traits::ConstZero;
 use num_traits::Zero;
 use rand::rngs::StdRng;
 use rand::Rng;

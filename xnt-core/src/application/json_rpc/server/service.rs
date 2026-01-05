@@ -1203,6 +1203,7 @@ pub mod tests {
     use crate::application::json_rpc::core::api::rpc::RpcApi;
     use crate::application::json_rpc::core::api::rpc::RpcError;
     use crate::application::json_rpc::core::model::common::RpcBlockSelector;
+    use crate::application::json_rpc::core::model::message::GetUtxoDigestRequest;
     use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplate;
     use crate::application::json_rpc::server::rpc::RpcServer;
     use crate::protocol::consensus::block::block_height::BlockHeight;
@@ -1447,7 +1448,9 @@ pub mod tests {
         for (i, output) in block.body().transaction_kernel().outputs.iter().enumerate() {
             let utxo_index = num_aocl_leaves + i as u64;
             let digest_entry = rpc_server
-                .get_utxo_digest(utxo_index)
+                .get_utxo_digest_call(GetUtxoDigestRequest {
+                    leaf_index: utxo_index,
+                })
                 .await
                 .expect("failed to get utxo digest");
 

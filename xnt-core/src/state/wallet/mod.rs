@@ -27,6 +27,7 @@ mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use num_traits::CheckedSub;
+    use num_traits::ConstZero;
     use num_traits::Zero;
     use rand::random;
     use rand::rngs::StdRng;

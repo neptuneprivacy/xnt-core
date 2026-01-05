@@ -1051,7 +1051,13 @@ impl GlobalState {
             {
                 let actually_spent = !current_msa.verify(Tip5::hash(&monitored_utxo.utxo), msmp);
                 if actually_spent {
-                    history.push((spending_block, spending_timestamp, spending_height, -amount, payment_id));
+                    history.push((
+                        spending_block,
+                        spending_timestamp,
+                        spending_height,
+                        -amount,
+                        payment_id,
+                    ));
                 }
             }
         }
@@ -2345,6 +2351,7 @@ mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use num_traits::CheckedSub;
+    use num_traits::ConstZero;
     use num_traits::Zero;
     use rand::random;
     use rand::rngs::StdRng;

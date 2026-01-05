@@ -311,6 +311,7 @@ mod tests {
 
     use itertools::Itertools;
     use macro_rules_attr::apply;
+    use num_traits::ConstZero;
     use tasm_lib::prelude::Digest;
     use tasm_lib::triton_vm::prelude::BFieldElement;
     use tasm_lib::twenty_first::prelude::MmrMembershipProof;

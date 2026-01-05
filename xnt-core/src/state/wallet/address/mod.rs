@@ -14,8 +14,8 @@ pub mod symmetric_key;
 pub use addressable_key::KeyType;
 pub use addressable_key::SpendingKey;
 pub use common::SubAddress;
-pub use receiving_address::ReceivingAddress;
 pub use generation_address::GenerationSubAddress;
+pub use receiving_address::ReceivingAddress;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -91,6 +91,9 @@ mod tests {
     }
 
     mod worker {
+        use num_traits::ConstZero;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
         use super::*;
         use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
         use crate::protocol::consensus::transaction::utxo_triple::UtxoTriple;
@@ -175,11 +178,13 @@ mod tests {
             println!("ciphertext.get_size() = {}", ciphertext.len() * 8);
 
             // 4. decrypt secrets
-            let (utxo_again, sender_randomness_again) = key.decrypt(&ciphertext).unwrap();
+            let (utxo_again, sender_randomness_again, payment_id_again) =
+                key.decrypt(&ciphertext).unwrap();
 
             // 5. verify that decrypted secrets match original secrets
             assert_eq!(utxo, utxo_again);
             assert_eq!(sender_randomness, sender_randomness_again);
+            assert_eq!(BFieldElement::ZERO, payment_id_again);
         }
 
         /// tests key generation, signing, and decrypting with a [SpendingKey]

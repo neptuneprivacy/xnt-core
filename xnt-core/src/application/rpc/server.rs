@@ -6709,6 +6709,10 @@ mod tests {
                         GenerationReceivingAddress::derive_from_seed(rng.random()).into()
                     }
                     KeyType::Symmetric => SymmetricKey::from_seed(rng.random()).into(),
+                    KeyType::GenerationSubAddr => {
+                        let gen_addr = GenerationReceivingAddress::derive_from_seed(rng.random());
+                        GenerationSubAddress::new(gen_addr, rng.random()).into()
+                    }
                 };
                 let output1: OutputFormat = (
                     external_receiving_address.clone(),
