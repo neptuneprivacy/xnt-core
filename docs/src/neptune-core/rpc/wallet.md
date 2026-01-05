@@ -51,6 +51,51 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
 
 ---
 
+## wallet_generateSubaddress
+
+Generates a subaddress from the current wallet's base address with a specified payment ID. Subaddresses allow receiving payments that can be identified by payment ID while sharing the same underlying spending key.
+
+**Parameters**
+
+1. `paymentId` - number, non-zero payment identifier (must be > 0)
+
+**Returns**
+
+- `address` - string, bech32-encoded subaddress
+- `paymentId` - number, the payment ID used
+- `baseAddress` - string, the base address this subaddress derives from
+
+**Errors**
+
+- Payment ID 0 is not allowed (use `wallet_generateAddress` for base address)
+- Only Generation addresses support subaddresses
+
+**Example**
+
+```
+// Request
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"wallet_generateSubaddress","params":{"paymentId":42},"id":1}'
+
+// Result
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "address": "xntnsm1...",
+    "paymentId": 42,
+    "baseAddress": "xntnwm1..."
+  }
+}
+```
+
+**Use Cases**
+
+- **Payment tracking**: Generate unique subaddresses per customer/invoice to identify payments
+- **Privacy**: Subaddresses are unlinkable to the base address without the spending key
+- **Organization**: Use payment IDs as invoice numbers, customer IDs, or order references
+
+---
+
 ## wallet_getBalance
 
 Returns total wallet balance.
@@ -186,7 +231,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
 
 ## wallet_validateAddress
 
-Validates an address string.
+Validates an address string and returns address details.
 
 **Parameters**
 
@@ -194,9 +239,13 @@ Validates an address string.
 
 **Returns**
 
-`address` - string or null, normalized address if valid
+- `address` - string or null, normalized address if valid
+- `addressType` - string or null, one of: `"generation"`, `"symmetric"`, `"generation_subaddress"`
+- `receiverIdentifier` - number or null, receiver identifier value
+- `baseAddress` - string or null, base address (only for subaddresses)
+- `paymentId` - number or null, payment ID (only for subaddresses)
 
-**Example**
+**Example (base address)**
 
 ```
 // Request
@@ -207,7 +256,31 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "address": "xntnwm1..."
+    "address": "xntnwm1...",
+    "addressType": "generation",
+    "receiverIdentifier": 12345678901234567890,
+    "baseAddress": null,
+    "paymentId": null
+  }
+}
+```
+
+**Example (subaddress)**
+
+```
+// Request
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"wallet_validateAddress","params":{"addressString":"xntnsm1..."},"id":1}'
+
+// Result
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "address": "xntnsm1...",
+    "addressType": "generation_subaddress",
+    "receiverIdentifier": 98765432109876543210,
+    "baseAddress": "xntnwm1...",
+    "paymentId": 42
   }
 }
 ```

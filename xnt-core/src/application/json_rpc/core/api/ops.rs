@@ -153,6 +153,9 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Wallet)]
     UnspentUtxos,
+
+    #[namespace(Namespace::Wallet)]
+    GenerateSubaddress,
 }
 
 #[cfg(test)]

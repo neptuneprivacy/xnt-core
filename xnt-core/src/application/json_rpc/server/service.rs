@@ -1043,13 +1043,46 @@ impl RpcApi for RpcServer {
         &self,
         request: ValidateAddressRequest,
     ) -> RpcResult<ValidateAddressResponse> {
+        use crate::state::wallet::address::SubAddress;
         let network = self.state.cli().network;
 
-        let ret = ReceivingAddress::from_bech32m(&request.address_string, network).ok();
+        let parsed = ReceivingAddress::from_bech32m(&request.address_string, network).ok();
 
-        let address = ret.and_then(|addr| addr.to_bech32m(network).ok());
+        match parsed {
+            Some(addr) => {
+                let address = addr.to_bech32m(network).ok();
+                let address_type = Some(match &addr {
+                    ReceivingAddress::Generation(_) => "generation".to_string(),
+                    ReceivingAddress::Symmetric(_) => "symmetric".to_string(),
+                    ReceivingAddress::GenerationSubAddr(_) => "generation_subaddress".to_string(),
+                });
+                let receiver_identifier = Some(addr.receiver_identifier().value());
 
-        Ok(ValidateAddressResponse { address })
+                // For subaddresses, include base_address and payment_id
+                let (base_address, payment_id) = match &addr {
+                    ReceivingAddress::GenerationSubAddr(subaddr) => {
+                        let (base, pid) = subaddr.clone().split();
+                        (base.to_bech32m(network).ok(), Some(pid.value()))
+                    }
+                    _ => (None, None),
+                };
+
+                Ok(ValidateAddressResponse {
+                    address,
+                    address_type,
+                    receiver_identifier,
+                    base_address,
+                    payment_id,
+                })
+            }
+            None => Ok(ValidateAddressResponse {
+                address: None,
+                address_type: None,
+                receiver_identifier: None,
+                base_address: None,
+                payment_id: None,
+            }),
+        }
     }
 
     async fn send_tx_call(&self, request: SendTxRequest) -> RpcResult<SendTxResponse> {
@@ -1180,6 +1213,79 @@ impl RpcApi for RpcServer {
             .collect();
 
         Ok(utxos)
+    }
+
+    async fn generate_subaddress_call(
+        &self,
+        request: GenerateSubaddressRequest,
+    ) -> RpcResult<GenerateSubaddressResponse> {
+        use crate::state::wallet::address::generation_address::GenerationSubAddress;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        let network = self.state.cli().network;
+        let payment_id = request.payment_id;
+
+        // payment_id must be non-zero for subaddresses
+        if payment_id == 0 {
+            return Err(RpcError::Server(JsonError::Custom {
+                code: -32602,
+                message: "payment_id must be non-zero for subaddresses; use base address for payment_id 0".to_string(),
+                data: None,
+            }));
+        }
+
+        let state = self.state.lock_guard().await;
+
+        // Get the latest spending key of Generation type
+        let current_counter = state.wallet_state.spending_key_counter(KeyType::Generation);
+        let index = current_counter.checked_sub(1).ok_or_else(|| {
+            RpcError::Server(JsonError::Custom {
+                code: -32000,
+                message: "No generation keys available".to_string(),
+                data: None,
+            })
+        })?;
+        let spending_key = state.wallet_state.nth_spending_key(KeyType::Generation, index);
+
+        // Get the receiving address and create the subaddress
+        let receiving_address = spending_key.to_address();
+        match receiving_address {
+            ReceivingAddress::Generation(gen_addr) => {
+                let subaddress = GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id))
+                    .map_err(|e| RpcError::Server(JsonError::Custom {
+                        code: -32000,
+                        message: e.to_string(),
+                        data: None,
+                    }))?;
+
+                let address = subaddress.to_bech32m(network).map_err(|e| {
+                    RpcError::Server(JsonError::Custom {
+                        code: -32000,
+                        message: format!("Failed to encode subaddress: {}", e),
+                        data: None,
+                    })
+                })?;
+
+                let base_address = gen_addr.to_bech32m(network).map_err(|e| {
+                    RpcError::Server(JsonError::Custom {
+                        code: -32000,
+                        message: format!("Failed to encode base address: {}", e),
+                        data: None,
+                    })
+                })?;
+
+                Ok(GenerateSubaddressResponse {
+                    address,
+                    payment_id,
+                    base_address,
+                })
+            }
+            _ => Err(RpcError::Server(JsonError::Custom {
+                code: -32000,
+                message: "Subaddresses are only supported for Generation addresses".to_string(),
+                data: None,
+            })),
+        }
     }
 }
 
