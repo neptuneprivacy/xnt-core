@@ -4211,6 +4211,14 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
+        // payment_id must be non-zero for subaddresses
+        if payment_id == 0 {
+            return Err(RpcError::Failed(
+                "payment_id must be non-zero for subaddresses; use base address for payment_id 0"
+                    .to_string(),
+            ));
+        }
+
         let state = self.state.lock_guard().await;
         let network = state.cli().network;
 
@@ -4225,8 +4233,8 @@ impl RPC for NeptuneRPCServer {
         let receiving_address = spending_key.to_address();
         let encoded = match receiving_address {
             ReceivingAddress::Generation(gen_addr) => {
-                let subaddress =
-                    GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id));
+                let subaddress = GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id))
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 subaddress.to_bech32m(network)
             }
             _ => {
@@ -6711,7 +6719,12 @@ mod tests {
                     KeyType::Symmetric => SymmetricKey::from_seed(rng.random()).into(),
                     KeyType::GenerationSubAddr => {
                         let gen_addr = GenerationReceivingAddress::derive_from_seed(rng.random());
-                        GenerationSubAddress::new(gen_addr, rng.random()).into()
+                        // Ensure non-zero payment_id for subaddress
+                        let mut payment_id: BFieldElement = rng.random();
+                        if payment_id.is_zero() {
+                            payment_id = BFieldElement::new(1);
+                        }
+                        GenerationSubAddress::new(gen_addr, payment_id).unwrap().into()
                     }
                 };
                 let output1: OutputFormat = (

@@ -956,6 +956,11 @@ async fn main() -> Result<()> {
             println!("{}", receiving_address.to_display_bech32m(network).unwrap())
         }
         Command::GenerateSubaddress { key_type, payment_id } => {
+            if payment_id == 0 {
+                eprintln!("Error: payment_id must be non-zero for subaddresses.");
+                eprintln!("Hint: Use 'next-receiving-address' for base address (payment_id 0).");
+                std::process::exit(1);
+            }
             let subaddress = client
                 .generate_subaddress(ctx, token, key_type, payment_id)
                 .await??;

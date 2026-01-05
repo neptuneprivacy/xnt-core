@@ -63,6 +63,11 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
         mutxos_v3.set(list_index, mutxo_v3).await;
     }
 
+    // Load tables to set schema version
+    storage.reset_schema();
+    let mut tables = WalletDbTables::load_schema_in_order(storage).await;
+    tables.schema_version.set(3).await;
+
     // success!
     Ok(())
 }

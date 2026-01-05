@@ -158,7 +158,18 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
     // duplicated in many real databases out there. So to create the index,
     // we must clear the expected UTXO list and build it again.
     let all_eutxos = eutxos_v2_read.get_all().await;
-    debug!("Found {} expected UTXOs for migration", all_eutxos.len());
+    let original_count = all_eutxos.len();
+    debug!("Found {} expected UTXOs for migration", original_count);
+
+    // SAFETY: Verify we have data in memory before clearing.
+    // This prevents data loss if get_all() silently fails.
+    let stored_count = eutxos_v2_read.len().await as usize;
+    anyhow::ensure!(
+        original_count == stored_count,
+        "Migration safety check failed: expected {} UTXOs but loaded {}. Aborting to prevent data loss.",
+        stored_count,
+        original_count
+    );
 
     // Create v2 expected_utxos table for writing
     storage.reset_schema();
