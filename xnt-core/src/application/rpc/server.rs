@@ -1975,12 +1975,9 @@ pub trait RPC {
     /// to the same underlying address. The subaddress uses the same encryption
     /// key as the base address, so all payments can be scanned with a single key.
     ///
-    /// Supported key types: Generation, Symmetric
-    ///
     /// Returns the subaddress as a bech32m-encoded string.
     async fn generate_subaddress(
         token: auth::Token,
-        key_type: KeyType,
         payment_id: u64,
     ) -> RpcResult<String>;
 
@@ -4205,7 +4202,6 @@ impl RPC for NeptuneRPCServer {
         self,
         _context: ::tarpc::context::Context,
         token: auth::Token,
-        key_type: KeyType,
         payment_id: u64,
     ) -> RpcResult<String> {
         log_slow_scope!(fn_name!());
@@ -4222,12 +4218,12 @@ impl RPC for NeptuneRPCServer {
         let state = self.state.lock_guard().await;
         let network = state.cli().network;
 
-        // Get the latest spending key of the specified type
-        let current_counter = state.wallet_state.spending_key_counter(key_type);
+        // Always use Generation key type - subaddresses only support Generation addresses
+        let current_counter = state.wallet_state.spending_key_counter(KeyType::Generation);
         let index = current_counter
             .checked_sub(1)
             .ok_or(RpcError::WalletKeyCounterIsZero)?;
-        let spending_key = state.wallet_state.nth_spending_key(key_type, index);
+        let spending_key = state.wallet_state.nth_spending_key(KeyType::Generation, index);
 
         // Get the receiving address and create the subaddress (only Generation addresses supported)
         let receiving_address = spending_key.to_address();
