@@ -5,7 +5,7 @@ use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::prelude::Mmr;
 use tracing::debug;
 
-use crate::api::export::NativeCurrencyAmount;
+use crate::api::export::{NativeCurrencyAmount, Utxo};
 use crate::api::export::ReceivingAddress;
 use crate::api::export::Timestamp;
 use crate::api::export::Transaction;
@@ -32,9 +32,12 @@ use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
 
 use crate::application::database::storage::storage_vec::traits::StorageVecStream;
+use crate::application::json_rpc::core::model::common::RpcBlockSelector;
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
+
+use crate::state::mempool::upgrade_priority::UpgradePriority;
 
 #[async_trait]
 impl RpcApi for RpcServer {
@@ -1162,6 +1165,581 @@ impl RpcApi for RpcServer {
             .collect();
 
         Ok(utxos)
+    }
+
+    async fn get_block_announcements_range_call(
+        &self,
+        request: GetBlockAnnouncementsRangeRequest,
+    ) -> RpcResult<GetBlockAnnouncementsRangeResponse> {
+        let state = self.state.lock_guard().await;
+        let mut blocks = Vec::new();
+
+        // Limit range to prevent abuse (max 1000 blocks per request)
+        let start_height = request.start_height;
+        let end_height = std::cmp::min(
+            request.end_height,
+            request.start_height.saturating_add(1000),
+        );
+
+        for height in start_height..=end_height {
+            use crate::protocol::consensus::block::block_height::BlockHeight;
+            let block_height = BlockHeight::from(height);
+            let selector = RpcBlockSelector::Height(block_height);
+            let digest = selector.as_digest(&state).await;
+            let announcements = match digest {
+                Some(digest) => state
+                    .chain
+                    .archival_state()
+                    .get_block(digest)
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .map(|b| {
+                        b.body()
+                            .transaction_kernel()
+                            .announcements
+                            .iter()
+                            .map(|a| a.message.clone().into())
+                            .collect::<Vec<_>>()
+                    }),
+                None => None,
+            };
+
+            blocks.push(BlockAnnouncementsEntry {
+                height,
+                announcements,
+            });
+        }
+
+        Ok(GetBlockAnnouncementsRangeResponse { blocks })
+    }
+
+    async fn get_archival_mutator_set_call(
+        &self,
+        _: GetArchivalMutatorSetRequest,
+    ) -> RpcResult<GetArchivalMutatorSetResponse> {
+        let state = self.state.lock_guard().await;
+        let archival_mutator_set = state.chain.archival_state().archival_mutator_set.ams();
+        let accumulator = archival_mutator_set.accumulator().await;
+        Ok(GetArchivalMutatorSetResponse {
+            archival_mutator_set: accumulator,
+        })
+    }
+
+    async fn get_utxo_creation_block_call(
+        &self,
+        request: GetUtxoCreationBlockRequest,
+    ) -> RpcResult<GetUtxoCreationBlockResponse> {
+        use crate::util_types::mutator_set::addition_record::AdditionRecord;
+
+        let bytes = match hex::decode(request.addition_record.trim_start_matches("0x")) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(GetUtxoCreationBlockResponse {
+                    last_aocl_index_in_block: Some(0),
+                    num_outputs_in_block: Some(0),
+                    error: Some(format!("Invalid addition_record hex: {}", e)),
+                });
+            }
+        };
+
+        let addition_record: AdditionRecord = match bincode::deserialize(&bytes) {
+            Ok(ar) => ar,
+            Err(e) => {
+                return Ok(GetUtxoCreationBlockResponse {
+                    last_aocl_index_in_block: Some(0),
+                    num_outputs_in_block: Some(0),
+                    error: Some(format!("Failed to deserialize addition_record: {}", e)),
+                });
+            }
+        };
+
+        let state = self.state.lock_guard().await;
+        let archival = state.chain.archival_state();
+
+        if let Some(commitment_index) = &state.utxo_commitment_index {
+            if let Ok(Some(location)) = commitment_index
+                .get_utxo_location(addition_record.canonical_commitment)
+                .await
+            {
+                use crate::protocol::consensus::block::block_height::BlockHeight;
+                let block_height = BlockHeight::from(location.block_height);
+                let block_digest = archival
+                    .archival_block_mmr
+                    .ammr()
+                    .get_leaf_async(block_height.into())
+                    .await;
+
+                if let Ok(Some(block)) = archival.get_block(block_digest).await {
+                    let tx_kernel = block.kernel.body.transaction_kernel();
+                    if let Some(output) = tx_kernel.outputs.get(location.output_index as usize) {
+                        if output.canonical_commitment == addition_record.canonical_commitment {
+                            return Ok(GetUtxoCreationBlockResponse {
+                                last_aocl_index_in_block: Some(
+                                    block
+                                        .mutator_set_accumulator_after()
+                                        .unwrap()
+                                        .aocl
+                                        .num_leafs()
+                                        - 1,
+                                ),
+                                num_outputs_in_block: Some(
+                                    block
+                                        .mutator_set_update()
+                                        .unwrap()
+                                        .additions
+                                        .len()
+                                        .try_into()
+                                        .unwrap(),
+                                ),
+                                error: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let max = None;
+        let opt_block = archival
+            .find_canonical_block_with_output(addition_record, max)
+            .await;
+        Ok(match opt_block {
+            Some(block) => GetUtxoCreationBlockResponse {
+                last_aocl_index_in_block: Some(
+                    block
+                        .mutator_set_accumulator_after()
+                        .unwrap()
+                        .aocl
+                        .num_leafs()
+                        - 1,
+                ),
+                num_outputs_in_block: Some(
+                    block
+                        .mutator_set_update()
+                        .unwrap()
+                        .additions
+                        .len()
+                        .try_into()
+                        .unwrap(),
+                ),
+                error: None,
+            },
+            None => GetUtxoCreationBlockResponse {
+                last_aocl_index_in_block: Some(0),
+                num_outputs_in_block: Some(0),
+                error: Some("UTXO not found in canonical chain".to_string()),
+            },
+        })
+    }
+
+    async fn get_aocl_authentication_path_call(
+        &self,
+        request: GetAoclAuthenticationPathRequest,
+    ) -> RpcResult<GetAoclAuthenticationPathResponse> {
+        let state = self.state.lock_guard().await;
+        let ams = state.chain.archival_state().archival_mutator_set.ams();
+
+        Ok(match ams.get_aocl_authentication_path(request.aocl_leaf_index).await {
+            Ok(auth_path) => {
+                match bincode::serialize(&auth_path) {
+                    Ok(bytes) => GetAoclAuthenticationPathResponse {
+                        auth_path_hex: Some(format!("0x{}", hex::encode(bytes))),
+                        error: None,
+                    },
+                    Err(e) => GetAoclAuthenticationPathResponse {
+                        auth_path_hex: None,
+                        error: Some(format!("Failed to serialize auth path: {}", e)),
+                    },
+                }
+            }
+            Err(e) => GetAoclAuthenticationPathResponse {
+                auth_path_hex: None,
+                error: Some(e.to_string()),
+            },
+        })
+    }
+
+    async fn get_chunks_and_auth_paths_call(
+        &self,
+        request: GetChunksAndAuthPathsRequest,
+    ) -> RpcResult<GetChunksAndAuthPathsResponse> {
+        let state = self.state.lock_guard().await;
+        let ams = state.chain.archival_state().archival_mutator_set.ams();
+
+        let mut chunks = Vec::new();
+        for chunk_index in request.chunk_indices {
+            match ams.get_chunk_and_auth_path(chunk_index).await {
+                Ok((auth_path, chunk)) => {
+                    let chunk_hex = match bincode::serialize(&chunk) {
+                        Ok(bytes) => format!("0x{}", hex::encode(bytes)),
+                        Err(e) => {
+                            return Ok(GetChunksAndAuthPathsResponse {
+                                chunks: vec![],
+                                error: Some(format!("Failed to serialize chunk {}: {}", chunk_index, e)),
+                            });
+                        }
+                    };
+                    let auth_path_hex = match bincode::serialize(&auth_path) {
+                        Ok(bytes) => format!("0x{}", hex::encode(bytes)),
+                        Err(e) => {
+                            return Ok(GetChunksAndAuthPathsResponse {
+                                chunks: vec![],
+                                error: Some(format!("Failed to serialize auth path for chunk {}: {}", chunk_index, e)),
+                            });
+                        }
+                    };
+                    chunks.push(ChunkAndAuthPath {
+                        chunk_index,
+                        chunk_hex,
+                        auth_path_hex,
+                    });
+                }
+                Err(e) => {
+                    return Ok(GetChunksAndAuthPathsResponse {
+                        chunks: vec![],
+                        error: Some(format!("Failed to get chunk {}: {}", chunk_index, e)),
+                    });
+                }
+            }
+        }
+
+        Ok(GetChunksAndAuthPathsResponse {
+            chunks,
+            error: None,
+        })
+    }
+
+    async fn get_state_call(&self, _: GetStateRequest) -> RpcResult<GetStateResponse> {
+        let state = self.state.lock_guard().await;
+
+        let height = state.chain.light_state().kernel.header.height;
+
+        let _cli = state.cli().clone();
+
+        let tip_digest = state.chain.light_state().hash();
+        let tip_hash = format!(
+            "0x{}",
+            hex::encode(bincode::serialize(&tip_digest).unwrap_or_default())
+        );
+        let network = self.state.cli().network.to_string();
+        Ok(GetStateResponse {
+            state: StateInfo {
+                height,
+                tip_hash,
+                network,
+            }
+        })
+    }
+
+    async fn generate_utxo_with_proof_call(
+        &self,
+        request: GenerateUtxoWithProofRequest,
+    ) -> RpcResult<GenerateUtxoWithProofResponse> {
+        use crate::twenty_first::prelude::Tip5;
+        use crate::util_types::mutator_set::addition_record::AdditionRecord;
+
+        let decode_hex = |s: &str| -> Result<Vec<u8>, String> {
+            hex::decode(s.trim_start_matches("0x")).map_err(|e| format!("Invalid hex: {}", e))
+        };
+
+        let utxo_bytes = match decode_hex(&request.utxo_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(e),
+                })
+            }
+        };
+        let addition_record_bytes = match decode_hex(&request.addition_record_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(e),
+                })
+            }
+        };
+        let sender_rand_bytes = match decode_hex(&request.sender_randomness_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(e),
+                })
+            }
+        };
+        let receiver_preimage_bytes = match decode_hex(&request.receiver_preimage_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(e),
+                })
+            }
+        };
+
+        let utxo: Utxo = match bincode::deserialize(&utxo_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(format!("Failed to deserialize utxo: {}", e)),
+                })
+            }
+        };
+        let addition_record: AdditionRecord = match bincode::deserialize(&addition_record_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(format!("Failed to deserialize addition_record: {}", e)),
+                })
+            }
+        };
+        let sender_randomness = match bincode::deserialize(&sender_rand_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(format!("Failed to deserialize sender_randomness: {}", e)),
+                })
+            }
+        };
+        let receiver_preimage = match bincode::deserialize(&receiver_preimage_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(format!("Failed to deserialize receiver_preimage: {}", e)),
+                })
+            }
+        };
+
+        let state = self.state.lock_guard().await;
+        let archival = state.chain.archival_state();
+        let max = request.max_search_depth.or(Some(1000));
+        let Some(creation_block) = archival
+            .find_canonical_block_with_output(addition_record, max)
+            .await
+        else {
+            return Ok(GenerateUtxoWithProofResponse {
+                utxo_hex: None,
+                msmp_hex: None,
+                error: Some("UTXO not found in canonical chain".to_string()),
+            });
+        };
+
+        let last_aocl_index_in_block = creation_block
+            .mutator_set_accumulator_after()
+            .expect("Block must have mutator set after")
+            .aocl
+            .num_leafs()
+            - 1;
+        let num_outputs_in_block: u64 = creation_block
+            .mutator_set_update()
+            .expect("Block must have mutator set update")
+            .additions
+            .len()
+            .try_into()
+            .unwrap();
+        let min_aocl_leaf_index = last_aocl_index_in_block - num_outputs_in_block + 1;
+
+        let mut haystack = last_aocl_index_in_block;
+        let ams = archival.archival_mutator_set.ams();
+        while ams.aocl.get_leaf_async(haystack).await != addition_record.canonical_commitment {
+            if haystack <= min_aocl_leaf_index {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some("UTXO addition record not found in block".to_string()),
+                });
+            }
+            haystack -= 1;
+        }
+        let aocl_leaf_index = haystack;
+
+        let item = Tip5::hash(&utxo);
+        let msmp = match ams
+            .restore_membership_proof(item, sender_randomness, receiver_preimage, aocl_leaf_index)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(GenerateUtxoWithProofResponse {
+                    utxo_hex: None,
+                    msmp_hex: None,
+                    error: Some(format!("Failed to restore membership proof: {}", e)),
+                });
+            }
+        };
+
+        let utxo_hex = format!("0x{}", hex::encode(bincode::serialize(&utxo).unwrap()));
+        let msmp_hex = format!("0x{}", hex::encode(bincode::serialize(&msmp).unwrap()));
+
+        Ok(GenerateUtxoWithProofResponse {
+            utxo_hex: Some(utxo_hex),
+            msmp_hex: Some(msmp_hex),
+            error: None,
+        })
+    }
+
+    async fn wallet_submit_transaction_call(
+        &self,
+        request: WalletSubmitTransactionRequest,
+    ) -> RpcResult<WalletSubmitTransactionResponse> {
+        use crate::protocol::consensus::transaction::Transaction;
+
+        tracing::info!("Submitting pre-built transaction from client");
+
+        let tx_bytes = match hex::decode(request.transaction_hex.trim_start_matches("0x")) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(WalletSubmitTransactionResponse {
+                    output_utxo_digests: vec![],
+                    success: false,
+                    error: Some(format!("Invalid transaction hex: {}", e)),
+                });
+            }
+        };
+
+        let transaction: Transaction = match bincode::deserialize(&tx_bytes) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return Ok(WalletSubmitTransactionResponse {
+                    output_utxo_digests: vec![],
+                    success: false,
+                    error: Some(format!("Failed to deserialize transaction: {}", e)),
+                });
+            }
+        };
+
+        // Verify the transaction is valid
+        let consensus_rule_set = {
+            let state = self.state.lock_guard().await;
+            let height = state.chain.light_state().kernel.header.height;
+            crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+                self.state.cli().network,
+                height,
+            )
+        };
+
+        let is_valid = transaction
+            .is_valid(self.state.cli().network, consensus_rule_set)
+            .await;
+
+        // Extract UTXO digests from outputs
+        let output_utxo_digests: Vec<String> = transaction
+            .kernel
+            .outputs
+            .iter()
+            .map(|output| format!("0x{}", output.canonical_commitment.to_hex()))
+            .collect();
+
+        if !is_valid {
+            tracing::warn!("Transaction validation failed");
+            return Ok(WalletSubmitTransactionResponse {
+                output_utxo_digests,
+                success: false,
+                error: Some("Transaction validation failed".to_string()),
+            });
+        }
+
+        let txid = transaction.kernel.txid();
+        let txid_hex = format!("0x{}", hex::encode(bincode::serialize(&txid).unwrap()));
+
+        tracing::info!(
+            "Transaction {} validated successfully, adding to mempool",
+            txid_hex
+        );
+
+        use std::sync::Arc;
+        let transaction_arc = Arc::new(transaction.clone());
+
+        let mut state = self.clone();
+        {
+            let mut gsm = state.state.lock_guard_mut().await;
+            gsm.mempool_insert(transaction, UpgradePriority::Irrelevant)
+                .await;
+        }
+
+        let broadcaster_tx = self.state.rpc_server_to_main_tx();
+        if broadcaster_tx
+            .send(crate::application::loops::channel::RPCServerToMain::BroadcastTx(transaction_arc))
+            .await
+            .is_err()
+        {
+            tracing::warn!("Failed to broadcast transaction {} to peers", txid_hex);
+        }
+
+        tracing::info!(
+            "Transaction {} added to mempool successfully with {} outputs: {:?}",
+            txid_hex,
+            output_utxo_digests.len(),
+            output_utxo_digests,
+        );
+
+        Ok(WalletSubmitTransactionResponse {
+            output_utxo_digests,
+            success: true,
+            error: None,
+        })
+    }
+
+    async fn get_mempool_tx_ids_call(&self, _: GetMempoolTxIdsRequest) -> RpcResult<GetMempoolTxIdsResponse> {
+        let state = self.state.lock_guard().await;
+
+        let tx_ids: Vec<String> = state
+            .mempool
+            .fee_density_iter()
+            .map(|(txid, _)| {
+                let txid_bytes = bincode::serialize(&txid)
+                    .expect("Failed to serialize transaction ID");
+                format!("0x{}", hex::encode(txid_bytes))
+            })
+            .collect();
+
+        Ok(GetMempoolTxIdsResponse {
+            tx_ids,
+            error: None,
+        })
+    }
+
+    async fn get_mempool_tx_kernel_call(&self, request: GetMempoolTxKernelRequest) -> RpcResult<GetMempoolTxKernelResponse> {
+        let state = self.state.lock_guard().await;
+
+        // Parse transaction ID from hex
+        let tx_id_bytes = hex::decode(request.tx_id.trim_start_matches("0x"))
+            .map_err(|e| format!("Invalid transaction ID hex: {}", e))
+            .ok();
+
+        let tx_id = match tx_id_bytes {
+            Some(bytes) => {
+                bincode::deserialize(&bytes)
+                    .map_err(|e| format!("Failed to deserialize transaction ID: {}", e))
+                    .ok()
+            }
+            None => None,
+        };
+
+        let kernel = tx_id.and_then(|id| {
+            state.mempool.get(id)
+                .map(|tx| (&tx.kernel).into())
+        });
+
+        Ok(GetMempoolTxKernelResponse {
+            kernel,
+            error: None,
+        })
     }
 }
 

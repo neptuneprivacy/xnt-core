@@ -393,7 +393,7 @@ impl TxOutput {
     ///
     /// Does nothing if there already is a time lock coin whose release date is
     /// later than the argument.
-    pub(crate) fn with_time_lock(self, release_date: Timestamp) -> Self {
+    pub fn with_time_lock(self, release_date: Timestamp) -> Self {
         Self {
             utxo: self.utxo.with_time_lock(release_date),
             sender_randomness: self.sender_randomness,

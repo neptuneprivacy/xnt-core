@@ -20,6 +20,7 @@ use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 
 use crate::api::export::BlockHeight;
+use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
 #[serde(rename_all = "camelCase")]
@@ -638,4 +639,195 @@ pub struct SendTxResponse {
     pub tip_when_sent: Digest,
     pub inputs: Vec<SendTxInput>,
     pub outputs: Vec<SendTxOutput>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBlockAnnouncementsRangeRequest {
+    pub start_height: u64,
+    pub end_height: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockAnnouncementsEntry {
+    pub height: u64,
+    pub announcements: Option<Vec<RpcBFieldElements>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBlockAnnouncementsRangeResponse {
+    pub blocks: Vec<BlockAnnouncementsEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetArchivalMutatorSetRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetArchivalMutatorSetResponse {
+    pub archival_mutator_set: MutatorSetAccumulator,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateUtxoWithProofRequest {
+    /// Hex-encoded bincode-serialized UTXO
+    pub utxo_hex: String,
+    /// Hex-encoded bincode-serialized AdditionRecord (for locating AOCL index)
+    pub addition_record_hex: String,
+    /// Hex-encoded bincode-serialized sender randomness
+    pub sender_randomness_hex: String,
+    /// Hex-encoded bincode-serialized receiver preimage
+    pub receiver_preimage_hex: String,
+    /// Optional search bound
+    pub max_search_depth: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateUtxoWithProofResponse {
+    /// Hex-encoded bincode-serialized UTXO echoed back
+    pub utxo_hex: Option<String>,
+    /// Hex-encoded bincode-serialized membership proof
+    pub msmp_hex: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoCreationBlockRequest {
+    /// Hex-encoded bincode-serialized AdditionRecord identifying the UTXO
+    pub addition_record: String,
+    /// Maximum search depth for canonical chain lookup
+    pub max_search_depth: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoCreationBlockResponse {
+    /// Block height where this UTXO was created, if found
+    pub last_aocl_index_in_block: Option<u64>,
+
+    pub num_outputs_in_block: Option<u64>,
+    /// Error description if lookup failed
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAoclAuthenticationPathRequest {
+    pub aocl_leaf_index: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAoclAuthenticationPathResponse {
+    /// Hex-encoded bincode-serialized MMR membership proof
+    pub auth_path_hex: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetChunksAndAuthPathsRequest {
+    pub chunk_indices: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkAndAuthPath {
+    pub chunk_index: u64,
+    /// Hex-encoded bincode-serialized chunk
+    pub chunk_hex: String,
+    /// Hex-encoded bincode-serialized MMR membership proof
+    pub auth_path_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetChunksAndAuthPathsResponse {
+    pub chunks: Vec<ChunkAndAuthPath>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetStateRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetStateResponse {
+    /// Complete node state information
+    pub state: StateInfo,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateInfo {
+    /// Current chain height
+    pub height: BlockHeight,
+
+    /// Current tip block hash
+    pub tip_hash: String,
+
+    /// Network name
+    pub network: String,
+}
+
+/// Request for submitting a pre-built transaction
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletSubmitTransactionRequest {
+    /// Hex-encoded bincode-serialized Transaction
+    pub transaction_hex: String,
+}
+
+/// Response for submitting a pre-built transaction
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletSubmitTransactionResponse {
+    /// UTXO digests (hex)
+    pub output_utxo_digests: Vec<String>,
+
+    /// Success status
+    pub success: bool,
+
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Request for getting mempool transaction IDs
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMempoolTxIdsRequest {}
+
+/// Response for getting mempool transaction IDs
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMempoolTxIdsResponse {
+    /// List of transaction IDs (hex-encoded)
+    pub tx_ids: Vec<String>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Request for getting a mempool transaction kernel
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMempoolTxKernelRequest {
+    /// Transaction ID (hex-encoded)
+    pub tx_id: String,
+}
+
+/// Response for getting a mempool transaction kernel
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMempoolTxKernelResponse {
+    /// Transaction kernel (if found)
+    pub kernel: Option<crate::application::json_rpc::core::model::block::transaction_kernel::RpcTransactionKernel>,
+    /// Error message if failed
+    pub error: Option<String>,
 }

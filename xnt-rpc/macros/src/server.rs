@@ -40,9 +40,10 @@ pub fn json_router_derive(input: TokenStream) -> TokenStream {
         inserts.push(quote! {
             if namespaces.contains(&#namespace) {
                 router.insert(#method_name, |api, params| async move {
+                    use crate::application::json_rpc::core::api::server::router::to_json_result;
                     let req: #req_type = serde_json::from_value(params)
                         .map_err(|_| JsonError::InvalidParams)?;
-                    let resp: #res_type = api.#call_fn(req).await.map_err(JsonError::from)?;
+                    let resp: #res_type = to_json_result(api.#call_fn(req).await)?;
                     serde_json::to_value(resp).map_err(|_| JsonError::InternalError)
                 });
             }

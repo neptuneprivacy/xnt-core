@@ -4,8 +4,35 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::application::json_rpc::core::api::rpc::RpcApi;
+use crate::application::json_rpc::core::api::rpc::RpcResult;
 use crate::application::json_rpc::core::model::json::JsonError;
 use crate::application::json_rpc::core::model::json::JsonResult;
+
+/// Helper function to convert RPC method results to JsonResult
+/// Handles both methods that return RpcResult<T> and methods that return T directly
+pub fn to_json_result<T>(result: impl RpcMethodResult<T>) -> Result<T, JsonError> {
+    result.into_json_result()
+}
+
+/// Helper trait to convert RPC method results to JsonResult
+pub trait RpcMethodResult<T> {
+    fn into_json_result(self) -> Result<T, JsonError>;
+}
+
+impl<T> RpcMethodResult<T> for RpcResult<T> {
+    fn into_json_result(self) -> Result<T, JsonError> {
+        self.map_err(JsonError::from)
+    }
+}
+
+impl<T> RpcMethodResult<T> for T
+where
+    T: 'static,
+{
+    fn into_json_result(self) -> Result<T, JsonError> {
+        Ok(self)
+    }
+}
 
 type HandlerFn = Box<
     dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = JsonResult<serde_json::Value>> + Send>>

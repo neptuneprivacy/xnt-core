@@ -2,6 +2,7 @@ use std::hash::Hash;
 
 #[cfg(any(test, feature = "arbitrary-impls"))]
 use arbitrary::Arbitrary;
+use serde_derive::{Deserialize, Serialize};
 use tasm_lib::prelude::Digest;
 
 use super::expected_utxo::UtxoNotifier;
@@ -21,9 +22,9 @@ use crate::util_types::mutator_set::addition_record::AdditionRecord;
 ///    key coincides with the receiver preimage.)
 ///
 /// See [UtxoNotificationPayload], [ExpectedUtxo]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "arbitrary-impls"), derive(Arbitrary))]
-pub(crate) struct IncomingUtxo {
+pub struct IncomingUtxo {
     pub(crate) utxo: Utxo,
     pub(crate) sender_randomness: Digest,
     pub(crate) receiver_preimage: Digest,

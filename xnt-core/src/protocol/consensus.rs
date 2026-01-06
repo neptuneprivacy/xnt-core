@@ -1,7 +1,11 @@
+use crate::api::export::Tip5;
+
 pub mod block;
 pub mod consensus_rule_set;
 pub mod transaction;
 pub mod type_scripts;
+
+pub type Hash = Tip5;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
