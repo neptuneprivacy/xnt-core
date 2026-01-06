@@ -27,6 +27,8 @@ pub(super) struct UtxoIndexerTables {
     pub(super) orphaned_blocks: DbtMap<Digest, ()>,
     /// commitment -> aocl_leaf_index
     pub(super) commitment_index: DbtMap<Digest, u64>,
+    /// hash(AbsoluteIndexSet) -> (block_height, block_digest) where spent
+    pub(super) removal_index: DbtMap<Digest, (BlockHeight, Digest)>,
     pub(super) sync_height: DbtSingleton<BlockHeight>,
     pub(super) schema_version: DbtSingleton<u16>,
 }
@@ -36,10 +38,11 @@ impl UtxoIndexerTables {
         let utxos = storage.schema.new_map("utxos").await;
         let orphaned_blocks = storage.schema.new_map("orphaned_blocks").await;
         let commitment_index = storage.schema.new_map("commitment_index").await;
+        let removal_index = storage.schema.new_map("removal_index").await;
         let sync_height = storage.schema.new_singleton::<BlockHeight>("sync_height").await;
         let schema_version = storage.schema.new_singleton::<u16>("schema_version").await;
 
-        Self { utxos, orphaned_blocks, commitment_index, sync_height, schema_version }
+        Self { utxos, orphaned_blocks, commitment_index, removal_index, sync_height, schema_version }
     }
 
     pub(super) async fn get_orphaned_blocks_set(&self) -> HashSet<Digest> {

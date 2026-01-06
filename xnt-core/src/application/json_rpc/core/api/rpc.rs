@@ -491,4 +491,15 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: GetAoclLeafIndicesRequest,
     ) -> RpcResult<GetAoclLeafIndicesResponse>;
+
+    async fn get_spent_status(
+        &self,
+        request: GetSpentStatusRequest,
+    ) -> RpcResult<GetSpentStatusResponse> {
+        self.get_spent_status_call(request).await
+    }
+    async fn get_spent_status_call(
+        &self,
+        request: GetSpentStatusRequest,
+    ) -> RpcResult<GetSpentStatusResponse>;
 }

@@ -162,6 +162,9 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Archival)]
     GetAoclLeafIndices,
+
+    #[namespace(Namespace::Archival)]
+    GetSpentStatus,
 }
 
 #[cfg(test)]

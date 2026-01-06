@@ -1333,6 +1333,21 @@ impl RpcApi for RpcServer {
 
         Ok(GetAoclLeafIndicesResponse { indices })
     }
+
+    async fn get_spent_status_call(
+        &self,
+        request: GetSpentStatusRequest,
+    ) -> RpcResult<GetSpentStatusResponse> {
+        let state = self.state.lock_guard().await;
+
+        let indexer = state
+            .utxo_indexer()
+            .ok_or(RpcError::UtxoIndexerDisabled)?;
+
+        let spent_at_heights = indexer.get_spent_statuses(&request.absolute_index_set_hashes).await;
+
+        Ok(GetSpentStatusResponse { spent_at_heights })
+    }
 }
 
 #[cfg(test)]

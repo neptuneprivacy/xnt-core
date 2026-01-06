@@ -10,4 +10,4 @@ pub use utxo_indexer_database::UtxoIndexerDbConnectError;
 pub use utxo_indexer_tables::height_to_bucket;
 pub use utxo_indexer_tables::BUCKET_SIZE;
 
-pub const UTXO_INDEXER_DB_NAME: &str = "utxo_indexer";
+pub const UTXO_INDEXER_DB_NAME: &str = "utxo_index";

@@ -700,6 +700,19 @@ pub struct GetAoclLeafIndicesResponse {
     pub indices: Vec<Option<u64>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpentStatusRequest {
+    pub absolute_index_set_hashes: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpentStatusResponse {
+    /// For each hash: Some(height) if spent (and not orphaned), None if unspent
+    pub spent_at_heights: Vec<Option<BlockHeight>>,
+}
+
 impl From<crate::state::utxo_indexer::IndexedUtxo> for RpcIndexedUtxo {
     fn from(utxo: crate::state::utxo_indexer::IndexedUtxo) -> Self {
         RpcIndexedUtxo {

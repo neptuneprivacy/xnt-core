@@ -211,6 +211,38 @@ impl UtxoIndexerDatabase {
         results
     }
 
+    pub async fn add_removal(&mut self, absolute_index_set_hash: Digest, height: BlockHeight, block_digest: Digest) {
+        self.tables.removal_index.insert(absolute_index_set_hash, (height, block_digest)).await;
+    }
+
+    /// Returns spent_at_height if UTXO is spent (and not orphaned), None otherwise
+    pub async fn get_spent_status(&self, absolute_index_set_hash: &Digest) -> Option<BlockHeight> {
+        if let Some((height, block_digest)) = self.tables.removal_index.get(absolute_index_set_hash).await {
+            if !self.tables.orphaned_blocks.get(&block_digest).await.is_some() {
+                return Some(height);
+            }
+        }
+        None
+    }
+
+    /// Batch lookup for spent status
+    pub async fn get_spent_statuses(&self, hashes: &[Digest]) -> Vec<Option<BlockHeight>> {
+        let orphaned = self.tables.get_orphaned_blocks_set().await;
+        let mut results = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Some((height, block_digest)) = self.tables.removal_index.get(hash).await {
+                if !orphaned.contains(&block_digest) {
+                    results.push(Some(height));
+                } else {
+                    results.push(None);
+                }
+            } else {
+                results.push(None);
+            }
+        }
+        results
+    }
+
     pub fn get_sync_height(&self) -> BlockHeight {
         self.tables.sync_height.get()
     }
@@ -235,6 +267,7 @@ impl UtxoIndexerDatabase {
         let height = block.kernel.header.height;
         let block_digest = block.hash();
 
+        // Index announcements (UTXOs)
         for announcement in block.kernel.body.transaction_kernel.announcements.iter() {
             if let Ok(receiver_id) = receiver_identifier_from_announcement(announcement) {
                 if let Ok(ciphertext) = ciphertext_from_announcement(announcement) {
@@ -245,10 +278,17 @@ impl UtxoIndexerDatabase {
             }
         }
 
+        // Index outputs (commitments)
         let outputs = &block.kernel.body.transaction_kernel.outputs;
         for (i, output) in outputs.iter().enumerate() {
             let aocl_leaf_index = prev_aocl_len + i as u64;
             self.add_commitment(output.canonical_commitment, aocl_leaf_index).await;
+        }
+
+        // Index inputs (removal records)
+        for removal_record in block.kernel.body.transaction_kernel.inputs.iter() {
+            let abs_index_hash = Tip5::hash(&removal_record.absolute_indices);
+            self.add_removal(abs_index_hash, height, block_digest).await;
         }
 
         if update_sync {
