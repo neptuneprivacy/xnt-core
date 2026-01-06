@@ -6,15 +6,6 @@
 **xnt-core** is the reference implementation for **xnt (Neptune Privacy)** — a privacy-focused decentralized digital cash protocol derived from Neptune Cash.
 
 
-## Disclaimer
-
-> [!CAUTION]
-> This software uses novel and untested cryptography. Use at own risk, and invest only that which
-> you can afford to lose.
-
-> [!IMPORTANT]
-> If a catastrophic vulnerability is discovered in the protocol, it might be restarted from genesis.
-
 ## Installing
 
 ### Compile from Source -- Linux Debian/Ubuntu
