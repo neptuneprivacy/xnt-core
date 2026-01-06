@@ -665,3 +665,47 @@ pub struct GenerateSubaddressResponse {
     pub payment_id: u64,
     pub base_address: String,
 }
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxosByReceiverRequest {
+    pub receiver_id_hash: Digest,
+    pub from_block_height: BlockHeight,
+    pub to_block_height: BlockHeight,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcIndexedUtxo {
+    pub block_height: BlockHeight,
+    pub block_digest: Digest,
+    pub ciphertext: Vec<BFieldElement>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxosByReceiverResponse {
+    pub utxos: Vec<RpcIndexedUtxo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAoclLeafIndicesRequest {
+    pub commitments: Vec<Digest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAoclLeafIndicesResponse {
+    pub indices: Vec<Option<u64>>,
+}
+
+impl From<crate::state::utxo_indexer::IndexedUtxo> for RpcIndexedUtxo {
+    fn from(utxo: crate::state::utxo_indexer::IndexedUtxo) -> Self {
+        RpcIndexedUtxo {
+            block_height: utxo.block_height,
+            block_digest: utxo.block_digest,
+            ciphertext: utxo.ciphertext,
+        }
+    }
+}

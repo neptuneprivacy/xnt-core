@@ -160,6 +160,21 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
         info!("Successfully imported {num_blocks_read} blocks.");
     }
 
+    // Sync UTXO indexer to tip if enabled
+    if cli_args.utxo_indexer {
+        let blocks_synced = global_state_lock
+            .lock_guard_mut()
+            .await
+            .sync_utxo_indexer_to_tip()
+            .await?;
+        if blocks_synced > 0 {
+            info!(
+                "UTXO indexer synced {} historical blocks to tip",
+                blocks_synced
+            );
+        }
+    }
+
     if !cli_args.triton_vm_env_vars.is_empty() {
         info!(
             "Triton VM environment variables set to: {}",
