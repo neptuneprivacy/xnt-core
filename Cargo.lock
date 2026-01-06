@@ -2209,6 +2209,7 @@ dependencies = [
  "systemstat",
  "tarpc",
  "tasm-lib",
+ "tempfile",
  "test-strategy 0.3.1",
  "thiserror 1.0.69",
  "thread-priority",

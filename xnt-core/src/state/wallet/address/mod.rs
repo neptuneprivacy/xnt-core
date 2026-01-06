@@ -15,6 +15,8 @@ pub use addressable_key::KeyType;
 pub use addressable_key::SpendingKey;
 pub use receiving_address::ReceivingAddress;
 
+pub use common::receiver_identifier_from_announcement;
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

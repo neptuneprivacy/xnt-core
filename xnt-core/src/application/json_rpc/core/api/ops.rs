@@ -153,6 +153,37 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Wallet)]
     UnspentUtxos,
+
+    //Wallet
+    #[namespace(Namespace::Archival)]
+    GetBlockAnnouncementsRange,
+
+    #[namespace(Namespace::Archival)]
+    GetArchivalMutatorSet,
+
+    #[namespace(Namespace::Archival)]
+    GetUtxoCreationBlock,
+
+    #[namespace(Namespace::Archival)]
+    GenerateUtxoWithProof,
+
+    #[namespace(Namespace::Archival)]
+    GetAoclAuthenticationPath,
+
+    #[namespace(Namespace::Archival)]
+    GetChunksAndAuthPaths,
+
+    #[namespace(Namespace::Node)]
+    GetState,
+
+    #[namespace(Namespace::Mempool)]
+    WalletSubmitTransaction,
+
+    #[namespace(Namespace::Mempool)]
+    GetMempoolTxIds,
+
+    #[namespace(Namespace::Mempool)]
+    GetMempoolTxKernel,
 }
 
 #[cfg(test)]

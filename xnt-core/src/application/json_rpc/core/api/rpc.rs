@@ -451,4 +451,89 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: UnspentUtxosRequest,
     ) -> RpcResult<UnspentUtxosResponse>;
+
+    async fn get_block_announcements_range(
+        &self,
+        start_height: u64,
+        end_height: u64,
+    ) -> RpcResult<GetBlockAnnouncementsRangeResponse> {
+        self.get_block_announcements_range_call(GetBlockAnnouncementsRangeRequest {
+            start_height,
+            end_height,
+        })
+            .await
+    }
+    async fn get_block_announcements_range_call(
+        &self,
+        request: GetBlockAnnouncementsRangeRequest,
+    ) -> RpcResult<GetBlockAnnouncementsRangeResponse>;
+
+
+    async fn get_archival_mutator_set_call(
+        &self,
+        request: GetArchivalMutatorSetRequest,
+    ) -> RpcResult<GetArchivalMutatorSetResponse>;
+
+    async fn get_utxo_creation_block(
+        &self,
+        addition_record: String,
+        max_search_depth: u64,
+    ) -> RpcResult<GetUtxoCreationBlockResponse> {
+        self.get_utxo_creation_block_call(GetUtxoCreationBlockRequest {
+            addition_record,
+            max_search_depth,
+        })
+            .await
+    }
+    async fn get_utxo_creation_block_call(
+        &self,
+        request: GetUtxoCreationBlockRequest,
+    ) -> RpcResult<GetUtxoCreationBlockResponse>;
+
+    async fn get_aocl_authentication_path_call(
+        &self,
+        request: GetAoclAuthenticationPathRequest,
+    ) -> RpcResult<GetAoclAuthenticationPathResponse>;
+
+    async fn get_chunks_and_auth_paths_call(
+        &self,
+        request: GetChunksAndAuthPathsRequest,
+    ) -> RpcResult<GetChunksAndAuthPathsResponse>;
+
+    async fn generate_utxo_with_proof(
+        &self,
+        req: GenerateUtxoWithProofRequest,
+    ) -> RpcResult<GenerateUtxoWithProofResponse> {
+        self.generate_utxo_with_proof_call(req).await
+    }
+    async fn generate_utxo_with_proof_call(
+        &self,
+        request: GenerateUtxoWithProofRequest,
+    ) -> RpcResult<GenerateUtxoWithProofResponse>;
+
+    async fn get_state(&self) -> RpcResult<GetStateResponse> {
+        self.get_state_call(GetStateRequest {}).await
+    }
+    async fn get_state_call(&self, request: GetStateRequest) -> RpcResult<GetStateResponse>;
+
+    async fn wallet_submit_transaction(
+        &self,
+        request: WalletSubmitTransactionRequest,
+    ) -> RpcResult<WalletSubmitTransactionResponse> {
+        self.wallet_submit_transaction_call(request).await
+    }
+    async fn wallet_submit_transaction_call(
+        &self,
+        request: WalletSubmitTransactionRequest,
+    ) -> RpcResult<WalletSubmitTransactionResponse>;
+
+    async fn get_mempool_tx_ids(&self) -> RpcResult<GetMempoolTxIdsResponse> {
+        self.get_mempool_tx_ids_call(GetMempoolTxIdsRequest {}).await
+    }
+    async fn get_mempool_tx_ids_call(&self, request: GetMempoolTxIdsRequest) -> RpcResult<GetMempoolTxIdsResponse>;
+
+    async fn get_mempool_tx_kernel(&self, tx_id: String) -> RpcResult<GetMempoolTxKernelResponse> {
+        self.get_mempool_tx_kernel_call(GetMempoolTxKernelRequest { tx_id }).await
+    }
+    async fn get_mempool_tx_kernel_call(&self, request: GetMempoolTxKernelRequest) -> RpcResult<GetMempoolTxKernelResponse>;
 }

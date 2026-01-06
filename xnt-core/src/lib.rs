@@ -31,6 +31,8 @@ pub mod protocol;
 pub mod state;
 pub mod util_types;
 
+pub mod utxo_index;
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub mod tests;

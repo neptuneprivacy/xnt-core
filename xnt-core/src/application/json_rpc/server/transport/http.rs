@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
 use axum::http::HeaderMap;
@@ -42,8 +43,12 @@ impl RpcServer {
             auth: self.rpc_auth.clone(),
         };
 
+        // Configure body size limit to allow large transactions
+        let body_limit = DefaultBodyLimit::max(50 * 1024 * 1024);
+
         let app = Router::new()
             .route("/", post(Self::rpc_handler))
+            .layer(body_limit)
             .with_state(state);
 
         axum::serve(listener, app).await.unwrap();

@@ -37,9 +37,9 @@ impl DataDirectory {
     ///
     /// The default varies by operating system, and includes the network, e.g.
     ///
-    /// - Linux:   /home/alice/.config/neptune/core/main
-    /// - Windows: C:\Users\Alice\AppData\Roaming\neptune\core\main
-    /// - macOS:   /Users/Alice/Library/Application Support/neptune/main
+    /// - Linux:   /home/alice/.config/xnt/xnt/main
+    /// - Windows: C:\Users\Alice\AppData\Roaming\xnt\xnt\main
+    /// - macOS:   /Users/Alice/Library/Application Support/xnt/xnt/main
     pub fn get(root_dir: Option<PathBuf>, network: Network) -> Result<Self> {
         let project_dirs = root_dir
             .map(ProjectDirs::from_path)
@@ -112,7 +112,7 @@ impl DataDirectory {
     /// for storing off-chain serialized transfer files.
     ///
     /// note: this is not used by xnt-core, but is used/shared by
-    ///       neptune-cli, xnt-dashboard
+    ///       xnt-cli, xnt-dashboard
     pub fn utxo_transfer_directory_path(&self) -> PathBuf {
         self.data_dir.join(Path::new(UTXO_TRANSFER_DIRECTORY))
     }
@@ -214,6 +214,13 @@ impl DataDirectory {
     pub fn block_index_database_dir_path(&self) -> PathBuf {
         self.database_dir_path()
             .join(Path::new(BLOCK_INDEX_DB_NAME))
+    }
+
+    /// The UTXO index database directory path.
+    ///
+    /// This directory lives within `DataDirectory::database_dir_path()`.
+    pub fn utxo_index_database_dir_path(&self) -> PathBuf {
+        self.database_dir_path().join(Path::new("utxo_index"))
     }
 
     /// The file path that contains block(s) with `file_index`.
