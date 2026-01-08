@@ -3,6 +3,7 @@ use num_traits::ConstZero;
 use tasm_lib::triton_vm::prelude::BFieldElement;
 use tracing::debug;
 
+use crate::application::database::storage::storage_schema::traits::StorageWriter;
 use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 use crate::application::database::storage::storage_vec::traits::*;
 use crate::state::wallet::wallet_db_tables::WalletDbTables;
@@ -61,6 +62,8 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
         eutxos_v4.set(list_index, eutxo_v4).await;
     }
 
+    storage.persist().await;
+
     // Load tables to set schema version
     storage.reset_schema();
     let mut tables = WalletDbTables::load_schema_in_order(storage).await;
@@ -106,6 +109,7 @@ mod migration {
         use crate::util_types::mutator_set::addition_record::AdditionRecord;
 
         // This is ExpectedUtxo as it is in v4 schema (with payment_id).
+        // Must match production ExpectedUtxo exactly.
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub(in super::super) struct ExpectedUtxo {
             pub utxo: Utxo,
@@ -115,6 +119,7 @@ mod migration {
             pub received_from: UtxoNotifier,
             pub notification_received: Timestamp,
             pub mined_in_block: Option<(Digest, Timestamp)>,
+            #[serde(default)]
             pub payment_id: BFieldElement,
         }
     }
