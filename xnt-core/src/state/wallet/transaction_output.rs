@@ -226,9 +226,9 @@ impl TxOutput {
         }
     }
 
-    /// Instantiate a [TxOutput] for native currency intended fro on-chain UTXO
+    /// Instantiate a [TxOutput] for native currency intended for on-chain UTXO
     /// notification.
-    pub(crate) fn onchain_native_currency(
+    pub fn onchain_native_currency(
         amount: NativeCurrencyAmount,
         sender_randomness: Digest,
         receiving_address: ReceivingAddress,
@@ -245,9 +245,9 @@ impl TxOutput {
         }
     }
 
-    /// Instantiate a [TxOutput] for native currency intended fro on-chain UTXO
-    /// notification.
-    pub(crate) fn onchain_native_currency_as_change(
+    /// Instantiate a [TxOutput] for native currency intended for on-chain UTXO
+    /// notification, marked as change.
+    pub fn onchain_native_currency_as_change(
         amount: NativeCurrencyAmount,
         sender_randomness: Digest,
         receiving_address: ReceivingAddress,

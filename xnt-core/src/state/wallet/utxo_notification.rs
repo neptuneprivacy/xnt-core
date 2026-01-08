@@ -76,6 +76,21 @@ impl UtxoNotificationPayload {
             payment_id,
         }
     }
+
+    /// Get the UTXO
+    pub fn utxo(&self) -> &Utxo {
+        &self.utxo
+    }
+
+    /// Get the sender randomness
+    pub fn sender_randomness(&self) -> Digest {
+        self.sender_randomness
+    }
+
+    /// Get the payment ID
+    pub fn payment_id(&self) -> BFieldElement {
+        self.payment_id
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

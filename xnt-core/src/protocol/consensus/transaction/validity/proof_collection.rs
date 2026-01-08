@@ -82,7 +82,7 @@ impl ProofCollection {
         )
     }
 
-    pub(crate) async fn produce(
+    pub async fn produce(
         primitive_witness: &PrimitiveWitness,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,

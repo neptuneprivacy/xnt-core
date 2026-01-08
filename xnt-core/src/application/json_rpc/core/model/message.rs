@@ -364,7 +364,17 @@ pub struct RestoreMembershipProofResponse {
     pub snapshot: RpcMsMembershipSnapshot,
 }
 
-#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetArchivalMutatorSetRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetArchivalMutatorSetResponse {
+    pub archival_mutator_set: RpcMutatorSetAccumulator,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitTransactionRequest {
     pub transaction: RpcTransaction,
