@@ -260,7 +260,7 @@ impl GenerationSpendingKey {
         }
     }
 
-    pub(crate) fn lock_script_and_witness(&self) -> LockScriptAndWitness {
+    pub fn lock_script_and_witness(&self) -> LockScriptAndWitness {
         LockScriptAndWitness::standard_hash_lock_from_preimage(self.unlock_key_preimage)
     }
 
@@ -325,9 +325,20 @@ impl GenerationSpendingKey {
             .decrypt(nonce, ciphertext_bytes.as_ref())
             .map_err(|_| anyhow!("Failed to decrypt symmetric payload."))?;
 
-        // convert plaintext to UtxoNotificationPayload (includes payment_id)
-        let payload: UtxoNotificationPayload = bincode::deserialize(&plaintext)?;
-        Ok((payload.utxo, payload.sender_randomness, payload.payment_id))
+        // Deserialize base fields (utxo, sender_randomness) - works for both old and new format
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct BasePayload { utxo: Utxo, sender_randomness: Digest }
+        let base: BasePayload = bincode::deserialize(&plaintext)?;
+        let base_size = bincode::serialized_size(&base)? as usize;
+
+        // payment_id is optional - present in new format, absent in old format
+        let payment_id = if plaintext.len() > base_size {
+            bincode::deserialize::<BFieldElement>(&plaintext[base_size..])?
+        } else {
+            BFieldElement::new(0)
+        };
+
+        Ok((base.utxo, base.sender_randomness, payment_id))
     }
 
     fn generate_spending_lock(&self) -> Digest {
