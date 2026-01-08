@@ -2263,8 +2263,13 @@ impl GlobalState {
                 break;
             };
 
-            let outputs_indexed = indexer.index_block_batch(&block, prev_aocl_len).await;
-            prev_aocl_len += outputs_indexed;
+            indexer.index_block_batch(&block, prev_aocl_len).await;
+
+            // Get accurate AOCL length after this block for next iteration
+            prev_aocl_len = block
+                .mutator_set_accumulator_after()
+                .map(|msa| msa.aocl.num_leafs())
+                .unwrap_or(prev_aocl_len);
             blocks_indexed += 1;
             current_height = current_height.next();
 

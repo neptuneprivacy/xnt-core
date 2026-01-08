@@ -295,7 +295,12 @@ impl UtxoIndexerDatabase {
             self.set_sync_height(height).await;
         }
 
-        outputs.len() as u64
+        // Return total AOCL additions: transaction outputs + guesser fee UTXOs
+        let guesser_fee_count = block
+            .guesser_fee_addition_records()
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+        outputs.len() as u64 + guesser_fee_count
     }
 }
 
