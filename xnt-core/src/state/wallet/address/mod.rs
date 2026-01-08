@@ -13,6 +13,7 @@ pub mod symmetric_key;
 
 pub use addressable_key::KeyType;
 pub use addressable_key::SpendingKey;
+pub use common::bfes_to_bytes;
 pub use common::ciphertext_from_announcement;
 pub use common::receiver_identifier_from_announcement;
 pub use common::SubAddress;
