@@ -3,6 +3,7 @@ use num_traits::ConstZero;
 use tasm_lib::triton_vm::prelude::BFieldElement;
 use tracing::debug;
 
+use crate::application::database::storage::storage_schema::traits::StorageWriter;
 use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 use crate::application::database::storage::storage_vec::traits::*;
 use crate::state::wallet::wallet_db_tables::WalletDbTables;
@@ -63,6 +64,8 @@ pub(super) async fn migrate(storage: &mut SimpleRustyStorage) -> anyhow::Result<
         mutxos_v3.set(list_index, mutxo_v3).await;
     }
 
+    storage.persist().await;
+
     // Load tables to set schema version
     storage.reset_schema();
     let mut tables = WalletDbTables::load_schema_in_order(storage).await;
@@ -113,13 +116,15 @@ mod migration {
         use crate::protocol::proof_abstractions::timestamp::Timestamp;
         use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
 
-        // This is MonitoredUtxo as it is in v3 schema (with payment_id).
+        // This is MonitoredUtxo as it is in v3/v4 schema (with payment_id).
+        // Must match production MonitoredUtxo exactly.
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub(in super::super) struct MonitoredUtxo {
             pub utxo: Utxo,
             pub aocl_leaf_index: u64,
             pub sender_randomness: Digest,
             pub receiver_preimage: Digest,
+            #[serde(default)]
             pub payment_id: BFieldElement,
             pub blockhash_to_membership_proof: VecDeque<(Digest, MsMembershipProof)>,
             pub number_of_mps_per_utxo: usize,
