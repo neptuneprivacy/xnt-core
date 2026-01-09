@@ -1245,18 +1245,24 @@ impl RpcApi for RpcServer {
                 data: None,
             })
         })?;
-        let spending_key = state.wallet_state.nth_spending_key(KeyType::Generation, index);
+        let spending_key = state
+            .wallet_state
+            .nth_spending_key(KeyType::Generation, index);
 
         // Get the receiving address and create the subaddress
         let receiving_address = spending_key.to_address();
         match receiving_address {
             ReceivingAddress::Generation(gen_addr) => {
-                let subaddress = GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id))
-                    .map_err(|e| RpcError::Server(JsonError::Custom {
-                        code: -32000,
-                        message: e.to_string(),
-                        data: None,
-                    }))?;
+                let subaddress =
+                    GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id)).map_err(
+                        |e| {
+                            RpcError::Server(JsonError::Custom {
+                                code: -32000,
+                                message: e.to_string(),
+                                data: None,
+                            })
+                        },
+                    )?;
 
                 let address = subaddress.to_bech32m(network).map_err(|e| {
                     RpcError::Server(JsonError::Custom {
@@ -1302,9 +1308,7 @@ impl RpcApi for RpcServer {
 
         let state = self.state.lock_guard().await;
 
-        let indexer = state
-            .utxo_indexer()
-            .ok_or(RpcError::UtxoIndexerDisabled)?;
+        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
 
         let utxos = indexer
             .get_utxos_in_range(
@@ -1325,9 +1329,7 @@ impl RpcApi for RpcServer {
     ) -> RpcResult<GetAoclLeafIndicesResponse> {
         let state = self.state.lock_guard().await;
 
-        let indexer = state
-            .utxo_indexer()
-            .ok_or(RpcError::UtxoIndexerDisabled)?;
+        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
 
         let indices = indexer.get_aocl_leaf_indices(&request.commitments).await;
 
@@ -1340,11 +1342,11 @@ impl RpcApi for RpcServer {
     ) -> RpcResult<GetSpentStatusResponse> {
         let state = self.state.lock_guard().await;
 
-        let indexer = state
-            .utxo_indexer()
-            .ok_or(RpcError::UtxoIndexerDisabled)?;
+        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
 
-        let spent_at_heights = indexer.get_spent_statuses(&request.absolute_index_set_hashes).await;
+        let spent_at_heights = indexer
+            .get_spent_statuses(&request.absolute_index_set_hashes)
+            .await;
 
         Ok(GetSpentStatusResponse { spent_at_heights })
     }
