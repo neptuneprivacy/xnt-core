@@ -1,6 +1,6 @@
 # Exchange Integration Guide
 
-NAPI SDK integration guide for exchanges and custodial wallets.
+NAPI SDK integration guide for exchanges and non-custodial wallets.
 
 **Reference:** See full working example at `xnt-sdk/examples/xnt-sdk-test.ts`
 
