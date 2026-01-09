@@ -69,7 +69,11 @@ impl UtxoNotificationPayload {
         }
     }
 
-    pub(crate) fn with_payment_id(utxo: Utxo, sender_randomness: Digest, payment_id: BFieldElement) -> Self {
+    pub(crate) fn with_payment_id(
+        utxo: Utxo,
+        sender_randomness: Digest,
+        payment_id: BFieldElement,
+    ) -> Self {
         Self {
             utxo,
             sender_randomness,

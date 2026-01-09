@@ -49,7 +49,8 @@ pub(super) const GENERATION_FLAG_U8: u8 = 79;
 pub const GENERATION_FLAG: BFieldElement = BFieldElement::new(GENERATION_FLAG_U8 as u64);
 
 pub(super) const GENERATION_SUBADDR_FLAG_U8: u8 = 179;
-pub const GENERATION_SUBADDR_FLAG: BFieldElement = BFieldElement::new(GENERATION_SUBADDR_FLAG_U8 as u64);
+pub const GENERATION_SUBADDR_FLAG: BFieldElement =
+    BFieldElement::new(GENERATION_SUBADDR_FLAG_U8 as u64);
 
 // note: we serde(skip) fields that can be computed from the seed in order to
 // keep the serialized (including bech32m) representation small.
@@ -304,7 +305,10 @@ impl GenerationSpendingKey {
     /// Decrypt a Generation Address ciphertext
     /// Returns (utxo, sender_randomness, payment_id)
     /// payment_id is 0 for base addresses, non-zero for subaddresses
-    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest, BFieldElement)> {
+    pub(super) fn decrypt(
+        &self,
+        ciphertext: &[BFieldElement],
+    ) -> Result<(Utxo, Digest, BFieldElement)> {
         // parse ciphertext
         ensure!(
             ciphertext.len() > CIPHERTEXT_SIZE_IN_BFES,
@@ -332,7 +336,10 @@ impl GenerationSpendingKey {
 
         // Deserialize base fields (utxo, sender_randomness) - works for both old and new format
         #[derive(serde::Serialize, serde::Deserialize)]
-        struct BasePayload { utxo: Utxo, sender_randomness: Digest }
+        struct BasePayload {
+            utxo: Utxo,
+            sender_randomness: Digest,
+        }
         let base: BasePayload = bincode::deserialize(&plaintext)?;
         let base_size = bincode::serialized_size(&base)? as usize;
 
