@@ -16,6 +16,7 @@ use crate::state::networking_state::BANNED_IPS_DB_NAME;
 use crate::state::shared::BLOCK_FILENAME_EXTENSION;
 use crate::state::shared::BLOCK_FILENAME_PREFIX;
 use crate::state::shared::DIR_NAME_FOR_BLOCKS;
+use crate::state::utxo_indexer::UTXO_INDEXER_DB_NAME;
 use crate::state::wallet::wallet_file::WALLET_DB_NAME;
 use crate::state::wallet::wallet_file::WALLET_DIRECTORY;
 use crate::state::wallet::wallet_file::WALLET_OUTPUT_COUNT_DB_NAME;
@@ -177,6 +178,11 @@ impl DataDirectory {
     pub fn wallet_output_count_database_dir_path(&self) -> PathBuf {
         self.database_dir_path()
             .join(Path::new(WALLET_OUTPUT_COUNT_DB_NAME))
+    }
+
+    pub fn utxo_indexer_database_dir_path(&self) -> PathBuf {
+        self.database_dir_path()
+            .join(Path::new(UTXO_INDEXER_DB_NAME))
     }
 
     ///////////////////////////////////////////////////////////////////////////

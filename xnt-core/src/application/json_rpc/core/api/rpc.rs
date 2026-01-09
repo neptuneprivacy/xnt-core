@@ -70,6 +70,12 @@ pub enum RpcError {
     // Common case errors
     #[error("Invalid address provided in arguments")]
     InvalidAddress,
+
+    #[error("UTXO indexer not enabled")]
+    UtxoIndexerDisabled,
+
+    #[error("Block range exceeds limit of {0}")]
+    BlockRangeExceedsLimit(u64),
 }
 
 pub type RpcResult<T> = Result<T, RpcError>;
@@ -452,10 +458,7 @@ pub trait RpcApi: Sync + Send {
         request: UnspentUtxosRequest,
     ) -> RpcResult<UnspentUtxosResponse>;
 
-    async fn generate_subaddress(
-        &self,
-        payment_id: u64,
-    ) -> RpcResult<GenerateSubaddressResponse> {
+    async fn generate_subaddress(&self, payment_id: u64) -> RpcResult<GenerateSubaddressResponse> {
         self.generate_subaddress_call(GenerateSubaddressRequest { payment_id })
             .await
     }
@@ -463,4 +466,37 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: GenerateSubaddressRequest,
     ) -> RpcResult<GenerateSubaddressResponse>;
+
+    async fn get_utxos_by_receiver(
+        &self,
+        request: GetUtxosByReceiverRequest,
+    ) -> RpcResult<GetUtxosByReceiverResponse> {
+        self.get_utxos_by_receiver_call(request).await
+    }
+    async fn get_utxos_by_receiver_call(
+        &self,
+        request: GetUtxosByReceiverRequest,
+    ) -> RpcResult<GetUtxosByReceiverResponse>;
+
+    async fn get_aocl_leaf_indices(
+        &self,
+        request: GetAoclLeafIndicesRequest,
+    ) -> RpcResult<GetAoclLeafIndicesResponse> {
+        self.get_aocl_leaf_indices_call(request).await
+    }
+    async fn get_aocl_leaf_indices_call(
+        &self,
+        request: GetAoclLeafIndicesRequest,
+    ) -> RpcResult<GetAoclLeafIndicesResponse>;
+
+    async fn get_spent_status(
+        &self,
+        request: GetSpentStatusRequest,
+    ) -> RpcResult<GetSpentStatusResponse> {
+        self.get_spent_status_call(request).await
+    }
+    async fn get_spent_status_call(
+        &self,
+        request: GetSpentStatusRequest,
+    ) -> RpcResult<GetSpentStatusResponse>;
 }

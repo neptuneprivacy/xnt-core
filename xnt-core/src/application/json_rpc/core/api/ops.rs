@@ -156,6 +156,15 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Wallet)]
     GenerateSubaddress,
+
+    #[namespace(Namespace::Archival)]
+    GetUtxosByReceiver,
+
+    #[namespace(Namespace::Archival)]
+    GetAoclLeafIndices,
+
+    #[namespace(Namespace::Archival)]
+    GetSpentStatus,
 }
 
 #[cfg(test)]

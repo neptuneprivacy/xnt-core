@@ -601,6 +601,10 @@ pub struct Args {
     /// - Misconfigurations leading to unexpected or unsafe behavior.
     #[clap(long)]
     pub unsafe_rpc: bool,
+
+    /// Enable UTXO indexer for offline signing queries.
+    #[clap(long)]
+    pub utxo_indexer: bool,
 }
 
 impl Default for Args {

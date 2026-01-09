@@ -1245,18 +1245,24 @@ impl RpcApi for RpcServer {
                 data: None,
             })
         })?;
-        let spending_key = state.wallet_state.nth_spending_key(KeyType::Generation, index);
+        let spending_key = state
+            .wallet_state
+            .nth_spending_key(KeyType::Generation, index);
 
         // Get the receiving address and create the subaddress
         let receiving_address = spending_key.to_address();
         match receiving_address {
             ReceivingAddress::Generation(gen_addr) => {
-                let subaddress = GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id))
-                    .map_err(|e| RpcError::Server(JsonError::Custom {
-                        code: -32000,
-                        message: e.to_string(),
-                        data: None,
-                    }))?;
+                let subaddress =
+                    GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id)).map_err(
+                        |e| {
+                            RpcError::Server(JsonError::Custom {
+                                code: -32000,
+                                message: e.to_string(),
+                                data: None,
+                            })
+                        },
+                    )?;
 
                 let address = subaddress.to_bech32m(network).map_err(|e| {
                     RpcError::Server(JsonError::Custom {
@@ -1286,6 +1292,63 @@ impl RpcApi for RpcServer {
                 data: None,
             })),
         }
+    }
+
+    async fn get_utxos_by_receiver_call(
+        &self,
+        request: GetUtxosByReceiverRequest,
+    ) -> RpcResult<GetUtxosByReceiverResponse> {
+        const MAX_BLOCK_RANGE: u64 = 10000;
+
+        let from = u64::from(request.from_block_height);
+        let to = u64::from(request.to_block_height);
+        if to > from && (to - from) > MAX_BLOCK_RANGE {
+            return Err(RpcError::BlockRangeExceedsLimit(MAX_BLOCK_RANGE));
+        }
+
+        let state = self.state.lock_guard().await;
+
+        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
+
+        let utxos = indexer
+            .get_utxos_in_range(
+                &request.receiver_id_hash,
+                request.from_block_height,
+                request.to_block_height,
+            )
+            .await;
+
+        Ok(GetUtxosByReceiverResponse {
+            utxos: utxos.into_iter().map(RpcIndexedUtxo::from).collect(),
+        })
+    }
+
+    async fn get_aocl_leaf_indices_call(
+        &self,
+        request: GetAoclLeafIndicesRequest,
+    ) -> RpcResult<GetAoclLeafIndicesResponse> {
+        let state = self.state.lock_guard().await;
+
+        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
+
+        let indices = indexer.get_aocl_leaf_indices(&request.commitments).await;
+
+        Ok(GetAoclLeafIndicesResponse { indices })
+    }
+
+    async fn get_spent_status_call(
+        &self,
+        request: GetSpentStatusRequest,
+    ) -> RpcResult<GetSpentStatusResponse> {
+        let state = self.state.lock_guard().await;
+
+        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
+
+        let spent_at_heights = indexer
+            .get_spent_statuses(&request.absolute_index_set_hashes)
+            .await;
+
+        Ok(GetSpentStatusResponse { spent_at_heights })
     }
 }
 

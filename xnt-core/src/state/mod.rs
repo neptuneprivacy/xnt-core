@@ -7,6 +7,7 @@ pub mod mining;
 pub mod networking_state;
 pub mod shared;
 pub mod transaction;
+pub mod utxo_indexer;
 pub mod wallet;
 
 use std::cmp::max;
@@ -36,6 +37,7 @@ use networking_state::NetworkingState;
 use num_traits::CheckedSub;
 use num_traits::Zero;
 use tasm_lib::triton_vm::prelude::*;
+use tasm_lib::twenty_first::prelude::Mmr;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 use tracing::debug;
 use tracing::info;
@@ -608,6 +610,8 @@ pub struct GlobalState {
     /// The `mining_state` can be updated by main task, mining task, or RPC server.
     pub mining_state: MiningState,
 
+    utxo_indexer: Option<utxo_indexer::UtxoIndexerDatabase>,
+
     /// Force wallet to maintain its own membership proofs. These membership
     /// proofs will otherwise be read from the archival mutator set.
     #[cfg(test)]
@@ -684,7 +688,29 @@ impl GlobalState {
             chain.light_state(),
         );
 
-        Ok(Self::new(wallet_state, chain, net, cli, mempool))
+        // Initialize UTXO indexer if enabled via CLI flag
+        let utxo_indexer = if cli.utxo_indexer {
+            match Self::initialize_utxo_indexer(&data_directory).await {
+                Ok(indexer) => {
+                    info!("UTXO indexer initialized successfully");
+                    Some(indexer)
+                }
+                Err(e) => {
+                    bail!("Failed to initialize UTXO indexer: {e}");
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self::new_with_indexer(
+            wallet_state,
+            chain,
+            net,
+            cli,
+            mempool,
+            utxo_indexer,
+        ))
     }
 
     pub fn new(
@@ -694,6 +720,17 @@ impl GlobalState {
         cli: cli_args::Args,
         mempool: Mempool,
     ) -> Self {
+        Self::new_with_indexer(wallet_state, chain, net, cli, mempool, None)
+    }
+
+    pub fn new_with_indexer(
+        wallet_state: WalletState,
+        chain: BlockchainState,
+        net: NetworkingState,
+        cli: cli_args::Args,
+        mempool: Mempool,
+        utxo_indexer: Option<utxo_indexer::UtxoIndexerDatabase>,
+    ) -> Self {
         Self {
             wallet_state,
             chain,
@@ -701,6 +738,7 @@ impl GlobalState {
             cli,
             mempool,
             mining_state: MiningState::default(),
+            utxo_indexer,
             #[cfg(test)]
             force_wallet_membership_proof_maintance: false,
         }
@@ -1729,8 +1767,11 @@ impl GlobalState {
             .persist()
             .await;
 
-        // flush peer_standings
         self.net.peer_databases.peer_standings.flush().await;
+
+        if let Some(indexer) = self.utxo_indexer.as_mut() {
+            indexer.persist().await;
+        }
 
         debug!("Flushed all databases");
 
@@ -1813,7 +1854,9 @@ impl GlobalState {
     async fn set_new_tip_internal(&mut self, new_tip: Block) -> Result<Vec<MempoolUpdateJob>> {
         crate::macros::log_scope_duration!();
 
-        // Update archival state
+        let old_tip_height = self.chain.light_state().header().height;
+        let old_tip_digest = self.chain.light_state().hash();
+
         self.chain
             .archival_state_mut()
             .write_block_as_tip(&new_tip)
@@ -1831,6 +1874,35 @@ impl GlobalState {
             .await?;
 
         *self.chain.light_state_mut() = std::sync::Arc::new(new_tip.clone());
+
+        if let Some(indexer) = self.utxo_indexer.as_mut() {
+            let new_tip_height = new_tip.kernel.header.height;
+            let new_tip_digest = new_tip.hash();
+
+            let is_reorg = new_tip_height <= old_tip_height && new_tip_digest != old_tip_digest;
+            if is_reorg {
+                debug!("UTXO indexer: reorg, marking {} orphaned", old_tip_digest);
+                indexer.handle_reorg(vec![old_tip_digest]).await;
+            }
+
+            let prev_aocl_len = self
+                .chain
+                .archival_state()
+                .get_tip_parent()
+                .await
+                .and_then(|parent| parent.mutator_set_accumulator_after().ok())
+                .map(|msa| msa.aocl.num_leafs())
+                .unwrap_or(0);
+
+            let indexed_count = indexer.index_block(&new_tip, prev_aocl_len).await;
+            indexer.persist().await;
+
+            trace!(
+                "UTXO indexer: indexed {} outputs at height {}",
+                indexed_count,
+                new_tip_height
+            );
+        }
 
         // Update mempool with UTXOs from this block. This is done by
         // removing all transaction that became invalid/was mined by this
@@ -2082,6 +2154,144 @@ impl GlobalState {
     #[inline]
     pub fn cli(&self) -> &cli_args::Args {
         &self.cli
+    }
+
+    #[inline]
+    pub fn utxo_indexer(&self) -> Option<&utxo_indexer::UtxoIndexerDatabase> {
+        self.utxo_indexer.as_ref()
+    }
+
+    #[inline]
+    pub fn utxo_indexer_mut(&mut self) -> Option<&mut utxo_indexer::UtxoIndexerDatabase> {
+        self.utxo_indexer.as_mut()
+    }
+
+    async fn initialize_utxo_indexer(
+        data_directory: &DataDirectory,
+    ) -> Result<utxo_indexer::UtxoIndexerDatabase> {
+        use crate::application::database::create_db_if_missing;
+        use crate::application::database::NeptuneLevelDb;
+
+        let db_path = data_directory.utxo_indexer_database_dir_path();
+        DataDirectory::create_dir_if_not_exists(&db_path).await?;
+
+        debug!("Opening UTXO indexer database at: {}", db_path.display());
+
+        let db = NeptuneLevelDb::new(&db_path, &create_db_if_missing()).await?;
+
+        let indexer = utxo_indexer::UtxoIndexerDatabase::try_connect_and_migrate(db)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        debug!(
+            "UTXO indexer connected. Sync height: {:?}",
+            indexer.get_sync_height()
+        );
+
+        Ok(indexer)
+    }
+
+    pub async fn sync_utxo_indexer_to_tip(&mut self) -> Result<u64> {
+        let Some(indexer) = self.utxo_indexer.as_mut() else {
+            return Ok(0);
+        };
+
+        let tip_height = self.chain.light_state().header().height;
+        let sync_height = indexer.get_sync_height();
+
+        if sync_height >= tip_height {
+            debug!(
+                "UTXO indexer already synced to tip (height {})",
+                tip_height
+            );
+            return Ok(0);
+        }
+
+        let start_height = if sync_height.is_genesis() && sync_height == BlockHeight::genesis() {
+            BlockHeight::genesis()
+        } else {
+            sync_height.next()
+        };
+
+        let total_blocks = u64::from(tip_height) - u64::from(start_height) + 1;
+        info!(
+            "Syncing UTXO indexer from height {} to {} ({} blocks)",
+            start_height, tip_height, total_blocks
+        );
+
+        let mut blocks_indexed = 0u64;
+        let mut current_height = start_height;
+        let mut prev_aocl_len = 0u64;
+
+        if !current_height.is_genesis() {
+            let parent_height: u64 = u64::from(current_height).saturating_sub(1);
+            if let Some(parent_digest) = self
+                .chain
+                .archival_state()
+                .archival_block_mmr
+                .ammr()
+                .try_get_leaf(parent_height)
+                .await
+            {
+                if let Some(parent_block) =
+                    self.chain.archival_state().get_block(parent_digest).await?
+                {
+                    prev_aocl_len = parent_block
+                        .mutator_set_accumulator_after()
+                        .map(|msa| msa.aocl.num_leafs())
+                        .unwrap_or(0);
+                }
+            }
+        }
+
+        while current_height <= tip_height {
+            let block_height_u64: u64 = current_height.into();
+            let Some(block_digest) = self
+                .chain
+                .archival_state()
+                .archival_block_mmr
+                .ammr()
+                .try_get_leaf(block_height_u64)
+                .await
+            else {
+                warn!("Could not find block at height {}", current_height);
+                break;
+            };
+
+            let Some(block) = self.chain.archival_state().get_block(block_digest).await? else {
+                warn!("Could not load block {}", block_digest);
+                break;
+            };
+
+            indexer.index_block_batch(&block, prev_aocl_len).await;
+
+            // Get accurate AOCL length after this block for next iteration
+            prev_aocl_len = block
+                .mutator_set_accumulator_after()
+                .map(|msa| msa.aocl.num_leafs())
+                .unwrap_or(prev_aocl_len);
+            blocks_indexed += 1;
+            current_height = current_height.next();
+
+            if blocks_indexed % 1000 == 0 {
+                indexer.set_sync_height(current_height.previous().unwrap_or(current_height)).await;
+                indexer.persist().await;
+                info!(
+                    "UTXO indexer sync progress: {} / {} blocks",
+                    blocks_indexed, total_blocks
+                );
+            }
+        }
+
+        indexer.set_sync_height(current_height.previous().unwrap_or(start_height)).await;
+        indexer.persist().await;
+
+        info!(
+            "UTXO indexer synced {} blocks to height {}",
+            blocks_indexed, tip_height
+        );
+
+        Ok(blocks_indexed)
     }
 
     pub(crate) fn proving_capability(&self) -> TxProvingCapability {
