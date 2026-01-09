@@ -117,24 +117,34 @@ Submits a proven transaction to the mempool for broadcast.
 
 **Parameters**
 
-1. `transaction` - string, hex-encoded serialized transaction (bincode format)
+1. `transaction` - object, full transaction with proof:
+   - `kernel` - object, transaction kernel
+   - `proof` - object, transaction proof (SingleProof or ProofCollection)
 
 **Returns**
 
-`accepted` - boolean, true if transaction was accepted
+`success` - boolean, true if transaction was accepted
+
+**Errors**
+
+- `InvalidTransaction` - validation failed
+- `CoinbaseTransaction` - coinbase not allowed
+- `FeeNegative` - negative fee
+- `FutureDated` - timestamp too far in future
+- `NotConfirmable` - invalid mutator set state
 
 **Example**
 
-```
+```json
 // Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"mempool_submitTransaction","params":["0x...hex_encoded_tx..."],"id":1}'
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"mempool_submitTransaction","params":[{"kernel":{...},"proof":{...}}],"id":1}'
 
 // Result
 {
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "accepted": true
+    "success": true
   }
 }
 ```

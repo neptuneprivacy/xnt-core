@@ -537,44 +537,6 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
 
 ---
 
-## wallet_submitTransaction
-
-Submits a pre-built transaction.
-
-**Parameters**
-
-1. `transaction` - object, full transaction with proof
-
-**Returns**
-
-`success` - boolean, true if accepted
-
-**Errors**
-
-- `InvalidTransaction` - validation failed
-- `CoinbaseTransaction` - coinbase not allowed
-- `FeeNegative` - negative fee
-- `FutureDated` - timestamp too far in future
-- `NotConfirmable` - invalid mutator set state
-
-**Example**
-
-```
-// Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"wallet_submitTransaction","params":[{"kernel":{...},"proof":{...}}],"id":1}'
-
-// Result
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "success": true
-  }
-}
-```
-
----
-
 ## wallet_countSentTransactionsAtBlock
 
 Counts sent transactions at a block.
