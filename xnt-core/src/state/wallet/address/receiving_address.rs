@@ -94,6 +94,14 @@ impl ReceivingAddress {
         }
     }
 
+    /// Get payment_id if this is a subaddress
+    pub fn payment_id(&self) -> Option<u64> {
+        match self {
+            Self::GenerationSubAddr(a) => Some(a.payment_id_u64()),
+            _ => None,
+        }
+    }
+
     /// generates a [Announcement] for an output Utxo
     ///
     /// The announcement contains a [`Vec<BFieldElement>`] with fields:

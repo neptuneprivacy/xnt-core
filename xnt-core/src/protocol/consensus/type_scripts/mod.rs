@@ -76,7 +76,7 @@ pub struct TypeScriptAndWitness {
 }
 
 impl TypeScriptAndWitness {
-    pub(crate) fn new_with_nondeterminism(program: Program, witness: NonDeterminism) -> Self {
+    pub fn new_with_nondeterminism(program: Program, witness: NonDeterminism) -> Self {
         Self {
             program,
             nd_memory: witness.ram.into_iter().collect(),

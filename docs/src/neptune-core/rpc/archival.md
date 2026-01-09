@@ -423,3 +423,81 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
   }
 }
 ```
+
+---
+
+## archival_restoreMembershipProof
+
+Restores membership proof for a UTXO given its commitment data.
+
+**Parameters**
+
+1. `utxoHash` - string, 40-char hex UTXO hash
+2. `senderRandomness` - string, 40-char hex sender randomness
+3. `receiverPreimage` - string, 40-char hex receiver preimage
+4. `aoclIndex` - number, AOCL leaf index
+
+**Returns**
+
+`proof` - object, membership proof (bincode-serialized, hex-encoded)
+
+---
+
+## archival_getUtxosByReceiver
+
+Fetches UTXOs for a receiver within a block range. Used by light wallets.
+
+**Parameters**
+
+1. `receiverIdHash` - string, 40-char hex hash of receiver ID
+2. `fromBlockHeight` - number, start of block range
+3. `toBlockHeight` - number, end of block range
+
+**Returns**
+
+`utxos` - array of objects containing:
+- `blockHeight` - number, block where UTXO was created
+- `blockDigest` - string, hex block hash
+- `ciphertext` - string, hex-encoded encrypted UTXO data
+
+---
+
+## archival_getAoclLeafIndices
+
+Gets AOCL leaf indices for multiple UTXO commitments.
+
+**Parameters**
+
+1. `commitments` - array of strings, hex commitment hashes
+
+**Returns**
+
+`indices` - array of numbers, AOCL indices (-1 if not found)
+
+---
+
+## archival_getSpentStatus
+
+Checks spent status for multiple UTXOs by absolute index set hash.
+
+**Parameters**
+
+1. `absoluteIndexSetHashes` - array of strings, hex absolute index set hashes
+
+**Returns**
+
+`spentHeights` - array of numbers, block height where spent (-1 if unspent)
+
+---
+
+## archival_getArchivalMutatorSet
+
+Returns the current mutator set state.
+
+**Parameters**
+
+None
+
+**Returns**
+
+`mutatorSet` - object, bincode-serialized mutator set (hex-encoded)

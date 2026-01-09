@@ -448,8 +448,17 @@ impl ProverJob {
     ///
     /// note: we do not verify that the path exists. That will occur anyway
     /// when triton-vm-prover is executed.
+    ///
+    /// If TRITON_VM_PROVER_PATH env var is set, uses that path instead.
+    /// This is useful for SDK/FFI usage where the executable is not xnt-core.
     #[cfg(not(test))]
     fn path_to_triton_vm_prover() -> Result<std::path::PathBuf, std::io::Error> {
+        // Check env var first (useful for SDK/FFI/NAPI usage)
+        if let Ok(path) = std::env::var("TRITON_VM_PROVER_PATH") {
+            return Ok(std::path::PathBuf::from(path));
+        }
+
+        // Fall back to same directory as current executable
         let mut exe_path = std::env::current_exe()?;
         exe_path.set_file_name("triton-vm-prover");
         Ok(exe_path)

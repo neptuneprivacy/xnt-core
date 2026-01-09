@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::header::AUTHORIZATION;
 use axum::http::HeaderMap;
@@ -42,8 +43,10 @@ impl RpcServer {
             auth: self.rpc_auth.clone(),
         };
 
+        // 50 MB limit to accommodate ProofCollection transactions (~20 MB)
         let app = Router::new()
             .route("/", post(Self::rpc_handler))
+            .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
             .with_state(state);
 
         axum::serve(listener, app).await.unwrap();

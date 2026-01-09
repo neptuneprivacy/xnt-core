@@ -575,36 +575,6 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
 
 ---
 
-## wallet_restoreMembershipProof
-
-Restores membership proofs for UTXOs.
-
-**Parameters**
-
-1. `absoluteIndexSets` - array, absolute index sets to restore
-
-**Returns**
-
-`snapshot` - object, restored membership snapshot
-
-**Example**
-
-```
-// Request
-curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"wallet_restoreMembershipProof","params":[[...]],"id":1}'
-
-// Result
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "snapshot": { ... }
-  }
-}
-```
-
----
-
 ## wallet_countSentTransactionsAtBlock
 
 Counts sent transactions at a block.

@@ -242,7 +242,7 @@ impl TransactionDetails {
     /// Constructor for TransactionDetails with some sanity checks.
     ///
     /// This fn does not perform any validation.  use validate() instead.
-    pub(crate) fn new(
+    pub fn new(
         tx_inputs: impl Into<TxInputList>,
         tx_outputs: impl Into<TxOutputList>,
         fee: NativeCurrencyAmount,

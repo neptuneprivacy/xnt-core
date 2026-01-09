@@ -111,6 +111,36 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
 
 ---
 
+## mempool_submitTransaction
+
+Submits a proven transaction to the mempool for broadcast.
+
+**Parameters**
+
+1. `transaction` - string, hex-encoded serialized transaction (bincode format)
+
+**Returns**
+
+`accepted` - boolean, true if transaction was accepted
+
+**Example**
+
+```
+// Request
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"mempool_submitTransaction","params":["0x...hex_encoded_tx..."],"id":1}'
+
+// Result
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "accepted": true
+  }
+}
+```
+
+---
+
 ## Tracking Transactions
 
 Transaction IDs can change when merged. Use `outputs` (UTXO commitments) for tracking:

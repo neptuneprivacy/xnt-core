@@ -1350,6 +1350,19 @@ impl RpcApi for RpcServer {
 
         Ok(GetSpentStatusResponse { spent_at_heights })
     }
+
+    async fn get_archival_mutator_set_call(
+        &self,
+        _: GetArchivalMutatorSetRequest,
+    ) -> RpcResult<GetArchivalMutatorSetResponse> {
+        let state = self.state.lock_guard().await;
+        let archival_mutator_set = state.chain.archival_state().archival_mutator_set.ams();
+        let accumulator = archival_mutator_set.accumulator().await;
+
+        Ok(GetArchivalMutatorSetResponse {
+            archival_mutator_set: (&accumulator).into(),
+        })
+    }
 }
 
 #[cfg(test)]

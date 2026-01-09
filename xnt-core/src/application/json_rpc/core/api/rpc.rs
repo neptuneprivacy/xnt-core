@@ -310,18 +310,6 @@ pub trait RpcApi: Sync + Send {
         request: RestoreMembershipProofRequest,
     ) -> RpcResult<RestoreMembershipProofResponse>;
 
-    async fn submit_transaction(
-        &self,
-        transaction: RpcTransaction,
-    ) -> RpcResult<SubmitTransactionResponse> {
-        self.submit_transaction_call(SubmitTransactionRequest { transaction })
-            .await
-    }
-    async fn submit_transaction_call(
-        &self,
-        request: SubmitTransactionRequest,
-    ) -> RpcResult<SubmitTransactionResponse>;
-
     /* Mining */
 
     async fn get_block_template(
@@ -382,6 +370,21 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: GetTransactionProofRequest,
     ) -> RpcResult<GetTransactionProofResponse>;
+
+    async fn submit_transaction(
+        &self,
+        transaction: RpcTransaction,
+    ) -> RpcResult<SubmitTransactionResponse> {
+        self.submit_transaction_call(SubmitTransactionRequest { transaction })
+            .await
+    }
+    async fn submit_transaction_call(
+        &self,
+        request: SubmitTransactionRequest,
+    ) -> RpcResult<SubmitTransactionResponse>;
+
+    /* Wallet */
+
     async fn generate_address(&self) -> RpcResult<GenerateAddressResponse> {
         self.generate_address_call(GenerateAddressRequest {}).await
     }
@@ -499,4 +502,13 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: GetSpentStatusRequest,
     ) -> RpcResult<GetSpentStatusResponse>;
+
+    async fn get_archival_mutator_set(&self) -> RpcResult<GetArchivalMutatorSetResponse> {
+        self.get_archival_mutator_set_call(GetArchivalMutatorSetRequest {})
+            .await
+    }
+    async fn get_archival_mutator_set_call(
+        &self,
+        request: GetArchivalMutatorSetRequest,
+    ) -> RpcResult<GetArchivalMutatorSetResponse>;
 }
