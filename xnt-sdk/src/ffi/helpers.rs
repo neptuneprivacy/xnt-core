@@ -5,6 +5,8 @@
 use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
 use std::ffi::c_char;
 
+use super::types::XntDigest;
+
 /// Convert Vec to raw pointer, returning null if empty
 pub fn vec_to_ptr<T>(v: Vec<T>) -> *mut T {
     if v.is_empty() {
@@ -39,15 +41,21 @@ pub fn parse_bfes_le(bytes: &[u8]) -> Vec<BFieldElement> {
     bytes
         .chunks(8)
         .map(|chunk| {
-            let arr: [u8; 8] = chunk.try_into().unwrap();
+            let mut arr = [0u8; 8];
+            arr[..chunk.len()].copy_from_slice(chunk);
             BFieldElement::new(u64::from_le_bytes(arr))
         })
         .collect()
 }
 
-/// Read slice from FFI pointer (unsafe, caller must ensure validity)
+/// Read slice from FFI pointer
+///
+/// # Safety
+/// - `ptr` must be valid for `len` elements
+/// - The memory must remain valid for the lifetime `'a`
+/// - Caller must ensure no mutable aliases exist
 #[inline]
-pub unsafe fn read_slice<T>(ptr: *const T, len: usize) -> &'static [T] {
+pub unsafe fn read_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     if ptr.is_null() || len == 0 {
         &[]
     } else {
@@ -56,12 +64,21 @@ pub unsafe fn read_slice<T>(ptr: *const T, len: usize) -> &'static [T] {
 }
 
 /// Read mutable slice from FFI pointer
+///
+/// # Safety
+/// - `ptr` must be valid for `len` elements
+/// - The memory must remain valid for the lifetime `'a`
+/// - Caller must ensure exclusive access
 #[inline]
-pub unsafe fn read_slice_mut<T>(ptr: *mut T, len: usize) -> &'static mut [T] {
-    std::slice::from_raw_parts_mut(ptr, len)
+pub unsafe fn read_slice_mut<'a, T>(ptr: *mut T, len: usize) -> &'a mut [T] {
+    if ptr.is_null() || len == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(ptr, len)
+    }
 }
 
 /// Parse XntDigest array to Vec<Digest>
-pub fn parse_digests(digests: &[crate::types::XntDigest]) -> Vec<neptune_privacy::prelude::twenty_first::prelude::Digest> {
+pub fn parse_digests(digests: &[XntDigest]) -> Vec<neptune_privacy::prelude::twenty_first::prelude::Digest> {
     digests.iter().map(|d| d.to_digest()).collect()
 }

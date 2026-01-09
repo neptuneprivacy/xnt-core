@@ -228,7 +228,7 @@ impl Utxo {
     ///
     /// Does nothing if there is a time lock present already whose release date
     /// is later than the argument.
-    pub(crate) fn with_time_lock(self, release_date: Timestamp) -> Self {
+    pub fn with_time_lock(self, release_date: Timestamp) -> Self {
         if self.release_date().is_some_and(|x| x >= release_date) {
             self
         } else {

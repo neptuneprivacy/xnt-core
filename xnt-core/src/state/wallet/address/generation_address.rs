@@ -195,6 +195,11 @@ impl GenerationSubAddress {
     pub fn encryption_key(&self) -> lattice::kem::PublicKey {
         self.base.encryption_key
     }
+
+    /// Get payment_id as u64
+    pub fn payment_id_u64(&self) -> u64 {
+        self.payment_id.value()
+    }
 }
 
 // Use macro for bech32m serialization

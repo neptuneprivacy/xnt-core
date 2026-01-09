@@ -27,15 +27,29 @@ impl ByteBuffer {
         std::mem::forget(boxed);
         Self { data: ptr, len }
     }
+
+    pub fn into_ptr(self) -> *mut Self {
+        Box::into_raw(Box::new(self))
+    }
 }
 
 /// Free a byte buffer allocated by xnt-ffi
+///
+/// # Safety
+/// - Must only be called once per buffer
+/// - Caller must NOT use the buffer after calling this function
+/// - Calling twice on same buffer causes undefined behavior (double-free)
 #[no_mangle]
 pub extern "C" fn xnt_bytes_free(buf: ByteBuffer) {
     free_vec!(buf.data, buf.len);
 }
 
 /// Free a string allocated by xnt-ffi
+///
+/// # Safety
+/// - Must only be called once per string
+/// - Caller must NOT use the string after calling this function
+/// - Calling twice on same pointer causes undefined behavior (double-free)
 #[no_mangle]
 pub extern "C" fn xnt_string_free(ptr: *mut c_char) {
     if !ptr.is_null() {
@@ -63,6 +77,10 @@ impl XntDigest {
 
     pub fn from_digest(d: Digest) -> Self {
         Self { bytes: d.into() }
+    }
+
+    pub fn from_bytes(bytes: [u8; 40]) -> Self {
+        Self { bytes }
     }
 
     pub fn from_hex(hex_str: &str) -> Option<Self> {
@@ -127,6 +145,11 @@ impl std::ops::DerefMut for XntDigest {
 }
 
 /// Free ByteBuffer pointer allocated by xnt-ffi
+///
+/// # Safety
+/// - Must only be called once per buffer
+/// - Caller must NOT use the buffer after calling this function
+/// - Calling twice on same pointer causes undefined behavior (double-free)
 #[no_mangle]
 pub extern "C" fn xnt_buffer_free(buf: *mut ByteBuffer) {
     if !buf.is_null() {

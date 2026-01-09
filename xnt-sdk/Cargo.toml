@@ -1,0 +1,52 @@
+[package]
+name = "xnt-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Multi-platform SDK for Neptune Privacy - C FFI, Node.js (NAPI), and WASM"
+
+[lib]
+# cdylib for both FFI (.so/.dylib/.dll) and napi (.node)
+# staticlib for static linking (FFI only)
+# rlib for Rust tests
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[example]]
+name = "xnt-sdk-test"
+path = "examples/xnt-sdk-test.rs"
+required-features = ["ffi"]
+
+[features]
+default = ["ffi"]
+# Pure C FFI with manual memory management (*_free functions)
+ffi = ["dep:cbindgen"]
+# Node.js native module via napi-rs (automatic GC)
+napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+
+[dependencies]
+neptune-privacy = { path = "../xnt-core" }
+libc = "0.2"
+thiserror = "1.0"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1.0"
+hex = "0.4"
+bincode = "1.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rand = "0.9"
+bip39 = { package = "tiny-bip39", version = "1.0" }
+sha3 = "0.10"
+aes-gcm = "0.10"
+aead = "0.5"
+num-traits = "0.2"
+zeroize = "1.8"
+
+# napi-rs dependencies (optional)
+napi = { version = "2", optional = true, default-features = false, features = ["napi6", "tokio_rt"] }
+napi-derive = { version = "2", optional = true }
+
+[build-dependencies]
+cbindgen = { version = "0.27", optional = true }
+napi-build = { version = "2", optional = true }
+
+[lints]
+workspace = true

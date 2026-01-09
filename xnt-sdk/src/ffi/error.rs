@@ -56,3 +56,13 @@ pub extern "C" fn xnt_get_last_error() -> *const c_char {
 pub extern "C" fn xnt_clear_error() {
     clear_last_error();
 }
+
+/// Get library version
+#[no_mangle]
+pub extern "C" fn xnt_version() -> *const c_char {
+    static VERSION: &[u8] = b"0.1.0\0";
+    VERSION.as_ptr() as *const c_char
+}
+
+// Type aliases for backwards compatibility
+pub type WalletHandle = super::seed::WalletEntropyHandle;

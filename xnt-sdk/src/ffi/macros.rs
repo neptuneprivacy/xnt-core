@@ -28,7 +28,7 @@ macro_rules! ffi_cstring {
     };
     ($str:expr, $msg:expr) => {
         std::ffi::CString::new($str).map(|c| c.into_raw()).unwrap_or_else(|e| {
-            $crate::error::set_last_error(&format!("{}: {e}", $msg));
+            $crate::ffi::error::set_last_error(&format!("{}: {e}", $msg));
             std::ptr::null_mut()
         })
     };
@@ -42,7 +42,7 @@ macro_rules! rpc_try {
         match $crate::json_rpc::rpc_call($client, $method, $params) {
             Ok(r) => r,
             Err(e) => {
-                $crate::error::set_last_error(&e);
+                $crate::ffi::error::set_last_error(&e);
                 return $null;
             }
         }
@@ -71,7 +71,7 @@ macro_rules! free_vec {
 macro_rules! check_null {
     ($ptr:expr, $msg:expr, $ret:expr) => {
         if $ptr.is_null() {
-            $crate::error::set_last_error($msg);
+            $crate::ffi::error::set_last_error($msg);
             return $ret;
         }
     };
@@ -81,7 +81,7 @@ macro_rules! check_null {
     };
     // Shorthand for XntErrorCode return
     ($ptr:expr) => {
-        check_null!($ptr, "null pointer", $crate::error::XntErrorCode::NullPointer)
+        check_null!($ptr, "null pointer", $crate::ffi::error::XntErrorCode::NullPointer)
     };
 }
 
@@ -90,10 +90,10 @@ macro_rules! check_null {
 #[macro_export]
 macro_rules! ffi_begin {
     () => {
-        $crate::error::clear_last_error();
+        $crate::ffi::error::clear_last_error();
     };
     ($($ptr:expr),+ $(,)?) => {
-        $crate::error::clear_last_error();
+        $crate::ffi::error::clear_last_error();
         $(
             check_null!($ptr);
         )+
@@ -108,7 +108,7 @@ macro_rules! ffi_result {
         match $result {
             Ok(val) => Box::into_raw(Box::new($handle(val))),
             Err(e) => {
-                $crate::error::set_last_error(&format!("{e}"));
+                $crate::ffi::error::set_last_error(&format!("{e}"));
                 std::ptr::null_mut()
             }
         }
@@ -117,7 +117,7 @@ macro_rules! ffi_result {
         match $result {
             Ok(val) => Box::into_raw(Box::new($handle(val))),
             Err(e) => {
-                $crate::error::set_last_error(&format!("{}: {e}", $msg));
+                $crate::ffi::error::set_last_error(&format!("{}: {e}", $msg));
                 std::ptr::null_mut()
             }
         }
@@ -130,7 +130,7 @@ macro_rules! ffi_result {
 macro_rules! copy_bytes_out {
     ($src:expr, $dst:expr, $len:expr) => {{
         unsafe { std::ptr::copy_nonoverlapping($src.as_ptr(), $dst, $len) };
-        $crate::error::XntErrorCode::Ok
+        $crate::ffi::error::XntErrorCode::Ok
     }};
 }
 
@@ -156,13 +156,13 @@ macro_rules! ffi_mut {
 #[macro_export]
 macro_rules! ffi_buffer {
     ($vec:expr) => {
-        Box::into_raw(Box::new($crate::types::ByteBuffer::from_vec($vec)))
+        $crate::ffi::types::ByteBuffer::from_vec($vec).into_ptr()
     };
     ($result:expr, $msg:expr) => {
         match $result {
-            Ok(vec) => Box::into_raw(Box::new($crate::types::ByteBuffer::from_vec(vec))),
+            Ok(vec) => $crate::ffi::types::ByteBuffer::from_vec(vec).into_ptr(),
             Err(e) => {
-                $crate::error::set_last_error(&format!("{}: {e}", $msg));
+                $crate::ffi::error::set_last_error(&format!("{}: {e}", $msg));
                 std::ptr::null_mut()
             }
         }
@@ -189,7 +189,7 @@ macro_rules! rpc_array {
         match $result.get($field) {
             Some(serde_json::Value::Array(arr)) => arr,
             _ => {
-                $crate::error::set_last_error("invalid response format");
+                $crate::ffi::error::set_last_error("invalid response format");
                 return $null;
             }
         }
@@ -202,13 +202,13 @@ macro_rules! rpc_array {
 macro_rules! check_data {
     ($ptr:expr, $len:expr) => {
         if $ptr.is_null() && $len > 0 {
-            $crate::error::set_last_error("data is null");
-            return $crate::error::XntErrorCode::NullPointer;
+            $crate::ffi::error::set_last_error("data is null");
+            return $crate::ffi::error::XntErrorCode::NullPointer;
         }
     };
     ($ptr:expr, $len:expr, $null:expr) => {
         if $ptr.is_null() && $len > 0 {
-            $crate::error::set_last_error("data is null");
+            $crate::ffi::error::set_last_error("data is null");
             return $null;
         }
     };

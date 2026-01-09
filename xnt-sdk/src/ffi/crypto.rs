@@ -9,11 +9,10 @@ use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
 use sha3::digest::{ExtendableOutput, Update};
 use sha3::Shake256;
 
-use crate::error::{set_last_error, XntErrorCode};
-use crate::helpers::{read_bytes, read_slice};
-use crate::types::XntDigest;
+use super::error::{set_last_error, XntErrorCode};
+use super::helpers::{read_bytes, read_slice};
+use super::types::{ByteBuffer, XntDigest};
 
-// === TIP5 Hash ===
 
 /// Hash arbitrary bytes with TIP5, output = 40 bytes (Digest)
 /// out: Buffer to write 40 bytes
@@ -51,16 +50,23 @@ pub extern "C" fn xnt_tip5_hash_digest(digest: *const XntDigest, out: *mut u8) -
     copy_bytes_out!(result, out, 40)
 }
 
-// === SHAKE256 XOF ===
+
+/// Maximum output length for SHAKE256 (1MB) - prevents OOM attacks
+const MAX_SHAKE256_OUTPUT: usize = 1_000_000;
 
 /// SHAKE256 XOF - variable output length
 /// Returns allocated buffer, caller must free with xnt_buffer_free()
 #[no_mangle]
-pub extern "C" fn xnt_shake256(data: *const u8, data_len: usize, output_len: usize) -> *mut crate::types::ByteBuffer {
+pub extern "C" fn xnt_shake256(data: *const u8, data_len: usize, output_len: usize) -> *mut ByteBuffer {
     ffi_begin!();
     check_data!(data, data_len, std::ptr::null_mut());
     if output_len == 0 {
         set_last_error("output_len must be > 0");
+        return std::ptr::null_mut();
+    }
+
+    if output_len > MAX_SHAKE256_OUTPUT {
+        set_last_error("output_len too large (max 1MB)");
         return std::ptr::null_mut();
     }
 
@@ -89,7 +95,6 @@ pub extern "C" fn xnt_shake256_32(data: *const u8, data_len: usize, out: *mut u8
     copy_bytes_out!(result, out, 32)
 }
 
-// === AES-256-GCM ===
 
 /// AES-256-GCM encrypt
 /// key: 32 bytes, nonce: 12 bytes
@@ -100,7 +105,7 @@ pub extern "C" fn xnt_aes256gcm_encrypt(
     nonce: *const u8,
     plaintext: *const u8,
     plaintext_len: usize,
-) -> *mut crate::types::ByteBuffer {
+) -> *mut ByteBuffer {
     ffi_begin!();
     check_null!(key, "key is null");
     check_null!(nonce, "nonce is null");
@@ -110,7 +115,13 @@ pub extern "C" fn xnt_aes256gcm_encrypt(
     let nonce_slice = unsafe { read_slice(nonce, 12) };
     let plaintext_slice = unsafe { read_slice(plaintext, plaintext_len) };
 
-    let cipher = Aes256Gcm::new_from_slice(key_slice).expect("key is 32 bytes");
+    let cipher = match Aes256Gcm::new_from_slice(key_slice) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(&format!("invalid key: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
     match cipher.encrypt(Nonce::from_slice(nonce_slice), plaintext_slice) {
         Ok(ciphertext) => ffi_buffer!(ciphertext),
         Err(e) => {
@@ -129,7 +140,7 @@ pub extern "C" fn xnt_aes256gcm_decrypt(
     nonce: *const u8,
     ciphertext: *const u8,
     ciphertext_len: usize,
-) -> *mut crate::types::ByteBuffer {
+) -> *mut ByteBuffer {
     ffi_begin!();
     check_null!(key, "key is null");
     check_null!(nonce, "nonce is null");
@@ -142,7 +153,13 @@ pub extern "C" fn xnt_aes256gcm_decrypt(
     let nonce_slice = unsafe { read_slice(nonce, 12) };
     let ciphertext_slice = unsafe { read_slice(ciphertext, ciphertext_len) };
 
-    let cipher = Aes256Gcm::new_from_slice(key_slice).expect("key is 32 bytes");
+    let cipher = match Aes256Gcm::new_from_slice(key_slice) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(&format!("invalid key: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
     match cipher.decrypt(Nonce::from_slice(nonce_slice), ciphertext_slice) {
         Ok(plaintext) => ffi_buffer!(plaintext),
         Err(e) => {
@@ -152,44 +169,6 @@ pub extern "C" fn xnt_aes256gcm_decrypt(
     }
 }
 
-// === BFieldElement Encoding ===
-
-/// Convert bytes to BFieldElements encoding
-/// Returns allocated buffer containing BFE values (8 bytes each, little-endian)
-/// Caller must free with xnt_buffer_free()
-#[no_mangle]
-pub extern "C" fn xnt_bytes_to_bfes(data: *const u8, data_len: usize) -> *mut crate::types::ByteBuffer {
-    ffi_begin!();
-
-    let bytes = unsafe { read_slice(data, data_len) };
-    let bfes = bytes_to_bfes(bytes);
-
-    // Serialize BFEs as little-endian u64s
-    let result: Vec<u8> = bfes.iter().flat_map(|bfe| bfe.value().to_le_bytes()).collect();
-    ffi_buffer!(result)
-}
-
-/// Convert BFieldElements back to bytes
-/// bfes_data: Buffer of BFE values (8 bytes each, little-endian)
-/// Returns decoded bytes, caller must free with xnt_buffer_free()
-#[no_mangle]
-pub extern "C" fn xnt_bfes_to_bytes(bfes_data: *const u8, bfes_len: usize) -> *mut crate::types::ByteBuffer {
-    ffi_begin!();
-    if bfes_data.is_null() || bfes_len == 0 {
-        set_last_error("bfes_data is null or empty");
-        return std::ptr::null_mut();
-    }
-    if bfes_len % 8 != 0 {
-        set_last_error("bfes_len must be multiple of 8");
-        return std::ptr::null_mut();
-    }
-
-    let data = unsafe { read_slice(bfes_data, bfes_len) };
-    let bfes = crate::helpers::parse_bfes_le(data);
-    ffi_buffer!(bfes_to_bytes(&bfes), "bfes decode failed")
-}
-
-// === Internal helpers ===
 
 /// Encodes a slice of bytes to a vec of BFieldElements
 fn bytes_to_bfes(bytes: &[u8]) -> Vec<BFieldElement> {
@@ -210,38 +189,4 @@ fn bytes_to_bfes(bytes: &[u8]) -> Vec<BFieldElement> {
         }
     }
     bfes
-}
-
-/// Decodes a slice of BFieldElements to a vec of bytes
-fn bfes_to_bytes(bfes: &[BFieldElement]) -> Result<Vec<u8>, &'static str> {
-    if bfes.is_empty() {
-        return Err("Cannot decode empty byte stream");
-    }
-
-    let length = bfes[0].value() as usize;
-    if length > std::mem::size_of_val(bfes) {
-        return Err("Byte stream shorter than indicated length");
-    }
-
-    let mut bytes: Vec<u8> = Vec::with_capacity(length);
-    let mut skip_top = false;
-    for bfe in bfes.iter().skip(1) {
-        let bfe_bytes = bfe.value().to_be_bytes();
-        if skip_top {
-            bytes.extend_from_slice(&bfe_bytes[4..8]);
-            skip_top = false;
-        } else {
-            bytes.extend_from_slice(&bfe_bytes[0..4]);
-            if bfe_bytes[0..4] == [0xff, 0xff, 0xff, 0xff] {
-                skip_top = true;
-            } else {
-                bytes.extend_from_slice(&bfe_bytes[4..8]);
-            }
-        }
-    }
-
-    if bytes.len() < length {
-        return Err("Decoded fewer bytes than expected");
-    }
-    Ok(bytes[0..length].to_vec())
 }

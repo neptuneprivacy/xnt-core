@@ -106,7 +106,7 @@ pub enum RpcMethods {
     #[namespace(Namespace::Wallet)]
     GetBlocks,
 
-    #[namespace(Namespace::Wallet)]
+    #[namespace(Namespace::Archival)]
     RestoreMembershipProof,
 
     #[namespace(Namespace::Mining)]

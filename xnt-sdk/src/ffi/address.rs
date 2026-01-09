@@ -1,26 +1,22 @@
 //! Address generation FFI
 //!
-//! GenerationReceivingAddress and SubAddress with payment_id support.
+//! Wraps core::Address and core::SubAddress for C FFI.
 
 use std::ffi::c_char;
 
-use neptune_privacy::application::config::network::Network;
-use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
-use neptune_privacy::state::wallet::address::generation_address::{GenerationReceivingAddress, GenerationSubAddress};
-use neptune_privacy::state::wallet::address::ReceivingAddress;
-use neptune_privacy::state::wallet::address::SubAddress;
+use crate::core::{Address, Network, SubAddress};
 
-use crate::error::{set_last_error, XntErrorCode};
-use crate::helpers::parse_cstr;
-use crate::seed::SpendingKeyHandle;
+use super::error::{set_last_error, XntErrorCode};
+use super::helpers::parse_cstr;
+use super::seed::SpendingKeyHandle;
 
-/// Opaque handle to receiving address (Generation or Symmetric)
-pub struct AddressHandle(pub(crate) ReceivingAddress);
+/// Opaque handle to receiving address
+pub struct AddressHandle(pub(crate) Address);
 
 /// Opaque handle to subaddress (address + payment_id)
-pub struct SubAddressHandle(pub(crate) GenerationSubAddress);
+pub struct SubAddressHandle(pub(crate) SubAddress);
 
-/// Network type for address encoding
+/// Network type for address encoding (C-compatible)
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub enum XntNetwork {
@@ -36,7 +32,7 @@ impl From<XntNetwork> for Network {
             XntNetwork::Main => Network::Main,
             XntNetwork::TestnetMock => Network::TestnetMock,
             XntNetwork::RegTest => Network::RegTest,
-            XntNetwork::Testnet => Network::Testnet(0),
+            XntNetwork::Testnet => Network::Testnet,
         }
     }
 }
@@ -54,21 +50,23 @@ pub extern "C" fn xnt_spending_key_to_address(handle: *const SpendingKeyHandle) 
 ffi_free!(xnt_address_free, AddressHandle);
 
 /// Encode address to bech32m string
-/// Caller must free with xnt_string_free()
 #[no_mangle]
 pub extern "C" fn xnt_address_to_bech32(handle: *const AddressHandle, network: XntNetwork) -> *mut c_char {
     ffi_begin!();
     check_null!(handle, "address handle is null");
 
     let addr = ffi_ref!(handle);
-    match addr.0.to_bech32m(network.into()) {
+    match addr.0.to_bech32(network.into()) {
         Ok(s) => ffi_cstring!(s),
         Err(e) => {
-            set_last_error(&format!("bech32m encoding failed: {e}"));
+            set_last_error(&format!("{e}"));
             std::ptr::null_mut()
         }
     }
 }
+
+// Neptune addresses contain full cryptographic data and can be ~4000+ chars
+const MAX_BECH32_LENGTH: usize = 8192;
 
 /// Decode address from bech32m string
 #[no_mangle]
@@ -80,14 +78,21 @@ pub extern "C" fn xnt_address_from_bech32(bech32: *const c_char, network: XntNet
         return std::ptr::null_mut();
     };
 
-    ffi_result!(
-        ReceivingAddress::from_bech32m(&s, network.into()),
-        AddressHandle,
-        "bech32m decoding failed"
-    )
+    if s.len() > MAX_BECH32_LENGTH {
+        set_last_error("bech32 string too long");
+        return std::ptr::null_mut();
+    }
+
+    match Address::from_bech32(&s, network.into()) {
+        Ok(addr) => Box::into_raw(Box::new(AddressHandle(addr))),
+        Err(e) => {
+            set_last_error(&format!("{e}"));
+            std::ptr::null_mut()
+        }
+    }
 }
 
-/// Get lock_script_hash from address (40 bytes = Digest)
+/// Get lock_script_hash from address (40 bytes)
 #[no_mangle]
 pub extern "C" fn xnt_address_lock_script_hash(handle: *const AddressHandle, out: *mut u8) -> XntErrorCode {
     ffi_begin!();
@@ -95,11 +100,11 @@ pub extern "C" fn xnt_address_lock_script_hash(handle: *const AddressHandle, out
     check_null!(out);
 
     let addr = ffi_ref!(handle);
-    let hash: [u8; 40] = addr.0.lock_script_hash().into();
-    copy_bytes_out!(hash, out, 40)
+    let hash = addr.0.lock_script_hash();
+    copy_bytes_out!(hash.bytes, out, 40)
 }
 
-/// Get receiver_identifier from address (8 bytes = BFieldElement)
+/// Get receiver_identifier from address (8 bytes)
 #[no_mangle]
 pub extern "C" fn xnt_address_receiver_id(handle: *const AddressHandle, out: *mut u8) -> XntErrorCode {
     ffi_begin!();
@@ -107,23 +112,21 @@ pub extern "C" fn xnt_address_receiver_id(handle: *const AddressHandle, out: *mu
     check_null!(out);
 
     let addr = ffi_ref!(handle);
-    let bytes = addr.0.receiver_identifier().value().to_le_bytes();
+    let bytes = addr.0.receiver_id().to_le_bytes();
     copy_bytes_out!(bytes, out, 8)
 }
 
-/// Get receiver_identifier from address as hex string
-/// Caller must free with xnt_string_free()
+/// Get receiver_identifier as hex string
 #[no_mangle]
 pub extern "C" fn xnt_address_receiver_id_hex(handle: *const AddressHandle) -> *mut c_char {
     ffi_begin!();
     check_null!(handle, "null pointer");
 
     let addr = ffi_ref!(handle);
-    ffi_cstring!(format!("{:016x}", addr.0.receiver_identifier().value()))
+    ffi_cstring!(addr.0.receiver_id_hex())
 }
 
-/// Get privacy_digest (receiver_postimage) from address (40 bytes)
-/// This is used to compute output commitments
+/// Get privacy_digest from address (40 bytes)
 #[no_mangle]
 pub extern "C" fn xnt_address_privacy_digest(handle: *const AddressHandle, out: *mut u8) -> XntErrorCode {
     ffi_begin!();
@@ -132,37 +135,21 @@ pub extern "C" fn xnt_address_privacy_digest(handle: *const AddressHandle, out: 
 
     let addr = ffi_ref!(handle);
     let digest = addr.0.privacy_digest();
-    let bytes: [u8; 40] = digest.into();
-    copy_bytes_out!(bytes, out, 40)
+    copy_bytes_out!(digest.bytes, out, 40)
 }
 
-// === SubAddress (with payment_id) ===
 
 /// Create subaddress from address with payment_id
-/// payment_id must be non-zero
-/// Only works for Generation addresses
 #[no_mangle]
 pub extern "C" fn xnt_subaddress_create(address: *const AddressHandle, payment_id: u64) -> *mut SubAddressHandle {
     ffi_begin!();
     check_null!(address, "address handle is null");
 
-    if payment_id == 0 {
-        set_last_error("payment_id must be non-zero for subaddress");
-        return std::ptr::null_mut();
-    }
-
     let addr = ffi_ref!(address);
-    // Subaddresses only work for Generation addresses
-    match &addr.0 {
-        ReceivingAddress::Generation(gen_addr) => {
-            ffi_result!(
-                gen_addr.with_payment_id(BFieldElement::new(payment_id)),
-                SubAddressHandle,
-                "subaddress creation failed"
-            )
-        }
-        _ => {
-            set_last_error("subaddress only supported for Generation addresses");
+    match addr.0.with_payment_id(payment_id) {
+        Ok(subaddr) => Box::into_raw(Box::new(SubAddressHandle(subaddr))),
+        Err(e) => {
+            set_last_error(&format!("{e}"));
             std::ptr::null_mut()
         }
     }
@@ -171,17 +158,16 @@ pub extern "C" fn xnt_subaddress_create(address: *const AddressHandle, payment_i
 ffi_free!(xnt_subaddress_free, SubAddressHandle);
 
 /// Encode subaddress to bech32m string
-/// Caller must free with xnt_string_free()
 #[no_mangle]
 pub extern "C" fn xnt_subaddress_to_bech32(handle: *const SubAddressHandle, network: XntNetwork) -> *mut c_char {
     ffi_begin!();
     check_null!(handle, "subaddress handle is null");
 
     let subaddr = ffi_ref!(handle);
-    match subaddr.0.to_bech32m(network.into()) {
+    match subaddr.0.to_bech32(network.into()) {
         Ok(s) => ffi_cstring!(s),
         Err(e) => {
-            set_last_error(&format!("bech32m encoding failed: {e}"));
+            set_last_error(&format!("{e}"));
             std::ptr::null_mut()
         }
     }
@@ -193,5 +179,36 @@ pub extern "C" fn xnt_subaddress_payment_id(handle: *const SubAddressHandle) -> 
     if handle.is_null() {
         return 0;
     }
-    ffi_ref!(handle).0.payment_id().value()
+    ffi_ref!(handle).0.payment_id()
+}
+
+
+use crate::core::ReceivingAddress;
+
+/// Opaque handle to ReceivingAddress - use for transaction outputs
+pub struct ReceivingAddressHandle(pub(crate) ReceivingAddress);
+
+/// Convert Address to ReceivingAddress
+#[no_mangle]
+pub extern "C" fn xnt_address_to_receiving(handle: *const AddressHandle) -> *mut ReceivingAddressHandle {
+    ffi_begin!();
+    check_null!(handle, "null");
+    Box::into_raw(Box::new(ReceivingAddressHandle(ffi_ref!(handle).0.to_receiving_address())))
+}
+
+/// Convert SubAddress to ReceivingAddress
+#[no_mangle]
+pub extern "C" fn xnt_subaddress_to_receiving(handle: *const SubAddressHandle) -> *mut ReceivingAddressHandle {
+    ffi_begin!();
+    check_null!(handle, "null");
+    Box::into_raw(Box::new(ReceivingAddressHandle(ffi_ref!(handle).0.to_receiving_address())))
+}
+
+ffi_free!(xnt_receiving_address_free, ReceivingAddressHandle);
+
+/// Get payment_id (0 = main, non-zero = subaddress)
+#[no_mangle]
+pub extern "C" fn xnt_receiving_address_payment_id(handle: *const ReceivingAddressHandle) -> u64 {
+    if handle.is_null() { return 0; }
+    ffi_ref!(handle).0.payment_id().unwrap_or(0)
 }

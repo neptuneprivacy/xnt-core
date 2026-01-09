@@ -327,6 +327,14 @@ impl TxOutput {
         self.owned
     }
 
+    /// Get receiving address if available
+    pub fn receiving_address(&self) -> Option<&ReceivingAddress> {
+        match &self.notification_method {
+            UtxoNotificationMethod::OnChain(addr) | UtxoNotificationMethod::OffChain(addr) => Some(addr),
+            UtxoNotificationMethod::None => None,
+        }
+    }
+
     /// Determine whether there is a time-lock, with any release date, on the
     /// UTXO.
     pub(crate) fn is_timelocked(&self) -> bool {

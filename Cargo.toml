@@ -7,7 +7,7 @@ members = [
     "xnt-dashboard",
     "xnt-rpc/macros",
     "xnt-rpc/client",
-    "xnt-ffi",
+    "xnt-sdk",
 ]
 
 [workspace.lints.rust]
