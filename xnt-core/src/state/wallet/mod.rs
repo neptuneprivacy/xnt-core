@@ -27,6 +27,7 @@ mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use num_traits::CheckedSub;
+    use num_traits::ConstZero;
     use num_traits::Zero;
     use rand::random;
     use rand::rngs::StdRng;
@@ -927,6 +928,7 @@ mod tests {
                     expected_utxo.sender_randomness,
                     alice_key.receiver_preimage(),
                     UtxoNotifier::OwnMinerComposeBlock,
+                    BFieldElement::ZERO,
                 )
             })
             .collect_vec();
@@ -942,6 +944,7 @@ mod tests {
             receiver_data_1_to_alice_new.sender_randomness(),
             alice_key.receiver_preimage(),
             UtxoNotifier::Cli,
+            BFieldElement::ZERO,
         );
         alice
             .lock_guard_mut()

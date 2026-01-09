@@ -4,6 +4,7 @@ use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
 use strum::EnumIter;
+use tasm_lib::triton_vm::prelude::BFieldElement;
 
 use crate::protocol::consensus::transaction::utxo::Utxo;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -14,13 +15,17 @@ use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
 pub struct WalletStatusElement {
     pub aocl_leaf_index: u64,
     pub utxo: Utxo,
+    /// Payment ID from subaddress. Zero for base address UTXOs.
+    #[serde(default)]
+    pub payment_id: u64,
 }
 
 impl WalletStatusElement {
-    pub fn new(aocl_leaf_index: u64, utxo: Utxo) -> Self {
+    pub fn new(aocl_leaf_index: u64, utxo: Utxo, payment_id: BFieldElement) -> Self {
         Self {
             aocl_leaf_index,
             utxo,
+            payment_id: payment_id.value(),
         }
     }
 }

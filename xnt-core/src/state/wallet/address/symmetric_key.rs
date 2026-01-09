@@ -128,16 +128,19 @@ impl SymmetricKey {
         common::derive_receiver_id(self.seed)
     }
 
-    /// decrypt a ciphertext into utxo secrets (utxo, sender_randomness)
+    /// decrypt a ciphertext into utxo secrets (utxo, sender_randomness, payment_id)
     ///
     /// The ciphertext_bfes param must contain the nonce in the first
     /// field and the ciphertext in the remaining fields.
     ///
     /// The output of `encrypt()` should be used as the input to `decrypt()`.
+    ///
+    /// Note: For symmetric keys, payment_id will always be 0 since symmetric
+    /// keys do not support subaddresses (only Generation keys support subaddresses).
     pub fn decrypt(
         &self,
         ciphertext_bfes: &[BFieldElement],
-    ) -> Result<(Utxo, Digest), DecryptError> {
+    ) -> Result<(Utxo, Digest, BFieldElement), DecryptError> {
         const NONCE_LEN: usize = 1;
 
         // 1. separate nonce from ciphertext.
@@ -155,8 +158,20 @@ impl SymmetricKey {
         let cipher = Aes256Gcm::new(&self.secret_key());
         let plaintext = cipher.decrypt(nonce, ciphertext_bytes.as_ref())?;
 
-        // 4. deserialize plaintext into (utxo, sender_randomness)
-        Ok(bincode::deserialize(&plaintext)?)
+        // Deserialize base fields (utxo, sender_randomness) - works for both old and new format
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct BasePayload { utxo: Utxo, sender_randomness: Digest }
+        let base: BasePayload = bincode::deserialize(&plaintext)?;
+        let base_size = bincode::serialized_size(&base)? as usize;
+
+        // payment_id is optional - present in new format, absent in old format
+        let payment_id = if plaintext.len() > base_size {
+            bincode::deserialize::<BFieldElement>(&plaintext[base_size..])?
+        } else {
+            BFieldElement::new(0)
+        };
+
+        Ok((base.utxo, base.sender_randomness, payment_id))
     }
 
     /// encrypts utxo secrets (utxo, sender_randomness) into ciphertext

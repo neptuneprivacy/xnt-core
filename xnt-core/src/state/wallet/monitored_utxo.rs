@@ -4,6 +4,7 @@ use std::fmt::Display;
 use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
+use tasm_lib::triton_vm::prelude::BFieldElement;
 use tasm_lib::triton_vm::prelude::Tip5;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 
@@ -38,6 +39,10 @@ pub struct MonitoredUtxo {
 
     /// The preimage of the receiver digest.
     pub receiver_preimage: Digest,
+
+    /// Payment ID from subaddress announcement. Zero for base address.
+    #[serde(default)]
+    pub payment_id: BFieldElement,
 
     /// Mapping from block digest to membership proof. The struct is assumed
     /// to have at least one membership proof, and all its AOCL indices are
@@ -102,6 +107,7 @@ impl MonitoredUtxo {
         aocl_leaf_index: u64,
         sender_randomness: Digest,
         receiver_preimage: Digest,
+        payment_id: BFieldElement,
         confirmed_in: &Block,
     ) -> Self {
         Self {
@@ -109,6 +115,7 @@ impl MonitoredUtxo {
             aocl_leaf_index,
             sender_randomness,
             receiver_preimage,
+            payment_id,
             blockhash_to_membership_proof: VecDeque::default(),
             number_of_mps_per_utxo: max_number_of_mps_stored,
             spent_in_block: None,
@@ -127,6 +134,7 @@ impl MonitoredUtxo {
         aocl_leaf_index: u64,
         sender_randomness: Digest,
         receiver_preimage: Digest,
+        payment_id: BFieldElement,
         confirmed_in_block: (Digest, Timestamp, BlockHeight),
     ) -> Self {
         Self {
@@ -134,6 +142,7 @@ impl MonitoredUtxo {
             aocl_leaf_index,
             sender_randomness,
             receiver_preimage,
+            payment_id,
             blockhash_to_membership_proof: VecDeque::default(),
             number_of_mps_per_utxo: max_number_of_mps_stored,
             spent_in_block: None,

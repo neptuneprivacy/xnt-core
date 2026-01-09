@@ -451,4 +451,16 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: UnspentUtxosRequest,
     ) -> RpcResult<UnspentUtxosResponse>;
+
+    async fn generate_subaddress(
+        &self,
+        payment_id: u64,
+    ) -> RpcResult<GenerateSubaddressResponse> {
+        self.generate_subaddress_call(GenerateSubaddressRequest { payment_id })
+            .await
+    }
+    async fn generate_subaddress_call(
+        &self,
+        request: GenerateSubaddressRequest,
+    ) -> RpcResult<GenerateSubaddressResponse>;
 }

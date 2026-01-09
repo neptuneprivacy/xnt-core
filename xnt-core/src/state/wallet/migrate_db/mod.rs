@@ -1,6 +1,8 @@
 mod migrate_db_impl;
 mod v0_to_v1;
 mod v1_to_v2;
+mod v2_to_v3;
+mod v3_to_v4;
 pub(crate) use migrate_db_impl::migrate_range;
 
 #[cfg(test)]

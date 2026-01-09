@@ -11,6 +11,7 @@ use futures::task::Context;
 use futures::task::Poll;
 use itertools::Itertools;
 use mock_tx::fake_create_transaction_from_details_for_tests;
+use num_traits::ConstZero;
 use num_traits::Zero;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
@@ -173,6 +174,7 @@ pub(crate) fn dummy_expected_utxo() -> ExpectedUtxo {
         received_from: UtxoNotifier::Myself,
         notification_received: Timestamp::now(),
         mined_in_block: None,
+        payment_id: BFieldElement::ZERO,
     }
 }
 

@@ -9,6 +9,7 @@ use anyhow::Result;
 use itertools::Itertools;
 use num_traits::CheckedAdd;
 use num_traits::CheckedSub;
+use num_traits::ConstZero;
 use num_traits::Zero;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
@@ -103,6 +104,9 @@ pub struct IncomingUtxoRecoveryData {
     pub sender_randomness: Digest,
     pub receiver_preimage: Digest,
     pub aocl_index: u64,
+    /// Payment ID from subaddress announcement. Zero for base address UTXOs.
+    #[serde(default)]
+    pub payment_id: BFieldElement,
 }
 
 impl IncomingUtxoRecoveryData {
@@ -125,6 +129,7 @@ impl TryFrom<&MonitoredUtxo> for IncomingUtxoRecoveryData {
             sender_randomness: msmp.sender_randomness,
             receiver_preimage: msmp.receiver_preimage,
             aocl_index: msmp.aocl_leaf_index,
+            payment_id: value.payment_id,
         })
     }
 }
@@ -394,6 +399,7 @@ impl WalletState {
                                 Block::premine_sender_randomness(configuration.network()),
                                 premine_key.privacy_preimage(),
                                 UtxoNotifier::Premine,
+                                BFieldElement::ZERO,
                             ))
                             .await;
                     }
@@ -479,6 +485,7 @@ impl WalletState {
                     tx_output.sender_randomness(),
                     spending_key.privacy_preimage(),
                     notifier,
+                    BFieldElement::ZERO,
                 )
             })
             .collect_vec()
@@ -517,6 +524,7 @@ impl WalletState {
 
                 let own_utxos = announced_utxos_from_announcements
                     .chain(own_utxos_from_expected_utxos)
+                    .unique_by(|iu| iu.addition_record())
                     .collect_vec();
 
                 let tx_id = tx_kernel.txid();
@@ -699,6 +707,7 @@ impl WalletState {
                 expected_utxo.sender_randomness,
                 expected_utxo.receiver_preimage,
                 expected_utxo.received_from,
+                expected_utxo.payment_id,
             ))
             .await;
         }
@@ -834,6 +843,7 @@ impl WalletState {
                     sender_randomness,
                     receiver_preimage: own_guesser_key.receiver_preimage(),
                     is_guesser_fee: true,
+                    payment_id: BFieldElement::ZERO,
                 })
                 .collect_vec()
         } else {
@@ -988,7 +998,9 @@ impl WalletState {
         key_type: KeyType,
     ) -> Box<dyn Iterator<Item = SpendingKey> + '_> {
         match key_type {
-            KeyType::Generation => Box::new(self.get_known_generation_spending_keys()),
+            KeyType::Generation | KeyType::GenerationSubAddr => {
+                Box::new(self.get_known_generation_spending_keys())
+            }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
         }
     }
@@ -999,7 +1011,9 @@ impl WalletState {
         key_type: KeyType,
     ) -> Box<dyn Iterator<Item = SpendingKey> + '_> {
         match key_type {
-            KeyType::Generation => Box::new(self.get_known_generation_spending_keys()),
+            KeyType::Generation | KeyType::GenerationSubAddr => {
+                Box::new(self.get_known_generation_spending_keys())
+            }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
         }
     }
@@ -1037,7 +1051,9 @@ impl WalletState {
     /// important to write to disk afterward to avoid possible funds loss.
     pub async fn next_unused_spending_key(&mut self, key_type: KeyType) -> SpendingKey {
         match key_type {
-            KeyType::Generation => self.next_unused_generation_spending_key().await.into(),
+            KeyType::Generation | KeyType::GenerationSubAddr => {
+                self.next_unused_generation_spending_key().await.into()
+            }
             KeyType::Symmetric => self.next_unused_symmetric_key().await.into(),
         }
     }
@@ -1048,7 +1064,7 @@ impl WalletState {
 
         if current_counter < new_counter {
             match key_type {
-                KeyType::Generation => {
+                KeyType::Generation | KeyType::GenerationSubAddr => {
                     self.wallet_db.set_generation_key_counter(new_counter).await;
 
                     for idx in current_counter..new_counter {
@@ -1071,7 +1087,9 @@ impl WalletState {
     /// Get index of the next unused spending key of a given type.
     pub fn spending_key_counter(&self, key_type: KeyType) -> u64 {
         match key_type {
-            KeyType::Generation => self.wallet_db.get_generation_key_counter(),
+            KeyType::Generation | KeyType::GenerationSubAddr => {
+                self.wallet_db.get_generation_key_counter()
+            }
             KeyType::Symmetric => self.wallet_db.get_symmetric_key_counter(),
         }
     }
@@ -1079,7 +1097,7 @@ impl WalletState {
     /// Get the nth derived spending key of a given type.
     pub fn nth_spending_key(&self, key_type: KeyType, index: u64) -> SpendingKey {
         match key_type {
-            KeyType::Generation => self
+            KeyType::Generation | KeyType::GenerationSubAddr => self
                 .wallet_entropy
                 .nth_generation_spending_key(index)
                 .into(),
@@ -1224,6 +1242,7 @@ impl WalletState {
                         sender_randomness: composer_output.sender_randomness(),
                         receiver_preimage,
                         is_guesser_fee: false,
+                        payment_id: BFieldElement::ZERO,
                     };
                     let addition_record = incoming_utxo.addition_record();
 
@@ -1398,13 +1417,15 @@ impl WalletState {
                     sender_randomness,
                     receiver_preimage,
                     is_guesser_fee,
+                    payment_id,
                 } = incoming_utxo.to_owned();
                 info!(
                     "Received UTXO in block {:x}, height {}\nvalue = {}\n\
-                    is guesser fee: {is_guesser_fee}\ntime-lock: {}\n\n",
+                    is guesser fee: {is_guesser_fee}\npayment_id: {}\ntime-lock: {}\n\n",
                     block.hash(),
                     block.kernel.header.height,
                     utxo.get_native_currency_amount(),
+                    payment_id.value(),
                     utxo.release_date()
                         .map(|t| t.standard_format())
                         .unwrap_or_else(|| "none".into()),
@@ -1421,6 +1442,7 @@ impl WalletState {
                     aocl_index,
                     new_own_membership_proof.sender_randomness,
                     new_own_membership_proof.receiver_preimage,
+                    payment_id,
                     block,
                 );
 
@@ -1443,6 +1465,7 @@ impl WalletState {
                             sender_randomness,
                             receiver_preimage,
                             aocl_index,
+                            payment_id,
                         };
                         incoming_utxo_recovery_data_list.push(utxo_ms_recovery_data);
                     }
@@ -1561,6 +1584,7 @@ impl WalletState {
                     utxo,
                     sender_randomness,
                     receiver_preimage,
+                    payment_id,
                     ..
                 } = incoming_utxo.to_owned();
                 let aocl_index = aocl_leaf_count;
@@ -1570,6 +1594,7 @@ impl WalletState {
                     aocl_index,
                     sender_randomness,
                     receiver_preimage,
+                    payment_id,
                     block,
                 );
                 let strong_key = mutxo.strong_utxo_key();
@@ -1584,6 +1609,7 @@ impl WalletState {
                             sender_randomness,
                             receiver_preimage,
                             aocl_index,
+                            payment_id,
                         };
                         recovery_data.push(utxo_ms_recovery_data);
                     }
@@ -1789,22 +1815,31 @@ impl WalletState {
 
         while let Some((_i, mutxo)) = stream.next().await {
             let utxo = mutxo.utxo.clone();
+            let payment_id = mutxo.payment_id;
             if let Some(mp) = mutxo.get_membership_proof_for_block(tip_digest) {
                 // To determine whether the UTXO was spent, we cannot rely on
                 // the `spent_in_block` which might be set to blocks that have
                 // since been reorganized away.
                 let spent = !mutator_set_accumulator.verify(Tip5::hash(&mutxo.utxo), &mp);
                 if spent {
-                    synced_spent.push(WalletStatusElement::new(mp.aocl_leaf_index, utxo));
+                    synced_spent.push(WalletStatusElement::new(
+                        mp.aocl_leaf_index,
+                        utxo,
+                        payment_id,
+                    ));
                 } else {
                     synced_unspent.push((
-                        WalletStatusElement::new(mp.aocl_leaf_index, utxo),
+                        WalletStatusElement::new(mp.aocl_leaf_index, utxo, payment_id),
                         mp.clone(),
                     ));
                 }
             } else {
                 let any_mp = &mutxo.blockhash_to_membership_proof.iter().next().unwrap().1;
-                unsynced.push(WalletStatusElement::new(any_mp.aocl_leaf_index, utxo));
+                unsynced.push(WalletStatusElement::new(
+                    any_mp.aocl_leaf_index,
+                    utxo,
+                    payment_id,
+                ));
             }
         }
 
@@ -3880,6 +3915,7 @@ pub(crate) mod tests {
                     sender_randomness,
                     receiver_preimage,
                     UtxoNotifier::Myself,
+                    BFieldElement::ZERO,
                 ))
                 .await;
             assert!(!wallet.wallet_db.expected_utxos().is_empty().await);
@@ -3930,6 +3966,7 @@ pub(crate) mod tests {
                     rand::random(),
                     rand::random(),
                     UtxoNotifier::Myself,
+                    BFieldElement::ZERO,
                 );
                 addition_records.push(eutxo.addition_record);
                 wallet.add_expected_utxo(eutxo).await;
@@ -4037,6 +4074,7 @@ pub(crate) mod tests {
                         rand::random(),
                         rand::random(),
                         UtxoNotifier::Myself,
+                        BFieldElement::ZERO,
                     ))
                     .await;
 
@@ -4608,6 +4646,7 @@ pub(crate) mod tests {
                     sender_randomness,
                     receiver_preimage,
                     is_guesser_fee: false,
+                    payment_id: BFieldElement::ZERO,
                 };
 
                 let addition_record = incoming_utxo.addition_record();

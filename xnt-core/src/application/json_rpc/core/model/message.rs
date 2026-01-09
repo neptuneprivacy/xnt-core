@@ -319,6 +319,8 @@ pub struct BlockInfoOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_digest: Option<Digest>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_identifier: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub utxo: Option<ApiUtxo>,
 }
 
@@ -555,6 +557,16 @@ pub struct ValidateAddressRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ValidateAddressResponse {
     pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_identifier: Option<u64>,
+    /// For subaddresses only: the base address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_address: Option<String>,
+    /// For subaddresses only: the payment_id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -638,4 +650,18 @@ pub struct SendTxResponse {
     pub tip_when_sent: Digest,
     pub inputs: Vec<SendTxInput>,
     pub outputs: Vec<SendTxOutput>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateSubaddressRequest {
+    pub payment_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateSubaddressResponse {
+    pub address: String,
+    pub payment_id: u64,
+    pub base_address: String,
 }

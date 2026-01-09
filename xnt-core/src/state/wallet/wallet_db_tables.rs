@@ -61,7 +61,7 @@ impl From<&UnlockedUtxo> for StrongUtxoKey {
 ///  [migrate_db](super::migrate_db).
 ///
 /// note: the very first schema version was 0, ie u16::default()
-pub(super) const WALLET_DB_SCHEMA_VERSION: u16 = 2;
+pub(super) const WALLET_DB_SCHEMA_VERSION: u16 = 4;
 
 /// represents logical "tables" in the Wallet database as used by `DbtSchema`.
 ///
@@ -232,6 +232,10 @@ impl WalletDbTables {
     pub(crate) fn monitored_utxos_table_count() -> u8 {
         0
     }
+
+    pub(crate) fn expected_utxo_table_count() -> u8 {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -245,10 +249,6 @@ pub(crate) mod tests {
 
         pub(crate) fn sync_label_table_count() -> u8 {
             3
-        }
-
-        pub(crate) fn expected_utxo_table_count() -> u8 {
-            1
         }
     }
 }

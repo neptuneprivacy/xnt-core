@@ -25,6 +25,7 @@ use arbitrary::Arbitrary;
 use bech32::FromBase32;
 use bech32::ToBase32;
 use bech32::Variant;
+use num_traits::Zero;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use tasm_lib::prelude::Tip5;
@@ -46,6 +47,9 @@ use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
 
 pub(super) const GENERATION_FLAG_U8: u8 = 79;
 pub const GENERATION_FLAG: BFieldElement = BFieldElement::new(GENERATION_FLAG_U8 as u64);
+
+pub(super) const GENERATION_SUBADDR_FLAG_U8: u8 = 179;
+pub const GENERATION_SUBADDR_FLAG: BFieldElement = BFieldElement::new(GENERATION_SUBADDR_FLAG_U8 as u64);
 
 // note: we serde(skip) fields that can be computed from the seed in order to
 // keep the serialized (including bech32m) representation small.
@@ -150,6 +154,99 @@ impl<'a> Arbitrary<'a> for GenerationReceivingAddress {
     }
 }
 
+/// A subaddress combining a base address with a payment_id.
+///
+/// SubAddress = GenerationReceivingAddress + payment_id
+///
+/// The subaddress can be converted to/from (address, payment_id) pair.
+/// When encoded as bech32m, it includes both the base address and payment_id.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationSubAddress {
+    /// The base receiving address
+    base: GenerationReceivingAddress,
+
+    /// The payment identifier for this subaddress
+    payment_id: BFieldElement,
+}
+
+impl GenerationSubAddress {
+    /// Create a new subaddress from a base address and payment_id.
+    ///
+    /// # Errors
+    /// Returns error if payment_id is zero - use base address directly for zero payment_id.
+    pub fn new(base: GenerationReceivingAddress, payment_id: BFieldElement) -> Result<Self> {
+        ensure!(
+            !payment_id.is_zero(),
+            "payment_id must be non-zero for subaddresses; use base address directly"
+        );
+        Ok(Self { base, payment_id })
+    }
+
+    /// Create a subaddress with an index-derived payment_id.
+    ///
+    /// # Errors
+    /// Returns error if index is zero - use base address directly for zero payment_id.
+    pub fn from_index(base: GenerationReceivingAddress, index: u64) -> Result<Self> {
+        ensure!(index != 0, "index must be non-zero for subaddresses");
+        Self::new(base, BFieldElement::new(index))
+    }
+
+    /// Get the encryption key (same as base address)
+    pub fn encryption_key(&self) -> lattice::kem::PublicKey {
+        self.base.encryption_key
+    }
+}
+
+// Use macro for bech32m serialization
+crate::impl_subaddress_bech32m!(GenerationSubAddress, "xntsa");
+
+#[cfg(any(test, feature = "arbitrary-impls"))]
+impl<'a> Arbitrary<'a> for GenerationSubAddress {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let base = GenerationReceivingAddress::arbitrary(u)?;
+        // payment_id must be non-zero for subaddresses
+        let mut payment_id = BFieldElement::arbitrary(u)?;
+        if payment_id.is_zero() {
+            payment_id = BFieldElement::new(1);
+        }
+        // unwrap is safe here because we ensured payment_id is non-zero
+        Ok(Self::new(base, payment_id).unwrap())
+    }
+}
+
+impl common::SubAddress for GenerationSubAddress {
+    type Base = GenerationReceivingAddress;
+
+    fn base(&self) -> &Self::Base {
+        &self.base
+    }
+
+    fn payment_id(&self) -> BFieldElement {
+        self.payment_id
+    }
+
+    fn receiver_identifier(&self) -> BFieldElement {
+        self.base.receiver_identifier
+    }
+
+    fn split(self) -> (Self::Base, BFieldElement) {
+        (self.base, self.payment_id)
+    }
+
+    fn flag() -> BFieldElement {
+        GENERATION_SUBADDR_FLAG
+    }
+
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
+        let payload_with_id = UtxoNotificationPayload::with_payment_id(
+            payload.utxo.clone(),
+            payload.sender_randomness,
+            self.payment_id,
+        );
+        self.base.encrypt(&payload_with_id)
+    }
+}
+
 impl GenerationSpendingKey {
     pub fn to_address(&self) -> GenerationReceivingAddress {
         let randomness: [u8; 32] = common::shake256::<32>(&bincode::serialize(&self.seed).unwrap());
@@ -163,7 +260,7 @@ impl GenerationSpendingKey {
         }
     }
 
-    pub(crate) fn lock_script_and_witness(&self) -> LockScriptAndWitness {
+    pub fn lock_script_and_witness(&self) -> LockScriptAndWitness {
         LockScriptAndWitness::standard_hash_lock_from_preimage(self.unlock_key_preimage)
     }
 
@@ -200,7 +297,9 @@ impl GenerationSpendingKey {
     }
 
     /// Decrypt a Generation Address ciphertext
-    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest)> {
+    /// Returns (utxo, sender_randomness, payment_id)
+    /// payment_id is 0 for base addresses, non-zero for subaddresses
+    pub(super) fn decrypt(&self, ciphertext: &[BFieldElement]) -> Result<(Utxo, Digest, BFieldElement)> {
         // parse ciphertext
         ensure!(
             ciphertext.len() > CIPHERTEXT_SIZE_IN_BFES,
@@ -226,8 +325,20 @@ impl GenerationSpendingKey {
             .decrypt(nonce, ciphertext_bytes.as_ref())
             .map_err(|_| anyhow!("Failed to decrypt symmetric payload."))?;
 
-        // convert plaintext to utxo and digest
-        Ok(bincode::deserialize(&plaintext)?)
+        // Deserialize base fields (utxo, sender_randomness) - works for both old and new format
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct BasePayload { utxo: Utxo, sender_randomness: Digest }
+        let base: BasePayload = bincode::deserialize(&plaintext)?;
+        let base_size = bincode::serialized_size(&base)? as usize;
+
+        // payment_id is optional - present in new format, absent in old format
+        let payment_id = if plaintext.len() > base_size {
+            bincode::deserialize::<BFieldElement>(&plaintext[base_size..])?
+        } else {
+            BFieldElement::new(0)
+        };
+
+        Ok((base.utxo, base.sender_randomness, payment_id))
     }
 
     fn generate_spending_lock(&self) -> Digest {
@@ -423,6 +534,22 @@ impl GenerationReceivingAddress {
     pub fn spending_lock(&self) -> Digest {
         self.lock_postimage
     }
+
+    /// Create a subaddress with the given payment_id
+    ///
+    /// # Errors
+    /// Returns error if payment_id is zero.
+    pub fn with_payment_id(&self, payment_id: BFieldElement) -> Result<GenerationSubAddress> {
+        GenerationSubAddress::new(*self, payment_id)
+    }
+
+    /// Create a subaddress with an index-derived payment_id
+    ///
+    /// # Errors
+    /// Returns error if index is zero.
+    pub fn subaddress(&self, index: u64) -> Result<GenerationSubAddress> {
+        GenerationSubAddress::from_index(*self, index)
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +600,64 @@ mod tests {
 
         // no crash
         let _ = GenerationReceivingAddress::from_bech32m(bech32m_string, network).unwrap();
+    }
+
+    mod generation_subaddress {
+        use super::*;
+        use common::SubAddress;
+
+        #[test]
+        fn new_rejects_zero_payment_id() {
+            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
+            let result = GenerationSubAddress::new(base, BFieldElement::new(0));
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("non-zero"));
+        }
+
+        #[test]
+        fn from_index_rejects_zero_index() {
+            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
+            let result = GenerationSubAddress::from_index(base, 0);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("non-zero"));
+        }
+
+        #[test]
+        fn new_accepts_nonzero_payment_id() {
+            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
+            let subaddr = GenerationSubAddress::new(base, BFieldElement::new(1)).unwrap();
+            assert_eq!(subaddr.payment_id(), BFieldElement::new(1));
+        }
+
+        #[test]
+        fn from_index_accepts_nonzero_index() {
+            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
+            let subaddr = GenerationSubAddress::from_index(base, 42).unwrap();
+            assert_eq!(subaddr.payment_id(), BFieldElement::new(42));
+        }
+
+        #[test]
+        fn bech32m_roundtrip() {
+            let network = Network::Main;
+            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
+            let subaddr = GenerationSubAddress::new(base, BFieldElement::new(12345)).unwrap();
+
+            let encoded = subaddr.to_bech32m(network).unwrap();
+            let decoded = GenerationSubAddress::from_bech32m(&encoded, network).unwrap();
+
+            assert_eq!(subaddr, decoded);
+            assert_eq!(decoded.payment_id(), BFieldElement::new(12345));
+        }
+
+        #[test]
+        fn split_returns_base_and_payment_id() {
+            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
+            let payment_id = BFieldElement::new(999);
+            let subaddr = GenerationSubAddress::new(base, payment_id).unwrap();
+
+            let (recovered_base, recovered_id) = subaddr.split();
+            assert_eq!(recovered_base, base);
+            assert_eq!(recovered_id, payment_id);
+        }
     }
 }
