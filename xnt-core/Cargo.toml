@@ -99,7 +99,7 @@ tarpc = { version = "^0.34", features = [
     "serde-transport-json",
     "tcp",
 ] }
-tasm-lib = "1.0.0"
+tasm-lib = { git = "https://github.com/neptuneprivacy/tasm-lib-patch.git", tag = "v1.0.1" }
 tiny-bip39 = "1.0"
 tokio = { version = "1.41", features = ["full", "tracing"] }
 tokio-serde = { version = "0.8", features = ["bincode", "json"] }
