@@ -624,9 +624,12 @@ impl Block {
         }
 
         // 1.a)
-        for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
-            if !self.appendix().contains(&required_claim) {
-                return Err(BlockValidationError::AppendixMissingClaim);
+        // Skip claim validation for old Neptune blocks (Reboot consensus) 
+        if consensus_rule_set != ConsensusRuleSet::Reboot {
+            for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
+                if !self.appendix().contains(&required_claim) {
+                    return Err(BlockValidationError::AppendixMissingClaim);
+                }
             }
         }
 
@@ -641,8 +644,11 @@ impl Block {
         };
 
         // 1.d)
-        if !BlockProgram::verify(self.body(), self.appendix(), block_proof, network).await {
-            return Err(BlockValidationError::ProofValidity);
+        // Skip proof verification for old Neptune blocks (Reboot consensus)
+        if consensus_rule_set != ConsensusRuleSet::Reboot {
+            if !BlockProgram::verify(self.body(), self.appendix(), block_proof, network).await {
+                return Err(BlockValidationError::ProofValidity);
+            }
         }
 
         // 1.e)
