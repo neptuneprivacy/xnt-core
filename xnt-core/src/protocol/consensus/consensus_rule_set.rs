@@ -3,17 +3,12 @@ use strum_macros::EnumIter;
 use crate::api::export::BlockHeight;
 use crate::api::export::Network;
 use crate::protocol::consensus::block::MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
-//use crate::BFieldElement;
+use crate::BFieldElement;
 
-/// Height of 1st block that follows the alpha consensus ruleset, for main net.
-/*
-pub const BLOCK_HEIGHT_HARDFORK_ALPHA_MAIN_NET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(0u64)); // enable by default
+/// Height of 1st block that follows the Xnt consensus ruleset (with Triton VM v1).
+pub const BLOCK_HEIGHT_HARDFORK_XNT_MAIN_NET: BlockHeight =
+    BlockHeight::new(BFieldElement::new(15256u64));
 
-/// Height of 1st block that follows the alpha consensus ruleset, for test net.
-pub const BLOCK_HEIGHT_HARDFORK_ALPHA_TESTNET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(0u64)); // enable by default
-*/
 
 /// Enumerates all possible sets of consensus rules.
 ///
@@ -50,21 +45,16 @@ impl ConsensusRuleSet {
     /// planned hard or soft forks that activate at a given height. The first
     /// argument is necessary because the forks can activate at different
     /// heights based on the network.
-    #[allow(dead_code)]
-    #[allow(unused_variables)]
     pub(crate) fn infer_from(network: Network, block_height: BlockHeight) -> Self {
         match network {
             Network::Main => {
-                ConsensusRuleSet::Xnt
-
-                /*
-                // Old neptune
-                if block_height < BLOCK_HEIGHT_HARDFORK_ALPHA_MAIN_NET {
+                // Old Neptune blocks (before Xnt hardfork) use Reboot consensus
+                // These blocks were created with Triton VM v0
+                if block_height < BLOCK_HEIGHT_HARDFORK_XNT_MAIN_NET {
                     ConsensusRuleSet::Reboot
                 } else {
-                    ConsensusRuleSet::HardforkAlpha
+                    ConsensusRuleSet::Xnt
                 }
-                */
             }
             Network::TestnetMock => ConsensusRuleSet::Xnt,
             Network::RegTest => ConsensusRuleSet::Xnt,
