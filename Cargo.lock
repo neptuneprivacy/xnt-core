@@ -2291,22 +2291,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
- "rayon",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
@@ -2381,7 +2365,7 @@ dependencies = [
  "sysinfo",
  "systemstat",
  "tarpc",
- "tasm-lib 1.0.0 (git+https://github.com/neptuneprivacy/tasm-lib-patch.git?tag=v1.0.1)",
+ "tasm-lib",
  "test-strategy 0.3.1",
  "thiserror 1.0.69",
  "thread-priority",
@@ -3903,28 +3887,6 @@ dependencies = [
 [[package]]
 name = "tasm-lib"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebbfc45d56548bb55036fa64cad69630d43173507257470865062305f3c7346c"
-dependencies = [
- "anyhow",
- "arbitrary",
- "const_format",
- "hex",
- "itertools 0.14.0",
- "ndarray 0.16.1",
- "num",
- "num-traits",
- "rand 0.9.2",
- "serde",
- "serde_json",
- "strum 0.27.2",
- "tasm-object-derive 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "triton-vm 1.0.0",
-]
-
-[[package]]
-name = "tasm-lib"
-version = "1.0.0"
 source = "git+https://github.com/neptuneprivacy/tasm-lib-patch.git?tag=v1.0.1#dd954abf4c894fbbd9edf224bdd58a48a75666e5"
 dependencies = [
  "anyhow",
@@ -3932,26 +3894,15 @@ dependencies = [
  "const_format",
  "hex",
  "itertools 0.14.0",
- "ndarray 0.17.2",
+ "ndarray",
  "num",
  "num-traits",
  "rand 0.9.2",
  "serde",
  "serde_json",
  "strum 0.27.2",
- "tasm-object-derive 1.0.0 (git+https://github.com/neptuneprivacy/tasm-lib-patch.git?tag=v1.0.1)",
- "triton-vm 2.0.0",
-]
-
-[[package]]
-name = "tasm-object-derive"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3277f41070fd40101837e1abb0e24d3e2ed145d613a3373b47712e656b3a2b37"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.106",
+ "tasm-object-derive",
+ "triton-vm",
 ]
 
 [[package]]
@@ -4500,46 +4451,14 @@ dependencies = [
 
 [[package]]
 name = "triton-air"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ac8f4ade43166339a0e5ac3c3d56a3675256d25b9e391d884f889a32a488c3b"
-dependencies = [
- "arbitrary",
- "itertools 0.14.0",
- "strum 0.27.2",
- "triton-constraint-circuit 1.0.0",
- "triton-isa 1.0.0",
- "twenty-first",
-]
-
-[[package]]
-name = "triton-air"
 version = "2.0.0"
 source = "git+https://github.com/TritonVM/triton-vm.git?tag=v2.0.0#4f8ab51d92c7f4808d03b4677ed19239e87f3548"
 dependencies = [
  "arbitrary",
  "itertools 0.14.0",
  "strum 0.27.2",
- "triton-constraint-circuit 2.0.0",
- "triton-isa 2.0.0",
- "twenty-first",
-]
-
-[[package]]
-name = "triton-constraint-builder"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2fe1e21c26e4f3c41164573b14fc83d1c3ddbc6de1a90e810aad0fcbf42d81c"
-dependencies = [
- "itertools 0.14.0",
- "prettyplease",
- "proc-macro2",
- "quote",
- "strum 0.27.2",
- "syn 2.0.106",
- "triton-air 1.0.0",
- "triton-constraint-circuit 1.0.0",
- "triton-isa 1.0.0",
+ "triton-constraint-circuit",
+ "triton-isa",
  "twenty-first",
 ]
 
@@ -4554,24 +4473,9 @@ dependencies = [
  "quote",
  "strum 0.27.2",
  "syn 2.0.106",
- "triton-air 2.0.0",
- "triton-constraint-circuit 2.0.0",
- "triton-isa 2.0.0",
- "twenty-first",
-]
-
-[[package]]
-name = "triton-constraint-circuit"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3107c3169544bc50599c74cb360b1f0caa38e43d4b50743bf4e7f35f66e13965"
-dependencies = [
- "arbitrary",
- "itertools 0.14.0",
- "ndarray 0.16.1",
- "num-traits",
- "proc-macro2",
- "quote",
+ "triton-air",
+ "triton-constraint-circuit",
+ "triton-isa",
  "twenty-first",
 ]
 
@@ -4582,29 +4486,10 @@ source = "git+https://github.com/TritonVM/triton-vm.git?tag=v2.0.0#4f8ab51d92c7f
 dependencies = [
  "arbitrary",
  "itertools 0.14.0",
- "ndarray 0.17.2",
+ "ndarray",
  "num-traits",
  "proc-macro2",
  "quote",
- "twenty-first",
-]
-
-[[package]]
-name = "triton-isa"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eab6aa297481933c4dd15c02077e4f8a53ef103d5dd0be206c0e25f70332d28b"
-dependencies = [
- "arbitrary",
- "get-size2",
- "itertools 0.14.0",
- "lazy_static",
- "nom 8.0.0",
- "nom-language",
- "num-traits",
- "serde",
- "strum 0.27.2",
- "thiserror 2.0.16",
  "twenty-first",
 ]
 
@@ -4628,37 +4513,6 @@ dependencies = [
 
 [[package]]
 name = "triton-vm"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5b49f18bdf1c0a0eae1687c57321156c7b495dfe71090391a4673b3521d0c50"
-dependencies = [
- "arbitrary",
- "colored",
- "get-size2",
- "indexmap 2.11.3",
- "itertools 0.14.0",
- "lazy_static",
- "memory-stats",
- "ndarray 0.16.1",
- "num-traits",
- "prettyplease",
- "proc-macro2",
- "rand 0.9.2",
- "rayon",
- "serde",
- "strum 0.27.2",
- "syn 2.0.106",
- "thiserror 2.0.16",
- "triton-air 1.0.0",
- "triton-constraint-builder 1.0.0",
- "triton-constraint-circuit 1.0.0",
- "triton-isa 1.0.0",
- "twenty-first",
- "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "triton-vm"
 version = "2.0.0"
 source = "git+https://github.com/TritonVM/triton-vm.git?tag=v2.0.0#4f8ab51d92c7f4808d03b4677ed19239e87f3548"
 dependencies = [
@@ -4669,7 +4523,7 @@ dependencies = [
  "itertools 0.14.0",
  "lazy_static",
  "memory-stats",
- "ndarray 0.17.2",
+ "ndarray",
  "num-traits",
  "prettyplease",
  "proc-macro2",
@@ -4679,10 +4533,10 @@ dependencies = [
  "strum 0.27.2",
  "syn 2.0.106",
  "thiserror 2.0.16",
- "triton-air 2.0.0",
- "triton-constraint-builder 2.0.0",
- "triton-constraint-circuit 2.0.0",
- "triton-isa 2.0.0",
+ "triton-air",
+ "triton-constraint-builder",
+ "triton-constraint-circuit",
+ "triton-isa",
  "twenty-first",
  "unicode-width 0.2.0",
 ]
@@ -5444,7 +5298,7 @@ dependencies = [
  "ratatui",
  "strum 0.27.2",
  "tarpc",
- "tasm-lib 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tasm-lib",
  "tokio",
  "unicode-width 0.1.14",
 ]
