@@ -3,7 +3,7 @@ name = "xnt-dashboard"
 description = "neptune-privacy tui dashboard and wallet"
 authors = ["Triton Software"]
 
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -16,7 +16,7 @@ mock = ["rand", "neptune-privacy/mock-rpc"]
 
 [dependencies]
 anyhow = { version = "1.0" }
-neptune-privacy = { version = "0.1.0", path = "../xnt-core" }
+neptune-privacy = { version = "0.2.0", path = "../xnt-core" }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.27"
 tarpc = { version = "^0.34", features = [
