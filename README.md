@@ -28,6 +28,12 @@
 > higher risk of database corruption and/or loss of funds. However, known bug fixes make their way into `master`
 > before being part of a release.
 
+
+!If you get a '-Wthreads' error, try:
+sudo apt install -y clang
+export CC=clang
+export CXX=clang++
+
 ### Windows
 
 To install Rust and cargo on Windows, you can
