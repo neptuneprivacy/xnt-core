@@ -91,6 +91,14 @@ impl XntWalletEntropy {
             inner: self.inner.derive_spending_key(index as u64),
         }
     }
+
+    /// Derive CTIDH spending key at index (CTIDH-512)
+    #[napi]
+    pub fn derive_ctidh_key(&self, index: u32) -> XntSpendingKey {
+        XntSpendingKey {
+            inner: self.inner.derive_ctidh_spending_key(index as u64),
+        }
+    }
 }
 
 /// Spending key for signing transactions
@@ -131,6 +139,18 @@ impl XntSpendingKey {
     #[napi]
     pub fn receiver_preimage_hex(&self) -> String {
         hex::encode(self.inner.receiver_preimage().bytes)
+    }
+
+    /// Check if this is a CTIDH spending key
+    #[napi]
+    pub fn is_ctidh(&self) -> bool {
+        self.inner.is_ctidh()
+    }
+
+    /// Check if this is a Generation spending key
+    #[napi]
+    pub fn is_generation(&self) -> bool {
+        self.inner.is_generation()
     }
 
     /// Get inner spending key (for internal use)

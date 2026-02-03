@@ -2,7 +2,7 @@
  * XNT-SDK TypeScript Test
  *
  * Usage: npx ts-node examples/xnt-sdk-test.ts [command]
- * Commands: version, seed, address, rpc, sync, utils, tx, full
+ * Commands: version, seed, address, rpc, sync, utils, tx, tx-ctidh, full
  */
 
 import {
@@ -30,6 +30,7 @@ import {
   xntMempoolIncoming,
   xntComputeCommitmentForOutput,
 } from "../src/napi/output";
+import { addMultiTypeInputs, buildMixedProofs } from "../src/ts/helpers";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -345,6 +346,131 @@ function testTx(): boolean {
   return true;
 }
 
+function testTxCtidh(): boolean {
+  log("\nTesting transaction Generation -> CTIDH (build & prove)...");
+
+  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
+  const genKey = wallet.deriveKey(0);
+  const genAddr = genKey.toAddress();
+
+  // Derive CTIDH key & address
+  const ctidhKey = wallet.deriveCtidhKey(0);
+  const ctidhAddr = ctidhKey.toAddress();
+
+  let client: XntRpcClient;
+  try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
+
+  // Sync wallet for both Generation and CTIDH keys
+  const genResult = syncWallet(client, genKey);
+  const ctidhResult = syncWallet(client, ctidhKey);
+
+  if ((!genResult || genResult.unspent.length === 0) &&
+      (!ctidhResult || ctidhResult.unspent.length === 0)) {
+    return skip("no unspent UTXOs for Generation or CTIDH");
+  }
+
+  const genAvailable = genResult
+    ? genResult.unspent.filter((_, i) => !genResult.pendingSpending.includes(i))
+    : [];
+  const ctidhAvailable = ctidhResult
+    ? ctidhResult.unspent.filter((_, i) => !ctidhResult.pendingSpending.includes(i))
+    : [];
+
+  if (genAvailable.length === 0 && ctidhAvailable.length === 0) {
+    return skip("all UTXOs pending spend for Generation and CTIDH");
+  }
+
+  ok(`Generation available: ${genAvailable.length}, CTIDH available: ${ctidhAvailable.length}`);
+
+  // Build unified pool of UTXOs with type tag
+  const all = [
+    ...genAvailable.map(u => ({ kind: "gen" as const, u })),
+    ...ctidhAvailable.map(u => ({ kind: "ctidh" as const, u })),
+  ];
+
+  // Select inputs across both key types
+  const fee = toNau(0.005);
+  const sendAmount = toNau(0.575);
+  const totalAmount = sendAmount + fee;
+
+  const amounts = all.map(x => x.u.decrypted.amount);
+  const selectedIdx = xntSelectInputs(amounts, totalAmount, 10);
+  if (selectedIdx.length === 0) {
+    return fail(`insufficient: need ${formatAmount(totalAmount)} have ${formatAmount(amounts.reduce((s, a) => s + a, 0n))}`);
+  }
+  const selected = selectedIdx.map(i => all[i]);
+  ok(`selected ${selected.length} UTXOs for ${formatAmount(totalAmount)}`);
+
+  // Build membership proofs for mixed Generation + CTIDH inputs
+  const {
+    genSelected,
+    ctidhSelected,
+    genProofBuffers,
+    ctidhProofBuffers,
+  } = buildMixedProofs(client, genKey, ctidhKey, selected);
+  if (genSelected.length > 0) {
+    ok(`got ${genProofBuffers.length} membership proofs for Generation inputs`);
+  }
+  if (ctidhSelected.length > 0) {
+    ok(`got ${ctidhProofBuffers.length} membership proofs for CTIDH inputs`);
+  }
+
+  // Build transaction
+  const mutatorSet = xntGetMutatorSet(client);
+  const builder = new XntTransactionBuilder();
+
+  // Add multi-type inputs with correct key and proof
+  addMultiTypeInputs(
+    builder,
+    selected,
+    genKey,
+    ctidhKey,
+    genProofBuffers,
+    ctidhProofBuffers,
+    genSelected,
+    ctidhSelected,
+  );
+
+  // Output goes to CTIDH address, change back to Generation address
+  builder.addOutput(ctidhAddr.toReceivingAddress(), sendAmount, xntRandomSenderRandomness());
+  builder.setFee(fee);
+  builder.setChange(genAddr, xntRandomSenderRandomness());
+
+  const builtTx = builder.build(mutatorSet, xntTimestampNow(), XntNetwork.Main);
+
+  // Print summary
+  const inputs = builtTx.inputs();
+  const outputs = builtTx.outputs();
+  log(`\n  Inputs (${inputs.length}): ${formatAmount(inputs.reduce((s, i) => s + i.amount, 0n))}`);
+  for (const inp of inputs) {
+    log(`    ${formatAmount(inp.amount)}, c=${inp.commitmentHex}`);
+  }
+  log(`  Outputs (${outputs.length}): ${formatAmount(outputs.reduce((s, o) => s + o.amount, 0n))}`);
+  for (const out of outputs) {
+    const pid = out.paymentId ? `, pid=${out.paymentId}` : "";
+    log(`    ${formatAmount(out.amount)}${out.isChange ? " (change)" : ""}${pid}, c=${out.commitmentHex}`);
+  }
+  log(`  Fee: ${formatAmount(fee)}`);
+  ok(`built: ${builtTx.toBytes().length} bytes`);
+
+  // Prove & submit
+  log("\n  Proving transaction (this takes several minutes)...");
+  const start = Date.now();
+  const provenTx = builtTx.prove();
+  ok(`proven in ${((Date.now() - start) / 1000).toFixed(1)}s`);
+
+  if (provenTx.hasProofCollection()) ok("has ProofCollection");
+
+  log("\n  Submitting (Generation -> CTIDH)...");
+  try {
+    provenTx.submit(client);
+    ok("submitted");
+  } catch (e) {
+    log(`  submit: ${e}`);
+  }
+
+  return true;
+}
 
 function testFull(): boolean {
   log("=== XNT-SDK TypeScript Test ===\n");
@@ -364,7 +490,7 @@ function testFull(): boolean {
 const cmd = process.argv[2] || "full";
 const testMap: Record<string, () => boolean> = {
   version: testVersion, seed: testSeed, address: testAddress,
-  rpc: testRpc, sync: testSync, utils: testUtils, tx: testTx, full: testFull,
+  rpc: testRpc, sync: testSync, utils: testUtils, tx: testTx, "tx-ctidh": testTxCtidh, full: testFull,
 };
 
 if (testMap[cmd]) {

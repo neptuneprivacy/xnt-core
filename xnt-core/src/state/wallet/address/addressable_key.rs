@@ -6,6 +6,7 @@ use tasm_lib::triton_vm::prelude::Digest;
 use tracing::warn;
 
 use super::common;
+use super::ctidh_address;
 use super::generation_address;
 use super::receiving_address::ReceivingAddress;
 use super::symmetric_key;
@@ -31,6 +32,9 @@ pub enum KeyType {
 
     /// [generation_address] subaddress with payment_id
     GenerationSubAddr = generation_address::GENERATION_SUBADDR_FLAG_U8,
+
+    /// [ctidh_address] shorter address
+    Ctidh = ctidh_address::CTIDH_FLAG_U8,
 }
 
 impl KeyType {
@@ -44,6 +48,7 @@ impl KeyType {
         match self {
             Self::Generation | Self::GenerationSubAddr => Self::Generation,
             Self::Symmetric => Self::Symmetric,
+            Self::Ctidh => Self::Ctidh,
         }
     }
 }
@@ -54,6 +59,7 @@ impl std::fmt::Display for KeyType {
             Self::Generation => write!(f, "Generation"),
             Self::Symmetric => write!(f, "Symmetric"),
             Self::GenerationSubAddr => write!(f, "GenerationSubAddr"),
+            Self::Ctidh => write!(f, "Ctidh"),
         }
     }
 }
@@ -64,6 +70,7 @@ impl From<&ReceivingAddress> for KeyType {
             ReceivingAddress::Generation(_) => Self::Generation,
             ReceivingAddress::Symmetric(_) => Self::Symmetric,
             ReceivingAddress::GenerationSubAddr(_) => Self::GenerationSubAddr,
+            ReceivingAddress::Ctidh(_) => Self::Ctidh,
         }
     }
 }
@@ -73,6 +80,7 @@ impl From<&SpendingKey> for KeyType {
         match addr {
             SpendingKey::Generation(_) => Self::Generation,
             SpendingKey::Symmetric(_) => Self::Symmetric,
+            SpendingKey::Ctidh(_) => Self::Ctidh,
         }
     }
 }
@@ -91,6 +99,7 @@ impl TryFrom<&Announcement> for KeyType {
             Ok(kt) if kt == Self::Generation.into() => Ok(Self::Generation),
             Ok(kt) if kt == Self::Symmetric.into() => Ok(Self::Symmetric),
             Ok(kt) if kt == Self::GenerationSubAddr.into() => Ok(Self::GenerationSubAddr),
+            Ok(kt) if kt == Self::Ctidh.into() => Ok(Self::Ctidh),
             _ => bail!("encountered Announcement of unknown type"),
         }
     }
@@ -99,19 +108,27 @@ impl TryFrom<&Announcement> for KeyType {
 impl KeyType {
     /// returns all available `AddressableKeyType`
     pub fn all_types() -> Vec<KeyType> {
-        vec![Self::Generation, Self::Symmetric, Self::GenerationSubAddr]
+        vec![
+            Self::Generation,
+            Self::Symmetric,
+            Self::GenerationSubAddr,
+            Self::Ctidh,
+        ]
     }
 }
 
 /// Represents cryptographic data necessary for spending funds (or, more
 /// specifically, for unlocking UTXOs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpendingKey {
     /// a key from [generation_address]
     Generation(generation_address::GenerationSpendingKey),
 
     /// a [symmetric_key]
     Symmetric(symmetric_key::SymmetricKey),
+
+    /// a [ctidh_address] key
+    Ctidh(ctidh_address::CtidhSpendingKey),
 }
 
 impl std::hash::Hash for SpendingKey {
@@ -132,6 +149,12 @@ impl From<symmetric_key::SymmetricKey> for SpendingKey {
     }
 }
 
+impl From<ctidh_address::CtidhSpendingKey> for SpendingKey {
+    fn from(key: ctidh_address::CtidhSpendingKey) -> Self {
+        Self::Ctidh(key)
+    }
+}
+
 // future improvements: a strong argument can be made that this type
 // (and the key types it wraps) should not have any methods with
 // outside types as parameters.  for example:
@@ -149,6 +172,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.to_address().into(),
             Self::Symmetric(k) => k.into(),
+            Self::Ctidh(k) => k.to_address().into(),
         }
     }
 
@@ -159,6 +183,7 @@ impl SpendingKey {
                 generation_spending_key.lock_script_and_witness()
             }
             SpendingKey::Symmetric(symmetric_key) => symmetric_key.lock_script_and_witness(),
+            SpendingKey::Ctidh(ctidh_key) => ctidh_key.lock_script_and_witness(),
         }
     }
 
@@ -181,6 +206,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.receiver_preimage(),
             Self::Symmetric(k) => k.receiver_preimage(),
+            Self::Ctidh(k) => k.receiver_preimage(),
         }
     }
 
@@ -201,6 +227,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.receiver_identifier(),
             Self::Symmetric(k) => k.receiver_identifier(),
+            Self::Ctidh(k) => k.receiver_identifier(),
         }
     }
 
@@ -220,6 +247,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.decrypt(ciphertext_bfes),
             Self::Symmetric(k) => k.decrypt(ciphertext_bfes).map_err(anyhow::Error::new),
+            Self::Ctidh(k) => k.decrypt(ciphertext_bfes),
         }
     }
 

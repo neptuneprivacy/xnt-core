@@ -1632,7 +1632,7 @@ pub(crate) mod tests {
             let output_to_self = TxOutput::onchain_native_currency(
                 NativeCurrencyAmount::coins(1),
                 rng.random(),
-                alice_key.to_address(),
+                alice_key.clone().to_address(),
                 true,
             );
 
@@ -1660,7 +1660,7 @@ pub(crate) mod tests {
                 alice.set_new_tip(block1.clone()).await.unwrap();
                 let outputs = vec![output_to_self.clone(); i];
                 let config2 = TxCreationConfig::default()
-                    .recover_change_on_chain(alice_key)
+                    .recover_change_on_chain(alice_key.clone())
                     .with_prover_capability(TxProvingCapability::SingleProof);
                 let tx2 = alice
                     .api()
@@ -1718,7 +1718,7 @@ pub(crate) mod tests {
                 let block_height2 = block2_without_valid_pow.header().height;
                 let consensus_rule_set_2 = ConsensusRuleSet::infer_from(network, block_height2);
                 let config3 = TxCreationConfig::default()
-                    .recover_change_on_chain(alice_key)
+                    .recover_change_on_chain(alice_key.clone())
                     .with_prover_capability(TxProvingCapability::SingleProof);
                 let tx3 = alice
                     .api()

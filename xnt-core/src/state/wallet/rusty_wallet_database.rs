@@ -468,6 +468,16 @@ impl RustyWalletDatabase {
         self.tables.symmetric_key_counter.set(counter).await;
     }
 
+    /// retrieve wallet derivation counter for CTIDH keys
+    pub fn get_ctidh_key_counter(&self) -> u64 {
+        self.tables.ctidh_key_counter.get()
+    }
+
+    /// set wallet derivation counter for CTIDH keys
+    pub async fn set_ctidh_key_counter(&mut self, counter: u64) {
+        self.tables.ctidh_key_counter.set(counter).await;
+    }
+
     /// retrieve the database schema version
     pub fn schema_version(&self) -> u16 {
         self.tables.schema_version.get()

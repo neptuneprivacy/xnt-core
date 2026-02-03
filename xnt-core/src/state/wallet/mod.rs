@@ -595,9 +595,10 @@ mod tests {
 
         let receiver_data_to_alice: TxOutputList =
             vec![receiver_data_12_to_alice, receiver_data_1_to_alice].into();
-        let bob_change_key = bob_wallet.nth_generation_spending_key_for_tests(0).into();
+        let bob_change_key: crate::state::wallet::address::SpendingKey =
+            bob_wallet.nth_generation_spending_key_for_tests(0).into();
         let config_1 = TxCreationConfig::default()
-            .recover_change_on_chain(bob_change_key)
+            .recover_change_on_chain(bob_change_key.clone())
             .with_prover_capability(TxProvingCapability::SingleProof);
         let block_height = BlockHeight::genesis();
         let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
@@ -864,7 +865,7 @@ mod tests {
         );
 
         let config_2b = TxCreationConfig::default()
-            .recover_change_off_chain(bob_change_key)
+            .recover_change_off_chain(bob_change_key.clone())
             .with_prover_capability(TxProvingCapability::SingleProof);
 
         let block_height_2_b = block_2_b.header().height;

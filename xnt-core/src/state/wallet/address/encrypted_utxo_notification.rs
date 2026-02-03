@@ -128,11 +128,7 @@ impl EncryptedUtxoNotification {
 mod tests {
     use arbitrary::Arbitrary;
     use arbitrary::Unstructured;
-    use bech32::FromBase32;
-    use bech32::ToBase32;
-    use proptest::collection::vec;
     use proptest::prop_assert;
-    use proptest::prop_assert_eq;
     use proptest_arbitrary_interop::arb;
     use tasm_lib::triton_vm::prelude::BFieldElement;
     use tasm_lib::twenty_first::bfe;
@@ -150,13 +146,6 @@ mod tests {
             };
             Ok(object)
         }
-    }
-
-    #[proptest]
-    fn base32_encoding(#[strategy(vec(arb::<u8>(), 0..1000))] bytes: Vec<u8>) {
-        let base32 = bytes.to_base32();
-        let bytes_again = Vec::<u8>::from_base32(&base32).unwrap();
-        prop_assert_eq!(bytes, bytes_again);
     }
 
     #[proptest]

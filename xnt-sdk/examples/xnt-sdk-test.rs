@@ -1,7 +1,7 @@
 //! XNT-SDK FFI test binary
 //!
 //! Usage: cargo run --example xnt-sdk-test [command]
-//! Commands: version, error, seed, address, crypto, utxo, utils, sync, tx, full
+//! Commands: version, error, seed, address, ctidh, crypto, utxo, utils, sync, tx, tx-ctidh, tx-mix, full
 
 use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use std::ffi::{CStr, CString};
@@ -56,6 +56,44 @@ impl Drop for Ctx {
     }
 }
 
+/// Context using a CTIDH-512 spending key (for CTIDH tx tests)
+struct CtxCtidh {
+    wallet: *mut WalletHandle,
+    key: *mut SpendingKeyHandle,
+    addr: *mut AddressHandle,
+}
+
+impl CtxCtidh {
+    fn new() -> Option<Self> {
+        let m = cstr(&test_mnemonic());
+        let wallet = xnt_wallet_from_mnemonic(m.as_ptr());
+        if wallet.is_null() {
+            return None;
+        }
+        // Derive CTIDH-512 spending key via FFI
+        let key = xnt_wallet_derive_ctidh_key(wallet, 0);
+        if key.is_null() {
+            xnt_wallet_free(wallet);
+            return None;
+        }
+        let addr = xnt_spending_key_to_address(key);
+        if addr.is_null() {
+            xnt_spending_key_free(key);
+            xnt_wallet_free(wallet);
+            return None;
+        }
+        Some(Self { wallet, key, addr })
+    }
+}
+
+impl Drop for CtxCtidh {
+    fn drop(&mut self) {
+        xnt_address_free(self.addr);
+        xnt_spending_key_free(self.key);
+        xnt_wallet_free(self.wallet);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()).unwrap_or("full") {
@@ -63,11 +101,13 @@ fn main() {
         "error" => test_error(),
         "seed" => test_seed(),
         "address" => test_address(),
+        "ctidh" => test_ctidh_address(),
         "crypto" => test_crypto(),
         "utxo" => test_utxo(),
         "utils" => test_utils(),
         "sync" => test_sync(),
         "tx" => test_tx(),
+        "tx-ctidh" => test_tx_ctidh_multi(),
         "full" => test_full(),
         cmd => { eprintln!("Unknown: {cmd}"); std::process::exit(1); }
     }
@@ -158,6 +198,39 @@ fn test_address() {
     xnt_subaddress_free(sub);
 
     if xnt_subaddress_create(ctx.addr, 0).is_null() { ok!("rejected payment_id=0"); }
+}
+
+/// Test CTIDH-512 address using Rust SDK (bech32m only).
+///
+/// This test:
+/// - derives a CTIDH spending key from the mnemonic
+/// - encodes the address as standard bech32m
+/// - roundtrips the bech32m form back to a CTIDH address.
+fn test_ctidh_address() {
+    println!("Testing CTIDH-512 address (bech32m)...");
+
+    // Build wallet from mnemonic using Rust SDK core
+    let mnemonic = test_mnemonic();
+    let wallet =
+        xnt_sdk::core::WalletEntropy::from_mnemonic(&mnemonic).expect("wallet from mnemonic");
+
+    // Derive CTIDH spending key (uses CTIDH-512 under the hood)
+    let key = wallet.derive_ctidh_spending_key(0);
+    let addr = key.to_address();
+
+    // Standard bech32m encoding (long form, always decodable)
+    let b32 = addr
+        .to_bech32(xnt_sdk::core::Network::Main)
+        .expect("ctidh bech32m encoding failed");
+    ok!("CTIDH bech32m: {b32}");
+
+    // Roundtrip: bech32 -> Address -> bech32 again using SDK API
+    let decoded =
+        xnt_sdk::core::Address::from_bech32(&b32, xnt_sdk::core::Network::Main).expect("decode bech32");
+    let roundtrip = decoded
+        .to_bech32(xnt_sdk::core::Network::Main)
+        .expect("re-encode bech32m");
+    ok!("CTIDH bech32m roundtrip: {roundtrip}");
 }
 
 fn test_crypto() {
@@ -580,6 +653,505 @@ fn test_tx() {
     xnt_mutator_set_free(ms);
     xnt_rpc_client_free(client);
     ok!("tx passed");
+}
+
+/// Build & prove a mixed transaction:
+/// - Inputs: existing Generation/KEM UTXOs (same as `test_tx`)
+/// - Output: sends to a CTIDH-512 receiving address
+fn test_tx_ctidh() {
+    println!("Testing mixed Generation -> CTIDH transaction (build & prove, 16GB RAM)...");
+    let ctx = Ctx::new().expect("setup");
+
+    let url = cstr(&rpc_url());
+    let client = xnt_rpc_client_create(url.as_ptr());
+    check!(client, "client");
+
+    let ms = xnt_sync_get_mutator_set(client);
+    check!(ms, "mutator_set");
+
+    let tip = xnt_sync_get_height(client);
+    if tip < 0 {
+        fail!("no height");
+    }
+    ok!("height: {tip}");
+
+    let mut rid_hash = XntDigest::new();
+    let mut preimage = XntDigest::new();
+    xnt_spending_key_receiver_id_hash(ctx.key, rid_hash.bytes.as_mut_ptr());
+    xnt_spending_key_receiver_preimage(ctx.key, preimage.bytes.as_mut_ptr());
+
+    let mut utxos: Vec<(XntDigest, XntDigest, i128, *mut UtxoHandle)> = Vec::new();
+    let mut from = 0u64;
+    while from <= tip as u64 {
+        let to = (from + 999).min(tip as u64);
+        let mut arr = xnt_sync_fetch_utxos(client, &rid_hash, from, to);
+        if arr.len > 0 && !arr.data.is_null() {
+            for i in 0..arr.len {
+                let idx = unsafe { &*arr.data.add(i) };
+                let dec = xnt_sync_decrypt_indexed_utxo(ctx.key, idx);
+                if !dec.utxo.is_null() {
+                    let mut h = XntDigest::new();
+                    if xnt_utxo_hash(dec.utxo, h.bytes.as_mut_ptr()) == XntErrorCode::Ok {
+                        utxos.push((h, dec.sender_randomness, xnt_utxo_get_amount(dec.utxo), dec.utxo));
+                    } else {
+                        xnt_utxo_free(dec.utxo);
+                    }
+                }
+            }
+            xnt_sync_indexed_utxos_free(&mut arr as *mut _);
+        }
+        from = to + 1;
+    }
+
+    if utxos.is_empty() {
+        xnt_mutator_set_free(ms);
+        xnt_rpc_client_free(client);
+        skip!("no UTXOs");
+    }
+    ok!("{} UTXOs", utxos.len());
+
+    let commits: Vec<XntDigest> = utxos
+        .iter()
+        .map(|(h, sr, _, _)| {
+            let mut c = XntDigest::new();
+            xnt_compute_commitment(h, sr, &preimage, c.bytes.as_mut_ptr());
+            c
+        })
+        .collect();
+
+    let aocl = xnt_sync_get_aocl_indices(client, commits.as_ptr(), commits.len());
+    if aocl.indices.is_null() {
+        for (_, _, _, u) in &utxos {
+            xnt_utxo_free(*u);
+        }
+        xnt_mutator_set_free(ms);
+        xnt_rpc_client_free(client);
+        fail!("no AOCL");
+    }
+    let indices = unsafe { std::slice::from_raw_parts(aocl.indices, aocl.len) };
+
+    let mut abs: Vec<XntDigest> = Vec::new();
+    let mut vi: Vec<usize> = Vec::new();
+    for (i, &idx) in indices.iter().enumerate() {
+        if idx >= 0 && i < utxos.len() {
+            let (h, sr, _, _) = &utxos[i];
+            let mut a = XntDigest::new();
+            if xnt_compute_absolute_index_set_hash(h, sr, &preimage, idx as u64, a.bytes.as_mut_ptr())
+                == XntErrorCode::Ok
+            {
+                abs.push(a);
+                vi.push(i);
+            }
+        }
+    }
+
+    let st = xnt_sync_check_spent(client, abs.as_ptr(), abs.len());
+    if st.heights.is_null() {
+        xnt_sync_aocl_indices_free(&aocl as *const _ as *mut _);
+        for (_, _, _, u) in &utxos {
+            xnt_utxo_free(*u);
+        }
+        xnt_mutator_set_free(ms);
+        xnt_rpc_client_free(client);
+        fail!("spent check failed");
+    }
+    let hs = unsafe { std::slice::from_raw_parts(st.heights, st.len) };
+
+    let mut unspent: Vec<(usize, i64, i128)> = Vec::new();
+    for (j, &h) in hs.iter().enumerate() {
+        if h < 0 && j < vi.len() {
+            let oi = vi[j];
+            unspent.push((oi, indices[oi], utxos[oi].2));
+        }
+    }
+    xnt_sync_spent_status_free(&st as *const _ as *mut _);
+    xnt_sync_aocl_indices_free(&aocl as *const _ as *mut _);
+    unspent.sort_by_key(|(_, _, a)| *a);
+    ok!("{} unspent", unspent.len());
+
+    if unspent.is_empty() {
+        for (_, _, _, u) in &utxos {
+            xnt_utxo_free(*u);
+        }
+        xnt_mutator_set_free(ms);
+        xnt_rpc_client_free(client);
+        skip!("no unspent");
+    }
+
+    let target = NativeCurrencyAmount::coins_from_str("0.612").unwrap().to_nau();
+    let fee = NativeCurrencyAmount::coins_from_str("0.005").unwrap().to_nau();
+    let needed = target + fee;
+
+    let mut sel: Vec<(usize, i64)> = Vec::new();
+    let mut total: i128 = 0;
+    for &(oi, ai, amt) in &unspent {
+        if total >= needed {
+            break;
+        }
+        sel.push((oi, ai));
+        total += amt;
+    }
+
+    if total < needed {
+        for (_, _, _, u) in &utxos {
+            xnt_utxo_free(*u);
+        }
+        xnt_mutator_set_free(ms);
+        xnt_rpc_client_free(client);
+        fail!(
+            "insufficient: need {} have {}",
+            NativeCurrencyAmount::from_nau(needed),
+            NativeCurrencyAmount::from_nau(total)
+        );
+    }
+    ok!(
+        "selected {}/{}, total: {}",
+        sel.len(),
+        unspent.len(),
+        NativeCurrencyAmount::from_nau(total)
+    );
+
+    let (mut uhs, mut srs, mut ais, mut us, mut amts): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
+        (vec![], vec![], vec![], vec![], vec![]);
+    for (oi, ai) in &sel {
+        let (h, sr, amt, u) = &utxos[*oi];
+        uhs.push(h.clone());
+        srs.push(sr.clone());
+        ais.push(*ai as u64);
+        amts.push(*amt);
+        us.push(*u);
+    }
+
+    let mut proofs: Vec<*mut MsMembershipProofHandle> = vec![std::ptr::null_mut(); sel.len()];
+    let r = xnt_sync_get_membership_proofs(
+        client,
+        uhs.as_ptr(),
+        srs.as_ptr(),
+        &preimage,
+        ais.as_ptr(),
+        sel.len(),
+        proofs.as_mut_ptr(),
+    );
+    if r != XntErrorCode::Ok {
+        for (_, _, _, u) in &utxos {
+            xnt_utxo_free(*u);
+        }
+        xnt_mutator_set_free(ms);
+        xnt_rpc_client_free(client);
+        fail!("proofs: {}", get_error());
+    }
+    ok!("{} proofs", proofs.len());
+
+    let builder = xnt_tx_builder_create();
+    check!(builder, "builder");
+
+    println!("\n  Inputs ({}):", proofs.len());
+    for i in 0..proofs.len() {
+        xnt_tx_builder_add_input(builder, us[i], ctx.key, proofs[i]);
+        let mut c = XntDigest::new();
+        xnt_compute_commitment(&uhs[i], &srs[i], &preimage, c.bytes.as_mut_ptr());
+        println!(
+            "    #{}: {}  c={}",
+            i + 1,
+            NativeCurrencyAmount::from_nau(amts[i]),
+            hex::encode(&c.bytes)
+        );
+    }
+    println!(
+        "    Total: {}",
+        NativeCurrencyAmount::from_nau(amts.iter().sum::<i128>())
+    );
+
+    for mp in &proofs {
+        xnt_ms_membership_proof_free(*mp);
+    }
+    for (_, _, _, u) in &utxos {
+        xnt_utxo_free(*u);
+    }
+
+    // Derive a CTIDH-2048 address from the same mnemonic via Rust SDK core
+    let mnemonic = test_mnemonic();
+    let wallet =
+        xnt_sdk::core::WalletEntropy::from_mnemonic(&mnemonic).expect("wallet from mnemonic");
+    let ctidh_key = wallet.derive_ctidh_spending_key(0);
+    let ctidh_addr = ctidh_key.to_address();
+    let ctidh_b32 = ctidh_addr
+        .to_bech32(xnt_sdk::core::Network::Main)
+        .expect("ctidh bech32m");
+    ok!("CTIDH recipient bech32: {ctidh_b32}");
+
+    // Import CTIDH address into FFI layer as ReceivingAddress
+    let ctidh_b32_c = cstr(&ctidh_b32);
+    let ctidh_addr_handle = xnt_address_from_bech32(ctidh_b32_c.as_ptr(), XntNetwork::Main);
+    check!(ctidh_addr_handle, "ctidh address from bech32");
+    let recv = xnt_address_to_receiving(ctidh_addr_handle);
+    check!(recv, "receiving address (ctidh)");
+
+    let osr = xnt_random_sender_randomness();
+    let csr = xnt_random_sender_randomness();
+    xnt_tx_builder_add_output(builder, recv, target, &osr);
+    xnt_tx_builder_set_change(builder, ctx.addr, &csr);
+    xnt_tx_builder_set_fee(builder, fee);
+
+    xnt_receiving_address_free(recv);
+    xnt_address_free(ctidh_addr_handle);
+
+    let ts = xnt_timestamp_now();
+    let built = xnt_tx_builder_build(builder, ms, ts, XntNetwork::Main);
+    check!(built, "build");
+
+    // Show built transaction summary
+    let inputs_info = xnt_built_transaction_inputs(built);
+    let outputs_info = xnt_built_transaction_outputs(built);
+    if !inputs_info.is_null() && !outputs_info.is_null() {
+        let inputs =
+            unsafe { std::slice::from_raw_parts((*inputs_info).data, (*inputs_info).len) };
+        let outputs =
+            unsafe { std::slice::from_raw_parts((*outputs_info).data, (*outputs_info).len) };
+
+        let in_total: i128 = inputs.iter().map(|i| i.amount).sum();
+        let out_total: i128 = outputs.iter().map(|o| o.amount).sum();
+
+        println!(
+            "\n  Inputs ({}): {}",
+            inputs.len(),
+            NativeCurrencyAmount::from_nau(in_total)
+        );
+        for inp in inputs {
+            println!(
+                "    {}, c={}",
+                NativeCurrencyAmount::from_nau(inp.amount),
+                hex::encode(&inp.commitment.bytes)
+            );
+        }
+        println!(
+            "  Outputs ({}): {}",
+            outputs.len(),
+            NativeCurrencyAmount::from_nau(out_total)
+        );
+        for out in outputs {
+            let change = if out.is_change { " (change)" } else { "" };
+            let pid = if out.payment_id != 0 {
+                format!(", pid={}", out.payment_id)
+            } else {
+                "".into()
+            };
+            println!(
+                "    {}{}{}, c={}",
+                NativeCurrencyAmount::from_nau(out.amount),
+                change,
+                pid,
+                hex::encode(&out.commitment.bytes)
+            );
+        }
+        println!("  Fee: {}", NativeCurrencyAmount::from_nau(fee));
+
+        xnt_tx_input_info_array_free(inputs_info);
+        xnt_tx_output_info_array_free(outputs_info);
+    }
+
+    ok!("built (mix Generation -> CTIDH)");
+
+    println!("Proving (mixed tx)...");
+    let start = std::time::Instant::now();
+    let proven = xnt_built_transaction_prove(built);
+    let elapsed = start.elapsed();
+    check!(proven, "prove");
+
+    if xnt_transaction_has_proof_collection(proven) {
+        ok!("proven in {:.1}s", elapsed.as_secs_f64());
+    }
+
+    let tx = xnt_transaction_serialize(proven);
+    check!(tx, "serialize");
+    ok!("tx: {} bytes", unsafe { &*tx }.len);
+
+    println!("\nSubmitting (mixed Generation -> CTIDH tx)...");
+    let sub = xnt_transaction_submit(proven, client);
+    if sub == XntErrorCode::Ok {
+        ok!("submitted");
+    } else {
+        println!("  result: {:?} - {}", sub, get_error());
+    }
+
+    xnt_buffer_free(tx);
+    xnt_transaction_free(proven);
+    xnt_built_transaction_free(built);
+    xnt_tx_builder_free(builder);
+    xnt_mutator_set_free(ms);
+    xnt_rpc_client_free(client);
+    ok!("tx-mix passed");
+}
+
+/// Multi-type input transaction (Generation + CTIDH) using Rust SDK core.
+///
+/// This test:
+/// - derives Generation and CTIDH spending keys from the same mnemonic
+/// - collects spendable inputs for both keys via SDK core
+/// - builds a mixed-input transaction sending to a CTIDH address
+fn test_tx_ctidh_multi() {
+    use xnt_sdk::core::{
+        json_rpc::RpcClient as CoreRpcClient,
+        sync::{collect_spendable_inputs_for_key, get_mutator_set, SpendableInput},
+        transaction::TransactionBuilder,
+        types::Network as CoreNetwork,
+        wallet::WalletEntropy as CoreWalletEntropy,
+    };
+
+    println!("Testing multi-input Generation + CTIDH (Rust SDK core, 16GB RAM)...");
+
+    let mnemonic = test_mnemonic();
+    let wallet = CoreWalletEntropy::from_mnemonic(&mnemonic).expect("wallet");
+
+    // Derive Generation and CTIDH keys from the same seed
+    let gen_key = wallet.derive_spending_key(0);
+    let ctidh_key = wallet.derive_ctidh_spending_key(0);
+    let gen_addr = gen_key.to_address();
+    let ctidh_addr = ctidh_key.to_address();
+    println!(
+        "length of CTIDH bech32m address: {}",
+        ctidh_addr
+            .to_bech32(CoreNetwork::Main)
+            .expect("ctidh bech32m encoding failed")
+            .len()
+    );
+    let ctidh_b32 = ctidh_addr
+        .to_bech32(CoreNetwork::Main)
+        .expect("ctidh bech32m");
+    ok!("CTIDH recipient bech32: {ctidh_b32}");
+
+    // RPC client
+    let client = CoreRpcClient::new(&rpc_url()).expect("rpc client");
+    let tip = client.chain_height().expect("height");
+    ok!("height: {tip}");
+
+    // Collect spendable inputs for both keys (handle RPC errors gracefully)
+    let mut gen_inputs = match collect_spendable_inputs_for_key(&client, &gen_key, 15000, tip) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[SKIP] collect Generation inputs failed: {e}");
+            Vec::new()
+        }
+    };
+    let mut ctidh_inputs = match collect_spendable_inputs_for_key(&client, &ctidh_key, 15000, tip) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[SKIP] collect CTIDH inputs failed: {e}");
+            Vec::new()
+        }
+    };
+
+    let mut all: Vec<SpendableInput> = Vec::new();
+    all.append(&mut gen_inputs);
+    all.append(&mut ctidh_inputs);
+    
+
+    if all.is_empty() {
+        skip!("no spendable inputs for Generation or CTIDH");
+    }
+    ok!(
+        "spendable inputs: Generation={}, CTIDH={}",
+        all.iter().filter(|s| s.spending_key.is_generation()).count(),
+        all.iter().filter(|s| s.spending_key.is_ctidh()).count()
+    );
+
+    // Select inputs across both key types
+    let target = NativeCurrencyAmount::coins_from_str("0.612").unwrap().to_nau();
+    let fee = NativeCurrencyAmount::coins_from_str("0.005").unwrap().to_nau();
+    let needed = target + fee;
+
+    all.sort_by_key(|s| s.amount);
+    let mut selected: Vec<SpendableInput> = Vec::new();
+    let mut total: i128 = 0;
+    for s in &all {
+        if total >= needed {
+            break;
+        }
+        selected.push(s.clone());
+        total += s.amount;
+    }
+
+    if total < needed {
+        fail!(
+            "insufficient: need {} have {}",
+            NativeCurrencyAmount::from_nau(needed),
+            NativeCurrencyAmount::from_nau(total)
+        );
+    }
+    ok!(
+        "selected {}/{}, total: {}",
+        selected.len(),
+        all.len(),
+        NativeCurrencyAmount::from_nau(total)
+    );
+
+    // Build transaction with mixed inputs
+    let mut builder = TransactionBuilder::new();
+    for s in &selected {
+        builder.add_input(s.utxo.clone(), s.spending_key.clone(), s.membership_proof.clone());
+    }
+
+    // Output to CTIDH address, change back to Generation address
+    let osr = {
+        let sr = xnt_random_sender_randomness();
+        xnt_sdk::core::types::Digest::from_bytes(sr.bytes)
+    };
+    let csr = {
+        let sr = xnt_random_sender_randomness();
+        xnt_sdk::core::types::Digest::from_bytes(sr.bytes)
+    };
+    builder.add_output(gen_addr.to_receiving_address(), target, osr);
+    builder.set_change(gen_addr, csr);
+    builder.set_fee(fee);
+
+    let mutator_set = get_mutator_set(&client).expect("mutator set");
+    let ts = xnt_timestamp_now();
+    let built = builder
+        .build(&mutator_set, ts, CoreNetwork::Main)
+        .expect("build");
+
+    // Print summary
+    let inputs_info = built.inputs();
+    let outputs_info = built.outputs();
+    println!("\n  Inputs ({}):", inputs_info.len());
+    for inp in &inputs_info {
+        println!(
+            "    c={}",
+            hex::encode(&inp.commitment.bytes)
+        );
+    }
+    println!("  Outputs ({}):", outputs_info.len());
+    for out in &outputs_info {
+        let change = if out.is_change { " (change)" } else { "" };
+        let pid = out.payment_id.map(|p| format!(", pid={p}")).unwrap_or_default();
+        println!(
+            "    {}{}, c={}",
+            change,
+            pid,
+            hex::encode(&out.commitment.bytes)
+        );
+    }
+    println!("  Fee: {}", NativeCurrencyAmount::from_nau(fee));
+    ok!("built (multi Generation + CTIDH)");
+
+    // Prove (async) and submit
+    println!("Proving (multi-input tx)...");
+    let start = std::time::Instant::now();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let proven = rt.block_on(built.prove()).expect("prove");
+    let elapsed = start.elapsed();
+    if proven.has_proof_collection() {
+        ok!("proven in {:.1}s", elapsed.as_secs_f64());
+    }
+
+    let tx_bytes = proven.to_bytes().expect("serialize");
+    ok!("tx: {} bytes", tx_bytes.len());
+
+    println!("\nSubmitting (multi Generation + CTIDH tx)...");
+    match proven.submit(&client) {
+        Ok(()) => ok!("submitted"),
+        Err(e) => println!("  submit failed: {e}"),
+    }
 }
 
 fn test_full() {

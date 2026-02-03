@@ -961,6 +961,7 @@ async fn main() -> Result<()> {
                         ReceivingAddress::Generation(_) => "Generation",
                         ReceivingAddress::Symmetric(_) => "Symmetric",
                         ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
+                        ReceivingAddress::Ctidh(_) => "Ctidh",
                     };
                     println!("Valid address!");
                     println!("Address type: {address_type}");

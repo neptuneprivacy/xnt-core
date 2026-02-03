@@ -91,6 +91,30 @@ impl MembershipProof {
     }
 }
 
+/// Spendable input collected from the chain for a specific spending key.
+///
+/// This struct is SDK-only; it is not serialized on-chain.
+#[derive(Clone)]
+pub struct SpendableInput {
+    /// The decrypted UTXO
+    pub utxo: Utxo,
+    /// The spending key that can unlock this UTXO (Generation or Ctidh)
+    pub spending_key: SpendingKey,
+    /// Membership proof for this UTXO in the mutator set
+    pub membership_proof: MembershipProof,
+    /// Sender randomness used in the commitment
+    pub sender_randomness: Digest,
+    /// AOCL leaf index for this UTXO
+    pub aocl_index: u64,
+    /// Amount in native currency (nau)
+    pub amount: i128,
+    /// Block height where the UTXO was created
+    pub block_height: u64,
+    /// Block digest where the UTXO was created
+    pub block_digest: Digest,
+}
+
+
 /// Compute canonical commitment for UTXO (using receiver_preimage)
 pub fn compute_commitment(
     utxo_hash: &Digest,
@@ -247,6 +271,177 @@ pub fn get_aocl_indices(client: &RpcClient, commitments: &[Digest]) -> Result<Ao
         .ok_or_else(|| XntError::RpcError("missing indices".to_string()))?;
 
     Ok(indices.iter().map(|v| v.as_i64().unwrap_or(-1)).collect())
+}
+
+/// Collect spendable inputs (UTXOs + membership proofs) for a single spending key.
+///
+/// This will:
+/// - fetch UTXOs by receiver_id_hash
+/// - decrypt them using the provided key
+/// - compute commitments and AOCL indices
+/// - filter out spent UTXOs
+/// - restore membership proofs for the remaining ones
+pub fn collect_spendable_inputs_for_key(
+    client: &RpcClient,
+    key: &SpendingKey,
+    from_height: u64,
+    to_height: u64,
+) -> Result<Vec<SpendableInput>> {
+    // Derive receiver_id_hash and receiver_preimage from SDK key
+    let rid_hash = key.receiver_id_hash();
+    let receiver_preimage = key.receiver_preimage();
+
+    // Fetch indexed UTXOs from archival node
+    let indexed = fetch_utxos(client, &rid_hash, from_height, to_height)?;
+    if indexed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Decrypt UTXOs using core SpendingKey::decrypt (works for Generation and Ctidh)
+    let mut utxos: Vec<(Utxo, Digest, i128, u64, Digest)> = Vec::new();
+    for idx in indexed {
+        // ciphertext_bfes are encoded little-endian u64s; convert back to BFieldElements
+        let bfe_words = idx
+            .ciphertext
+            .chunks(8)
+            .map(|chunk| {
+                let mut arr = [0u8; 8];
+                arr[..chunk.len()].copy_from_slice(chunk);
+                u64::from_le_bytes(arr)
+            })
+            .collect::<Vec<u64>>();
+
+        let bfes: Vec<neptune_privacy::prelude::twenty_first::prelude::BFieldElement> =
+            bfe_words
+                .into_iter()
+                .map(|v| neptune_privacy::prelude::twenty_first::prelude::BFieldElement::new(v))
+                .collect();
+
+        let (core_utxo, sr, _payment_id) = key
+            .inner
+            .decrypt(&bfes)
+            .map_err(|e| XntError::CryptoError(format!("decryption failed: {e}")))?;
+        {
+            let amount = core_utxo.get_native_currency_amount().to_nau();
+            let utxo = Utxo::from_core(core_utxo);
+            utxos.push((utxo, Digest::from_core(sr), amount, idx.block_height, idx.block_digest));
+        }
+    }
+
+    if utxos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Compute commitments and fetch AOCL indices
+    let commits: Vec<Digest> = utxos
+        .iter()
+        .map(|(u, sr, _, _, _)| compute_commitment(&u.hash(), sr, &receiver_preimage))
+        .collect();
+
+    let aocl = get_aocl_indices(client, &commits)?;
+    if aocl.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build AbsoluteIndexSet hashes and check spent status
+    let mut abs_hashes: Vec<Digest> = Vec::new();
+    let mut valid_indices: Vec<usize> = Vec::new();
+    for (i, &idx) in aocl.iter().enumerate() {
+        if idx >= 0 && i < utxos.len() {
+            let (ref u, ref sr, _, _, _) = utxos[i];
+            let h = compute_absolute_index_set_hash(&u.hash(), sr, &receiver_preimage, idx as u64);
+            abs_hashes.push(h);
+            valid_indices.push(i);
+        }
+    }
+
+    if abs_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let spent = check_spent(client, &abs_hashes)?;
+    if spent.len() != valid_indices.len() {
+        return Err(XntError::RpcError(
+            "spent status length mismatch".to_string(),
+        ));
+    }
+
+    // Filter to unspent
+    let mut unspent_indices: Vec<(usize, u64)> = Vec::new();
+    for (j, &h) in spent.iter().enumerate() {
+        if h < 0 && j < valid_indices.len() {
+            let oi = valid_indices[j];
+            let aocl_idx = aocl[oi];
+            if aocl_idx >= 0 {
+                unspent_indices.push((oi, aocl_idx as u64));
+            }
+        }
+    }
+
+    if unspent_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Restore membership proofs for unspent UTXOs
+    use neptune_privacy::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipProofPrivacyPreserving;
+
+    let absolute_index_sets: Vec<AbsoluteIndexSet> = unspent_indices
+        .iter()
+        .map(|(oi, idx)| {
+            let (ref u, ref sr, _, _, _) = utxos[*oi];
+            AbsoluteIndexSet::compute(
+                u.hash().to_core(),
+                sr.to_core(),
+                receiver_preimage.to_core(),
+                *idx,
+            )
+        })
+        .collect();
+
+    let params = json!([absolute_index_sets]);
+    let result = client.call("archival_restoreMembershipProof", params)?;
+    let snapshot = result
+        .get("snapshot")
+        .ok_or_else(|| XntError::RpcError("missing snapshot".to_string()))?;
+    let proofs_arr = snapshot
+        .get("membershipProofs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| XntError::RpcError("missing membershipProofs".to_string()))?;
+
+    if proofs_arr.len() != unspent_indices.len() {
+        return Err(XntError::RpcError(
+            "membershipProofs length mismatch".to_string(),
+        ));
+    }
+
+    let mut res = Vec::with_capacity(unspent_indices.len());
+    for (idx, proof_val) in proofs_arr.iter().enumerate() {
+        let rpc_proof: RpcMsMembershipProofPrivacyPreserving =
+            serde_json::from_value(proof_val.clone())
+                .map_err(|e| XntError::RpcError(format!("parse proof {idx} failed: {e}")))?;
+
+        let (_oi, aocl_idx) = unspent_indices[idx];
+        let (ref u, ref sr, amount, bh, bd) = utxos[unspent_indices[idx].0];
+
+        let msmp = rpc_proof
+            .extract_ms_membership_proof(aocl_idx, sr.to_core(), receiver_preimage.to_core())
+            .ok_or_else(|| {
+                XntError::RpcError(format!("extract proof {idx} failed for aocl index {aocl_idx}"))
+            })?;
+
+        res.push(SpendableInput {
+            utxo: u.clone(),
+            spending_key: key.clone(),
+            membership_proof: MembershipProof::from_core(msmp),
+            sender_randomness: sr.clone(),
+            aocl_index: aocl_idx,
+            amount,
+            block_height: bh,
+            block_digest: bd.clone(),
+        });
+    }
+
+    Ok(res)
 }
 
 /// Get current mutator set from archival node

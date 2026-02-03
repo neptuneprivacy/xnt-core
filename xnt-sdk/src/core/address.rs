@@ -31,7 +31,6 @@ impl Address {
             .to_bech32m(network.into())
             .map_err(|e| XntError::EncodingError(e.to_string()))
     }
-
     /// Get lock_script_hash (40 bytes = Digest)
     pub fn lock_script_hash(&self) -> Digest {
         Digest::from_core(self.inner.lock_script_hash())

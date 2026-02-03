@@ -34,6 +34,8 @@ pub struct ReceiveScreen {
     fg: Color,
     bg: Color,
     in_focus: bool,
+    /// Which key type to use when generating / showing a receiving address.
+    current_key_type: KeyType,
     data: Arc<std::sync::Mutex<Option<ReceivingAddress>>>,
     server: Arc<DashboardRpcClient>,
     generating: Arc<Mutex<bool>>,
@@ -44,18 +46,25 @@ pub struct ReceiveScreen {
 
 impl ReceiveScreen {
     pub fn new(rpc_server: Arc<DashboardRpcClient>, network: Network, token: auth::Token) -> Self {
-        Self {
+        let data = Arc::new(Mutex::new(None));
+        let server = rpc_server.clone();
+        let escalatable_event = Arc::new(std::sync::Mutex::new(None));
+        let s = Self {
             active: false,
             fg: Color::Gray,
             bg: Color::Black,
             in_focus: false,
-            data: Arc::new(Mutex::new(None)),
+            current_key_type: KeyType::Generation,
+            data: data.clone(),
             server: rpc_server,
             generating: Arc::new(Mutex::new(false)),
-            escalatable_event: Arc::new(std::sync::Mutex::new(None)),
+            escalatable_event: escalatable_event.clone(),
             network,
             token,
-        }
+        };
+        // Preload address so it's ready when user opens Receive (no need to press Enter first).
+        s.populate_receiving_address_async(server, token, data, s.current_key_type);
+        s
     }
 
     fn populate_receiving_address_async(
@@ -63,16 +72,34 @@ impl ReceiveScreen {
         rpc_client: Arc<DashboardRpcClient>,
         token: auth::Token,
         data: Arc<Mutex<Option<ReceivingAddress>>>,
+        key_type: KeyType,
     ) {
         if data.lock().unwrap().is_none() {
             let escalatable_event = self.escalatable_event.clone();
 
             tokio::spawn(async move {
-                let receiving_address = rpc_client
-                    .latest_address(context::current(), token, KeyType::Generation)
+                // Try to get the latest address; if none exists yet (or any error),
+                // fall back to creating the next receiving address.
+                let receiving_address = match rpc_client
+                    .latest_address(context::current(), token, key_type)
                     .await
-                    .unwrap()
-                    .unwrap();
+                    .ok()
+                    .and_then(|rpc_result| rpc_result.ok())
+                {
+                    Some(addr) => addr,
+                    None => match rpc_client
+                        .next_receiving_address(context::current(), token, key_type)
+                        .await
+                        .ok()
+                        .and_then(|rpc_result| rpc_result.ok())
+                    {
+                        Some(addr) => addr,
+                        None => {
+                            // Give up silently; UI will just show "-" for address.
+                            return;
+                        }
+                    },
+                };
                 *data.lock().unwrap() = Some(receiving_address);
                 *escalatable_event.lock().unwrap() = Some(DashboardEvent::RefreshScreen);
             });
@@ -85,12 +112,13 @@ impl ReceiveScreen {
         token: auth::Token,
         data: Arc<Mutex<Option<ReceivingAddress>>>,
         generating: Arc<Mutex<bool>>,
+        key_type: KeyType,
     ) {
         let escalatable_event = self.escalatable_event.clone();
         tokio::spawn(async move {
             *generating.lock().unwrap() = true;
             let receiving_address = rpc_client
-                .next_receiving_address(context::current(), token, KeyType::Generation)
+                .next_receiving_address(context::current(), token, key_type)
                 .await
                 .unwrap()
                 .unwrap();
@@ -112,16 +140,32 @@ impl ReceiveScreen {
                                 self.token,
                                 self.data.clone(),
                                 self.generating.clone(),
+                                self.current_key_type,
+                            );
+                            escalate_event = Some(DashboardEvent::RefreshScreen);
+                        }
+                        // Toggle between Generation and Ctidh receiving address types.
+                        KeyCode::Char('t') | KeyCode::Char('T') => {
+                            self.current_key_type = match self.current_key_type {
+                                KeyType::Generation | KeyType::GenerationSubAddr => KeyType::Ctidh,
+                                KeyType::Ctidh => KeyType::Generation,
+                                KeyType::Symmetric => KeyType::Generation,
+                            };
+                            // Clear cached address so we fetch a fresh one for the new key type.
+                            *self.data.lock().unwrap() = None;
+                            self.populate_receiving_address_async(
+                                self.server.clone(),
+                                self.token,
+                                self.data.clone(),
+                                self.current_key_type,
                             );
                             escalate_event = Some(DashboardEvent::RefreshScreen);
                         }
                         KeyCode::Char('c') => {
                             if let Some(address) = self.data.lock().unwrap().as_ref() {
+                                let encoded = address.to_bech32m(self.network).unwrap();
                                 return Some(DashboardEvent::ConsoleMode(
-                                    ConsoleIO::InputRequested(format!(
-                                        "{}\n\n",
-                                        address.to_bech32m(self.network).unwrap()
-                                    )),
+                                    ConsoleIO::InputRequested(format!("{encoded}\n\n")),
                                 ));
                             }
                         }
@@ -142,7 +186,7 @@ impl Screen for ReceiveScreen {
         let server_arc = self.server.clone();
         let data_arc = self.data.clone();
         let token = self.token;
-        self.populate_receiving_address_async(server_arc, token, data_arc);
+        self.populate_receiving_address_async(server_arc, token, data_arc, self.current_key_type);
     }
 
     fn deactivate(&mut self) {
@@ -189,51 +233,30 @@ impl Widget for ReceiveScreen {
 
         // display address
         let receiving_address = self.data.lock().unwrap().to_owned();
+        let key_type_label = match self.current_key_type {
+            KeyType::Generation | KeyType::GenerationSubAddr => "Generation",
+            KeyType::Symmetric => "Symmetric",
+            KeyType::Ctidh => "CTIDH",
+        };
         let (mut address, address_abbrev) = match receiving_address {
-            Some(addr) => (
-                addr.to_bech32m(self.network).unwrap(),
-                addr.to_bech32m_abbreviated(self.network).unwrap(),
-            ),
+            Some(addr) => match self.current_key_type {
+                KeyType::Ctidh => {
+                    let bech = addr.to_bech32m(self.network).unwrap();
+                    (bech.clone(), bech)
+                }
+                _ => (
+                    addr.to_bech32m(self.network).unwrap(),
+                    addr.to_bech32m_abbreviated(self.network).unwrap(),
+                ),
+            },
             None => ("-".to_string(), "-".to_string()),
         };
         let width = max(0, inner.width as isize - 2) as usize;
         if width > 0 {
             let mut address_lines = vec![];
 
-            let address_abbrev_rect = vrecter.next(1 + 2);
-            let address_abbrev_display = Paragraph::new(Text::from(address_abbrev))
-                .style(style)
-                .block(Block::default().borders(Borders::ALL).title(Span::styled(
-                    "Receiving Address (abbreviated)",
-                    Style::default(),
-                )))
-                .alignment(Alignment::Left);
-            address_abbrev_display.render(address_abbrev_rect, buf);
-
-            vrecter.next(1);
-
-            while address.len() > width {
-                let (line, remainder) = address.split_at(width);
-                address_lines.push(line.to_owned());
-
-                address = remainder.to_owned();
-            }
-            address_lines.push(address);
-
-            let address_rect = vrecter.next((address_lines.len() + 2).try_into().unwrap());
-            if address_rect.height > 0 {
-                let address_display = Paragraph::new(Text::from(address_lines.join("\n")))
-                    .style(style)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(Span::styled("Receiving Address", Style::default())),
-                    )
-                    .alignment(Alignment::Left);
-                address_display.render(address_rect, buf);
-            }
-
-            // display generation instructions
+            // display generation instructions at the top so they are always visible,
+            // even when the address box is very tall.
             if *self.generating.lock().unwrap() {
                 let generating_text =
                     Paragraph::new(Span::from("Generating ...")).alignment(Alignment::Left);
@@ -249,14 +272,24 @@ impl Widget for ReceiveScreen {
                     Span::styled("Enter ↵", Style::default().fg(Color::Rgb(49, 64, 167))),
                     Span::from(" to "),
                     Span::from(action),
-                    Span::from("."),
+                    Span::from(" ("),
+                    Span::styled(
+                        key_type_label,
+                        Style::default().fg(Color::Rgb(49, 64, 167)),
+                    ),
+                    Span::from(").  Press "),
+                    Span::styled(
+                        "T",
+                        Style::default().fg(Color::Rgb(49, 64, 167)),
+                    ),
+                    Span::from(" to toggle Generation/CTIDH."),
                 ]);
                 let style = Style::default().fg(self.fg);
                 let generate_instructions = Paragraph::new(instructions).style(style);
                 generate_instructions.render(vrecter.next(1), buf);
             }
 
-            // display copy instructions
+            // display copy instructions just under the main instructions
             if self.in_focus {
                 let style = Style::default().fg(self.fg);
                 let instructions = Line::from(vec![
@@ -269,10 +302,55 @@ impl Widget for ReceiveScreen {
                             style
                         },
                     ),
-                    Span::from(" display in console mode."),
+                    Span::from(" to show current address in console mode."),
                 ]);
                 let generate_instructions = Paragraph::new(instructions).style(style);
                 generate_instructions.render(vrecter.next(1), buf);
+            }
+
+            // then show abbreviated and full address below the instructions
+            let address_abbrev_rect = vrecter.next(1 + 2);
+            let address_abbrev_display = Paragraph::new(Text::from(address_abbrev))
+                .style(style)
+                .block(Block::default().borders(Borders::ALL).title(Span::styled(
+                    format!("Receiving Address ({key_type_label}, abbreviated)"),
+                    Style::default(),
+                )))
+                .alignment(Alignment::Left);
+            address_abbrev_display.render(address_abbrev_rect, buf);
+
+            vrecter.next(1);
+
+            while address.len() > width {
+                let split_at = address
+                    .char_indices()
+                    .take_while(|(i, c)| i + c.len_utf8() <= width)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or_else(|| {
+                        address.chars().next().map(|c| c.len_utf8()).unwrap_or(0)
+                    });
+                let (line, remainder) = address.split_at(split_at);
+                address_lines.push(line.to_owned());
+
+                address = remainder.to_owned();
+            }
+            address_lines.push(address);
+
+            let address_rect = vrecter.next((address_lines.len() + 2).try_into().unwrap());
+            if address_rect.height > 0 {
+                let address_display = Paragraph::new(Text::from(address_lines.join("\n")))
+                    .style(style)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(Span::styled(
+                                format!("Receiving Address ({key_type_label})"),
+                                Style::default(),
+                            )),
+                    )
+                    .alignment(Alignment::Left);
+                address_display.render(address_rect, buf);
             }
         }
     }

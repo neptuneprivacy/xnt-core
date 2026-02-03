@@ -58,6 +58,15 @@ impl WalletEntropy {
             inner: CoreSpendingKey::Generation(gen_key),
         }
     }
+
+    /// Derive Nth CTIDH spending key (currently CTIDH-512 as implemented
+    /// in the `neptune-privacy` core via dCTIDH).
+    pub fn derive_ctidh_spending_key(&self, index: u64) -> SpendingKey {
+        let ctidh_key = self.inner.nth_ctidh_spending_key(index);
+        SpendingKey {
+            inner: CoreSpendingKey::Ctidh(ctidh_key),
+        }
+    }
 }
 
 /// Spending key for signing transactions
@@ -69,7 +78,7 @@ pub struct SpendingKey {
 impl SpendingKey {
     /// Get receiving address from spending key
     pub fn to_address(&self) -> Address {
-        Address::from_core(self.inner.to_address())
+        Address::from_core(self.inner.clone().to_address())
     }
 
     /// Get receiver identifier (8 bytes, little-endian u64)
@@ -91,5 +100,15 @@ impl SpendingKey {
     /// Get receiver preimage (privacy_preimage) for commitment computation
     pub fn receiver_preimage(&self) -> Digest {
         Digest::from_core(self.inner.privacy_preimage())
+    }
+
+    /// Returns true if this is a CTIDH spending key.
+    pub fn is_ctidh(&self) -> bool {
+        matches!(self.inner, CoreSpendingKey::Ctidh(_))
+    }
+
+    /// Returns true if this is a Generation spending key.
+    pub fn is_generation(&self) -> bool {
+        matches!(self.inner, CoreSpendingKey::Generation(_))
     }
 }

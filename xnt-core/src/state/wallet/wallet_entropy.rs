@@ -12,6 +12,7 @@ use zeroize::ZeroizeOnDrop;
 
 use super::address::ReceivingAddress;
 use crate::protocol::consensus::block::block_height::BlockHeight;
+use crate::state::wallet::address::ctidh_address;
 use crate::state::wallet::address::generation_address;
 use crate::state::wallet::address::symmetric_key;
 use crate::state::wallet::secret_key_material::SecretKeyMaterial;
@@ -80,6 +81,23 @@ impl WalletEntropy {
             .concat(),
         );
         generation_address::GenerationSpendingKey::derive_from_seed(key_seed)
+    }
+
+    /// Derives a CTIDH spending key at `index`.
+    ///
+    /// note: this is a read-only method and does not modify wallet state.  When
+    /// requesting a new key for purposes of a new wallet receiving address,
+    /// callers should use [wallet_state::WalletState::next_unused_spending_key()]
+    /// which takes &mut self.
+    pub fn nth_ctidh_spending_key(&self, index: u64) -> ctidh_address::CtidhSpendingKey {
+        let key_seed = Tip5::hash_varlen(
+            &[
+                self.secret_seed.0.encode(),
+                bfe_vec![ctidh_address::CTIDH_FLAG, index],
+            ]
+            .concat(),
+        );
+        ctidh_address::CtidhSpendingKey::derive_from_seed(key_seed)
     }
 
     /// derives a symmetric key at `index`

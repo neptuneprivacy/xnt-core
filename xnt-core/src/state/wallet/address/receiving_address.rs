@@ -9,6 +9,7 @@ use serde::Serialize;
 use tasm_lib::triton_vm::prelude::Digest;
 
 use super::common::SubAddress;
+use super::ctidh_address;
 use super::generation_address;
 use super::symmetric_key;
 use crate::api::export::KeyType;
@@ -40,6 +41,9 @@ pub enum ReceivingAddress {
 
     /// a [generation_address] subaddress with payment_id
     GenerationSubAddr(generation_address::GenerationSubAddress),
+
+    /// a [ctidh_address] shorter address
+    Ctidh(Box<ctidh_address::CtidhReceivingAddress>),
 }
 
 impl From<generation_address::GenerationReceivingAddress> for ReceivingAddress {
@@ -72,6 +76,18 @@ impl From<generation_address::GenerationSubAddress> for ReceivingAddress {
     }
 }
 
+impl From<ctidh_address::CtidhReceivingAddress> for ReceivingAddress {
+    fn from(a: ctidh_address::CtidhReceivingAddress) -> Self {
+        Self::Ctidh(Box::new(a))
+    }
+}
+
+impl From<&ctidh_address::CtidhReceivingAddress> for ReceivingAddress {
+    fn from(a: &ctidh_address::CtidhReceivingAddress) -> Self {
+        Self::Ctidh(Box::new(*a))
+    }
+}
+
 impl TryFrom<ReceivingAddress> for generation_address::GenerationReceivingAddress {
     type Error = anyhow::Error;
 
@@ -91,6 +107,7 @@ impl ReceivingAddress {
             Self::Generation(a) => a.receiver_identifier(),
             Self::Symmetric(a) => a.receiver_identifier(),
             Self::GenerationSubAddr(a) => a.receiver_identifier(),
+            Self::Ctidh(a) => a.receiver_identifier(),
         }
     }
 
@@ -98,7 +115,7 @@ impl ReceivingAddress {
     pub fn payment_id(&self) -> Option<u64> {
         match self {
             Self::GenerationSubAddr(a) => Some(a.payment_id_u64()),
-            _ => None,
+            Self::Generation(_) | Self::Symmetric(_) | Self::Ctidh(_) => None,
         }
     }
 
@@ -125,6 +142,7 @@ impl ReceivingAddress {
             ReceivingAddress::GenerationSubAddr(subaddr) => {
                 subaddr.generate_announcement(&utxo_notification_payload)
             }
+            ReceivingAddress::Ctidh(ctidh) => ctidh.generate_announcement(&utxo_notification_payload),
         }
     }
 
@@ -147,6 +165,9 @@ impl ReceivingAddress {
                     .base()
                     .private_utxo_notification(&utxo_notification_payload, network)
             }
+            ReceivingAddress::Ctidh(ctidh) => {
+                ctidh.private_utxo_notification(&utxo_notification_payload, network)
+            }
         }
     }
 
@@ -156,6 +177,7 @@ impl ReceivingAddress {
             Self::Generation(a) => a.spending_lock(),
             Self::Symmetric(k) => k.lock_after_image(),
             Self::GenerationSubAddr(a) => a.base().spending_lock(),
+            Self::Ctidh(a) => a.spending_lock(),
         }
     }
 
@@ -166,6 +188,7 @@ impl ReceivingAddress {
             Self::Generation(a) => a.receiver_postimage(),
             Self::Symmetric(k) => k.receiver_postimage(),
             Self::GenerationSubAddr(a) => a.base().receiver_postimage(),
+            Self::Ctidh(a) => a.receiver_postimage(),
         }
     }
 
@@ -179,6 +202,7 @@ impl ReceivingAddress {
             Self::Generation(a) => a.encrypt(utxo_notification_payload),
             Self::Symmetric(a) => a.encrypt(utxo_notification_payload),
             Self::GenerationSubAddr(a) => a.encrypt(utxo_notification_payload),
+            Self::Ctidh(a) => a.encrypt(utxo_notification_payload),
         }
     }
 
@@ -197,6 +221,7 @@ impl ReceivingAddress {
             Self::Generation(k) => k.to_bech32m(network),
             Self::Symmetric(k) => k.to_bech32m(network),
             Self::GenerationSubAddr(k) => k.to_bech32m(network),
+            Self::Ctidh(k) => k.to_bech32m(network),
         }
     }
 
@@ -235,6 +260,7 @@ impl ReceivingAddress {
             Self::Generation(k) => k.to_bech32m(network),
             Self::Symmetric(k) => k.to_display_bech32m(network),
             Self::GenerationSubAddr(k) => k.to_bech32m(network),
+            Self::Ctidh(k) => k.to_bech32m(network),
         }
     }
 
@@ -255,14 +281,29 @@ impl ReceivingAddress {
         Ok(self.bech32m_abbreviate(self.to_display_bech32m(network)?, network))
     }
 
+    /// Largest byte index <= `n` that is a UTF-8 character boundary (avoids splitting emoji).
+    fn floor_char_boundary(s: &str, n: usize) -> usize {
+        let n = n.min(s.len());
+        let mut i = n;
+        while i > 0 && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+
     fn bech32m_abbreviate(&self, bech32m: String, network: Network) -> String {
         let first_len = self.get_hrp(network).len() + 12usize;
         let last_len = 12usize;
 
-        assert!(bech32m.len() > first_len + last_len);
+        if bech32m.len() <= first_len + last_len {
+            return bech32m;
+        }
 
-        let (first, _) = bech32m.split_at(first_len);
-        let (_, last) = bech32m.split_at(bech32m.len() - last_len);
+        let first_end = Self::floor_char_boundary(&bech32m, first_len);
+        let last_start = Self::floor_char_boundary(&bech32m, bech32m.len().saturating_sub(last_len));
+
+        let (first, _) = bech32m.split_at(first_end);
+        let (_, last) = bech32m.split_at(last_start);
 
         format!("{first}...{last}")
     }
@@ -283,6 +324,11 @@ impl ReceivingAddress {
             return Ok(addr.into());
         }
 
+        // Try CTIDH address (prefix: xntct)
+        if let Ok(addr) = ctidh_address::CtidhReceivingAddress::from_bech32m(encoded, network) {
+            return Ok(addr.into());
+        }
+
         // Try symmetric key
         let key = symmetric_key::SymmetricKey::from_bech32m(encoded, network)?;
         Ok(key.into())
@@ -296,6 +342,7 @@ impl ReceivingAddress {
             Self::GenerationSubAddr(_) => {
                 generation_address::GenerationSubAddress::get_hrp(network)
             }
+            Self::Ctidh(_) => ctidh_address::CtidhReceivingAddress::get_hrp(network),
         }
     }
 
@@ -307,6 +354,7 @@ impl ReceivingAddress {
             Self::Generation(x) => x.lock_script().hash(),
             Self::Symmetric(x) => x.lock_script().hash(),
             Self::GenerationSubAddr(x) => x.base().lock_script().hash(),
+            Self::Ctidh(x) => x.lock_script().hash(),
         }
     }
 

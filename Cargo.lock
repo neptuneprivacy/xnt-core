@@ -909,6 +909,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctidh512"
+version = "0.1.0"
+
+[[package]]
 name = "ctor"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2326,6 +2330,7 @@ dependencies = [
  "clap",
  "clienter",
  "console-subscriber",
+ "ctidh512",
  "directories",
  "divan",
  "field_count",
@@ -2355,6 +2360,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_tuple",
+ "sha2",
  "sha3",
  "statrs",
  "strum 0.27.2",

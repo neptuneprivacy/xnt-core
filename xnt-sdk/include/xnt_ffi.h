@@ -292,6 +292,11 @@ xnt_
 struct XntSpendingKeyHandle *xnt_wallet_derive_key(const struct XntWalletEntropyHandle *handle,
                                                    uint64_t index);
 
+// Derive Nth CTIDH spending key (CTIDH-512)
+xnt_
+struct XntSpendingKeyHandle *xnt_wallet_derive_ctidh_key(const struct XntWalletEntropyHandle *handle,
+                                                         uint64_t index);
+
 // Get receiver_id from spending key
 xnt_ uint64_t xnt_spending_key_receiver_id(const struct XntSpendingKeyHandle *handle);
 

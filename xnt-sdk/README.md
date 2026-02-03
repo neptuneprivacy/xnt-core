@@ -24,6 +24,14 @@ The SDK is open source and intended as foundational infrastructure for:
 
 Builders, the next phase is in your hands.
 
+## CTIDH-512 keys (post-quantum)
+
+The SDK supports **CTIDH-512** receiving addresses and spending keys (the same implementation as `neptune-privacy` core).
+
+- **Rust**: `WalletEntropy::derive_ctidh_spending_key(index)`
+- **Node.js (NAPI)**: `wallet.deriveCtidhKey(index)`
+- **C FFI**: `xnt_wallet_derive_ctidh_key(wallet, index)`
+
 We’ll continue improving the SDK and releasing updates as the ecosystem grows.
 If you’re building privacy preserving applications and care about non-custodial design, this is for you!
 
