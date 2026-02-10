@@ -18,6 +18,7 @@ use block_selector::BlockSelectorExtended;
 use bytes::Buf;
 use get_size2::GetSize;
 use itertools::Itertools;
+use num_traits::ConstZero;
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::prelude::Digest;
