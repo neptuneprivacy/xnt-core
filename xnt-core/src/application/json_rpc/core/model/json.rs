@@ -29,7 +29,7 @@ pub enum JsonError {
     InvalidParams,
     #[error("Internal error")]
     InternalError,
-    #[error("Server error")]
+    #[error("{message}")]
     Custom {
         code: i32,
         message: String,

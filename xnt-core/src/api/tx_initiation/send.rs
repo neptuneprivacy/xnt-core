@@ -26,7 +26,9 @@
 //!             outputs,
 //!             change_policy,
 //!             fee,
-//!             Timestamp::now()
+//!             Timestamp::now(),
+//!             0,
+//!             None,
 //!         ).await
 //! }
 //! ```
@@ -62,6 +64,7 @@ impl TransactionSender {
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
         exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
     ) -> Result<TxCreationArtifacts, error::SendError> {
         TransactionInitiator {
             global_state_lock: self.global_state_lock.clone(),
@@ -72,6 +75,7 @@ impl TransactionSender {
             fee,
             timestamp,
             exclude_recent_blocks,
+            max_inputs,
         )
         .await
     }

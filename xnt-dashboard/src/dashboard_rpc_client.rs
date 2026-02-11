@@ -224,6 +224,7 @@ impl DashboardRpcClient {
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
         exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
     ) -> ::core::result::Result<RpcResult<TxCreationArtifacts>, ::tarpc::client::RpcError> {
         match self {
             DashboardRpcClient::Authentic(rpcclient) => {
@@ -235,6 +236,7 @@ impl DashboardRpcClient {
                         change_policy,
                         fee,
                         exclude_recent_blocks,
+                        max_inputs,
                     )
                     .await
             }
@@ -249,6 +251,7 @@ impl DashboardRpcClient {
                         change_policy,
                         fee,
                         exclude_recent_blocks,
+                        max_inputs,
                     )
                     .await
             }

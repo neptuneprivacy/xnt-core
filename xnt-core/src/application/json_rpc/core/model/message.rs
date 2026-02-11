@@ -626,6 +626,9 @@ pub struct SendTxRequest {
     pub to_address: String,
     #[serde(default)]
     pub exclude_recent_blocks: usize,
+    /// Maximum number of input UTXOs to select. `None` means no limit.
+    #[serde(default)]
+    pub max_inputs: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

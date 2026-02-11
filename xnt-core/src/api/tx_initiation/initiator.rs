@@ -83,6 +83,7 @@ impl TransactionInitiator {
         spend_amount: NativeCurrencyAmount,
         timestamp: Timestamp,
         exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
     ) -> impl IntoIterator<Item = TxInput> {
         TxInputListBuilder::new()
             .spendable_inputs(
@@ -92,6 +93,7 @@ impl TransactionInitiator {
             )
             .policy(policy)
             .spend_amount(spend_amount)
+            .max_inputs(max_inputs)
             .build()
     }
 
@@ -251,6 +253,7 @@ impl TransactionInitiator {
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
         exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
     ) -> Result<TxCreationArtifacts, error::SendError> {
         self.send_inner(
             outputs,
@@ -259,6 +262,7 @@ impl TransactionInitiator {
             timestamp,
             false,
             exclude_recent_blocks,
+            max_inputs,
         )
         .await
     }
@@ -276,6 +280,7 @@ impl TransactionInitiator {
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
         exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
     ) -> Result<TxCreationArtifacts, error::SendError> {
         self.send_inner(
             outputs,
@@ -284,6 +289,7 @@ impl TransactionInitiator {
             timestamp,
             true,
             exclude_recent_blocks,
+            max_inputs,
         )
         .await
     }
@@ -303,6 +309,7 @@ impl TransactionInitiator {
         timestamp: Timestamp,
         transparent: bool,
         exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
     ) -> Result<TxCreationArtifacts, error::SendError> {
         self.private().check_proceed_with_send(fee).await?;
 
@@ -321,7 +328,7 @@ impl TransactionInitiator {
         let spend_amount = tx_outputs.total_native_coins() + fee;
         let policy = InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending);
         let tx_inputs = self
-            .select_spendable_inputs(policy, spend_amount, timestamp, exclude_recent_blocks)
+            .select_spendable_inputs(policy, spend_amount, timestamp, exclude_recent_blocks, max_inputs)
             .await
             .into_iter()
             .collect::<Vec<_>>();

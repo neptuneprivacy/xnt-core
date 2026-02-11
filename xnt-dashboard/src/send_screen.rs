@@ -151,13 +151,14 @@ impl SendScreen {
             .send(
                 send_ctx,
                 token,
-                vec![OutputFormat::AddressAndAmount(valid_address, valid_amount)],
+                vec![OutputFormat::AddressAndAmountAndMedium(valid_address, valid_amount, UtxoNotificationMedium::OnChain)],
                 ChangePolicy::recover_to_next_unused_key(
                     KeyType::Symmetric,
                     UtxoNotificationMedium::OnChain,
                 ),
                 valid_fee,
                 0, // exclude_recent_blocks
+                None, // max_inputs
             )
             .await
             .unwrap();

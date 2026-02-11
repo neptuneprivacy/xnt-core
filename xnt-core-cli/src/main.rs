@@ -1204,6 +1204,7 @@ async fn main() -> Result<()> {
                     ChangePolicy::recover_to_next_unused_key(KeyType::Symmetric, notify_self),
                     fee,
                     exclude_recent_blocks,
+                    None,
                 )
                 .await?;
             let tx_artifacts = match resp {
@@ -1265,6 +1266,7 @@ async fn main() -> Result<()> {
                     ),
                     fee,
                     exclude_recent_blocks,
+                    None,
                 )
                 .await?;
             let tx_artifacts = match resp {
@@ -1329,6 +1331,7 @@ async fn main() -> Result<()> {
                     ),
                     fee,
                     exclude_recent_blocks,
+                    None,
                 )
                 .await?;
             match res {
@@ -1389,6 +1392,7 @@ async fn main() -> Result<()> {
                     ),
                     fee,
                     exclude_recent_blocks,
+                    None,
                 )
                 .await?;
             match res {

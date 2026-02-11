@@ -70,6 +70,7 @@ pub async fn alice_sends_to_self() -> anyhow::Result<()> {
             NativeCurrencyAmount::zero(),
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 
@@ -203,6 +204,7 @@ pub async fn alice_sends_to_bob(
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 
@@ -333,6 +335,7 @@ pub async fn alice_sends_to_random_key() -> anyhow::Result<()> {
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 
@@ -457,6 +460,7 @@ pub async fn alice_sends_transparent_transaction() -> anyhow::Result<()> {
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 
@@ -635,6 +639,7 @@ pub async fn alice_sends_time_locked_funds() -> anyhow::Result<()> {
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 
@@ -728,6 +733,7 @@ pub async fn alice_sends_time_locked_funds() -> anyhow::Result<()> {
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await;
     assert!(matches!(
@@ -767,6 +773,7 @@ pub async fn alice_sends_time_locked_funds() -> anyhow::Result<()> {
             fee_amount,
             one_year_later,
             0,
+            None,
         )
         .await;
     assert!(

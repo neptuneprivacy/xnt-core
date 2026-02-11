@@ -262,6 +262,8 @@ impl MockRpcClient {
         _outputs: Vec<OutputFormat>,
         _change_policy: ChangePolicy,
         _fee: NativeCurrencyAmount,
+        _exclude_recent_blocks: usize,
+        _max_inputs: Option<usize>,
     ) -> ::core::result::Result<RpcResult<TxCreationArtifacts>, ::tarpc::client::RpcError> {
         tokio::task::yield_now().await;
         Ok(Err(RpcError::Failed("cannot send; mocking".to_string())))

@@ -1141,6 +1141,7 @@ impl RpcApi for RpcServer {
                 valid_fee,
                 Timestamp::now(),
                 request.exclude_recent_blocks,
+                request.max_inputs,
             )
             .await
             .map_err(|e| {
@@ -1692,6 +1693,7 @@ pub mod tests {
                 mock_amount,
                 network.launch_date() + Timestamp::months(3),
                 0,
+                None,
             )
             .await
             .unwrap();
