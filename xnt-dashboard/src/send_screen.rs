@@ -158,6 +158,7 @@ impl SendScreen {
                 ),
                 valid_fee,
                 0, // exclude_recent_blocks
+                None, // max_inputs
             )
             .await
             .unwrap();

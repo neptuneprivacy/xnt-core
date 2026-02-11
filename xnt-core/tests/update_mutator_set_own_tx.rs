@@ -87,6 +87,7 @@ pub async fn alice_updates_mutator_set_data_on_own_transaction() {
                 NativeCurrencyAmount::coins(1),
                 Timestamp::now(),
                 0,
+                None,
             )
             .await
             .unwrap();

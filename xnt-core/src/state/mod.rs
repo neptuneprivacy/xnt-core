@@ -2854,6 +2854,7 @@ mod tests {
                     amount,
                     timestamp,
                     3,
+                    None,
                 )
                 .await
                 .into_iter()
