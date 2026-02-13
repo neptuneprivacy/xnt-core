@@ -1056,12 +1056,17 @@ impl RpcApi for RpcServer {
                     ReceivingAddress::Symmetric(_) => "symmetric".to_string(),
                     ReceivingAddress::GenerationSubAddr(_) => "generation_subaddress".to_string(),
                     ReceivingAddress::Ctidh(_) => "ctidh".to_string(),
+                    ReceivingAddress::CtidhSubAddr(_) => "ctidh_subaddress".to_string(),
                 });
                 let receiver_identifier = Some(addr.receiver_identifier().value());
 
                 // For subaddresses, include base_address and payment_id
                 let (base_address, payment_id) = match &addr {
                     ReceivingAddress::GenerationSubAddr(subaddr) => {
+                        let (base, pid) = subaddr.clone().split();
+                        (base.to_bech32m(network).ok(), Some(pid.value()))
+                    }
+                    ReceivingAddress::CtidhSubAddr(subaddr) => {
                         let (base, pid) = subaddr.clone().split();
                         (base.to_bech32m(network).ok(), Some(pid.value()))
                     }
@@ -1120,6 +1125,7 @@ impl RpcApi for RpcServer {
                 ReceivingAddress::Symmetric(_) => "Symmetric",
                 ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
                 ReceivingAddress::Ctidh(_) => "Ctidh",
+                ReceivingAddress::CtidhSubAddr(_) => "CtidhSubAddr",
             },
             to_address.receiver_identifier()
         );

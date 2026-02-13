@@ -148,7 +148,7 @@ impl ReceiveScreen {
                         KeyCode::Char('t') | KeyCode::Char('T') => {
                             self.current_key_type = match self.current_key_type {
                                 KeyType::Generation | KeyType::GenerationSubAddr => KeyType::Ctidh,
-                                KeyType::Ctidh => KeyType::Generation,
+                                KeyType::Ctidh | KeyType::CtidhSubAddr => KeyType::Generation,
                                 KeyType::Symmetric => KeyType::Generation,
                             };
                             // Clear cached address so we fetch a fresh one for the new key type.
@@ -236,7 +236,7 @@ impl Widget for ReceiveScreen {
         let key_type_label = match self.current_key_type {
             KeyType::Generation | KeyType::GenerationSubAddr => "Generation",
             KeyType::Symmetric => "Symmetric",
-            KeyType::Ctidh => "CTIDH",
+            KeyType::Ctidh | KeyType::CtidhSubAddr => "CTIDH",
         };
         let (mut address, address_abbrev) = match receiving_address {
             Some(addr) => match self.current_key_type {

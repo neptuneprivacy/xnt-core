@@ -353,9 +353,11 @@ function testTxCtidh(): boolean {
   const genKey = wallet.deriveKey(0);
   const genAddr = genKey.toAddress();
 
-  // Derive CTIDH key & address
+
+  // Derive CTIDH key & base address
   const ctidhKey = wallet.deriveCtidhKey(0);
   const ctidhAddr = ctidhKey.toAddress();
+  const ctidhSubAddr = ctidhAddr.ctidhSubaddress(61002);
 
   let client: XntRpcClient;
   try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
@@ -417,9 +419,10 @@ function testTxCtidh(): boolean {
 
   // Build transaction
   const mutatorSet = xntGetMutatorSet(client);
+
   const builder = new XntTransactionBuilder();
 
-  // Add multi-type inputs with correct key and proof
+  // Add multi-type inputs
   addMultiTypeInputs(
     builder,
     selected,
@@ -431,7 +434,7 @@ function testTxCtidh(): boolean {
     ctidhSelected,
   );
 
-  // Output goes to CTIDH address, change back to Generation address
+  // Output goes to CTIDH subaddress, change back to Generation address
   builder.addOutput(ctidhAddr.toReceivingAddress(), sendAmount, xntRandomSenderRandomness());
   builder.setFee(fee);
   builder.setChange(genAddr, xntRandomSenderRandomness());
@@ -472,6 +475,84 @@ function testTxCtidh(): boolean {
   return true;
 }
 
+function testUtxosWithPaymentId(): boolean {
+  log("\nListing UTXOs (Generation + CTIDH)...");
+
+  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
+  const genKey = wallet.deriveKey(0);
+
+  const ctidhKey = wallet.deriveCtidhKey(0);
+  log(`ctidhKey: ${ctidhKey.toAddress().toBech32(XntNetwork.Main)}`);
+  const ctidhSubAddr = ctidhKey.toAddress().ctidhSubaddress(61002);
+  log(`ctidhSubAddr: ${ctidhSubAddr.toBech32(XntNetwork.Main)}`);
+
+  let client: XntRpcClient;
+  try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
+
+  const genResult = syncWallet(client, genKey);
+  const ctidhResult = syncWallet(client, ctidhKey);
+
+  ok(`Generation: ${genResult ? genResult.unspent.length : 0} unspent, ${genResult ? genResult.pendingIncoming.length : 0} pending`);
+  ok(`CTIDH: ${ctidhResult ? ctidhResult.unspent.length : 0} unspent, ${ctidhResult ? ctidhResult.pendingIncoming.length : 0} pending`);
+
+  const rows: {
+    kind: "Generation" | "CTIDH";
+    status: "UNSPENT" | "PENDING_INCOMING";
+    amount: bigint;
+    paymentId: number | bigint;
+    extra: string;
+  }[] = [];
+
+  const pushFromSync = (kind: "Generation" | "CTIDH", res: SyncResult | null) => {
+    if (!res) return;
+
+    log(`  ${kind}: ${res.unspent.length} unspent, ${res.pendingIncoming.length} pending incoming`);
+
+    for (const u of res.unspent) {
+      const d = u.decrypted;
+      log(`    UNSPENT: amount=${formatAmount(d.amount)}, paymentId=${d.paymentId}, aocl=${u.aoclIndex}, h=${d.blockHeight}`);
+      if (d.paymentId) {
+        rows.push({
+          kind,
+          status: "UNSPENT",
+          amount: d.amount,
+          paymentId: d.paymentId,
+          extra: `aocl=${u.aoclIndex}, h=${d.blockHeight}`,
+        });
+      }
+    }
+
+    for (const p of res.pendingIncoming) {
+      log(`    PENDING_INCOMING: amount=${formatAmount(p.amount)}, paymentId=${p.paymentId}`);
+      if (p.paymentId) {
+        rows.push({
+          kind,
+          status: "PENDING_INCOMING",
+          amount: p.amount,
+          paymentId: p.paymentId,
+          extra: "mempool",
+        });
+      }
+    }
+  };
+
+  pushFromSync("Generation", genResult);
+  pushFromSync("CTIDH", ctidhResult);
+
+  if (rows.length === 0) {
+    return skip("no UTXOs with for Generation or CTIDH");
+  }
+
+  ok(`found ${rows.length} UTXOs`);
+  for (const r of rows) {
+    log(
+      `  [${r.kind}] ${r.status} amount=${formatAmount(r.amount)} pid=${r.paymentId} ${r.extra}`,
+    );
+  }
+
+  return true;
+}
+
 function testFull(): boolean {
   log("=== XNT-SDK TypeScript Test ===\n");
 
@@ -490,7 +571,10 @@ function testFull(): boolean {
 const cmd = process.argv[2] || "full";
 const testMap: Record<string, () => boolean> = {
   version: testVersion, seed: testSeed, address: testAddress,
-  rpc: testRpc, sync: testSync, utils: testUtils, tx: testTx, "tx-ctidh": testTxCtidh, full: testFull,
+  rpc: testRpc, sync: testSync, utils: testUtils, tx: testTx,
+  "tx-ctidh": testTxCtidh,
+  "utxos-pid": testUtxosWithPaymentId,
+  full: testFull,
 };
 
 if (testMap[cmd]) {

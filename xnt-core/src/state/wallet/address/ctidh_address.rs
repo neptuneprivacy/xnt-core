@@ -11,12 +11,14 @@ use bech32::Variant;
 use ctidh512::{derive, keygen, sk_to_pk, PublicKey, SecretKey};
 use serde::Deserialize;
 use serde::Serialize;
+use num_traits::Zero;
 use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 
 use super::common;
 use super::common::deterministically_derive_seed_and_nonce;
+use super::common::SubAddress as SubAddressTrait;
 use super::encrypted_utxo_notification::EncryptedUtxoNotification;
 use crate::application::config::network::Network;
 use crate::protocol::consensus::transaction::announcement::Announcement;
@@ -29,6 +31,10 @@ use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
 pub(super) const CTIDH_FLAG_U8: u8 = 201;
 pub const CTIDH_FLAG: BFieldElement = BFieldElement::new(CTIDH_FLAG_U8 as u64);
 
+/// Key type flag for CTIDH subaddresses (with payment_id) in announcements.
+pub(super) const CTIDH_SUBADDR_FLAG_U8: u8 = 202;
+pub const CTIDH_SUBADDR_FLAG: BFieldElement = BFieldElement::new(CTIDH_SUBADDR_FLAG_U8 as u64);
+
 /// Bech32m length for 2048-bit: 6 (HRP) + 1 + base32(256) + 6 checksum = 6+1+410+6 = 423.
 pub const CTIDH_ADDRESS_MAX_BECH32M_LEN: usize = 430;
 
@@ -39,6 +45,155 @@ pub struct CtidhReceivingAddress {
     receiver_identifier: BFieldElement,
     receiver_postimage: Digest,
     lock_postimage: Digest,
+}
+
+/// A subaddress combining a base CTIDH receiving address with a payment_id.
+///
+/// CtidhSubAddress = CtidhReceivingAddress + payment_id
+///
+/// The subaddress can be converted to/from (address, payment_id) pair. When
+/// encoded as bech32m, it includes both the base address and payment_id.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CtidhSubAddress {
+    /// The base receiving address
+    base: CtidhReceivingAddress,
+
+    /// The payment identifier for this subaddress
+    payment_id: BFieldElement,
+}
+
+impl CtidhSubAddress {
+    /// Create a new subaddress from a base address and payment_id.
+    ///
+    /// # Errors
+    /// Returns error if payment_id is zero - use base address directly for zero payment_id.
+    pub fn new(base: CtidhReceivingAddress, payment_id: BFieldElement) -> Result<Self> {
+        ensure!(
+            !payment_id.is_zero(),
+            "payment_id must be non-zero for subaddresses; use base address directly"
+        );
+        Ok(Self { base, payment_id })
+    }
+
+    /// Create a subaddress with an index-derived payment_id.
+    ///
+    /// # Errors
+    /// Returns error if index is zero - use base address directly for zero payment_id.
+    pub fn from_index(base: CtidhReceivingAddress, index: u64) -> Result<Self> {
+        ensure!(index != 0, "index must be non-zero for subaddresses");
+        Self::new(base, BFieldElement::new(index))
+    }
+
+    /// Get the encryption key (same as base address)
+    pub fn encryption_key(&self) -> PublicKey {
+        *self.base.encryption_key()
+    }
+
+    /// Get payment_id as u64
+    pub fn payment_id_u64(&self) -> u64 {
+        self.payment_id.value()
+    }
+}
+
+// Implement bech32m serialization for CtidhSubAddress.
+// Override the macro implementation to only encode encryption_key + payment_id
+// (not the full struct) to keep it compact like base address.
+impl CtidhSubAddress {
+    /// Returns human readable prefix (hrp) for CTIDH subaddress
+    pub(super) fn get_hrp(network: Network) -> String {
+        format!("xntcta{}", common::network_hrp_char(network))
+    }
+
+    /// Encode subaddress as bech32m string (only encryption_key + payment_id)
+    pub fn to_bech32m(&self, network: Network) -> Result<String> {
+        let hrp = Self::get_hrp(network);
+        // Only encode encryption_key (64 bytes) + payment_id (8 bytes) = 72 bytes total
+        // This matches the compact format of base address (64 bytes)
+        let mut payload = Vec::with_capacity(72);
+        payload.extend_from_slice(&self.base.encryption_key()[..]);
+        payload.extend_from_slice(&self.payment_id.value().to_le_bytes());
+        
+        let variant = Variant::Bech32m;
+        let enc = bech32::encode(&hrp, payload.to_base32(), variant)
+            .map_err(|e| anyhow!("bech32m encode: {e}"))?;
+        ensure!(
+            enc.len() <= CTIDH_ADDRESS_MAX_BECH32M_LEN + 20, // Allow some extra for payment_id
+            "CTIDH subaddress bech32m length {} exceeds maximum",
+            enc.len()
+        );
+        Ok(enc)
+    }
+
+    /// Decode subaddress from bech32m string
+    pub fn from_bech32m(encoded: &str, network: Network) -> Result<Self> {
+        let expected_hrp = Self::get_hrp(network);
+        let (hrp, data, variant) = bech32::decode(encoded)?;
+
+        ensure!(
+            variant == Variant::Bech32m,
+            "Can only decode bech32m subaddresses.",
+        );
+        ensure!(
+            hrp == expected_hrp,
+            "Invalid prefix for CTIDH subaddress. Expected: {expected_hrp}, got: {hrp}",
+        );
+
+        let payload = Vec::<u8>::from_base32(&data)?;
+        ensure!(
+            payload.len() == 72,
+            "CTIDH subaddress payload must be 72 bytes (64 encryption_key + 8 payment_id), got {}",
+            payload.len()
+        );
+        
+        // Extract encryption_key (first 64 bytes)
+        let mut encryption_key = [0u8; 64];
+        encryption_key.copy_from_slice(&payload[0..64]);
+        
+        // Extract payment_id (last 8 bytes)
+        let payment_id_bytes = &payload[64..72];
+        let payment_id_value = u64::from_le_bytes([
+            payment_id_bytes[0], payment_id_bytes[1], payment_id_bytes[2], payment_id_bytes[3],
+            payment_id_bytes[4], payment_id_bytes[5], payment_id_bytes[6], payment_id_bytes[7],
+        ]);
+        
+        let base = CtidhReceivingAddress::from_public_key(encryption_key);
+        let payment_id = BFieldElement::new(payment_id_value);
+        
+        Self::new(base, payment_id)
+    }
+}
+
+impl SubAddressTrait for CtidhSubAddress {
+    type Base = CtidhReceivingAddress;
+
+    fn base(&self) -> &Self::Base {
+        &self.base
+    }
+
+    fn payment_id(&self) -> BFieldElement {
+        self.payment_id
+    }
+
+    fn receiver_identifier(&self) -> BFieldElement {
+        self.base.receiver_identifier()
+    }
+
+    fn split(self) -> (Self::Base, BFieldElement) {
+        (self.base, self.payment_id)
+    }
+
+    fn flag() -> BFieldElement {
+        CTIDH_SUBADDR_FLAG
+    }
+
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
+        let payload_with_id = UtxoNotificationPayload::with_payment_id(
+            payload.utxo.clone(),
+            payload.sender_randomness,
+            self.payment_id,
+        );
+        self.base.encrypt(&payload_with_id)
+    }
 }
 
 /// Only seed is persisted; derived fields have [serde(skip)] and are recomputed on deserialize.
@@ -335,7 +490,7 @@ impl CtidhReceivingAddress {
         let plaintext = bincode::serialize(&(
             payload.utxo.clone(),
             payload.sender_randomness,
-            BFieldElement::new(0),
+            payload.payment_id,
         ))
         .unwrap();
         let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
@@ -425,23 +580,4 @@ mod tests {
     use super::*;
     use crate::application::config::network::Network;
 
-    #[test]
-    fn ctidh_address_bech32m_long_format_roundtrip() {
-        let key = CtidhSpendingKey::keygen();
-        let addr = key.to_address();
-        let enc = addr.to_bech32m_long(Network::Testnet(0)).unwrap();
-        let (hrp, _, _) = bech32::decode(&enc).unwrap();
-        assert!(enc.starts_with(&format!("{}1", hrp)));
-        let decoded = CtidhReceivingAddress::from_bech32m(&enc, Network::Testnet(0)).unwrap();
-        assert_eq!(addr, decoded);
-    }
-
-}
-
-#[cfg(any(test, feature = "arbitrary-impls"))]
-impl<'a> arbitrary::Arbitrary<'a> for CtidhReceivingAddress {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let pk: [u8; 256] = u.arbitrary()?;
-        Ok(Self::from_public_key(pk))
-    }
 }

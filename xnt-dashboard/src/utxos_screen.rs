@@ -245,7 +245,7 @@ impl Widget for UtxosScreen {
         // table
         let style = Style::default().fg(self.fg).bg(self.bg);
         let selected_style = style.add_modifier(Modifier::REVERSED);
-        let header = vec!["received", "id", "amount", "release date", "spent"];
+        let header = vec!["received", "id", "amount", "release date", "payment id", "spent"];
 
         let matrix = self
             .data
@@ -262,6 +262,11 @@ impl Widget for UtxosScreen {
                     c.release_date
                         .map(|rd| rd.standard_format())
                         .unwrap_or_else(|| "-".to_string()),
+                    if c.payment_id > 0 {
+                        format!("{}", c.payment_id)
+                    } else {
+                        "-".to_string()
+                    },
                     c.spent.to_string(),
                 ]
             })

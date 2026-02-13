@@ -962,18 +962,29 @@ async fn main() -> Result<()> {
                         ReceivingAddress::Symmetric(_) => "Symmetric",
                         ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
                         ReceivingAddress::Ctidh(_) => "Ctidh",
+                        ReceivingAddress::CtidhSubAddr(_) => "CtidhSubAddr",
                     };
                     println!("Valid address!");
                     println!("Address type: {address_type}");
                     println!("Receiver Identifier: {}", addr.receiver_identifier());
 
                     // If subaddress, also show base address and payment_id
-                    if let ReceivingAddress::GenerationSubAddr(subaddr) = &addr {
-                        let (base_addr, payment_id) = subaddr.clone().split();
-                        if let Ok(base_encoded) = base_addr.to_bech32m(network) {
-                            println!("Base address: {base_encoded}");
+                    match &addr {
+                        ReceivingAddress::GenerationSubAddr(subaddr) => {
+                            let (base_addr, payment_id) = subaddr.clone().split();
+                            if let Ok(base_encoded) = base_addr.to_bech32m(network) {
+                                println!("Base address: {base_encoded}");
+                            }
+                            println!("Payment ID: {}", payment_id.value());
                         }
-                        println!("Payment ID: {}", payment_id.value());
+                        ReceivingAddress::CtidhSubAddr(subaddr) => {
+                            let (base_addr, payment_id) = subaddr.clone().split();
+                            if let Ok(base_encoded) = base_addr.to_bech32m(network) {
+                                println!("Base address: {base_encoded}");
+                            }
+                            println!("Payment ID: {}", payment_id.value());
+                        }
+                        _ => {}
                     }
                 }
                 None => {

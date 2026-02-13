@@ -4,6 +4,7 @@ use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
 use neptune_privacy::state::wallet::address::generation_address::{
     GenerationReceivingAddress, GenerationSubAddress,
 };
+use neptune_privacy::state::wallet::address::ctidh_address::CtidhSubAddress;
 use neptune_privacy::state::wallet::address::{
     ReceivingAddress as CoreReceivingAddress, SubAddress as CoreSubAddress,
 };
@@ -68,6 +69,31 @@ impl Address {
             }
             _ => Err(XntError::InvalidInput(
                 "subaddress only supported for Generation addresses".to_string(),
+            )),
+        }
+    }
+
+    /// Create CTIDH subaddress with payment_id
+    pub fn ctidh_subaddress(&self, payment_id: u64) -> Result<ReceivingAddress> {
+        if payment_id == 0 {
+            return Err(XntError::InvalidInput(
+                "payment_id must be non-zero".to_string(),
+            ));
+        }
+
+        match &self.inner {
+            CoreReceivingAddress::Ctidh(ct_addr) => {
+                let sub = CtidhSubAddress::new(
+                    **ct_addr,
+                    BFieldElement::new(payment_id),
+                )
+                .map_err(|e| XntError::Other(e.to_string()))?;
+                Ok(ReceivingAddress {
+                    inner: CoreReceivingAddress::CtidhSubAddr(sub),
+                })
+            }
+            _ => Err(XntError::InvalidInput(
+                "ctidh_subaddress only supported for CTIDH addresses".to_string(),
             )),
         }
     }
@@ -140,18 +166,28 @@ pub struct ReceivingAddress {
 }
 
 impl ReceivingAddress {
+    /// Encode address to bech32m string
+    pub fn to_bech32(&self, network: Network) -> Result<String> {
+        self.inner
+            .to_bech32m(network.into())
+            .map_err(|e| XntError::EncodingError(e.to_string()))
+    }
+
     /// Get payment_id if this is a subaddress, None for main address
     pub fn payment_id(&self) -> Option<u64> {
-        use neptune_privacy::state::wallet::address::SubAddress as SubAddressTrait;
         match &self.inner {
             CoreReceivingAddress::GenerationSubAddr(sub) => Some(sub.payment_id().value()),
+            CoreReceivingAddress::CtidhSubAddr(sub) => Some(sub.payment_id().value()),
             _ => None,
         }
     }
 
     /// Check if this is a subaddress
     pub fn is_subaddress(&self) -> bool {
-        matches!(self.inner, CoreReceivingAddress::GenerationSubAddr(_))
+        matches!(
+            self.inner,
+            CoreReceivingAddress::GenerationSubAddr(_) | CoreReceivingAddress::CtidhSubAddr(_)
+        )
     }
 
     /// Get the inner CoreReceivingAddress

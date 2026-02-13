@@ -3705,12 +3705,13 @@ impl RPC for NeptuneRPCServer {
                     aocl_leaf_index: Some(monitored_utxo.aocl_leaf_index),
                     amount: monitored_utxo.utxo.get_native_currency_amount(),
                     release_date: monitored_utxo.utxo.release_date(),
+                    payment_id: monitored_utxo.payment_id.value(),
                 });
             }
         }
 
         // get unconfirmed incoming UTXOs
-        for (incoming_utxo, addition_record) in state.wallet_state.mempool_unspent_utxos_iter() {
+        for (incoming_utxo, addition_record, payment_id) in state.wallet_state.mempool_unspent_utxos_with_payment_id_iter() {
             if present_addition_records.insert(addition_record) {
                 ui_utxos.push(UiUtxo {
                     received: UtxoStatusEvent::Pending,
@@ -3718,6 +3719,7 @@ impl RPC for NeptuneRPCServer {
                     spent: UtxoStatusEvent::None,
                     amount: incoming_utxo.get_native_currency_amount(),
                     release_date: incoming_utxo.release_date(),
+                    payment_id,
                 });
             }
         }
@@ -3731,6 +3733,7 @@ impl RPC for NeptuneRPCServer {
                     spent: UtxoStatusEvent::None,
                     amount: expected_utxo.utxo.get_native_currency_amount(),
                     release_date: expected_utxo.utxo.release_date(),
+                    payment_id: expected_utxo.payment_id.value(),
                 });
             }
         }

@@ -380,6 +380,13 @@ impl WalletState {
                 .next_unused_spending_key(KeyType::Symmetric)
                 .await;
         }
+        // Ensure CTIDH key index 0 is known
+        // This allows wallet to scan CTIDH UTXOs sent to index 0
+        if wallet_state.known_ctidh_keys.is_empty() {
+            let _ = wallet_state
+                .next_unused_spending_key(KeyType::Ctidh)
+                .await;
+        }
 
         // For premine UTXOs there is an additional complication: we do not know
         // the derivation index with which they were derived. So we derive a few
@@ -566,6 +573,14 @@ impl WalletState {
             .values()
             .flatten()
             .map(|iu| (&iu.utxo, iu.addition_record()))
+    }
+
+    /// Iterator over mempool unspent UTXOs with payment_id included
+    pub fn mempool_unspent_utxos_with_payment_id_iter(&self) -> impl Iterator<Item = (&Utxo, AdditionRecord, u64)> {
+        self.mempool_unspent_utxos
+            .values()
+            .flatten()
+            .map(|iu| (&iu.utxo, iu.addition_record(), iu.payment_id.value()))
     }
 
     pub(crate) fn mempool_balance_updates(
@@ -1016,7 +1031,7 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
-            KeyType::Ctidh => Box::new(self.get_known_ctidh_keys()),
+            KeyType::Ctidh | KeyType::CtidhSubAddr => Box::new(self.get_known_ctidh_keys()),
         }
     }
 
@@ -1030,7 +1045,7 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
-            KeyType::Ctidh => Box::new(self.get_known_ctidh_keys()),
+            KeyType::Ctidh | KeyType::CtidhSubAddr => Box::new(self.get_known_ctidh_keys()),
         }
     }
 
@@ -1075,7 +1090,7 @@ impl WalletState {
                 self.next_unused_generation_spending_key().await.into()
             }
             KeyType::Symmetric => self.next_unused_symmetric_key().await.into(),
-            KeyType::Ctidh => self.next_unused_ctidh_key().await.into(),
+            KeyType::Ctidh | KeyType::CtidhSubAddr => self.next_unused_ctidh_key().await.into(),
         }
     }
 
@@ -1101,7 +1116,7 @@ impl WalletState {
                         self.known_symmetric_keys.push(key);
                     }
                 }
-                KeyType::Ctidh => {
+                KeyType::Ctidh | KeyType::CtidhSubAddr => {
                     self.wallet_db.set_ctidh_key_counter(new_counter).await;
                     for idx in current_counter..new_counter {
                         let key = self.wallet_entropy.nth_ctidh_spending_key(idx).into();
@@ -1119,7 +1134,7 @@ impl WalletState {
                 self.wallet_db.get_generation_key_counter()
             }
             KeyType::Symmetric => self.wallet_db.get_symmetric_key_counter(),
-            KeyType::Ctidh => self.wallet_db.get_ctidh_key_counter(),
+            KeyType::Ctidh | KeyType::CtidhSubAddr => self.wallet_db.get_ctidh_key_counter(),
         }
     }
 
@@ -1131,7 +1146,9 @@ impl WalletState {
                 .nth_generation_spending_key(index)
                 .into(),
             KeyType::Symmetric => self.wallet_entropy.nth_symmetric_key(index).into(),
-            KeyType::Ctidh => self.wallet_entropy.nth_ctidh_spending_key(index).into(),
+            KeyType::Ctidh | KeyType::CtidhSubAddr => {
+                self.wallet_entropy.nth_ctidh_spending_key(index).into()
+            }
         }
     }
 

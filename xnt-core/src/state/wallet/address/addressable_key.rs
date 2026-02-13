@@ -35,12 +35,15 @@ pub enum KeyType {
 
     /// [ctidh_address] shorter address
     Ctidh = ctidh_address::CTIDH_FLAG_U8,
+
+    /// [ctidh_address] subaddress with payment_id
+    CtidhSubAddr = ctidh_address::CTIDH_SUBADDR_FLAG_U8,
 }
 
 impl KeyType {
     /// Returns true if this key type uses subaddress format (has payment_id)
     pub fn is_subaddress(&self) -> bool {
-        matches!(self, Self::GenerationSubAddr)
+        matches!(self, Self::GenerationSubAddr | Self::CtidhSubAddr)
     }
 
     /// Returns the base key type (without subaddress)
@@ -48,7 +51,7 @@ impl KeyType {
         match self {
             Self::Generation | Self::GenerationSubAddr => Self::Generation,
             Self::Symmetric => Self::Symmetric,
-            Self::Ctidh => Self::Ctidh,
+            Self::Ctidh | Self::CtidhSubAddr => Self::Ctidh,
         }
     }
 }
@@ -60,6 +63,7 @@ impl std::fmt::Display for KeyType {
             Self::Symmetric => write!(f, "Symmetric"),
             Self::GenerationSubAddr => write!(f, "GenerationSubAddr"),
             Self::Ctidh => write!(f, "Ctidh"),
+            Self::CtidhSubAddr => write!(f, "CtidhSubAddr"),
         }
     }
 }
@@ -71,6 +75,7 @@ impl From<&ReceivingAddress> for KeyType {
             ReceivingAddress::Symmetric(_) => Self::Symmetric,
             ReceivingAddress::GenerationSubAddr(_) => Self::GenerationSubAddr,
             ReceivingAddress::Ctidh(_) => Self::Ctidh,
+            ReceivingAddress::CtidhSubAddr(_) => Self::CtidhSubAddr,
         }
     }
 }
@@ -100,6 +105,7 @@ impl TryFrom<&Announcement> for KeyType {
             Ok(kt) if kt == Self::Symmetric.into() => Ok(Self::Symmetric),
             Ok(kt) if kt == Self::GenerationSubAddr.into() => Ok(Self::GenerationSubAddr),
             Ok(kt) if kt == Self::Ctidh.into() => Ok(Self::Ctidh),
+            Ok(kt) if kt == Self::CtidhSubAddr.into() => Ok(Self::CtidhSubAddr),
             _ => bail!("encountered Announcement of unknown type"),
         }
     }
@@ -113,6 +119,7 @@ impl KeyType {
             Self::Symmetric,
             Self::GenerationSubAddr,
             Self::Ctidh,
+            Self::CtidhSubAddr,
         ]
     }
 }

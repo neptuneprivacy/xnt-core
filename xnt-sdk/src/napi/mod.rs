@@ -213,6 +213,16 @@ impl XntAddress {
         Ok(XntSubAddress { inner: subaddr })
     }
 
+    /// Create CTIDH subaddress with payment_id
+    #[napi]
+    pub fn ctidh_subaddress(&self, payment_id: i64) -> Result<XntReceivingAddress> {
+        let subaddr = self
+            .inner
+            .ctidh_subaddress(payment_id as u64)
+            .map_err(|e| Error::from_reason(format!("ctidh subaddress creation failed: {e}")))?;
+        Ok(XntReceivingAddress { inner: subaddr })
+    }
+
     /// Convert to ReceivingAddress for addOutput
     #[napi]
     pub fn to_receiving_address(&self) -> XntReceivingAddress {
@@ -261,6 +271,13 @@ pub struct XntReceivingAddress {
 
 #[napi]
 impl XntReceivingAddress {
+    /// Encode address to bech32m string
+    #[napi]
+    pub fn to_bech32(&self, network: XntNetwork) -> Result<String> {
+        self.inner
+            .to_bech32(network.into())
+            .map_err(|e| Error::from_reason(format!("bech32m encoding failed: {e}")))
+    }
     /// Get payment_id if this is a subaddress, null otherwise
     #[napi]
     pub fn payment_id(&self) -> Option<i64> {
