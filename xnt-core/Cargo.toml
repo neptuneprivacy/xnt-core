@@ -127,7 +127,7 @@ hex = "0.4.3"
 sha2 = "0.10"
 axum-extra = { version = "0.10.0", features = ["erased-json", "typed-header"], optional = true }
 tower-http = { version = "0.6.2", features = ["cors", "trace"], optional = true }
-ctidh512 = { path = "../../dCTIDH/rust/ctidh512" }
+ctidh512 = { git = "https://github.com/neptuneprivacy/dCTIDH-512sp.git" }
 
 [dev-dependencies]
 
