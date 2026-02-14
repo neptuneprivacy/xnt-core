@@ -37,29 +37,27 @@ pub fn select_inputs(amounts: &[i128], target: i128, limit: usize) -> Result<Vec
         return Err(XntError::TransactionError("no UTXOs available".into()));
     }
 
-    // Sliding window: prefer fewer inputs, but use smallest UTXOs that work
+    // UTXO consolidation: pick the best window of up to `limit`
+    // contiguous inputs (sorted ascending) that covers the spend
+    // amount while maximizing the number of small UTXOs consumed.
     let max_window = limit.min(indexed.len());
 
-    for window_size in 1..=max_window {
-        for start in 0..=(indexed.len() - window_size) {
-            let window = &indexed[start..start + window_size];
-            // Use checked arithmetic to prevent overflow
-            let sum = window
-                .iter()
-                .try_fold(0i128, |acc, (_, amt)| acc.checked_add(*amt))
-                .ok_or_else(|| XntError::TransactionError("amount overflow".into()))?;
-            if sum >= target {
-                return Ok(window.iter().map(|(idx, _)| *idx).collect());
-            }
+    for start in 0..=(indexed.len() - max_window) {
+        let window = &indexed[start..start + max_window];
+        let sum = window
+            .iter()
+            .try_fold(0i128, |acc, (_, amt)| acc.checked_add(*amt))
+            .ok_or_else(|| XntError::TransactionError("amount overflow".into()))?;
+        if sum >= target {
+            return Ok(window.iter().map(|(idx, _)| *idx).collect());
         }
     }
 
-    // No valid window found - use saturating arithmetic for error message
+    // No valid window found
     let total: i128 = indexed.iter().map(|(_, amt)| amt).fold(0i128, |a, b| a.saturating_add(*b));
-    let best: i128 = indexed.iter().rev().take(max_window).map(|(_, amt)| amt).fold(0i128, |a, b| a.saturating_add(*b));
     Err(XntError::TransactionError(format!(
-        "insufficient: best={} total={} need={} (limit={})",
-        best, total, target, limit
+        "insufficient: total={} need={} (limit={})",
+        total, target, limit
     )))
 }
 

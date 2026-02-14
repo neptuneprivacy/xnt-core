@@ -145,21 +145,23 @@ impl TxInputListBuilder {
 
         match max_inputs {
             Some(limit) => {
-                // Sliding window: try smallest window size first (fewer inputs preferred),
-                // then slide across sorted inputs to find the optimal subset.
+                // UTXO consolidation: pick the best window of up to `limit`
+                // contiguous inputs (sorted ascending) that covers the spend
+                // amount while maximizing the number of small UTXOs consumed.
+                // Try from the smallest end first; slide right if needed.
                 let max_window = limit.min(spendable_inputs.len());
 
-                for window_size in 1..=max_window {
-                    for start in 0..=(spendable_inputs.len() - window_size) {
-                        let window = &spendable_inputs[start..start + window_size];
-                        let sum = window
-                            .iter()
-                            .fold(NativeCurrencyAmount::zero(), |acc, input| {
-                                acc + input.utxo.get_native_currency_amount()
-                            });
-                        if sum >= spend_amount {
-                            return window.to_vec();
-                        }
+                // Try full window first (max consolidation), slide to find
+                // the window starting at the smallest possible index.
+                for start in 0..=(spendable_inputs.len() - max_window) {
+                    let window = &spendable_inputs[start..start + max_window];
+                    let sum = window
+                        .iter()
+                        .fold(NativeCurrencyAmount::zero(), |acc, input| {
+                            acc + input.utxo.get_native_currency_amount()
+                        });
+                    if sum >= spend_amount {
+                        return window.to_vec();
                     }
                 }
 
