@@ -144,11 +144,11 @@ impl ReceiveScreen {
                             );
                             escalate_event = Some(DashboardEvent::RefreshScreen);
                         }
-                        // Toggle between Generation and Ctidh receiving address types.
+                        // Toggle between Generation and dCTIDH receiving address types.
                         KeyCode::Char('t') | KeyCode::Char('T') => {
                             self.current_key_type = match self.current_key_type {
-                                KeyType::Generation | KeyType::GenerationSubAddr => KeyType::Ctidh,
-                                KeyType::Ctidh | KeyType::CtidhSubAddr => KeyType::Generation,
+                                KeyType::Generation | KeyType::GenerationSubAddr => KeyType::dCTIDH,
+                                KeyType::dCTIDH | KeyType::dCTIDHSubAddr => KeyType::Generation,
                                 KeyType::Symmetric => KeyType::Generation,
                             };
                             // Clear cached address so we fetch a fresh one for the new key type.
@@ -236,11 +236,11 @@ impl Widget for ReceiveScreen {
         let key_type_label = match self.current_key_type {
             KeyType::Generation | KeyType::GenerationSubAddr => "Generation",
             KeyType::Symmetric => "Symmetric",
-            KeyType::Ctidh | KeyType::CtidhSubAddr => "CTIDH",
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => "CTIDH",
         };
         let (mut address, address_abbrev) = match receiving_address {
             Some(addr) => match self.current_key_type {
-                KeyType::Ctidh => {
+                KeyType::dCTIDH => {
                     let bech = addr.to_bech32m(self.network).unwrap();
                     (bech.clone(), bech)
                 }

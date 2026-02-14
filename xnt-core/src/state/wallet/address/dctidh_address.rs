@@ -8,7 +8,7 @@ use anyhow::Result;
 use bech32::FromBase32;
 use bech32::ToBase32;
 use bech32::Variant;
-use ctidh512::{derive, keygen, sk_to_pk, PublicKey, SecretKey};
+use dctidh512::{derive, keygen, sk_to_pk, PublicKey, SecretKey};
 use serde::Deserialize;
 use serde::Serialize;
 use num_traits::Zero;
@@ -39,7 +39,7 @@ pub const CTIDH_SUBADDR_FLAG: BFieldElement = BFieldElement::new(CTIDH_SUBADDR_F
 pub const CTIDH_ADDRESS_MAX_BECH32M_LEN: usize = 430;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CtidhReceivingAddress {
+pub struct dCTIDHReceivingAddress {
     #[serde(with = "serde_arrays")]
     encryption_key: PublicKey,
     receiver_identifier: BFieldElement,
@@ -49,25 +49,25 @@ pub struct CtidhReceivingAddress {
 
 /// A subaddress combining a base CTIDH receiving address with a payment_id.
 ///
-/// CtidhSubAddress = CtidhReceivingAddress + payment_id
+/// dCTIDHSubAddress = dCTIDHReceivingAddress + payment_id
 ///
 /// The subaddress can be converted to/from (address, payment_id) pair. When
 /// encoded as bech32m, it includes both the base address and payment_id.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CtidhSubAddress {
+pub struct dCTIDHSubAddress {
     /// The base receiving address
-    base: CtidhReceivingAddress,
+    base: dCTIDHReceivingAddress,
 
     /// The payment identifier for this subaddress
     payment_id: BFieldElement,
 }
 
-impl CtidhSubAddress {
+impl dCTIDHSubAddress {
     /// Create a new subaddress from a base address and payment_id.
     ///
     /// # Errors
     /// Returns error if payment_id is zero - use base address directly for zero payment_id.
-    pub fn new(base: CtidhReceivingAddress, payment_id: BFieldElement) -> Result<Self> {
+    pub fn new(base: dCTIDHReceivingAddress, payment_id: BFieldElement) -> Result<Self> {
         ensure!(
             !payment_id.is_zero(),
             "payment_id must be non-zero for subaddresses; use base address directly"
@@ -79,7 +79,7 @@ impl CtidhSubAddress {
     ///
     /// # Errors
     /// Returns error if index is zero - use base address directly for zero payment_id.
-    pub fn from_index(base: CtidhReceivingAddress, index: u64) -> Result<Self> {
+    pub fn from_index(base: dCTIDHReceivingAddress, index: u64) -> Result<Self> {
         ensure!(index != 0, "index must be non-zero for subaddresses");
         Self::new(base, BFieldElement::new(index))
     }
@@ -95,10 +95,10 @@ impl CtidhSubAddress {
     }
 }
 
-// Implement bech32m serialization for CtidhSubAddress.
+// Implement bech32m serialization for dCTIDHSubAddress.
 // Override the macro implementation to only encode encryption_key + payment_id
 // (not the full struct) to keep it compact like base address.
-impl CtidhSubAddress {
+impl dCTIDHSubAddress {
     /// Returns human readable prefix (hrp) for CTIDH subaddress
     pub(super) fn get_hrp(network: Network) -> String {
         format!("xntcta{}", common::network_hrp_char(network))
@@ -156,15 +156,15 @@ impl CtidhSubAddress {
             payment_id_bytes[4], payment_id_bytes[5], payment_id_bytes[6], payment_id_bytes[7],
         ]);
         
-        let base = CtidhReceivingAddress::from_public_key(encryption_key);
+        let base = dCTIDHReceivingAddress::from_public_key(encryption_key);
         let payment_id = BFieldElement::new(payment_id_value);
         
         Self::new(base, payment_id)
     }
 }
 
-impl SubAddressTrait for CtidhSubAddress {
-    type Base = CtidhReceivingAddress;
+impl SubAddressTrait for dCTIDHSubAddress {
+    type Base = dCTIDHReceivingAddress;
 
     fn base(&self) -> &Self::Base {
         &self.base
@@ -198,7 +198,7 @@ impl SubAddressTrait for CtidhSubAddress {
 
 /// Only seed is persisted; derived fields have [serde(skip)] and are recomputed on deserialize.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CtidhSpendingKey {
+pub struct dCTIDHSpendingKey {
     seed: Digest,
 
     #[serde(skip)]
@@ -214,7 +214,7 @@ pub struct CtidhSpendingKey {
     unlock_key_preimage: Digest,
 }
 
-impl<'de> serde::de::Deserialize<'de> for CtidhSpendingKey {
+impl<'de> serde::de::Deserialize<'de> for dCTIDHSpendingKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::de::Deserializer<'de>,
@@ -228,10 +228,10 @@ impl<'de> serde::de::Deserialize<'de> for CtidhSpendingKey {
         struct FieldVisitor;
 
         impl<'de> serde::de::Visitor<'de> for FieldVisitor {
-            type Value = CtidhSpendingKey;
+            type Value = dCTIDHSpendingKey;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("struct CtidhSpendingKey")
+                formatter.write_str("struct dCTIDHSpendingKey")
             }
 
             fn visit_seq<V>(self, mut seq: V) -> Result<Self::Value, V::Error>
@@ -241,7 +241,7 @@ impl<'de> serde::de::Deserialize<'de> for CtidhSpendingKey {
                 let seed = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                Ok(CtidhSpendingKey::derive_from_seed(seed))
+                Ok(dCTIDHSpendingKey::derive_from_seed(seed))
             }
 
             fn visit_map<V>(self, mut map: V) -> Result<Self::Value, V::Error>
@@ -260,17 +260,17 @@ impl<'de> serde::de::Deserialize<'de> for CtidhSpendingKey {
                     }
                 }
                 let seed_digest = seed.ok_or_else(|| serde::de::Error::missing_field("seed"))?;
-                Ok(CtidhSpendingKey::derive_from_seed(seed_digest))
+                Ok(dCTIDHSpendingKey::derive_from_seed(seed_digest))
             }
         }
 
         const FIELDS: &[&str] = &["seed"];
-        deserializer.deserialize_struct("CtidhSpendingKey", FIELDS, FieldVisitor)
+        deserializer.deserialize_struct("dCTIDHSpendingKey", FIELDS, FieldVisitor)
     }
 }
 
 /// Format a CTIDH public key as hex in the same form as dCTIDH's test/demo output
-/// (big-endian with "0x" prefix). Use for comparing with dCTIDH test_pubkey_compare or ctidh_demo.
+/// (big-endian with "0x" prefix). Use for comparing with dCTIDH test_pubkey_compare or dctidh_demo.
 /// Rust's `hex::encode(pk)` is little-endian and has no "0x", so it's 2 chars shorter and reversed.
 pub fn public_key_hex_dctidh_format(pk: &PublicKey) -> String {
     let mut s = "0x".to_string();
@@ -280,13 +280,13 @@ pub fn public_key_hex_dctidh_format(pk: &PublicKey) -> String {
     s
 }
 
-impl std::fmt::Debug for CtidhSpendingKey {
+impl std::fmt::Debug for dCTIDHSpendingKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Derive public key from secret key for debugging purposes.
         let public_key = sk_to_pk(&self.secret_key).unwrap_or([0u8; 64]);
         // Use little-endian hex (same as hex::encode) for compact Debug.
         // For dCTIDH comparison use public_key_hex_dctidh_format(&public_key).
-        f.debug_struct("CtidhSpendingKey")
+        f.debug_struct("dCTIDHSpendingKey")
             .field("public_key", &hex::encode(&public_key[..]))
             .finish_non_exhaustive()
     }
@@ -303,18 +303,18 @@ fn lock_preimage_from_public_key(pk: &PublicKey) -> Digest {
     Tip5::hash_varlen(&bfes)
 }
 
-const CTIDH_SK_DOMAIN: &[u8] = b"ctidh512_sk";
+const CTIDH_SK_DOMAIN: &[u8] = b"dctidh512_sk";
 
 /// Domain for deriving ephemeral CTIDH key from payload (deterministic announcement, like Generation).
-const CTIDH_EPH_SK_DOMAIN: &[u8] = b"ctidh512_eph_sk";
+const CTIDH_EPH_SK_DOMAIN: &[u8] = b"dctidh512_eph_sk";
 
-impl CtidhSpendingKey {
+impl dCTIDHSpendingKey {
     pub fn derive_from_seed(seed: Digest) -> Self {
         let seed_bytes = bincode::serialize(&seed).unwrap();
         let secret_key_bytes =
             common::shake256::<74>(&[seed_bytes.as_slice(), CTIDH_SK_DOMAIN].concat());
         let secret_key: SecretKey = secret_key_bytes;
-        let public_key = sk_to_pk(&secret_key).expect("ctidh sk_to_pk from derived sk");
+        let public_key = sk_to_pk(&secret_key).expect("dctidh sk_to_pk from derived sk");
         let receiver_identifier = receiver_identifier_from_public_key(&public_key);
         let receiver_preimage = lock_preimage_from_public_key(&public_key);
         let unlock_key_preimage = receiver_preimage;
@@ -355,10 +355,10 @@ impl CtidhSpendingKey {
     }
 
     /// Receiving address for this key.
-    pub fn to_address(&self) -> CtidhReceivingAddress {
+    pub fn to_address(&self) -> dCTIDHReceivingAddress {
         let public_key =
-            sk_to_pk(&self.secret_key).expect("ctidh sk_to_pk from spending secret key");
-        CtidhReceivingAddress::from_public_key(public_key)
+            sk_to_pk(&self.secret_key).expect("dctidh sk_to_pk from spending secret key");
+        dCTIDHReceivingAddress::from_public_key(public_key)
     }
 
     pub fn receiver_preimage(&self) -> Digest {
@@ -445,7 +445,7 @@ impl CtidhSpendingKey {
     }
 }
 
-impl CtidhReceivingAddress {
+impl dCTIDHReceivingAddress {
     pub fn from_public_key(public_key: PublicKey) -> Self {
         let receiver_identifier = receiver_identifier_from_public_key(&public_key);
         let preimage = lock_preimage_from_public_key(&public_key);
@@ -484,7 +484,7 @@ impl CtidhReceivingAddress {
         let eph_sk_bytes =
             common::shake256::<74>(&[seed_32.as_slice(), CTIDH_EPH_SK_DOMAIN].concat());
         let eph_sk: SecretKey = eph_sk_bytes;
-        let eph_pk = sk_to_pk(&eph_sk).expect("ctidh eph sk_to_pk");
+        let eph_pk = sk_to_pk(&eph_sk).expect("dctidh eph sk_to_pk");
         let shared_secret = derive(&self.encryption_key, &eph_sk).expect("CTIDH derive");
         let aes_key: [u8; 32] = common::shake256::<32>(&shared_secret);
         let plaintext = bincode::serialize(&(

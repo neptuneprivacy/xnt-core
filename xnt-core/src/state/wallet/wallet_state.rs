@@ -28,7 +28,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
-use crate::state::wallet::address::ctidh_address;
+use crate::state::wallet::address::dctidh_address;
 use super::address::generation_address;
 use super::address::symmetric_key;
 use super::address::KeyType;
@@ -93,7 +93,7 @@ pub struct WalletState {
     known_generation_keys: Vec<SpendingKey>,
     known_symmetric_keys: Vec<SpendingKey>,
     /// CTIDH key
-    known_ctidh_keys: Vec<SpendingKey>,
+    known_dctidh_keys: Vec<SpendingKey>,
 
     /// Tunable options for configuring how the wallet state operates.
     pub(crate) configuration: WalletConfiguration,
@@ -329,9 +329,9 @@ impl WalletState {
             .map(|idx| wallet_entropy.nth_symmetric_key(idx).into())
             .collect_vec();
 
-        let ctidh_counter = rusty_wallet_database.get_ctidh_key_counter();
-        let known_ctidh_keys: Vec<SpendingKey> = (0..ctidh_counter)
-            .map(|idx| wallet_entropy.nth_ctidh_spending_key(idx).into())
+        let dctidh_counter = rusty_wallet_database.get_dctidh_key_counter();
+        let known_dctidh_keys: Vec<SpendingKey> = (0..dctidh_counter)
+            .map(|idx| wallet_entropy.nth_dctidh_spending_key(idx).into())
             .collect_vec();
 
         let mut wallet_state = Self {
@@ -341,7 +341,7 @@ impl WalletState {
             mempool_unspent_utxos: Default::default(),
             known_generation_keys,
             known_symmetric_keys,
-            known_ctidh_keys,
+            known_dctidh_keys,
             configuration: configuration.clone(),
         };
 
@@ -382,9 +382,9 @@ impl WalletState {
         }
         // Ensure CTIDH key index 0 is known
         // This allows wallet to scan CTIDH UTXOs sent to index 0
-        if wallet_state.known_ctidh_keys.is_empty() {
+        if wallet_state.known_dctidh_keys.is_empty() {
             let _ = wallet_state
-                .next_unused_spending_key(KeyType::Ctidh)
+                .next_unused_spending_key(KeyType::dCTIDH)
                 .await;
         }
 
@@ -1013,12 +1013,12 @@ impl WalletState {
         let future_symmetric_keys = self
             .get_future_symmetric_keys(num_future_keys)
             .map(|(i, sk)| (KeyType::Symmetric, i, SpendingKey::from(sk)));
-        let future_ctidh_keys = self
-            .get_future_ctidh_spending_keys(num_future_keys)
-            .map(|(i, csk)| (KeyType::Ctidh, i, SpendingKey::from(csk)));
+        let future_dctidh_keys = self
+            .get_future_dctidh_spending_keys(num_future_keys)
+            .map(|(i, csk)| (KeyType::dCTIDH, i, SpendingKey::from(csk)));
         future_generation_keys
             .chain(future_symmetric_keys)
-            .chain(future_ctidh_keys)
+            .chain(future_dctidh_keys)
     }
 
     /// returns all spending keys of `key_type` with derivation index less than current counter
@@ -1031,7 +1031,7 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
-            KeyType::Ctidh | KeyType::CtidhSubAddr => Box::new(self.get_known_ctidh_keys()),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => Box::new(self.get_known_dctidh_keys()),
         }
     }
 
@@ -1045,7 +1045,7 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
-            KeyType::Ctidh | KeyType::CtidhSubAddr => Box::new(self.get_known_ctidh_keys()),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => Box::new(self.get_known_dctidh_keys()),
         }
     }
 
@@ -1073,8 +1073,8 @@ impl WalletState {
         self.known_symmetric_keys.iter().cloned()
     }
 
-    fn get_known_ctidh_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
-        self.known_ctidh_keys.iter().cloned()
+    fn get_known_dctidh_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
+        self.known_dctidh_keys.iter().cloned()
     }
 
     /// Get the next unused spending key of a given type.
@@ -1090,7 +1090,7 @@ impl WalletState {
                 self.next_unused_generation_spending_key().await.into()
             }
             KeyType::Symmetric => self.next_unused_symmetric_key().await.into(),
-            KeyType::Ctidh | KeyType::CtidhSubAddr => self.next_unused_ctidh_key().await.into(),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => self.next_unused_dctidh_key().await.into(),
         }
     }
 
@@ -1116,11 +1116,11 @@ impl WalletState {
                         self.known_symmetric_keys.push(key);
                     }
                 }
-                KeyType::Ctidh | KeyType::CtidhSubAddr => {
-                    self.wallet_db.set_ctidh_key_counter(new_counter).await;
+                KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
+                    self.wallet_db.set_dctidh_key_counter(new_counter).await;
                     for idx in current_counter..new_counter {
-                        let key = self.wallet_entropy.nth_ctidh_spending_key(idx).into();
-                        self.known_ctidh_keys.push(key);
+                        let key = self.wallet_entropy.nth_dctidh_spending_key(idx).into();
+                        self.known_dctidh_keys.push(key);
                     }
                 }
             }
@@ -1134,7 +1134,7 @@ impl WalletState {
                 self.wallet_db.get_generation_key_counter()
             }
             KeyType::Symmetric => self.wallet_db.get_symmetric_key_counter(),
-            KeyType::Ctidh | KeyType::CtidhSubAddr => self.wallet_db.get_ctidh_key_counter(),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => self.wallet_db.get_dctidh_key_counter(),
         }
     }
 
@@ -1146,8 +1146,8 @@ impl WalletState {
                 .nth_generation_spending_key(index)
                 .into(),
             KeyType::Symmetric => self.wallet_entropy.nth_symmetric_key(index).into(),
-            KeyType::Ctidh | KeyType::CtidhSubAddr => {
-                self.wallet_entropy.nth_ctidh_spending_key(index).into()
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
+                self.wallet_entropy.nth_dctidh_spending_key(index).into()
             }
         }
     }
@@ -1185,13 +1185,13 @@ impl WalletState {
     }
 
     /// Get the next unused CTIDH key
-    pub async fn next_unused_ctidh_key(
+    pub async fn next_unused_dctidh_key(
         &mut self,
-    ) -> crate::state::wallet::address::ctidh_address::CtidhSpendingKey {
-        let index = self.wallet_db.get_ctidh_key_counter();
-        let key = self.wallet_entropy.nth_ctidh_spending_key(index);
-        self.wallet_db.set_ctidh_key_counter(index + 1).await;
-        self.known_ctidh_keys.push(key.clone().into());
+    ) -> crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey {
+        let index = self.wallet_db.get_dctidh_key_counter();
+        let key = self.wallet_entropy.nth_dctidh_spending_key(index);
+        self.wallet_db.set_dctidh_key_counter(index + 1).await;
+        self.known_dctidh_keys.push(key.clone().into());
         key
     }
 
@@ -1219,13 +1219,13 @@ impl WalletState {
 
     /// Get the next n CTIDH spending keys (with derivation indices)
     /// without modifying the counter.
-    pub(crate) fn get_future_ctidh_spending_keys(
+    pub(crate) fn get_future_dctidh_spending_keys(
         &self,
         num_future_keys: usize,
-    ) -> impl Iterator<Item = (u64, ctidh_address::CtidhSpendingKey)> + use<'_> {
-        let index = self.wallet_db.get_ctidh_key_counter();
+    ) -> impl Iterator<Item = (u64, dctidh_address::dCTIDHSpendingKey)> + use<'_> {
+        let index = self.wallet_db.get_dctidh_key_counter();
         (index..index + (num_future_keys as u64))
-            .map(|i| (i, self.wallet_entropy.nth_ctidh_spending_key(i)))
+            .map(|i| (i, self.wallet_entropy.nth_dctidh_spending_key(i)))
     }
 
     pub(crate) async fn claim_utxo(&mut self, utxo_claim_data: ClaimUtxoData) -> Result<()> {

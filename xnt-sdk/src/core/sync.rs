@@ -98,7 +98,7 @@ impl MembershipProof {
 pub struct SpendableInput {
     /// The decrypted UTXO
     pub utxo: Utxo,
-    /// The spending key that can unlock this UTXO (Generation or Ctidh)
+    /// The spending key that can unlock this UTXO (Generation or dCTIDH)
     pub spending_key: SpendingKey,
     /// Membership proof for this UTXO in the mutator set
     pub membership_proof: MembershipProof,
@@ -297,7 +297,7 @@ pub fn collect_spendable_inputs_for_key(
         return Ok(Vec::new());
     }
 
-    // Decrypt UTXOs using core SpendingKey::decrypt (works for Generation and Ctidh)
+    // Decrypt UTXOs using core SpendingKey::decrypt (works for Generation and dCTIDH)
     let mut utxos: Vec<(Utxo, Digest, i128, u64, Digest)> = Vec::new();
     for idx in indexed {
         // ciphertext_bfes are encoded little-endian u64s; convert back to BFieldElements

@@ -1,16 +1,24 @@
 import {
   XntTransactionBuilder,
   XntMembershipProof,
-  XntPendingUtxo,
+  XntDecryptedUtxo,
   xntGetMembershipProofs,
 } from "../napi/output";
 
 /**
- * Selected input for mixed Generation + CTIDH transactions.
+ * An unspent UTXO with its decrypted data and AOCL index.
+ */
+export type UnspentUtxo = {
+  decrypted: XntDecryptedUtxo;
+  aoclIndex: number;
+};
+
+/**
+ * Selected input for mixed Generation + dCTIDH transactions.
  */
 export type MixedSelectedInput = {
-  kind: "gen" | "ctidh";
-  u: XntPendingUtxo;
+  kind: "gen" | "dctidh";
+  u: UnspentUtxo;
 };
 
 export type IndexedSelected = {
@@ -19,18 +27,18 @@ export type IndexedSelected = {
 };
 
 /**
- * Add heterogeneous inputs (Generation + CTIDH) to a `XntTransactionBuilder`
+ * Add heterogeneous inputs (Generation + dCTIDH) to a `XntTransactionBuilder`
  * using the correct membership proof for each key type.
  */
 export function addMultiTypeInputs(
   builder: XntTransactionBuilder,
   selected: MixedSelectedInput[],
   genKey: any,
-  ctidhKey: any,
+  dCTIDHKey: any,
   genProofBuffers: Buffer[],
-  ctidhProofBuffers: Buffer[],
+  dCTIDHProofBuffers: Buffer[],
   genSelected: IndexedSelected[],
-  ctidhSelected: IndexedSelected[],
+  dCTIDHSelected: IndexedSelected[],
 ): void {
   for (let i = 0; i < selected.length; i++) {
     const item = selected[i];
@@ -41,16 +49,16 @@ export function addMultiTypeInputs(
       const proof = XntMembershipProof.fromBytes(genProofBuffers[pos]);
       builder.addInput(item.u.decrypted.utxo, genKey, proof);
     } else {
-      const pos = ctidhSelected.findIndex(x => x.idx === i);
+      const pos = dCTIDHSelected.findIndex(x => x.idx === i);
       if (pos < 0) continue;
-      const proof = XntMembershipProof.fromBytes(ctidhProofBuffers[pos]);
-      builder.addInput(item.u.decrypted.utxo, ctidhKey, proof);
+      const proof = XntMembershipProof.fromBytes(dCTIDHProofBuffers[pos]);
+      builder.addInput(item.u.decrypted.utxo, dCTIDHKey, proof);
     }
   }
 }
 
 /**
- * Build membership proofs for a mixed set of selected inputs (Generation + CTIDH).
+ * Build membership proofs for a mixed set of selected inputs (Generation + dCTIDH).
  *
  * Returns the partitioned selections plus the raw proof buffers so callers can
  * log counts or inspect them before adding inputs to a transaction.
@@ -58,20 +66,20 @@ export function addMultiTypeInputs(
 export function buildMixedProofs(
   client: any,
   genKey: any,
-  ctidhKey: any,
+  dCTIDHKey: any,
   selected: MixedSelectedInput[],
 ): {
   genSelected: IndexedSelected[];
-  ctidhSelected: IndexedSelected[];
+  dCTIDHSelected: IndexedSelected[];
   genProofBuffers: Buffer[];
-  ctidhProofBuffers: Buffer[];
+  dCTIDHProofBuffers: Buffer[];
 } {
   const genSelected: IndexedSelected[] = selected
     .map((s, idx) => ({ s, idx }))
     .filter(x => x.s.kind === "gen");
-  const ctidhSelected: IndexedSelected[] = selected
+  const dCTIDHSelected: IndexedSelected[] = selected
     .map((s, idx) => ({ s, idx }))
-    .filter(x => x.s.kind === "ctidh");
+    .filter(x => x.s.kind === "dctidh");
 
   const genProofBuffers: Buffer[] = genSelected.length > 0
     ? xntGetMembershipProofs(
@@ -83,16 +91,16 @@ export function buildMixedProofs(
       )
     : [];
 
-  const ctidhProofBuffers: Buffer[] = ctidhSelected.length > 0
+  const dCTIDHProofBuffers: Buffer[] = dCTIDHSelected.length > 0
     ? xntGetMembershipProofs(
         client,
-        ctidhSelected.map(x => x.s.u.decrypted.utxo.hashHex()),
-        ctidhSelected.map(x => x.s.u.decrypted.senderRandomnessHex),
-        ctidhKey.receiverPreimageHex(),
-        ctidhSelected.map(x => x.s.u.aoclIndex),
+        dCTIDHSelected.map(x => x.s.u.decrypted.utxo.hashHex()),
+        dCTIDHSelected.map(x => x.s.u.decrypted.senderRandomnessHex),
+        dCTIDHKey.receiverPreimageHex(),
+        dCTIDHSelected.map(x => x.s.u.aoclIndex),
       )
     : [];
 
-  return { genSelected, ctidhSelected, genProofBuffers, ctidhProofBuffers };
+  return { genSelected, dCTIDHSelected, genProofBuffers, dCTIDHProofBuffers };
 }
 

@@ -2,7 +2,7 @@
  * XNT-SDK TypeScript Test
  *
  * Usage: npx ts-node examples/xnt-sdk-test.ts [command]
- * Commands: version, seed, address, rpc, sync, utils, tx, tx-ctidh, full
+ * Commands: version, seed, address, rpc, sync, utils, tx, utxos-pid, full
  */
 
 import {
@@ -30,29 +30,8 @@ import {
   xntMempoolIncoming,
   xntComputeCommitmentForOutput,
 } from "../src/napi/output";
-import { addMultiTypeInputs, buildMixedProofs } from "../src/ts/helpers";
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} required`);
-  return value;
-}
-
-const TEST_MNEMONIC = requireEnv("XNT_TEST_MNEMONIC");
-const RPC_URL = requireEnv("XNT_RPC_URL");
-
-const log = console.log;
-const ok = (msg: string) => log(`[OK] ${msg}`);
-const fail = (msg: string) => { log(`[FAIL] ${msg}`); return false; };
-const skip = (msg: string) => { log(`[SKIP] ${msg}`); return false; };
-
-const CONVERSION_FACTOR = 4n * 10n ** 30n; // 1 XNT = 4 * 10^30 NAU
-const toNau = (xnt: number) => BigInt(Math.round(xnt * 1e8)) * CONVERSION_FACTOR / 100000000n;
-const formatAmount = (nau: bigint) => {
-  const abs = nau < 0n ? -nau : nau;
-  const sign = nau < 0n ? "-" : "";
-  return `${sign}${abs / CONVERSION_FACTOR}.${((abs % CONVERSION_FACTOR) * 100000000n / CONVERSION_FACTOR).toString().padStart(8, "0")} XNT`;
-};
+// ── Types ──────────────────────────────────────────────────────────────────
 
 interface UnspentUtxo {
   decrypted: XntDecryptedUtxo;
@@ -62,525 +41,410 @@ interface UnspentUtxo {
 
 interface SyncResult {
   unspent: UnspentUtxo[];
-  pendingSpending: number[];  // indices into unspent that are pending spend
+  pendingSpending: number[];
   pendingIncoming: XntPendingUtxo[];
 }
 
-function syncWallet(client: XntRpcClient, key: ReturnType<XntWalletEntropy["deriveKey"]>): SyncResult | null {
-  const ridHashHex = key.receiverIdHashHex();
-  const receiverPreimageHex = key.receiverPreimageHex();
+// ── Logger ─────────────────────────────────────────────────────────────────
 
-  const height = client.chainHeight();
-  if (height < 0) return null;
+class Logger {
+  skipCount = 0;
+  failCount = 0;
 
-  // Fetch & decrypt all UTXOs
-  const decrypted: XntDecryptedUtxo[] = [];
-  for (let from = 0; from <= height; from += 1000) {
-    const indexed = xntFetchUtxos(client, ridHashHex, from, Math.min(from + 999, height));
-    for (const u of indexed) {
-      try {
-        decrypted.push(xntDecryptIndexedUtxo(key, u.ciphertext, u.blockHeight, u.blockDigestHex));
-      } catch { /* not ours */ }
-    }
-  }
-  if (decrypted.length === 0) return { unspent: [], pendingSpending: [], pendingIncoming: [] };
-
-  // Get AOCL indices
-  const commitments = decrypted.map(u =>
-    xntComputeCommitment(u.utxo.hashHex(), u.senderRandomnessHex, receiverPreimageHex)
-  );
-  const aoclIndices = xntGetAoclIndices(client, commitments);
-
-  // Check spent status for valid UTXOs
-  const validUtxos: { idx: number; aocl: number; absHash: string }[] = [];
-  aoclIndices.forEach((aocl, i) => {
-    if (aocl >= 0) {
-      const u = decrypted[i];
-      const absHash = xntComputeAbsoluteIndexSetHash(u.utxo.hashHex(), u.senderRandomnessHex, receiverPreimageHex, aocl);
-      validUtxos.push({ idx: i, aocl, absHash });
-    }
-  });
-
-  const spentStatus = xntCheckSpent(client, validUtxos.map(v => v.absHash));
-  const now = BigInt(Date.now());
-
-  // Filter unspent and spendable (not timelocked)
-  const unspent = validUtxos
-    .filter((_, j) => spentStatus[j] < 0)
-    .map(v => ({ decrypted: decrypted[v.idx], aoclIndex: v.aocl, absHash: v.absHash }))
-    .filter(u => u.decrypted.utxo.canSpendAt(now));
-
-  // Check mempool for pending spending
-  const absHashes = unspent.map(u => u.absHash);
-  let pendingSpending: number[] = [];
-  try {
-    pendingSpending = xntMempoolSpending(client, absHashes);
-  } catch { /* mempool check failed, ignore */ }
-
-  // Check mempool for pending incoming
-  let pendingIncoming: XntPendingUtxo[] = [];
-  try {
-    pendingIncoming = xntMempoolIncoming(client, key);
-  } catch { /* mempool check failed, ignore */ }
-
-  return { unspent, pendingSpending, pendingIncoming };
-}
-
-
-function testVersion(): boolean {
-  log("Testing version...");
-  ok(`version: ${xntVersion()}`);
-  return true;
-}
-
-function testSeed(): boolean {
-  log("\nTesting seed...");
-
-  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
-  ok("imported");
-
-  if (wallet.toMnemonic() !== TEST_MNEMONIC) return fail("mnemonic mismatch");
-  ok("roundtrip");
-
-  const key = wallet.deriveKey(0);
-  ok(`receiver_id: ${key.receiverIdHex()}`);
-
-  const gen = XntWalletEntropy.generate();
-  ok(`generated ${gen.toMnemonic().split(" ").length} words`);
-
-  return true;
-}
-
-function testAddress(): boolean {
-  log("\nTesting address...");
-
-  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
-  const addr = wallet.deriveKey(0).toAddress();
-
-  const bech32 = addr.toBech32(XntNetwork.Main);
-  ok(`bech32: ${bech32}`);
-
-  const decoded = XntAddress.fromBech32(bech32, XntNetwork.Main);
-  if (decoded.toBech32(XntNetwork.Main) !== bech32) return fail("roundtrip");
-  ok("roundtrip");
-
-  const sub = addr.withPaymentId(12345);
-  const subBech32 = sub.toBech32(XntNetwork.Main);
-  ok(`subaddress payment_id=${sub.paymentId()}: ${subBech32}`);
-
-  try { addr.withPaymentId(0); return fail("should reject payment_id=0"); }
-  catch { ok("rejected payment_id=0"); }
-
-  return true;
-}
-
-function testRpc(): boolean {
-  log("\nTesting RPC...");
-
-  let client: XntRpcClient;
-  try { client = new XntRpcClient(RPC_URL); } catch { return skip("no server"); }
-
-  try { client.ping(); ok("ping"); } catch { return skip("ping failed"); }
-  ok(`height: ${client.chainHeight()}`);
-
-  return true;
-}
-
-function testSync(): boolean {
-  log("\nTesting sync...");
-
-  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
-  const key = wallet.deriveKey(0);
-
-  let client: XntRpcClient;
-  try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
-
-  const result = syncWallet(client, key);
-  if (!result) return skip("sync failed");
-
-  ok(`found ${result.unspent.length} unspent UTXOs`);
-
-  let total = 0n;
-  const receiverPreimage = key.receiverPreimageHex();
-  const privacyDigest = key.toAddress().privacyDigestHex();
-
-  log("\n  Unspent UTXOs:");
-  for (let i = 0; i < result.unspent.length; i++) {
-    const u = result.unspent[i];
-    const d = u.decrypted;
-    total += d.amount;
-    const pending = result.pendingSpending.includes(i) ? " [PENDING SPEND]" : "";
-    const c = xntComputeCommitment(d.utxo.hashHex(), d.senderRandomnessHex, receiverPreimage);
-    const pid = d.paymentId ? `, pid=${d.paymentId}` : "";
-    log(`    aocl=${u.aoclIndex}, h=${d.blockHeight}, amt=${formatAmount(d.amount)}${pid}${pending}, c=${c}`);
+  private write(level: string, msg: string, data?: Record<string, unknown>) {
+    const entry: Record<string, unknown> = { ts: new Date().toISOString(), level, msg };
+    if (data !== undefined) entry.data = data;
+    console.log(JSON.stringify(entry));
   }
 
-  // Show pending incoming
-  let incomingTotal = 0n;
-  if (result.pendingIncoming.length > 0) {
-    log(`\n  Pending Incoming (${result.pendingIncoming.length}):`);
+  info(msg: string, data?: Record<string, unknown>) { this.write("info", msg, data); }
+  ok(msg: string, data?: Record<string, unknown>) { this.write("ok", msg, data); }
+
+  fail(msg: string, data?: Record<string, unknown>): false {
+    this.failCount++;
+    this.write("fail", msg, data);
+    return false;
+  }
+
+  skip(msg: string, data?: Record<string, unknown>): false {
+    this.skipCount++;
+    this.write("skip", msg, data);
+    return false;
+  }
+}
+
+// ── AmountUtil ─────────────────────────────────────────────────────────────
+
+class AmountUtil {
+  private static readonly FACTOR = 4n * 10n ** 30n;
+
+  static toNau(xnt: number): bigint {
+    return BigInt(Math.round(xnt * 1e8)) * this.FACTOR / 100000000n;
+  }
+
+  static format(nau: bigint): string {
+    const abs = nau < 0n ? -nau : nau;
+    const sign = nau < 0n ? "-" : "";
+    return `${sign}${abs / this.FACTOR}.${((abs % this.FACTOR) * 100000000n / this.FACTOR).toString().padStart(8, "0")} XNT`;
+  }
+}
+
+// ── WalletHelper ───────────────────────────────────────────────────────────
+
+class WalletHelper {
+  constructor(private log: Logger) {}
+
+  connectRpc(): XntRpcClient | null {
+    const url = process.env.XNT_RPC_URL;
+    if (!url) { this.log.skip("XNT_RPC_URL not set"); return null; }
+    try {
+      const client = new XntRpcClient(url);
+      client.ping();
+      return client;
+    } catch {
+      this.log.skip("no server");
+      return null;
+    }
+  }
+
+  loadTestWallet(index = 0) {
+    const mnemonic = process.env.XNT_TEST_MNEMONIC;
+    if (!mnemonic) throw new Error("XNT_TEST_MNEMONIC required");
+    const wallet = new XntWalletEntropy(mnemonic);
+    const key = wallet.derivedCTIDHKey(index);
+    const addr = key.toAddress();
+    return { wallet, key, addr };
+  }
+
+  sync(client: XntRpcClient, key: ReturnType<XntWalletEntropy["derivedCTIDHKey"]>): SyncResult | null {
+    const ridHashHex = key.receiverIdHashHex();
+    const receiverPreimageHex = key.receiverPreimageHex();
+    const height = client.chainHeight();
+    if (height < 0) return null;
+
+    const decrypted: XntDecryptedUtxo[] = [];
+    for (let from = 0; from <= height; from += 1000) {
+      const indexed = xntFetchUtxos(client, ridHashHex, from, Math.min(from + 999, height));
+      for (const u of indexed) {
+        try {
+          decrypted.push(xntDecryptIndexedUtxo(key, u.ciphertext, u.blockHeight, u.blockDigestHex));
+        } catch { /* not ours */ }
+      }
+    }
+    if (decrypted.length === 0) return { unspent: [], pendingSpending: [], pendingIncoming: [] };
+
+    const commitments = decrypted.map(u =>
+      xntComputeCommitment(u.utxo.hashHex(), u.senderRandomnessHex, receiverPreimageHex)
+    );
+    const aoclIndices = xntGetAoclIndices(client, commitments);
+
+    const validUtxos: { idx: number; aocl: number; absHash: string }[] = [];
+    aoclIndices.forEach((aocl, i) => {
+      if (aocl >= 0) {
+        const u = decrypted[i];
+        const absHash = xntComputeAbsoluteIndexSetHash(u.utxo.hashHex(), u.senderRandomnessHex, receiverPreimageHex, aocl);
+        validUtxos.push({ idx: i, aocl, absHash });
+      }
+    });
+
+    const spentStatus = xntCheckSpent(client, validUtxos.map(v => v.absHash));
+    const now = BigInt(Date.now());
+
+    const unspent = validUtxos
+      .filter((_, j) => spentStatus[j] < 0)
+      .map(v => ({ decrypted: decrypted[v.idx], aoclIndex: v.aocl, absHash: v.absHash }))
+      .filter(u => u.decrypted.utxo.canSpendAt(now));
+
+    const absHashes = unspent.map(u => u.absHash);
+    let pendingSpending: number[] = [];
+    try { pendingSpending = xntMempoolSpending(client, absHashes); } catch { /* mempool check failed */ }
+
+    let pendingIncoming: XntPendingUtxo[] = [];
+    try { pendingIncoming = xntMempoolIncoming(client, key); } catch { /* mempool check failed */ }
+
+    return { unspent, pendingSpending, pendingIncoming };
+  }
+
+  availableUtxos(result: SyncResult): UnspentUtxo[] {
+    return result.unspent.filter((_, i) => !result.pendingSpending.includes(i));
+  }
+}
+
+// ── TestRunner ─────────────────────────────────────────────────────────────
+
+class TestRunner {
+  private log = new Logger();
+  private wallet = new WalletHelper(this.log);
+  private tests: Map<string, () => boolean>;
+
+  constructor() {
+    this.tests = new Map([
+      ["version", () => this.testVersion()],
+      ["seed", () => this.testSeed()],
+      ["address", () => this.testAddress()],
+      ["utils", () => this.testUtils()],
+      ["rpc", () => this.testRpc()],
+      ["sync", () => this.testSync()],
+      ["tx", () => this.testTx()],
+      ["utxos-pid", () => this.testUtxosPid()],
+    ]);
+  }
+
+  run(command: string) {
+    if (command === "full") {
+      this.log.info("XNT-SDK TypeScript Test");
+      let pass = 0, fail = 0, skip = 0;
+
+      for (const [name, fn] of this.tests) {
+        this.log.info(`test: ${name}`);
+        const beforeSkip = this.log.skipCount;
+        const result = fn();
+        if (result) pass++;
+        else if (this.log.skipCount > beforeSkip) skip++;
+        else fail++;
+      }
+
+      this.log.info("summary", { pass, fail, skip, total: this.tests.size });
+      process.exit(fail === 0 ? 0 : 1);
+    }
+
+    const fn = this.tests.get(command);
+    if (!fn) {
+      this.log.fail(`unknown command: ${command}`);
+      process.exit(1);
+    }
+    fn();
+  }
+
+  // ── Tests ────────────────────────────────────────────────────────────────
+
+  private testVersion(): boolean {
+    this.log.ok("version", { version: xntVersion() });
+    return true;
+  }
+
+  private testSeed(): boolean {
+    const wallet = XntWalletEntropy.generate();
+    const mnemonic = wallet.toMnemonic();
+    this.log.ok("mnemonic generated", { mnemonic });
+
+    const restored = new XntWalletEntropy(mnemonic);
+    if (restored.toMnemonic() !== mnemonic) return this.log.fail("mnemonic roundtrip");
+    this.log.ok("mnemonic roundtrip");
+
+    const key = wallet.derivedCTIDHKey(0);
+    this.log.ok("dCTIDH key derived", { receiverId: key.receiverIdHex() });
+    return true;
+  }
+
+  private testAddress(): boolean {
+    const { addr } = this.wallet.loadTestWallet();
+    const bech32 = addr.toBech32(XntNetwork.Main);
+    this.log.ok("dCTIDH address", { bech32 });
+
+    const decoded = XntAddress.fromBech32(bech32, XntNetwork.Main);
+    if (decoded.toBech32(XntNetwork.Main) !== bech32) return this.log.fail("dCTIDH roundtrip");
+    this.log.ok("dCTIDH roundtrip");
+
+    const sub = addr.dCTIDHSubaddress(111);
+    this.log.ok("dCTIDH subaddress", { pid: 111, bech32: sub.toBech32(XntNetwork.Main) });
+    return true;
+  }
+
+  private testUtils(): boolean {
+    this.log.ok("timestamp", { value: xntTimestampNow() });
+    this.log.ok("random sender_randomness", { hex: xntRandomSenderRandomness().slice(0, 16) });
+    return true;
+  }
+
+  private testRpc(): boolean {
+    const client = this.wallet.connectRpc();
+    if (!client) return false;
+    this.log.ok("ping");
+    this.log.ok("height", { height: client.chainHeight() });
+    return true;
+  }
+
+  private testSync(): boolean {
+    const client = this.wallet.connectRpc();
+    if (!client) return false;
+
+    const { key, addr } = this.wallet.loadTestWallet();
+    const result = this.wallet.sync(client, key);
+    if (!result) return this.log.skip("sync failed");
+
+    this.log.ok("synced", { unspent: result.unspent.length });
+
+    let total = 0n;
+    const receiverPreimage = key.receiverPreimageHex();
+    const privacyDigest = addr.privacyDigestHex();
+
+    for (let i = 0; i < result.unspent.length; i++) {
+      const u = result.unspent[i];
+      const d = u.decrypted;
+      total += d.amount;
+      const pending = result.pendingSpending.includes(i);
+      const c = xntComputeCommitment(d.utxo.hashHex(), d.senderRandomnessHex, receiverPreimage);
+      this.log.info("utxo", {
+        aocl: u.aoclIndex, height: d.blockHeight,
+        amount: AmountUtil.format(d.amount),
+        ...(d.paymentId ? { pid: d.paymentId } : {}),
+        ...(pending ? { pendingSpend: true } : {}),
+        commitment: c,
+      });
+    }
+
+    let incomingTotal = 0n;
     for (const p of result.pendingIncoming) {
       incomingTotal += p.amount;
       const c = xntComputeCommitmentForOutput(p.utxo.hashHex(), p.senderRandomnessHex, privacyDigest);
-      const pid = p.paymentId > 0 ? `, pid=${p.paymentId}` : "";
-      log(`    amt=${formatAmount(p.amount)}${pid}, c=${c}`);
-    }
-  }
-
-  // Calculate pending spending total
-  let spendingTotal = 0n;
-  for (const idx of result.pendingSpending) {
-    spendingTotal += result.unspent[idx].decrypted.amount;
-  }
-
-  // Balance summary
-  const available = total - spendingTotal;
-  const unconfirmed = available + incomingTotal;
-  log(`\n  Balance: ${formatAmount(total)}`);
-  if (incomingTotal > 0n || spendingTotal > 0n) {
-    log(`  Unconfirmed: ${formatAmount(unconfirmed)}`);
-  }
-
-  return true;
-}
-
-function testUtils(): boolean {
-  log("\nTesting utils...");
-  ok(`timestamp: ${xntTimestampNow()}`);
-  ok(`random sender_randomness: ${xntRandomSenderRandomness().slice(0, 16)}...`);
-  return true;
-}
-
-function testTx(): boolean {
-  log("\nTesting transaction (build & prove)...");
-
-  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
-  const key = wallet.deriveKey(0);
-  const addr = key.toAddress();
-
-  let client: XntRpcClient;
-  try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
-
-  // Sync wallet
-  const result = syncWallet(client, key);
-  if (!result || result.unspent.length === 0) return skip("no unspent UTXOs");
-  ok(`found ${result.unspent.length} unspent UTXOs`);
-
-  // Filter out pending spending UTXOs
-  const available = result.unspent.filter((_, i) => !result.pendingSpending.includes(i));
-  if (available.length === 0) return skip("all UTXOs pending spend");
-  if (available.length < result.unspent.length) {
-    ok(`${result.unspent.length - available.length} UTXOs pending spend, ${available.length} available`);
-  }
-
-  // Select inputs
-  const fee = toNau(0.005);
-  const sendAmount = toNau(0.575);
-  const totalAmount = sendAmount + fee;
-
-  const amounts = available.map(u => u.decrypted.amount);
-  const selected = xntSelectInputs(amounts, totalAmount, 10);
-  ok(`selected ${selected.length} UTXOs for ${formatAmount(totalAmount)}`);
-
-  // Get membership proofs for selected
-  const selectedUtxos = selected.map(i => available[i]);
-  const proofBuffers = xntGetMembershipProofs(
-    client,
-    selectedUtxos.map(u => u.decrypted.utxo.hashHex()),
-    selectedUtxos.map(u => u.decrypted.senderRandomnessHex),
-    key.receiverPreimageHex(),
-    selectedUtxos.map(u => u.aoclIndex)
-  );
-  ok(`got ${proofBuffers.length} membership proofs`);
-
-  // Build transaction
-  const mutatorSet = xntGetMutatorSet(client);
-  const builder = new XntTransactionBuilder();
-
-  for (let i = 0; i < selected.length; i++) {
-    const proof = XntMembershipProof.fromBytes(proofBuffers[i]);
-    builder.addInput(selectedUtxos[i].decrypted.utxo, key, proof);
-  }
-
-  // Send to recipient address (edit this address string as needed)
-  const RECIPIENT_ADDRESS = "xntsam1fukfru30yfx8vgr5qc7twg7ghsm7ck4m4943elkdzknyz66lswejf2d3uzx6g929zza7pvqye3zx8y3zjgfmktzrqjlhg5823wx0nmnr8a2nkj8lhfskfd692yzwa38l882nwvc5vvlnuu27alrnljs9whfks8tncshpdel6tv8cyfmqrd2xef9vlmr5k9py7n5h9yne07znm22jt8wxalleydetpjpj6dy3fuv9kyl6c8sv76zuw6ff2jwjervrzh6t8jmt0mgnle6v20nwygu9qnu3r5xmagtnew278ect08hys9yz9cf9anc7uwr4w945cxf4evhqgux83gf3k2prq40v3u97qhsjqae90s72pju69zh4752mzvwgm426yr2p3ag5m7zeuf0wgcuyztr9vw8ua5kpl8v8gypqhxpzav0ccp8he5mmfss007vykgqydhz528agu6vju9k3cnxywhpjskhkrfmw6gjx42kdksvlz8dhcvzl27gey6trvevscfmj94rl7cwnnr2tllumc9suv9as2xfkklfj4xdnv8y3fax3wcmqx8vyha5jnmt5cw2hjk6034vddanadzvy04k7g5d6tx2qmtmtjuatu8vjh7sq3uwm75zk5qygh3ye7pwxuutxk53vv3aae7kmndstwlhcg6km7st90xl5ecn65htnn8aju8pj5n4kex43pln80n9lz6u56yu39q67wq233dynql5zff3ndc27xaq2vc8vz3xn5xjpr0mc9znrcmed0wu5sx7sngzdl2w8986jsyn48wnveca9mdn5wlunqe8wwznwk5krx5rscp2f3sw604hm7wct6tpaxe7l5v6l9hgglhjyymslthx0l8xadkg6a4dcejgttkq9ak9gr23gq42g73cy8h5x9wjv24ayqsyecrnt8cg0g3c3kw2kc7xydwfmh934flkhxyl6hdermdn7nv9806d93d8vyxmad8urhy0smglxv99awqf8kwku3w49hg5v0khd37pg2rc5tf737qqfgfd8je6nqtknw4t98x5tdqen8gj06dylt586mrcjermlu7d3r0x7mnvrr9dfn73qeng5ccj9tm3nzcmnrame6kwsg48tczvv0d46ykk5m6kmy2z967sc0v23m0gqe0w7fy7c4q8y66405m0rvwqrdws66ek3kuyju0hz4h929snhcn0yj3dd54e4qrm0ymxurw0uxh82w2h0jf0sqly0dtt3z4xn0qvpf3letk772zdvlmsmg74k2ge96t4ttaavw6hc9yylpx62kjg77lrg7r57j9arakxgfwxu8wkm3rfrv442797wl9wm4m27vfeg9u6ff8zlceax8mrrfvyzezf5uuuadvcvgt7wfdvtgm3926nh9txzlu4yg3dhdm92zqdusyjwzdrlfggdypmgp25vtxzl2ut6pvupvra0mdnfekjpagrln7nl4vqz69c6cn6z0xmn5dvsg6fx2dukyk3cpvd6ka04avmnxru7nghd0pzzuhc2j0a3vnnwuc3xxjmvlxsld5w92q33u46sr9kt73vwdkf6t36q96hxxfsgj26we3pks6cd3ku8krelalcn94tdpkdy8889qy9dc5aqk7lnal499nhqgeh7a70fm0nju5r23583u059pazck4grpklanczq9r26a4vz4hygmswc2z8m3sxj5n3l0v8ezq6nf7elhmylqeytazt39na3s0kfuq0s2q9yrw5y4y04v9r7shj8w80xdy4yqrl2kkhz8amzd7t7w6n5yzskhd2yurwm70amkqxsvut689plyjc9lc8k7c4477sfg30l4g9633nnyyg8kdgj2w6hud2ee5zyjw3cpghhumpq6as8a0dwtqctqgyuef2yzyfcfcpu234h8x2yqaxxmxgqnlqm2235vsm7sar6xva2yqq75yelsdnp9xxy4qmf787xd3yd5s8nn3pxskj3yx7glywjhwuv26jku420c84qx7sd596ydp9j34def6thy4nvw2ctypg9qvcuaythfl0qj789f03tt0m78cwumahut4q5fqyv0kq9tvwfm42qx0sx9wq9wd5atwwfawrvrc5jxf887sydncyz3m6x0yus8nu2a78s6p9gdx3dtnrk07w3anrp0ra2laj5adz4gady7ept70lflr32jp7jzj5a3ee4j6ff95rm54qtxw4e793zs25xpz0k5at7ceh8pym5zd6y7uxgd0us8t5v2kqgzp6eg2md8ktekvz85vnlqp7kc9cschw3s5vrdxwpd4467p53a7093yxturp0eckcgn0tzqxse5u0uwp2rvxv94jfes2he607ud8rtq8g0sh2vj0v9vw0lfftkcd6medp60u4rvnkrlwj5dv06z66elmnlee3p8xzwmds20q4yutakx7f2s75dmxsdf6hvjv5yrv0nwdaeehwd7s97vqfpyr6579kvkr6tex5wd0k8ahukhy0lr8wh346sjzxh29uxz2censsr38sm24pjrv2tttnvtrewdgd7ftpjnnuqkuatth4a8lsp20n6vatrmqzpnqn4erwfkhcst9g7lkk9c50z3lgulhz7c6yvwr0uhmsef8p2w7r5hefpave8fskgwcmqrgwz3e7935luds7mfk8uz53eywmrnc004p6mrsqujr6gprkyxqpltuqnk8cet5t84lsvs3lqhxvxm8wnv4npk4rlt47gntc4mpzsl3zz5gkquaqkjlgsc0tkt8sh5zff4jn48l7dxg84y4g9t627t79jymqltdw9d0929z803xy7gn5nz5pj0nsdheklytssm5d3hvyjmklp56wrfv4z6zg79k9a0529pgcrmfwq6tzf96jrxs962u2yhfyx3td5qzd6nplnrkdd8ur93zxzehnsc26zca6dmdrp9mvtfarx3l570cs707dztk3e9s2qy7zvg0tjmfp0u3hd9g9ka0u8sup554csxkx88cf36psn4rz63m705er27lp63jsgp72qqwmzatyrhl8sq24xvkz9s67lncyy30l9zgz052l77dlnxjzf4e9prwcdarkaklplnn8u5vh8yjc38hrwjh6us9nlz93h05qf2jtq45yr8pmk8zyn34378pqrg9tlazdaaex5ax6c9ffgmjrq0l6762hyyvf6nhn0mn7aga58mu74prctc59w44wjq8tqv89deue479ycx98zl20nxft6nn9dn6z640wez0sydv0yx08yct6smgedltj6x0wqacyl70sxtztxr860px6f2tsvgrd92a4t0gwhwdhz4j9znhl2fcxl87t585cgdpesg3y2ffnar98wkaqj3l9r37mktrr3ju85a6p954duqehaxsqjhpr2dmq0pmspw2wn74a7vwm0jx24y6emz6agj2hkt0cjn4c89wygwzmqyqqqqqqqq6r0cka"; // placeholder - replace with valid bech32 address
-  const recipient = XntAddress.fromBech32(RECIPIENT_ADDRESS, XntNetwork.Main);
-  builder.addOutput(recipient.toReceivingAddress(), sendAmount, xntRandomSenderRandomness());
-  builder.setFee(fee);
-  builder.setChange(addr, xntRandomSenderRandomness());
-
-  const builtTx = builder.build(mutatorSet, xntTimestampNow(), XntNetwork.Main);
-
-  // Print summary
-  const inputs = builtTx.inputs();
-  const outputs = builtTx.outputs();
-  log(`\n  Inputs (${inputs.length}): ${formatAmount(inputs.reduce((s, i) => s + i.amount, 0n))}`);
-  for (const inp of inputs) {
-    log(`    ${formatAmount(inp.amount)}, c=${inp.commitmentHex}`);
-  }
-  log(`  Outputs (${outputs.length}): ${formatAmount(outputs.reduce((s, o) => s + o.amount, 0n))}`);
-  for (const out of outputs) {
-    const pid = out.paymentId ? `, pid=${out.paymentId}` : "";
-    log(`    ${formatAmount(out.amount)}${out.isChange ? " (change)" : ""}${pid}, c=${out.commitmentHex}`);
-  }
-  log(`  Fee: ${formatAmount(fee)}`);
-  ok(`built: ${builtTx.toBytes().length} bytes`);
-
-  // Prove (WARNING: ~16GB RAM, several minutes)
-  log("\n  Proving transaction (this takes several minutes)...");
-  const start = Date.now();
-  const provenTx = builtTx.prove();
-  ok(`proven in ${((Date.now() - start) / 1000).toFixed(1)}s`);
-
-  if (provenTx.hasProofCollection()) ok("has ProofCollection");
-
-  // Submit
-  log("\n  Submitting transaction...");
-  try {
-    provenTx.submit(client);
-    ok("submitted");
-  } catch (e) {
-    log(`  submit: ${e}`);
-  }
-
-  return true;
-}
-
-function testTxCtidh(): boolean {
-  log("\nTesting transaction Generation -> CTIDH (build & prove)...");
-
-  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
-  const genKey = wallet.deriveKey(0);
-  const genAddr = genKey.toAddress();
-
-
-  // Derive CTIDH key & base address
-  const ctidhKey = wallet.deriveCtidhKey(0);
-  const ctidhAddr = ctidhKey.toAddress();
-  const ctidhSubAddr = ctidhAddr.ctidhSubaddress(61002);
-
-  let client: XntRpcClient;
-  try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
-
-  // Sync wallet for both Generation and CTIDH keys
-  const genResult = syncWallet(client, genKey);
-  const ctidhResult = syncWallet(client, ctidhKey);
-
-  if ((!genResult || genResult.unspent.length === 0) &&
-      (!ctidhResult || ctidhResult.unspent.length === 0)) {
-    return skip("no unspent UTXOs for Generation or CTIDH");
-  }
-
-  const genAvailable = genResult
-    ? genResult.unspent.filter((_, i) => !genResult.pendingSpending.includes(i))
-    : [];
-  const ctidhAvailable = ctidhResult
-    ? ctidhResult.unspent.filter((_, i) => !ctidhResult.pendingSpending.includes(i))
-    : [];
-
-  if (genAvailable.length === 0 && ctidhAvailable.length === 0) {
-    return skip("all UTXOs pending spend for Generation and CTIDH");
-  }
-
-  ok(`Generation available: ${genAvailable.length}, CTIDH available: ${ctidhAvailable.length}`);
-
-  // Build unified pool of UTXOs with type tag
-  const all = [
-    ...genAvailable.map(u => ({ kind: "gen" as const, u })),
-    ...ctidhAvailable.map(u => ({ kind: "ctidh" as const, u })),
-  ];
-
-  // Select inputs across both key types
-  const fee = toNau(0.005);
-  const sendAmount = toNau(0.575);
-  const totalAmount = sendAmount + fee;
-
-  const amounts = all.map(x => x.u.decrypted.amount);
-  const selectedIdx = xntSelectInputs(amounts, totalAmount, 10);
-  if (selectedIdx.length === 0) {
-    return fail(`insufficient: need ${formatAmount(totalAmount)} have ${formatAmount(amounts.reduce((s, a) => s + a, 0n))}`);
-  }
-  const selected = selectedIdx.map(i => all[i]);
-  ok(`selected ${selected.length} UTXOs for ${formatAmount(totalAmount)}`);
-
-  // Build membership proofs for mixed Generation + CTIDH inputs
-  const {
-    genSelected,
-    ctidhSelected,
-    genProofBuffers,
-    ctidhProofBuffers,
-  } = buildMixedProofs(client, genKey, ctidhKey, selected);
-  if (genSelected.length > 0) {
-    ok(`got ${genProofBuffers.length} membership proofs for Generation inputs`);
-  }
-  if (ctidhSelected.length > 0) {
-    ok(`got ${ctidhProofBuffers.length} membership proofs for CTIDH inputs`);
-  }
-
-  // Build transaction
-  const mutatorSet = xntGetMutatorSet(client);
-
-  const builder = new XntTransactionBuilder();
-
-  // Add multi-type inputs
-  addMultiTypeInputs(
-    builder,
-    selected,
-    genKey,
-    ctidhKey,
-    genProofBuffers,
-    ctidhProofBuffers,
-    genSelected,
-    ctidhSelected,
-  );
-
-  // Output goes to CTIDH subaddress, change back to Generation address
-  builder.addOutput(ctidhAddr.toReceivingAddress(), sendAmount, xntRandomSenderRandomness());
-  builder.setFee(fee);
-  builder.setChange(genAddr, xntRandomSenderRandomness());
-
-  const builtTx = builder.build(mutatorSet, xntTimestampNow(), XntNetwork.Main);
-
-  // Print summary
-  const inputs = builtTx.inputs();
-  const outputs = builtTx.outputs();
-  log(`\n  Inputs (${inputs.length}): ${formatAmount(inputs.reduce((s, i) => s + i.amount, 0n))}`);
-  for (const inp of inputs) {
-    log(`    ${formatAmount(inp.amount)}, c=${inp.commitmentHex}`);
-  }
-  log(`  Outputs (${outputs.length}): ${formatAmount(outputs.reduce((s, o) => s + o.amount, 0n))}`);
-  for (const out of outputs) {
-    const pid = out.paymentId ? `, pid=${out.paymentId}` : "";
-    log(`    ${formatAmount(out.amount)}${out.isChange ? " (change)" : ""}${pid}, c=${out.commitmentHex}`);
-  }
-  log(`  Fee: ${formatAmount(fee)}`);
-  ok(`built: ${builtTx.toBytes().length} bytes`);
-
-  // Prove & submit
-  log("\n  Proving transaction (this takes several minutes)...");
-  const start = Date.now();
-  const provenTx = builtTx.prove();
-  ok(`proven in ${((Date.now() - start) / 1000).toFixed(1)}s`);
-
-  if (provenTx.hasProofCollection()) ok("has ProofCollection");
-
-  log("\n  Submitting (Generation -> CTIDH)...");
-  try {
-    provenTx.submit(client);
-    ok("submitted");
-  } catch (e) {
-    log(`  submit: ${e}`);
-  }
-
-  return true;
-}
-
-function testUtxosWithPaymentId(): boolean {
-  log("\nListing UTXOs (Generation + CTIDH)...");
-
-  const wallet = new XntWalletEntropy(TEST_MNEMONIC);
-  const genKey = wallet.deriveKey(0);
-
-  const ctidhKey = wallet.deriveCtidhKey(0);
-  log(`ctidhKey: ${ctidhKey.toAddress().toBech32(XntNetwork.Main)}`);
-  const ctidhSubAddr = ctidhKey.toAddress().ctidhSubaddress(61002);
-  log(`ctidhSubAddr: ${ctidhSubAddr.toBech32(XntNetwork.Main)}`);
-
-  let client: XntRpcClient;
-  try { client = new XntRpcClient(RPC_URL); client.ping(); } catch { return skip("no server"); }
-
-  const genResult = syncWallet(client, genKey);
-  const ctidhResult = syncWallet(client, ctidhKey);
-
-  ok(`Generation: ${genResult ? genResult.unspent.length : 0} unspent, ${genResult ? genResult.pendingIncoming.length : 0} pending`);
-  ok(`CTIDH: ${ctidhResult ? ctidhResult.unspent.length : 0} unspent, ${ctidhResult ? ctidhResult.pendingIncoming.length : 0} pending`);
-
-  const rows: {
-    kind: "Generation" | "CTIDH";
-    status: "UNSPENT" | "PENDING_INCOMING";
-    amount: bigint;
-    paymentId: number | bigint;
-    extra: string;
-  }[] = [];
-
-  const pushFromSync = (kind: "Generation" | "CTIDH", res: SyncResult | null) => {
-    if (!res) return;
-
-    log(`  ${kind}: ${res.unspent.length} unspent, ${res.pendingIncoming.length} pending incoming`);
-
-    for (const u of res.unspent) {
-      const d = u.decrypted;
-      log(`    UNSPENT: amount=${formatAmount(d.amount)}, paymentId=${d.paymentId}, aocl=${u.aoclIndex}, h=${d.blockHeight}`);
-      if (d.paymentId) {
-        rows.push({
-          kind,
-          status: "UNSPENT",
-          amount: d.amount,
-          paymentId: d.paymentId,
-          extra: `aocl=${u.aoclIndex}, h=${d.blockHeight}`,
-        });
-      }
+      this.log.info("pending-incoming", {
+        amount: AmountUtil.format(p.amount),
+        ...(p.paymentId > 0 ? { pid: p.paymentId } : {}),
+        commitment: c,
+      });
     }
 
-    for (const p of res.pendingIncoming) {
-      log(`    PENDING_INCOMING: amount=${formatAmount(p.amount)}, paymentId=${p.paymentId}`);
-      if (p.paymentId) {
-        rows.push({
-          kind,
-          status: "PENDING_INCOMING",
-          amount: p.amount,
-          paymentId: p.paymentId,
-          extra: "mempool",
-        });
-      }
+    let spendingTotal = 0n;
+    for (const idx of result.pendingSpending) {
+      spendingTotal += result.unspent[idx].decrypted.amount;
     }
-  };
 
-  pushFromSync("Generation", genResult);
-  pushFromSync("CTIDH", ctidhResult);
-
-  if (rows.length === 0) {
-    return skip("no UTXOs with for Generation or CTIDH");
+    const available = total - spendingTotal;
+    const unconfirmed = available + incomingTotal;
+    this.log.ok("balance", {
+      confirmed: AmountUtil.format(total),
+      ...(incomingTotal > 0n || spendingTotal > 0n ? { unconfirmed: AmountUtil.format(unconfirmed) } : {}),
+    });
+    return true;
   }
 
-  ok(`found ${rows.length} UTXOs`);
-  for (const r of rows) {
-    log(
-      `  [${r.kind}] ${r.status} amount=${formatAmount(r.amount)} pid=${r.paymentId} ${r.extra}`,
+  private testTx(): boolean {
+    const client = this.wallet.connectRpc();
+    if (!client) return false;
+
+    const { key, addr } = this.wallet.loadTestWallet();
+    const result = this.wallet.sync(client, key);
+    if (!result || result.unspent.length === 0) return this.log.skip("no unspent UTXOs");
+    this.log.ok("synced", { unspent: result.unspent.length });
+
+    const available = this.wallet.availableUtxos(result);
+    if (available.length === 0) return this.log.skip("all UTXOs pending spend");
+    if (available.length < result.unspent.length) {
+      this.log.info("filtered pending", {
+        available: available.length,
+        pendingSpend: result.unspent.length - available.length,
+      });
+    }
+
+    const fee = AmountUtil.toNau(0.005);
+    const sendAmount = AmountUtil.toNau(0.575);
+    const totalAmount = sendAmount + fee;
+
+    const amounts = available.map(u => u.decrypted.amount);
+    const selected = xntSelectInputs(amounts, totalAmount, 10);
+    if (selected.length === 0) {
+      return this.log.fail("insufficient funds", {
+        need: AmountUtil.format(totalAmount),
+        have: AmountUtil.format(amounts.reduce((s, a) => s + a, 0n)),
+      });
+    }
+    this.log.ok("inputs selected", { count: selected.length, total: AmountUtil.format(totalAmount) });
+
+    const selectedUtxos = selected.map(i => available[i]);
+    const proofBuffers = xntGetMembershipProofs(
+      client,
+      selectedUtxos.map(u => u.decrypted.utxo.hashHex()),
+      selectedUtxos.map(u => u.decrypted.senderRandomnessHex),
+      key.receiverPreimageHex(),
+      selectedUtxos.map(u => u.aoclIndex),
     );
+    this.log.ok("membership proofs", { count: proofBuffers.length });
+
+    const mutatorSet = xntGetMutatorSet(client);
+    const builder = new XntTransactionBuilder();
+
+    for (let i = 0; i < selected.length; i++) {
+      const proof = XntMembershipProof.fromBytes(proofBuffers[i]);
+      builder.addInput(selectedUtxos[i].decrypted.utxo, key, proof);
+    }
+
+    const recipient = addr.dCTIDHSubaddress(33354);
+    builder.addOutput(recipient, sendAmount, xntRandomSenderRandomness());
+    builder.setFee(fee);
+    builder.setChange(addr, xntRandomSenderRandomness());
+
+    const builtTx = builder.build(mutatorSet, xntTimestampNow(), XntNetwork.Main);
+
+    const inputs = builtTx.inputs();
+    const outputs = builtTx.outputs();
+    for (const inp of inputs) {
+      this.log.info("tx-input", { amount: AmountUtil.format(inp.amount), commitment: inp.commitmentHex });
+    }
+    for (const out of outputs) {
+      this.log.info("tx-output", {
+        amount: AmountUtil.format(out.amount),
+        ...(out.isChange ? { change: true } : {}),
+        ...(out.paymentId ? { pid: out.paymentId } : {}),
+        commitment: out.commitmentHex,
+      });
+    }
+    this.log.ok("built", { bytes: builtTx.toBytes().length, fee: AmountUtil.format(fee) });
+
+    this.log.info("proving (this takes several minutes)");
+    const start = Date.now();
+    const provenTx = builtTx.prove();
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    this.log.ok("proven", { seconds: elapsed, hasProofCollection: provenTx.hasProofCollection() });
+
+    this.log.info("submitting");
+    try {
+      provenTx.submit(client);
+      this.log.ok("submitted");
+    } catch (e) {
+      this.log.fail("submit failed", { error: String(e) });
+    }
+
+    return true;
   }
 
-  return true;
-}
+  private testUtxosPid(): boolean {
+    const client = this.wallet.connectRpc();
+    if (!client) return false;
 
-function testFull(): boolean {
-  log("=== XNT-SDK TypeScript Test ===\n");
+    const { key, addr } = this.wallet.loadTestWallet();
+    this.log.info("addresses", {
+      dCTIDH: addr.toBech32(XntNetwork.Main),
+      subaddress: addr.dCTIDHSubaddress(61002).toBech32(XntNetwork.Main),
+    });
 
-  const tests = [testVersion, testSeed, testAddress, testUtils, testRpc, testSync];
-  let passed = 0;
+    const result = this.wallet.sync(client, key);
+    if (!result) return this.log.skip("sync failed");
 
-  for (const test of tests) {
-    if (test()) passed++;
-    log();
+    for (const u of result.unspent) {
+      const d = u.decrypted;
+      this.log.info("unspent", {
+        amount: AmountUtil.format(d.amount),
+        ...(d.paymentId ? { pid: d.paymentId } : {}),
+        aocl: u.aoclIndex, height: d.blockHeight,
+      });
+    }
+
+    for (const p of result.pendingIncoming) {
+      this.log.info("pending-incoming", {
+        amount: AmountUtil.format(p.amount),
+        ...(p.paymentId > 0 ? { pid: p.paymentId } : {}),
+      });
+    }
+
+    const total = result.unspent.length + result.pendingIncoming.length;
+    if (total === 0) return this.log.skip("no dCTIDH UTXOs");
+    this.log.ok("utxos", { unspent: result.unspent.length, pending: result.pendingIncoming.length });
+    return true;
   }
-
-  log(`=== Done: ${passed}/${tests.length} passed ===`);
-  return passed === tests.length;
 }
 
-const cmd = process.argv[2] || "full";
-const testMap: Record<string, () => boolean> = {
-  version: testVersion, seed: testSeed, address: testAddress,
-  rpc: testRpc, sync: testSync, utils: testUtils, tx: testTx,
-  "tx-ctidh": testTxCtidh,
-  "utxos-pid": testUtxosWithPaymentId,
-  full: testFull,
-};
+// ── Entry Point ────────────────────────────────────────────────────────────
 
-if (testMap[cmd]) {
-  const success = testMap[cmd]();
-  if (cmd === "full") process.exit(success ? 0 : 1);
-} else {
-  console.error(`Unknown: ${cmd}`);
-  process.exit(1);
-}
+const runner = new TestRunner();
+runner.run(process.argv[2] || "full");

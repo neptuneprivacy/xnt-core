@@ -1,7 +1,7 @@
 //! XNT-SDK FFI test binary
 //!
 //! Usage: cargo run --example xnt-sdk-test [command]
-//! Commands: version, error, seed, address, ctidh, crypto, utxo, utils, sync, tx, tx-ctidh, tx-mix, full
+//! Commands: version, error, seed, address, dctidh, crypto, utxo, utils, sync, tx, tx-dctidh, tx-mix, full
 
 use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use std::ffi::{CStr, CString};
@@ -57,13 +57,13 @@ impl Drop for Ctx {
 }
 
 /// Context using a CTIDH-512 spending key (for CTIDH tx tests)
-struct CtxCtidh {
+struct CtxdCTIDH {
     wallet: *mut WalletHandle,
     key: *mut SpendingKeyHandle,
     addr: *mut AddressHandle,
 }
 
-impl CtxCtidh {
+impl CtxdCTIDH {
     fn new() -> Option<Self> {
         let m = cstr(&test_mnemonic());
         let wallet = xnt_wallet_from_mnemonic(m.as_ptr());
@@ -71,7 +71,7 @@ impl CtxCtidh {
             return None;
         }
         // Derive CTIDH-512 spending key via FFI
-        let key = xnt_wallet_derive_ctidh_key(wallet, 0);
+        let key = xnt_wallet_derive_dctidh_key(wallet, 0);
         if key.is_null() {
             xnt_wallet_free(wallet);
             return None;
@@ -86,7 +86,7 @@ impl CtxCtidh {
     }
 }
 
-impl Drop for CtxCtidh {
+impl Drop for CtxdCTIDH {
     fn drop(&mut self) {
         xnt_address_free(self.addr);
         xnt_spending_key_free(self.key);
@@ -101,13 +101,13 @@ fn main() {
         "error" => test_error(),
         "seed" => test_seed(),
         "address" => test_address(),
-        "ctidh" => test_ctidh_address(),
+        "dctidh" => test_dctidh_address(),
         "crypto" => test_crypto(),
         "utxo" => test_utxo(),
         "utils" => test_utils(),
         "sync" => test_sync(),
         "tx" => test_tx(),
-        "tx-ctidh" => test_tx_ctidh_multi(),
+        "tx-dctidh" => test_tx_dctidh_multi(),
         "full" => test_full(),
         cmd => { eprintln!("Unknown: {cmd}"); std::process::exit(1); }
     }
@@ -206,7 +206,7 @@ fn test_address() {
 /// - derives a CTIDH spending key from the mnemonic
 /// - encodes the address as standard bech32m
 /// - roundtrips the bech32m form back to a CTIDH address.
-fn test_ctidh_address() {
+fn test_dctidh_address() {
     println!("Testing CTIDH-512 address (bech32m)...");
 
     // Build wallet from mnemonic using Rust SDK core
@@ -215,13 +215,13 @@ fn test_ctidh_address() {
         xnt_sdk::core::WalletEntropy::from_mnemonic(&mnemonic).expect("wallet from mnemonic");
 
     // Derive CTIDH spending key (uses CTIDH-512 under the hood)
-    let key = wallet.derive_ctidh_spending_key(0);
+    let key = wallet.derive_dctidh_spending_key(0);
     let addr = key.to_address();
 
     // Standard bech32m encoding (long form, always decodable)
     let b32 = addr
         .to_bech32(xnt_sdk::core::Network::Main)
-        .expect("ctidh bech32m encoding failed");
+        .expect("dctidh bech32m encoding failed");
     ok!("CTIDH bech32m: {b32}");
 
     // Roundtrip: bech32 -> Address -> bech32 again using SDK API
@@ -658,7 +658,7 @@ fn test_tx() {
 /// Build & prove a mixed transaction:
 /// - Inputs: existing Generation/KEM UTXOs (same as `test_tx`)
 /// - Output: sends to a CTIDH-512 receiving address
-fn test_tx_ctidh() {
+fn test_tx_dctidh() {
     println!("Testing mixed Generation -> CTIDH transaction (build & prove, 16GB RAM)...");
     let ctx = Ctx::new().expect("setup");
 
@@ -873,19 +873,19 @@ fn test_tx_ctidh() {
     let mnemonic = test_mnemonic();
     let wallet =
         xnt_sdk::core::WalletEntropy::from_mnemonic(&mnemonic).expect("wallet from mnemonic");
-    let ctidh_key = wallet.derive_ctidh_spending_key(0);
-    let ctidh_addr = ctidh_key.to_address();
-    let ctidh_b32 = ctidh_addr
+    let dctidh_key = wallet.derive_dctidh_spending_key(0);
+    let dctidh_addr = dctidh_key.to_address();
+    let dctidh_b32 = dctidh_addr
         .to_bech32(xnt_sdk::core::Network::Main)
-        .expect("ctidh bech32m");
-    ok!("CTIDH recipient bech32: {ctidh_b32}");
+        .expect("dctidh bech32m");
+    ok!("CTIDH recipient bech32: {dctidh_b32}");
 
     // Import CTIDH address into FFI layer as ReceivingAddress
-    let ctidh_b32_c = cstr(&ctidh_b32);
-    let ctidh_addr_handle = xnt_address_from_bech32(ctidh_b32_c.as_ptr(), XntNetwork::Main);
-    check!(ctidh_addr_handle, "ctidh address from bech32");
-    let recv = xnt_address_to_receiving(ctidh_addr_handle);
-    check!(recv, "receiving address (ctidh)");
+    let dctidh_b32_c = cstr(&dctidh_b32);
+    let dctidh_addr_handle = xnt_address_from_bech32(dctidh_b32_c.as_ptr(), XntNetwork::Main);
+    check!(dctidh_addr_handle, "dctidh address from bech32");
+    let recv = xnt_address_to_receiving(dctidh_addr_handle);
+    check!(recv, "receiving address (dctidh)");
 
     let osr = xnt_random_sender_randomness();
     let csr = xnt_random_sender_randomness();
@@ -894,7 +894,7 @@ fn test_tx_ctidh() {
     xnt_tx_builder_set_fee(builder, fee);
 
     xnt_receiving_address_free(recv);
-    xnt_address_free(ctidh_addr_handle);
+    xnt_address_free(dctidh_addr_handle);
 
     let ts = xnt_timestamp_now();
     let built = xnt_tx_builder_build(builder, ms, ts, XntNetwork::Main);
@@ -989,7 +989,7 @@ fn test_tx_ctidh() {
 /// - derives Generation and CTIDH spending keys from the same mnemonic
 /// - collects spendable inputs for both keys via SDK core
 /// - builds a mixed-input transaction sending to a CTIDH address
-fn test_tx_ctidh_multi() {
+fn test_tx_dctidh_multi() {
     use xnt_sdk::core::{
         json_rpc::RpcClient as CoreRpcClient,
         sync::{collect_spendable_inputs_for_key, get_mutator_set, SpendableInput},
@@ -1005,20 +1005,20 @@ fn test_tx_ctidh_multi() {
 
     // Derive Generation and CTIDH keys from the same seed
     let gen_key = wallet.derive_spending_key(0);
-    let ctidh_key = wallet.derive_ctidh_spending_key(0);
+    let dctidh_key = wallet.derive_dctidh_spending_key(0);
     let gen_addr = gen_key.to_address();
-    let ctidh_addr = ctidh_key.to_address();
+    let dctidh_addr = dctidh_key.to_address();
     println!(
         "length of CTIDH bech32m address: {}",
-        ctidh_addr
+        dctidh_addr
             .to_bech32(CoreNetwork::Main)
-            .expect("ctidh bech32m encoding failed")
+            .expect("dctidh bech32m encoding failed")
             .len()
     );
-    let ctidh_b32 = ctidh_addr
+    let dctidh_b32 = dctidh_addr
         .to_bech32(CoreNetwork::Main)
-        .expect("ctidh bech32m");
-    ok!("CTIDH recipient bech32: {ctidh_b32}");
+        .expect("dctidh bech32m");
+    ok!("CTIDH recipient bech32: {dctidh_b32}");
 
     // RPC client
     let client = CoreRpcClient::new(&rpc_url()).expect("rpc client");
@@ -1033,7 +1033,7 @@ fn test_tx_ctidh_multi() {
             Vec::new()
         }
     };
-    let mut ctidh_inputs = match collect_spendable_inputs_for_key(&client, &ctidh_key, 15000, tip) {
+    let mut dctidh_inputs = match collect_spendable_inputs_for_key(&client, &dctidh_key, 15000, tip) {
         Ok(v) => v,
         Err(e) => {
             println!("[SKIP] collect CTIDH inputs failed: {e}");
@@ -1043,7 +1043,7 @@ fn test_tx_ctidh_multi() {
 
     let mut all: Vec<SpendableInput> = Vec::new();
     all.append(&mut gen_inputs);
-    all.append(&mut ctidh_inputs);
+    all.append(&mut dctidh_inputs);
     
 
     if all.is_empty() {
@@ -1052,7 +1052,7 @@ fn test_tx_ctidh_multi() {
     ok!(
         "spendable inputs: Generation={}, CTIDH={}",
         all.iter().filter(|s| s.spending_key.is_generation()).count(),
-        all.iter().filter(|s| s.spending_key.is_ctidh()).count()
+        all.iter().filter(|s| s.spending_key.is_dctidh()).count()
     );
 
     // Select inputs across both key types

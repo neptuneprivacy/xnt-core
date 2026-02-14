@@ -1055,8 +1055,8 @@ impl RpcApi for RpcServer {
                     ReceivingAddress::Generation(_) => "generation".to_string(),
                     ReceivingAddress::Symmetric(_) => "symmetric".to_string(),
                     ReceivingAddress::GenerationSubAddr(_) => "generation_subaddress".to_string(),
-                    ReceivingAddress::Ctidh(_) => "ctidh".to_string(),
-                    ReceivingAddress::CtidhSubAddr(_) => "ctidh_subaddress".to_string(),
+                    ReceivingAddress::dCTIDH(_) => "dctidh".to_string(),
+                    ReceivingAddress::dCTIDHSubAddr(_) => "dctidh_subaddress".to_string(),
                 });
                 let receiver_identifier = Some(addr.receiver_identifier().value());
 
@@ -1066,7 +1066,7 @@ impl RpcApi for RpcServer {
                         let (base, pid) = subaddr.clone().split();
                         (base.to_bech32m(network).ok(), Some(pid.value()))
                     }
-                    ReceivingAddress::CtidhSubAddr(subaddr) => {
+                    ReceivingAddress::dCTIDHSubAddr(subaddr) => {
                         let (base, pid) = subaddr.clone().split();
                         (base.to_bech32m(network).ok(), Some(pid.value()))
                     }
@@ -1124,8 +1124,8 @@ impl RpcApi for RpcServer {
                 ReceivingAddress::Generation(_) => "Generation",
                 ReceivingAddress::Symmetric(_) => "Symmetric",
                 ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
-                ReceivingAddress::Ctidh(_) => "Ctidh",
-                ReceivingAddress::CtidhSubAddr(_) => "CtidhSubAddr",
+                ReceivingAddress::dCTIDH(_) => "dCTIDH",
+                ReceivingAddress::dCTIDHSubAddr(_) => "dCTIDHSubAddr",
             },
             to_address.receiver_identifier()
         );

@@ -4,7 +4,7 @@ use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
 use neptune_privacy::state::wallet::address::generation_address::{
     GenerationReceivingAddress, GenerationSubAddress,
 };
-use neptune_privacy::state::wallet::address::ctidh_address::CtidhSubAddress;
+use neptune_privacy::state::wallet::address::dctidh_address::dCTIDHSubAddress;
 use neptune_privacy::state::wallet::address::{
     ReceivingAddress as CoreReceivingAddress, SubAddress as CoreSubAddress,
 };
@@ -74,7 +74,7 @@ impl Address {
     }
 
     /// Create CTIDH subaddress with payment_id
-    pub fn ctidh_subaddress(&self, payment_id: u64) -> Result<ReceivingAddress> {
+    pub fn dctidh_subaddress(&self, payment_id: u64) -> Result<ReceivingAddress> {
         if payment_id == 0 {
             return Err(XntError::InvalidInput(
                 "payment_id must be non-zero".to_string(),
@@ -82,18 +82,18 @@ impl Address {
         }
 
         match &self.inner {
-            CoreReceivingAddress::Ctidh(ct_addr) => {
-                let sub = CtidhSubAddress::new(
+            CoreReceivingAddress::dCTIDH(ct_addr) => {
+                let sub = dCTIDHSubAddress::new(
                     **ct_addr,
                     BFieldElement::new(payment_id),
                 )
                 .map_err(|e| XntError::Other(e.to_string()))?;
                 Ok(ReceivingAddress {
-                    inner: CoreReceivingAddress::CtidhSubAddr(sub),
+                    inner: CoreReceivingAddress::dCTIDHSubAddr(sub),
                 })
             }
             _ => Err(XntError::InvalidInput(
-                "ctidh_subaddress only supported for CTIDH addresses".to_string(),
+                "dctidh_subaddress only supported for CTIDH addresses".to_string(),
             )),
         }
     }
@@ -177,7 +177,7 @@ impl ReceivingAddress {
     pub fn payment_id(&self) -> Option<u64> {
         match &self.inner {
             CoreReceivingAddress::GenerationSubAddr(sub) => Some(sub.payment_id().value()),
-            CoreReceivingAddress::CtidhSubAddr(sub) => Some(sub.payment_id().value()),
+            CoreReceivingAddress::dCTIDHSubAddr(sub) => Some(sub.payment_id().value()),
             _ => None,
         }
     }
@@ -186,7 +186,7 @@ impl ReceivingAddress {
     pub fn is_subaddress(&self) -> bool {
         matches!(
             self.inner,
-            CoreReceivingAddress::GenerationSubAddr(_) | CoreReceivingAddress::CtidhSubAddr(_)
+            CoreReceivingAddress::GenerationSubAddr(_) | CoreReceivingAddress::dCTIDHSubAddr(_)
         )
     }
 

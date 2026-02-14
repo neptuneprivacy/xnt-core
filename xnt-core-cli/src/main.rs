@@ -961,8 +961,8 @@ async fn main() -> Result<()> {
                         ReceivingAddress::Generation(_) => "Generation",
                         ReceivingAddress::Symmetric(_) => "Symmetric",
                         ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
-                        ReceivingAddress::Ctidh(_) => "Ctidh",
-                        ReceivingAddress::CtidhSubAddr(_) => "CtidhSubAddr",
+                        ReceivingAddress::dCTIDH(_) => "dCTIDH",
+                        ReceivingAddress::dCTIDHSubAddr(_) => "dCTIDHSubAddr",
                     };
                     println!("Valid address!");
                     println!("Address type: {address_type}");
@@ -977,7 +977,7 @@ async fn main() -> Result<()> {
                             }
                             println!("Payment ID: {}", payment_id.value());
                         }
-                        ReceivingAddress::CtidhSubAddr(subaddr) => {
+                        ReceivingAddress::dCTIDHSubAddr(subaddr) => {
                             let (base_addr, payment_id) = subaddr.clone().split();
                             if let Ok(base_encoded) = base_addr.to_bech32m(network) {
                                 println!("Base address: {base_encoded}");

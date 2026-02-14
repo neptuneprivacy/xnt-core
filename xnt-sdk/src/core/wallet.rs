@@ -61,10 +61,10 @@ impl WalletEntropy {
 
     /// Derive Nth CTIDH spending key (currently CTIDH-512 as implemented
     /// in the `neptune-privacy` core via dCTIDH).
-    pub fn derive_ctidh_spending_key(&self, index: u64) -> SpendingKey {
-        let ctidh_key = self.inner.nth_ctidh_spending_key(index);
+    pub fn derive_dctidh_spending_key(&self, index: u64) -> SpendingKey {
+        let dctidh_key = self.inner.nth_dctidh_spending_key(index);
         SpendingKey {
-            inner: CoreSpendingKey::Ctidh(ctidh_key),
+            inner: CoreSpendingKey::dCTIDH(dctidh_key),
         }
     }
 }
@@ -103,8 +103,8 @@ impl SpendingKey {
     }
 
     /// Returns true if this is a CTIDH spending key.
-    pub fn is_ctidh(&self) -> bool {
-        matches!(self.inner, CoreSpendingKey::Ctidh(_))
+    pub fn is_dctidh(&self) -> bool {
+        matches!(self.inner, CoreSpendingKey::dCTIDH(_))
     }
 
     /// Returns true if this is a Generation spending key.

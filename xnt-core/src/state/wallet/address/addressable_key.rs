@@ -6,7 +6,7 @@ use tasm_lib::triton_vm::prelude::Digest;
 use tracing::warn;
 
 use super::common;
-use super::ctidh_address;
+use super::dctidh_address;
 use super::generation_address;
 use super::receiving_address::ReceivingAddress;
 use super::symmetric_key;
@@ -33,17 +33,17 @@ pub enum KeyType {
     /// [generation_address] subaddress with payment_id
     GenerationSubAddr = generation_address::GENERATION_SUBADDR_FLAG_U8,
 
-    /// [ctidh_address] shorter address
-    Ctidh = ctidh_address::CTIDH_FLAG_U8,
+    /// [dctidh_address] shorter address
+    dCTIDH = dctidh_address::CTIDH_FLAG_U8,
 
-    /// [ctidh_address] subaddress with payment_id
-    CtidhSubAddr = ctidh_address::CTIDH_SUBADDR_FLAG_U8,
+    /// [dctidh_address] subaddress with payment_id
+    dCTIDHSubAddr = dctidh_address::CTIDH_SUBADDR_FLAG_U8,
 }
 
 impl KeyType {
     /// Returns true if this key type uses subaddress format (has payment_id)
     pub fn is_subaddress(&self) -> bool {
-        matches!(self, Self::GenerationSubAddr | Self::CtidhSubAddr)
+        matches!(self, Self::GenerationSubAddr | Self::dCTIDHSubAddr)
     }
 
     /// Returns the base key type (without subaddress)
@@ -51,7 +51,7 @@ impl KeyType {
         match self {
             Self::Generation | Self::GenerationSubAddr => Self::Generation,
             Self::Symmetric => Self::Symmetric,
-            Self::Ctidh | Self::CtidhSubAddr => Self::Ctidh,
+            Self::dCTIDH | Self::dCTIDHSubAddr => Self::dCTIDH,
         }
     }
 }
@@ -62,8 +62,8 @@ impl std::fmt::Display for KeyType {
             Self::Generation => write!(f, "Generation"),
             Self::Symmetric => write!(f, "Symmetric"),
             Self::GenerationSubAddr => write!(f, "GenerationSubAddr"),
-            Self::Ctidh => write!(f, "Ctidh"),
-            Self::CtidhSubAddr => write!(f, "CtidhSubAddr"),
+            Self::dCTIDH => write!(f, "dCTIDH"),
+            Self::dCTIDHSubAddr => write!(f, "dCTIDHSubAddr"),
         }
     }
 }
@@ -74,8 +74,8 @@ impl From<&ReceivingAddress> for KeyType {
             ReceivingAddress::Generation(_) => Self::Generation,
             ReceivingAddress::Symmetric(_) => Self::Symmetric,
             ReceivingAddress::GenerationSubAddr(_) => Self::GenerationSubAddr,
-            ReceivingAddress::Ctidh(_) => Self::Ctidh,
-            ReceivingAddress::CtidhSubAddr(_) => Self::CtidhSubAddr,
+            ReceivingAddress::dCTIDH(_) => Self::dCTIDH,
+            ReceivingAddress::dCTIDHSubAddr(_) => Self::dCTIDHSubAddr,
         }
     }
 }
@@ -85,7 +85,7 @@ impl From<&SpendingKey> for KeyType {
         match addr {
             SpendingKey::Generation(_) => Self::Generation,
             SpendingKey::Symmetric(_) => Self::Symmetric,
-            SpendingKey::Ctidh(_) => Self::Ctidh,
+            SpendingKey::dCTIDH(_) => Self::dCTIDH,
         }
     }
 }
@@ -104,8 +104,8 @@ impl TryFrom<&Announcement> for KeyType {
             Ok(kt) if kt == Self::Generation.into() => Ok(Self::Generation),
             Ok(kt) if kt == Self::Symmetric.into() => Ok(Self::Symmetric),
             Ok(kt) if kt == Self::GenerationSubAddr.into() => Ok(Self::GenerationSubAddr),
-            Ok(kt) if kt == Self::Ctidh.into() => Ok(Self::Ctidh),
-            Ok(kt) if kt == Self::CtidhSubAddr.into() => Ok(Self::CtidhSubAddr),
+            Ok(kt) if kt == Self::dCTIDH.into() => Ok(Self::dCTIDH),
+            Ok(kt) if kt == Self::dCTIDHSubAddr.into() => Ok(Self::dCTIDHSubAddr),
             _ => bail!("encountered Announcement of unknown type"),
         }
     }
@@ -118,8 +118,8 @@ impl KeyType {
             Self::Generation,
             Self::Symmetric,
             Self::GenerationSubAddr,
-            Self::Ctidh,
-            Self::CtidhSubAddr,
+            Self::dCTIDH,
+            Self::dCTIDHSubAddr,
         ]
     }
 }
@@ -134,8 +134,8 @@ pub enum SpendingKey {
     /// a [symmetric_key]
     Symmetric(symmetric_key::SymmetricKey),
 
-    /// a [ctidh_address] key
-    Ctidh(ctidh_address::CtidhSpendingKey),
+    /// a [dctidh_address] key
+    dCTIDH(dctidh_address::dCTIDHSpendingKey),
 }
 
 impl std::hash::Hash for SpendingKey {
@@ -156,9 +156,9 @@ impl From<symmetric_key::SymmetricKey> for SpendingKey {
     }
 }
 
-impl From<ctidh_address::CtidhSpendingKey> for SpendingKey {
-    fn from(key: ctidh_address::CtidhSpendingKey) -> Self {
-        Self::Ctidh(key)
+impl From<dctidh_address::dCTIDHSpendingKey> for SpendingKey {
+    fn from(key: dctidh_address::dCTIDHSpendingKey) -> Self {
+        Self::dCTIDH(key)
     }
 }
 
@@ -179,7 +179,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.to_address().into(),
             Self::Symmetric(k) => k.into(),
-            Self::Ctidh(k) => k.to_address().into(),
+            Self::dCTIDH(k) => k.to_address().into(),
         }
     }
 
@@ -190,7 +190,7 @@ impl SpendingKey {
                 generation_spending_key.lock_script_and_witness()
             }
             SpendingKey::Symmetric(symmetric_key) => symmetric_key.lock_script_and_witness(),
-            SpendingKey::Ctidh(ctidh_key) => ctidh_key.lock_script_and_witness(),
+            SpendingKey::dCTIDH(dctidh_key) => dctidh_key.lock_script_and_witness(),
         }
     }
 
@@ -213,7 +213,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.receiver_preimage(),
             Self::Symmetric(k) => k.receiver_preimage(),
-            Self::Ctidh(k) => k.receiver_preimage(),
+            Self::dCTIDH(k) => k.receiver_preimage(),
         }
     }
 
@@ -234,7 +234,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.receiver_identifier(),
             Self::Symmetric(k) => k.receiver_identifier(),
-            Self::Ctidh(k) => k.receiver_identifier(),
+            Self::dCTIDH(k) => k.receiver_identifier(),
         }
     }
 
@@ -254,7 +254,7 @@ impl SpendingKey {
         match self {
             Self::Generation(k) => k.decrypt(ciphertext_bfes),
             Self::Symmetric(k) => k.decrypt(ciphertext_bfes).map_err(anyhow::Error::new),
-            Self::Ctidh(k) => k.decrypt(ciphertext_bfes),
+            Self::dCTIDH(k) => k.decrypt(ciphertext_bfes),
         }
     }
 

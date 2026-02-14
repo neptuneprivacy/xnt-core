@@ -92,11 +92,11 @@ impl XntWalletEntropy {
         }
     }
 
-    /// Derive CTIDH spending key at index (CTIDH-512)
-    #[napi]
-    pub fn derive_ctidh_key(&self, index: u32) -> XntSpendingKey {
+    /// Derive dCTIDH spending key at index (dCTIDH-512)
+    #[napi(js_name = "derivedCTIDHKey")]
+    pub fn derive_dctidh_key(&self, index: u32) -> XntSpendingKey {
         XntSpendingKey {
-            inner: self.inner.derive_ctidh_spending_key(index as u64),
+            inner: self.inner.derive_dctidh_spending_key(index as u64),
         }
     }
 }
@@ -141,10 +141,10 @@ impl XntSpendingKey {
         hex::encode(self.inner.receiver_preimage().bytes)
     }
 
-    /// Check if this is a CTIDH spending key
-    #[napi]
-    pub fn is_ctidh(&self) -> bool {
-        self.inner.is_ctidh()
+    /// Check if this is a dCTIDH spending key
+    #[napi(js_name = "isDCTIDH")]
+    pub fn is_dctidh(&self) -> bool {
+        self.inner.is_dctidh()
     }
 
     /// Check if this is a Generation spending key
@@ -213,13 +213,13 @@ impl XntAddress {
         Ok(XntSubAddress { inner: subaddr })
     }
 
-    /// Create CTIDH subaddress with payment_id
-    #[napi]
-    pub fn ctidh_subaddress(&self, payment_id: i64) -> Result<XntReceivingAddress> {
+    /// Create dCTIDH subaddress with payment_id
+    #[napi(js_name = "dCTIDHSubaddress")]
+    pub fn dctidh_subaddress(&self, payment_id: i64) -> Result<XntReceivingAddress> {
         let subaddr = self
             .inner
-            .ctidh_subaddress(payment_id as u64)
-            .map_err(|e| Error::from_reason(format!("ctidh subaddress creation failed: {e}")))?;
+            .dctidh_subaddress(payment_id as u64)
+            .map_err(|e| Error::from_reason(format!("dctidh subaddress creation failed: {e}")))?;
         Ok(XntReceivingAddress { inner: subaddr })
     }
 

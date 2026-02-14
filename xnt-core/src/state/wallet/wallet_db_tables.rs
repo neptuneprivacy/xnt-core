@@ -164,7 +164,7 @@ pub(super) struct WalletDbTables {
 
     // table number: 14
     /// Counter for next CTIDH key derivation index.
-    pub(super) ctidh_key_counter: DbtSingleton<u64>,
+    pub(super) dctidh_key_counter: DbtSingleton<u64>,
 }
 
 impl WalletDbTables {
@@ -214,9 +214,9 @@ impl WalletDbTables {
             .new_map("addition_record_to_expected_utxo")
             .await;
 
-        let ctidh_key_counter = storage
+        let dctidh_key_counter = storage
             .schema
-            .new_singleton::<u64>("ctidh_key_counter")
+            .new_singleton::<u64>("dctidh_key_counter")
             .await;
 
         WalletDbTables {
@@ -231,7 +231,7 @@ impl WalletDbTables {
             strong_key_to_mutxo,
             index_set_to_mutxo,
             addition_record_to_expected_utxo,
-            ctidh_key_counter,
+            dctidh_key_counter,
         }
     }
 
