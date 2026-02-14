@@ -1,8 +1,8 @@
 /**
  * XNT-SDK TypeScript Test
  *
- * Usage: npx ts-node examples/xnt-sdk-test.ts [command]
- * Commands: version, seed, address, rpc, sync, utils, tx, utxos-pid, full
+ * Usage: npx ts-node examples/xnt-sdk-test.ts [command] [arg]
+ * Commands: version, seed, address [payment-id], shortaddress [payment-id], rpc, sync, utils, tx <recipient> <amount> <fee>
  */
 
 import {
@@ -111,9 +111,11 @@ class WalletHelper {
     const mnemonic = process.env.XNT_TEST_MNEMONIC;
     if (!mnemonic) throw new Error("XNT_TEST_MNEMONIC required");
     const wallet = new XntWalletEntropy(mnemonic);
+    const genKey = wallet.deriveKey(index);
+    const genAddr = genKey.toAddress();
     const key = wallet.derivedCTIDHKey(index);
     const addr = key.toAddress();
-    return { wallet, key, addr };
+    return { wallet, genKey, genAddr, key, addr };
   }
 
   sync(client: XntRpcClient, key: ReturnType<XntWalletEntropy["derivedCTIDHKey"]>): SyncResult | null {
@@ -175,37 +177,38 @@ class WalletHelper {
 class TestRunner {
   private log = new Logger();
   private wallet = new WalletHelper(this.log);
-  private tests: Map<string, () => boolean>;
+  private tests: Map<string, (args: string[]) => boolean>;
 
   constructor() {
     this.tests = new Map([
-      ["version", () => this.testVersion()],
-      ["seed", () => this.testSeed()],
-      ["address", () => this.testAddress()],
-      ["utils", () => this.testUtils()],
-      ["rpc", () => this.testRpc()],
-      ["sync", () => this.testSync()],
-      ["tx", () => this.testTx()],
-      ["utxos-pid", () => this.testUtxosPid()],
+      ["version", (_) => this.testVersion()],
+      ["seed", (_) => this.testSeed()],
+      ["address", (a) => this.testAddress(a)],
+      ["shortaddress", (a) => this.testShortAddress(a)],
+      ["utils", (_) => this.testUtils()],
+      ["rpc", (_) => this.testRpc()],
+      ["sync", (_) => this.testSync()],
+      ["tx", (a) => this.testTx(a)],
     ]);
   }
 
-  run(command: string) {
-    if (command === "full") {
-      this.log.info("XNT-SDK TypeScript Test");
-      let pass = 0, fail = 0, skip = 0;
-
-      for (const [name, fn] of this.tests) {
-        this.log.info(`test: ${name}`);
-        const beforeSkip = this.log.skipCount;
-        const result = fn();
-        if (result) pass++;
-        else if (this.log.skipCount > beforeSkip) skip++;
-        else fail++;
+  run(command: string, args: string[]) {
+    if (command === "help") {
+      console.log("Usage: npx ts-node examples/xnt-sdk-test.ts [command] [arg]\n");
+      console.log("Commands:");
+      const argHints: Record<string, string> = {
+        address: "[payment-id]",
+        shortaddress: "[payment-id]",
+        tx: "<recipient> <amount> <fee>",
+      };
+      for (const name of this.tests.keys()) {
+        const hint = argHints[name];
+        console.log(`  ${name}${hint ? " " + hint : ""}`);
       }
-
-      this.log.info("summary", { pass, fail, skip, total: this.tests.size });
-      process.exit(fail === 0 ? 0 : 1);
+      console.log("\nExamples:");
+      console.log("  npx ts-node examples/xnt-sdk-test.ts version");
+      console.log("  npx ts-node examples/xnt-sdk-test.ts address 111");
+      return;
     }
 
     const fn = this.tests.get(command);
@@ -213,7 +216,7 @@ class TestRunner {
       this.log.fail(`unknown command: ${command}`);
       process.exit(1);
     }
-    fn();
+    fn(args);
   }
 
   // ── Tests ────────────────────────────────────────────────────────────────
@@ -230,24 +233,43 @@ class TestRunner {
 
     const restored = new XntWalletEntropy(mnemonic);
     if (restored.toMnemonic() !== mnemonic) return this.log.fail("mnemonic roundtrip");
-    this.log.ok("mnemonic roundtrip");
 
     const key = wallet.derivedCTIDHKey(0);
     this.log.ok("dCTIDH key derived", { receiverId: key.receiverIdHex() });
     return true;
   }
 
-  private testAddress(): boolean {
+  private testAddress(args: string[]): boolean {
+    const paymentId = args[0] ? parseInt(args[0], 10) : undefined;
+    const { genAddr } = this.wallet.loadTestWallet();
+
+    const bech32 = genAddr.toBech32(XntNetwork.Main);
+    this.log.ok("Generation address", { bech32 });
+    const decoded = XntAddress.fromBech32(bech32, XntNetwork.Main);
+    if (decoded.toBech32(XntNetwork.Main) !== bech32) return this.log.fail("Generation roundtrip");
+
+    if (paymentId !== undefined) {
+      const sub = genAddr.withPaymentId(paymentId);
+      this.log.ok("Generation subaddress", { pid: paymentId, bech32: sub.toBech32(XntNetwork.Main) });
+    }
+
+    return true;
+  }
+
+  private testShortAddress(args: string[]): boolean {
+    const paymentId = args[0] ? parseInt(args[0], 10) : undefined;
     const { addr } = this.wallet.loadTestWallet();
+
     const bech32 = addr.toBech32(XntNetwork.Main);
     this.log.ok("dCTIDH address", { bech32 });
-
     const decoded = XntAddress.fromBech32(bech32, XntNetwork.Main);
     if (decoded.toBech32(XntNetwork.Main) !== bech32) return this.log.fail("dCTIDH roundtrip");
-    this.log.ok("dCTIDH roundtrip");
 
-    const sub = addr.dCTIDHSubaddress(111);
-    this.log.ok("dCTIDH subaddress", { pid: 111, bech32: sub.toBech32(XntNetwork.Main) });
+    if (paymentId !== undefined) {
+      const sub = addr.dCTIDHSubaddress(paymentId);
+      this.log.ok("dCTIDH subaddress", { pid: paymentId, bech32: sub.toBech32(XntNetwork.Main) });
+    }
+
     return true;
   }
 
@@ -319,7 +341,14 @@ class TestRunner {
     return true;
   }
 
-  private testTx(): boolean {
+  private testTx(args: string[]): boolean {
+    const [recipientBech32, amountStr, feeStr] = args;
+    if (!recipientBech32 || !amountStr || !feeStr) {
+      return this.log.fail("tx requires: recipient amount fee");
+    }
+    const amountXnt = parseFloat(amountStr);
+    const feeXnt = parseFloat(feeStr);
+
     const client = this.wallet.connectRpc();
     if (!client) return false;
 
@@ -337,8 +366,8 @@ class TestRunner {
       });
     }
 
-    const fee = AmountUtil.toNau(0.005);
-    const sendAmount = AmountUtil.toNau(0.575);
+    const fee = AmountUtil.toNau(feeXnt);
+    const sendAmount = AmountUtil.toNau(amountXnt);
     const totalAmount = sendAmount + fee;
 
     const amounts = available.map(u => u.decrypted.amount);
@@ -369,7 +398,7 @@ class TestRunner {
       builder.addInput(selectedUtxos[i].decrypted.utxo, key, proof);
     }
 
-    const recipient = addr.dCTIDHSubaddress(33354);
+    const recipient = XntAddress.fromBech32(recipientBech32, XntNetwork.Main).toReceivingAddress();
     builder.addOutput(recipient, sendAmount, xntRandomSenderRandomness());
     builder.setFee(fee);
     builder.setChange(addr, xntRandomSenderRandomness());
@@ -408,43 +437,9 @@ class TestRunner {
     return true;
   }
 
-  private testUtxosPid(): boolean {
-    const client = this.wallet.connectRpc();
-    if (!client) return false;
-
-    const { key, addr } = this.wallet.loadTestWallet();
-    this.log.info("addresses", {
-      dCTIDH: addr.toBech32(XntNetwork.Main),
-      subaddress: addr.dCTIDHSubaddress(61002).toBech32(XntNetwork.Main),
-    });
-
-    const result = this.wallet.sync(client, key);
-    if (!result) return this.log.skip("sync failed");
-
-    for (const u of result.unspent) {
-      const d = u.decrypted;
-      this.log.info("unspent", {
-        amount: AmountUtil.format(d.amount),
-        ...(d.paymentId ? { pid: d.paymentId } : {}),
-        aocl: u.aoclIndex, height: d.blockHeight,
-      });
-    }
-
-    for (const p of result.pendingIncoming) {
-      this.log.info("pending-incoming", {
-        amount: AmountUtil.format(p.amount),
-        ...(p.paymentId > 0 ? { pid: p.paymentId } : {}),
-      });
-    }
-
-    const total = result.unspent.length + result.pendingIncoming.length;
-    if (total === 0) return this.log.skip("no dCTIDH UTXOs");
-    this.log.ok("utxos", { unspent: result.unspent.length, pending: result.pendingIncoming.length });
-    return true;
-  }
 }
 
 // ── Entry Point ────────────────────────────────────────────────────────────
 
 const runner = new TestRunner();
-runner.run(process.argv[2] || "full");
+runner.run(process.argv[2] || "help", process.argv.slice(3));
