@@ -252,7 +252,7 @@ impl TransactionDetailsBuilder {
                                 &gs.wallet_state,
                                 tip.header().height,
                                 change_amount,
-                                *key,
+                                (*key).clone(),
                                 medium,
                             ),
                             tip,

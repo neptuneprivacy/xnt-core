@@ -91,6 +91,14 @@ impl XntWalletEntropy {
             inner: self.inner.derive_spending_key(index as u64),
         }
     }
+
+    /// Derive dCTIDH spending key at index (dCTIDH-512)
+    #[napi(js_name = "derivedCTIDHKey")]
+    pub fn derive_dctidh_key(&self, index: u32) -> XntSpendingKey {
+        XntSpendingKey {
+            inner: self.inner.derive_dctidh_spending_key(index as u64),
+        }
+    }
 }
 
 /// Spending key for signing transactions
@@ -131,6 +139,18 @@ impl XntSpendingKey {
     #[napi]
     pub fn receiver_preimage_hex(&self) -> String {
         hex::encode(self.inner.receiver_preimage().bytes)
+    }
+
+    /// Check if this is a dCTIDH spending key
+    #[napi(js_name = "isDCTIDH")]
+    pub fn is_dctidh(&self) -> bool {
+        self.inner.is_dctidh()
+    }
+
+    /// Check if this is a Generation spending key
+    #[napi]
+    pub fn is_generation(&self) -> bool {
+        self.inner.is_generation()
     }
 
     /// Get inner spending key (for internal use)
@@ -193,6 +213,16 @@ impl XntAddress {
         Ok(XntSubAddress { inner: subaddr })
     }
 
+    /// Create dCTIDH subaddress with payment_id
+    #[napi(js_name = "dCTIDHSubaddress")]
+    pub fn dctidh_subaddress(&self, payment_id: i64) -> Result<XntReceivingAddress> {
+        let subaddr = self
+            .inner
+            .dctidh_subaddress(payment_id as u64)
+            .map_err(|e| Error::from_reason(format!("dctidh subaddress creation failed: {e}")))?;
+        Ok(XntReceivingAddress { inner: subaddr })
+    }
+
     /// Convert to ReceivingAddress for addOutput
     #[napi]
     pub fn to_receiving_address(&self) -> XntReceivingAddress {
@@ -241,6 +271,13 @@ pub struct XntReceivingAddress {
 
 #[napi]
 impl XntReceivingAddress {
+    /// Encode address to bech32m string
+    #[napi]
+    pub fn to_bech32(&self, network: XntNetwork) -> Result<String> {
+        self.inner
+            .to_bech32(network.into())
+            .map_err(|e| Error::from_reason(format!("bech32m encoding failed: {e}")))
+    }
     /// Get payment_id if this is a subaddress, null otherwise
     #[napi]
     pub fn payment_id(&self) -> Option<i64> {

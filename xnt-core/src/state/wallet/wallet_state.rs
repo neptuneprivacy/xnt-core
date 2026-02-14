@@ -28,6 +28,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::state::wallet::address::dctidh_address;
 use super::address::generation_address;
 use super::address::symmetric_key;
 use super::address::KeyType;
@@ -91,6 +92,8 @@ pub struct WalletState {
     // derivation order is preserved and each key must be unique.
     known_generation_keys: Vec<SpendingKey>,
     known_symmetric_keys: Vec<SpendingKey>,
+    /// CTIDH key
+    known_dctidh_keys: Vec<SpendingKey>,
 
     /// Tunable options for configuring how the wallet state operates.
     pub(crate) configuration: WalletConfiguration,
@@ -326,6 +329,11 @@ impl WalletState {
             .map(|idx| wallet_entropy.nth_symmetric_key(idx).into())
             .collect_vec();
 
+        let dctidh_counter = rusty_wallet_database.get_dctidh_key_counter();
+        let known_dctidh_keys: Vec<SpendingKey> = (0..dctidh_counter)
+            .map(|idx| wallet_entropy.nth_dctidh_spending_key(idx).into())
+            .collect_vec();
+
         let mut wallet_state = Self {
             wallet_db: rusty_wallet_database,
             wallet_entropy,
@@ -333,6 +341,7 @@ impl WalletState {
             mempool_unspent_utxos: Default::default(),
             known_generation_keys,
             known_symmetric_keys,
+            known_dctidh_keys,
             configuration: configuration.clone(),
         };
 
@@ -371,6 +380,13 @@ impl WalletState {
                 .next_unused_spending_key(KeyType::Symmetric)
                 .await;
         }
+        // Ensure CTIDH key index 0 is known
+        // This allows wallet to scan CTIDH UTXOs sent to index 0
+        if wallet_state.known_dctidh_keys.is_empty() {
+            let _ = wallet_state
+                .next_unused_spending_key(KeyType::dCTIDH)
+                .await;
+        }
 
         // For premine UTXOs there is an additional complication: we do not know
         // the derivation index with which they were derived. So we derive a few
@@ -389,15 +405,15 @@ impl WalletState {
         // wallet-DB recovery will include genesis block outputs.
         if sync_label == Digest::default() {
             // Check if we are premine recipients, and add expected UTXOs if so.
-            for premine_key in premine_keys {
-                let own_receiving_address = premine_key.to_address();
+            for premine_key in &premine_keys {
+                let own_receiving_address = premine_key.clone().to_address();
                 for utxo in Block::premine_utxos() {
                     if utxo.lock_script_hash() == own_receiving_address.lock_script_hash() {
                         wallet_state
                             .add_expected_utxo(ExpectedUtxo::new(
                                 utxo,
                                 Block::premine_sender_randomness(configuration.network()),
-                                premine_key.privacy_preimage(),
+                                premine_key.clone().privacy_preimage(),
                                 UtxoNotifier::Premine,
                                 BFieldElement::ZERO,
                             ))
@@ -557,6 +573,14 @@ impl WalletState {
             .values()
             .flatten()
             .map(|iu| (&iu.utxo, iu.addition_record()))
+    }
+
+    /// Iterator over mempool unspent UTXOs with payment_id included
+    pub fn mempool_unspent_utxos_with_payment_id_iter(&self) -> impl Iterator<Item = (&Utxo, AdditionRecord, u64)> {
+        self.mempool_unspent_utxos
+            .values()
+            .flatten()
+            .map(|iu| (&iu.utxo, iu.addition_record(), iu.payment_id.value()))
     }
 
     pub(crate) fn mempool_balance_updates(
@@ -989,7 +1013,12 @@ impl WalletState {
         let future_symmetric_keys = self
             .get_future_symmetric_keys(num_future_keys)
             .map(|(i, sk)| (KeyType::Symmetric, i, SpendingKey::from(sk)));
-        future_generation_keys.chain(future_symmetric_keys)
+        let future_dctidh_keys = self
+            .get_future_dctidh_spending_keys(num_future_keys)
+            .map(|(i, csk)| (KeyType::dCTIDH, i, SpendingKey::from(csk)));
+        future_generation_keys
+            .chain(future_symmetric_keys)
+            .chain(future_dctidh_keys)
     }
 
     /// returns all spending keys of `key_type` with derivation index less than current counter
@@ -1002,6 +1031,7 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => Box::new(self.get_known_dctidh_keys()),
         }
     }
 
@@ -1015,6 +1045,7 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => Box::new(self.get_known_dctidh_keys()),
         }
     }
 
@@ -1027,7 +1058,7 @@ impl WalletState {
     // of keys that have received funds, up to some "gap".  In bitcoin/bip32
     // this gap is defined as 20 keys in a row that have never received funds.
     fn get_known_generation_spending_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
-        self.known_generation_keys.iter().copied()
+        self.known_generation_keys.iter().cloned()
     }
 
     // TODO: These spending keys should probably be derived dynamically from some
@@ -1039,7 +1070,11 @@ impl WalletState {
     // of keys that have received funds, up to some "gap".  In bitcoin/bip32
     // this gap is defined as 20 keys in a row that have never received funds.
     fn get_known_symmetric_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
-        self.known_symmetric_keys.iter().copied()
+        self.known_symmetric_keys.iter().cloned()
+    }
+
+    fn get_known_dctidh_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
+        self.known_dctidh_keys.iter().cloned()
     }
 
     /// Get the next unused spending key of a given type.
@@ -1055,6 +1090,7 @@ impl WalletState {
                 self.next_unused_generation_spending_key().await.into()
             }
             KeyType::Symmetric => self.next_unused_symmetric_key().await.into(),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => self.next_unused_dctidh_key().await.into(),
         }
     }
 
@@ -1080,6 +1116,13 @@ impl WalletState {
                         self.known_symmetric_keys.push(key);
                     }
                 }
+                KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
+                    self.wallet_db.set_dctidh_key_counter(new_counter).await;
+                    for idx in current_counter..new_counter {
+                        let key = self.wallet_entropy.nth_dctidh_spending_key(idx).into();
+                        self.known_dctidh_keys.push(key);
+                    }
+                }
             }
         }
     }
@@ -1091,6 +1134,7 @@ impl WalletState {
                 self.wallet_db.get_generation_key_counter()
             }
             KeyType::Symmetric => self.wallet_db.get_symmetric_key_counter(),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => self.wallet_db.get_dctidh_key_counter(),
         }
     }
 
@@ -1102,6 +1146,9 @@ impl WalletState {
                 .nth_generation_spending_key(index)
                 .into(),
             KeyType::Symmetric => self.wallet_entropy.nth_symmetric_key(index).into(),
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
+                self.wallet_entropy.nth_dctidh_spending_key(index).into()
+            }
         }
     }
 
@@ -1137,6 +1184,17 @@ impl WalletState {
         key
     }
 
+    /// Get the next unused CTIDH key
+    pub async fn next_unused_dctidh_key(
+        &mut self,
+    ) -> crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey {
+        let index = self.wallet_db.get_dctidh_key_counter();
+        let key = self.wallet_entropy.nth_dctidh_spending_key(index);
+        self.wallet_db.set_dctidh_key_counter(index + 1).await;
+        self.known_dctidh_keys.push(key.clone().into());
+        key
+    }
+
     /// Get the next n generation spending keys (with derivation indices)
     /// without modifying the counter.
     pub(crate) fn get_future_generation_spending_keys(
@@ -1157,6 +1215,17 @@ impl WalletState {
         let index = self.wallet_db.get_symmetric_key_counter();
         (index..index + (num_future_keys as u64))
             .map(|i| (i, self.wallet_entropy.nth_symmetric_key(i)))
+    }
+
+    /// Get the next n CTIDH spending keys (with derivation indices)
+    /// without modifying the counter.
+    pub(crate) fn get_future_dctidh_spending_keys(
+        &self,
+        num_future_keys: usize,
+    ) -> impl Iterator<Item = (u64, dctidh_address::dCTIDHSpendingKey)> + use<'_> {
+        let index = self.wallet_db.get_dctidh_key_counter();
+        (index..index + (num_future_keys as u64))
+            .map(|i| (i, self.wallet_entropy.nth_dctidh_spending_key(i)))
     }
 
     pub(crate) async fn claim_utxo(&mut self, utxo_claim_data: ClaimUtxoData) -> Result<()> {
@@ -3595,7 +3664,7 @@ pub(crate) mod tests {
 
             let genesis = Block::genesis(network);
             let guesser_address = alice_wallet.guesser_fee_key().to_address();
-            let change_key = alice_wallet.nth_generation_spending_key(0).into();
+            let change_key: SpendingKey = alice_wallet.nth_generation_spending_key(0).into();
             let guesser_fraction = 0.5f64;
 
             // Alice mines a block
@@ -3650,7 +3719,7 @@ pub(crate) mod tests {
                 send_amt1,
                 NativeCurrencyAmount::coins(1),
                 now,
-                change_key,
+                change_key.clone(),
             )
             .await
             .unwrap();
@@ -3669,7 +3738,7 @@ pub(crate) mod tests {
                 send_amt2,
                 NativeCurrencyAmount::coins(1),
                 now,
-                change_key,
+                change_key.clone(),
             )
             .await
             .unwrap();
@@ -3694,7 +3763,7 @@ pub(crate) mod tests {
                     NativeCurrencyAmount::coins(1),
                     NativeCurrencyAmount::coins(1),
                     now,
-                    change_key,
+                    change_key.clone(),
                 )
                 .await
                 .is_err(),
@@ -4154,13 +4223,13 @@ pub(crate) mod tests {
 
             // Create a transaction that spends all of Alice's balance.
             let timestamp = network.launch_date() + Timestamp::months(14);
-            let change_key = alice_wallet.nth_symmetric_key(0).into();
+            let change_key: SpendingKey = alice_wallet.nth_symmetric_key(0).into();
             let spending_tx_1a = outgoing_transaction(
                 &mut alice_global_lock,
                 NativeCurrencyAmount::coins(19),
                 NativeCurrencyAmount::coins(1),
                 timestamp,
-                change_key,
+                change_key.clone(),
             )
             .await
             .unwrap();
@@ -4221,7 +4290,7 @@ pub(crate) mod tests {
                 NativeCurrencyAmount::coins(19),
                 NativeCurrencyAmount::coins(1),
                 timestamp,
-                change_key,
+                change_key.clone(),
             )
             .await;
 

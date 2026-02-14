@@ -161,6 +161,10 @@ pub(super) struct WalletDbTables {
     ///
     /// Length must match [`Self::expected_utxos`].
     pub(super) addition_record_to_expected_utxo: DbtMap<AdditionRecord, Index>,
+
+    // table number: 14
+    /// Counter for next CTIDH key derivation index.
+    pub(super) dctidh_key_counter: DbtSingleton<u64>,
 }
 
 impl WalletDbTables {
@@ -210,6 +214,11 @@ impl WalletDbTables {
             .new_map("addition_record_to_expected_utxo")
             .await;
 
+        let dctidh_key_counter = storage
+            .schema
+            .new_singleton::<u64>("dctidh_key_counter")
+            .await;
+
         WalletDbTables {
             sync_label,
             monitored_utxos,
@@ -222,6 +231,7 @@ impl WalletDbTables {
             strong_key_to_mutxo,
             index_set_to_mutxo,
             addition_record_to_expected_utxo,
+            dctidh_key_counter,
         }
     }
 

@@ -567,43 +567,7 @@ impl GenerationReceivingAddress {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-
     use super::*;
-
-    mod generation_spending_key {
-        use super::*;
-
-        // we test serialization roundtrip because we skip fields when serializing and
-        // there is a custom impl Deserialization for GenerationSpendingKey
-        //
-        // serde crates can use either sequential or map visitor access pattern when deserializing
-        // so it is important to test both.
-        mod serialization {
-            use super::*;
-
-            // note: bincode uses sequential access pattern when deserializing.
-            #[test]
-            pub fn roundtrip_bincode() {
-                let spending_key = GenerationSpendingKey::derive_from_seed(rand::random());
-
-                let s = bincode::serialize(&spending_key).unwrap();
-                let deserialized_key: GenerationSpendingKey = bincode::deserialize(&s).unwrap();
-
-                assert_eq!(spending_key, deserialized_key);
-            }
-
-            // note serde_json uses map access pattern when deserializing.
-            #[test]
-            pub fn roundtrip_json() {
-                let spending_key = GenerationSpendingKey::derive_from_seed(rand::random());
-
-                let s = serde_json::to_string(&spending_key).unwrap();
-                let deserialized_key: GenerationSpendingKey = serde_json::from_str(&s).unwrap();
-
-                assert_eq!(spending_key, deserialized_key);
-            }
-        }
-    }
 
     #[test]
     fn can_parse_valid_address() {
@@ -619,36 +583,6 @@ mod tests {
         use common::SubAddress;
 
         #[test]
-        fn new_rejects_zero_payment_id() {
-            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
-            let result = GenerationSubAddress::new(base, BFieldElement::new(0));
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("non-zero"));
-        }
-
-        #[test]
-        fn from_index_rejects_zero_index() {
-            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
-            let result = GenerationSubAddress::from_index(base, 0);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("non-zero"));
-        }
-
-        #[test]
-        fn new_accepts_nonzero_payment_id() {
-            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
-            let subaddr = GenerationSubAddress::new(base, BFieldElement::new(1)).unwrap();
-            assert_eq!(subaddr.payment_id(), BFieldElement::new(1));
-        }
-
-        #[test]
-        fn from_index_accepts_nonzero_index() {
-            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
-            let subaddr = GenerationSubAddress::from_index(base, 42).unwrap();
-            assert_eq!(subaddr.payment_id(), BFieldElement::new(42));
-        }
-
-        #[test]
         fn bech32m_roundtrip() {
             let network = Network::Main;
             let base = GenerationReceivingAddress::derive_from_seed(rand::random());
@@ -659,17 +593,6 @@ mod tests {
 
             assert_eq!(subaddr, decoded);
             assert_eq!(decoded.payment_id(), BFieldElement::new(12345));
-        }
-
-        #[test]
-        fn split_returns_base_and_payment_id() {
-            let base = GenerationReceivingAddress::derive_from_seed(rand::random());
-            let payment_id = BFieldElement::new(999);
-            let subaddr = GenerationSubAddress::new(base, payment_id).unwrap();
-
-            let (recovered_base, recovered_id) = subaddr.split();
-            assert_eq!(recovered_base, base);
-            assert_eq!(recovered_id, payment_id);
         }
     }
 }

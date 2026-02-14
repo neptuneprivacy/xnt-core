@@ -235,6 +235,7 @@ impl TransactionBuilder {
                         "symmetric keys not supported".to_string(),
                     ));
                 }
+                CoreSpendingKey::dCTIDH(dctidh_key) => dctidh_key.lock_script_and_witness(),
             };
             let unlocked = UnlockedUtxo::unlock(
                 input.utxo.inner.clone(),

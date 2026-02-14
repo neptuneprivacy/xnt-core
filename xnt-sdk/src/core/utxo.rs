@@ -8,6 +8,7 @@ use neptune_privacy::protocol::consensus::transaction::utxo::Utxo as CoreUtxo;
 use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use neptune_privacy::protocol::proof_abstractions::timestamp::Timestamp;
 use neptune_privacy::state::wallet::address::ciphertext_from_announcement;
+use neptune_privacy::state::wallet::address::dctidh_address::{CTIDH_FLAG, CTIDH_SUBADDR_FLAG};
 use neptune_privacy::state::wallet::address::generation_address::{GENERATION_FLAG, GENERATION_SUBADDR_FLAG};
 use neptune_privacy::state::wallet::address::receiver_identifier_from_announcement;
 
@@ -105,9 +106,13 @@ pub fn decrypt_announcement(
     }
 
     let key_type = announcement.message[0];
-    if key_type != GENERATION_FLAG && key_type != GENERATION_SUBADDR_FLAG {
+    if key_type != GENERATION_FLAG
+        && key_type != GENERATION_SUBADDR_FLAG
+        && key_type != CTIDH_FLAG
+        && key_type != CTIDH_SUBADDR_FLAG
+    {
         return Err(XntError::InvalidInput(
-            "not a generation address announcement".to_string(),
+            "unsupported announcement key type".to_string(),
         ));
     }
 

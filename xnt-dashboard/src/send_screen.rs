@@ -393,7 +393,15 @@ impl Widget for SendScreen {
             let mut address_lines = vec![];
 
             while address.len() > width {
-                let (line, remainder) = address.split_at(width);
+                let split_at = address
+                    .char_indices()
+                    .take_while(|(i, c)| i + c.len_utf8() <= width)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or_else(|| {
+                        address.chars().next().map(|c| c.len_utf8()).unwrap_or(0)
+                    });
+                let (line, remainder) = address.split_at(split_at);
                 address_lines.push(line.to_owned());
                 address = remainder.to_owned();
             }

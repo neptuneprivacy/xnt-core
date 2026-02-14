@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use unicode_width::UnicodeWidthStr;
 
+use super::dashboard_app::ConsoleIO;
 use super::dashboard_app::DashboardEvent;
 use super::screen::Screen;
 use crate::dashboard_rpc_client::DashboardRpcClient;
@@ -187,7 +188,25 @@ impl AddressScreen {
                     match key.code {
                         KeyCode::Down => self.events.next(),
                         KeyCode::Up => self.events.previous(),
-                        // todo: PgUp,PgDn.  (but how to determine page size?  fixed n?)
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            let keys = self.data.lock().unwrap();
+                            let len = keys.len();
+                            if len > 0 {
+                                let selected = self.events.state.selected().unwrap_or(Events::TABLE_HEADER_ROWS);
+                                let body_index = selected.saturating_sub(Events::TABLE_HEADER_ROWS);
+                                if body_index < len {
+                                    let key = keys[len - 1 - body_index].clone();
+                                    let full = key.to_address().to_bech32m(self.network).unwrap();
+                                    escalate_event = Some(DashboardEvent::ConsoleMode(
+                                        ConsoleIO::InputRequested(format!("{}\n\n", full)),
+                                    ));
+                                } else {
+                                    escalate_event = Some(event);
+                                }
+                            } else {
+                                escalate_event = Some(event);
+                            }
+                        }
                         _ => {
                             escalate_event = Some(event);
                         }
@@ -242,9 +261,14 @@ impl Widget for AddressScreen {
         } else {
             Style::default().fg(Color::Gray).bg(self.bg)
         };
+        let title = if self.in_focus {
+            "Known Addresses (C: copy full address)"
+        } else {
+            "Known Addresses"
+        };
         Block::default()
             .borders(Borders::ALL)
-            .title("Known Addresses")
+            .title(title)
             .style(style)
             .render(area, buf);
 
@@ -272,7 +296,7 @@ impl Widget for AddressScreen {
             .map(|key| {
                 vec![
                     KeyType::from(key).to_string(),
-                    key.to_address()
+                    key.clone().to_address()
                         .to_display_bech32m_abbreviated(self.network)
                         .unwrap(),
                 ]

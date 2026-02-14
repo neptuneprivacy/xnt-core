@@ -504,7 +504,7 @@ impl RpcApi for RpcServer {
                         .find_spending_key_for_utxo(&incoming.utxo);
                     let receiving_address = spending_key
                         .as_ref()
-                        .and_then(|key| key.to_address().to_bech32m(network).ok());
+                        .and_then(|key| key.clone().to_address().to_bech32m(network).ok());
                     let receiver_identifier = spending_key
                         .as_ref()
                         .map(|key| key.receiver_identifier().value());
@@ -917,7 +917,7 @@ impl RpcApi for RpcServer {
                 .wallet_state
                 .get_all_known_addressable_spending_keys()
                 .find(|k| k.lock_script_hash() == lock_script_hash)
-                .and_then(|key| key.to_address().to_bech32m(network).ok());
+                .and_then(|key| key.clone().to_address().to_bech32m(network).ok());
 
             history_rows.push(History {
                 leaf_index,
@@ -1055,12 +1055,18 @@ impl RpcApi for RpcServer {
                     ReceivingAddress::Generation(_) => "generation".to_string(),
                     ReceivingAddress::Symmetric(_) => "symmetric".to_string(),
                     ReceivingAddress::GenerationSubAddr(_) => "generation_subaddress".to_string(),
+                    ReceivingAddress::dCTIDH(_) => "dctidh".to_string(),
+                    ReceivingAddress::dCTIDHSubAddr(_) => "dctidh_subaddress".to_string(),
                 });
                 let receiver_identifier = Some(addr.receiver_identifier().value());
 
                 // For subaddresses, include base_address and payment_id
                 let (base_address, payment_id) = match &addr {
                     ReceivingAddress::GenerationSubAddr(subaddr) => {
+                        let (base, pid) = subaddr.clone().split();
+                        (base.to_bech32m(network).ok(), Some(pid.value()))
+                    }
+                    ReceivingAddress::dCTIDHSubAddr(subaddr) => {
                         let (base, pid) = subaddr.clone().split();
                         (base.to_bech32m(network).ok(), Some(pid.value()))
                     }
@@ -1118,6 +1124,8 @@ impl RpcApi for RpcServer {
                 ReceivingAddress::Generation(_) => "Generation",
                 ReceivingAddress::Symmetric(_) => "Symmetric",
                 ReceivingAddress::GenerationSubAddr(_) => "GenerationSubAddr",
+                ReceivingAddress::dCTIDH(_) => "dCTIDH",
+                ReceivingAddress::dCTIDHSubAddr(_) => "dCTIDHSubAddr",
             },
             to_address.receiver_identifier()
         );

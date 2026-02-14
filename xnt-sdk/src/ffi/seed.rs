@@ -77,6 +77,21 @@ pub extern "C" fn xnt_wallet_derive_key(handle: *const WalletEntropyHandle, inde
     Box::into_raw(Box::new(SpendingKeyHandle(wallet.0.derive_spending_key(index))))
 }
 
+/// Derive Nth CTIDH spending key (CTIDH-512)
+#[no_mangle]
+pub extern "C" fn xnt_wallet_derive_dctidh_key(
+    handle: *const WalletEntropyHandle,
+    index: u64,
+) -> *mut SpendingKeyHandle {
+    ffi_begin!();
+    check_null!(handle, "wallet handle is null");
+
+    let wallet = ffi_ref!(handle);
+    Box::into_raw(Box::new(SpendingKeyHandle(
+        wallet.0.derive_dctidh_spending_key(index),
+    )))
+}
+
 ffi_free!(xnt_spending_key_free, SpendingKeyHandle);
 
 /// Get receiver_id from spending key

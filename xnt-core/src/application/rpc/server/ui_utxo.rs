@@ -42,6 +42,9 @@ pub struct UiUtxo {
     pub spent: UtxoStatusEvent,
     pub amount: NativeCurrencyAmount,
     pub release_date: Option<Timestamp>,
+    /// Payment ID from subaddress. Zero for base address UTXOs.
+    #[serde(default)]
+    pub payment_id: u64,
 }
 
 #[cfg(feature = "mock-rpc")]
@@ -79,6 +82,11 @@ impl rand::distr::Distribution<UiUtxo> for rand::distr::StandardUniform {
                 Some(rng.random())
             } else {
                 None
+            },
+            payment_id: if rng.random_bool(0.3) {
+                rng.random_range(1u64..10000)
+            } else {
+                0
             },
         }
     }
