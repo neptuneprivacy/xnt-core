@@ -133,3 +133,4 @@ test_database3/
 node_modules
 xnt-sdk/src/napi/output/*
 !xnt-sdk/src/napi/output/.gitkeep
+rust-toolchain.toml
