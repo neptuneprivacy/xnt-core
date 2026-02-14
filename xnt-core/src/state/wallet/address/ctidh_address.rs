@@ -35,9 +35,6 @@ pub const CTIDH_FLAG: BFieldElement = BFieldElement::new(CTIDH_FLAG_U8 as u64);
 pub(super) const CTIDH_SUBADDR_FLAG_U8: u8 = 202;
 pub const CTIDH_SUBADDR_FLAG: BFieldElement = BFieldElement::new(CTIDH_SUBADDR_FLAG_U8 as u64);
 
-/// Bech32m length for 2048-bit: 6 (HRP) + 1 + base32(256) + 6 checksum = 6+1+410+6 = 423.
-pub const CTIDH_ADDRESS_MAX_BECH32M_LEN: usize = 430;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CtidhReceivingAddress {
     #[serde(with = "serde_arrays")]

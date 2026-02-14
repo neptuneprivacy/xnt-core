@@ -869,7 +869,7 @@ fn test_tx_ctidh() {
         xnt_utxo_free(*u);
     }
 
-    // Derive a CTIDH-2048 address from the same mnemonic via Rust SDK core
+    // Derive a CTIDH-512 address from the same mnemonic via Rust SDK core
     let mnemonic = test_mnemonic();
     let wallet =
         xnt_sdk::core::WalletEntropy::from_mnemonic(&mnemonic).expect("wallet from mnemonic");
