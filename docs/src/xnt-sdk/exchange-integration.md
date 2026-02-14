@@ -28,6 +28,89 @@ npm run build
 
 ---
 
+## Quick Start with Example CLI
+
+The SDK ships with a ready-to-use CLI tool at `xnt-sdk/examples/xnt-sdk-test.ts`. After building the SDK:
+
+```bash
+cd xnt-sdk
+npx ts-node examples/xnt-sdk-test.ts
+```
+
+This prints all available commands:
+
+```
+Usage: npx ts-node examples/xnt-sdk-test.ts [command] [arg]
+
+Commands:
+  version
+  seed
+  address [payment-id]
+  shortaddress [payment-id]
+  utils
+  rpc
+  sync
+  tx <recipient> <amount> <fee>
+```
+
+### Try Offline Commands
+
+These work without a running node:
+
+```bash
+# Check SDK version
+npx ts-node examples/xnt-sdk-test.ts version
+
+# Generate a new wallet seed
+npx ts-node examples/xnt-sdk-test.ts seed
+
+# Show Generation address (long)
+XNT_TEST_MNEMONIC="your 18 word mnemonic" npx ts-node examples/xnt-sdk-test.ts address
+
+# Show Generation subaddress with payment ID
+XNT_TEST_MNEMONIC="your 18 word mnemonic" npx ts-node examples/xnt-sdk-test.ts address 12345
+
+# Show dCTIDH address (short)
+XNT_TEST_MNEMONIC="your 18 word mnemonic" npx ts-node examples/xnt-sdk-test.ts shortaddress
+
+# Show dCTIDH subaddress with payment ID
+XNT_TEST_MNEMONIC="your 18 word mnemonic" npx ts-node examples/xnt-sdk-test.ts shortaddress 12345
+```
+
+### Try Online Commands
+
+These require a running xnt-core node:
+
+```bash
+export XNT_TEST_MNEMONIC="your 18 word mnemonic"
+export XNT_RPC_URL="http://localhost:9897/"
+
+# Test RPC connection
+npx ts-node examples/xnt-sdk-test.ts rpc
+
+# Sync wallet and show balance
+npx ts-node examples/xnt-sdk-test.ts sync
+
+# Send transaction (recipient can be any address type)
+npx ts-node examples/xnt-sdk-test.ts tx xntctm1... 0.575 0.005
+```
+
+### Output Format
+
+All commands output structured JSON, one line per event:
+
+```json
+{"ts":"2025-01-01T00:00:00.000Z","level":"ok","msg":"version","data":{"version":"0.5.0"}}
+```
+
+Pipe through `jq` for readability:
+
+```bash
+npx ts-node examples/xnt-sdk-test.ts version | jq
+```
+
+---
+
 ## Imports
 
 ```typescript
@@ -72,55 +155,75 @@ const mnemonic = wallet.toMnemonic();
 // Import existing wallet
 const imported = new XntWalletEntropy(mnemonic);
 
-// Derive spending key at index 0
-const key = wallet.deriveKey(0);
+// Derive Generation spending key at index 0 (long address)
+const genKey = wallet.deriveKey(0);
 
-// Key methods
+// Derive dCTIDH spending key at index 0 (short address)
+const key = wallet.derivedCTIDHKey(0);
+
+// Key methods (same for both key types)
 key.receiverIdHex();        // receiver ID hex
 key.receiverIdHashHex();    // receiver ID hash hex (for UTXO queries)
 key.receiverPreimageHex();  // receiver preimage hex (for decryption)
 key.toAddress();            // returns XntAddress
+key.isDCTIDH();             // true for dCTIDH keys
+key.isGeneration();         // true for Generation keys
 ```
 
 ---
 
 ## Address
 
-### Base Address
+Two address families are supported. Both can receive funds and create subaddresses with payment IDs.
+
+> **Recommendation:** Use **dCTIDH (short address)** for new integrations. dCTIDH addresses are ~130 characters vs ~4000 for Generation, making them far more practical for QR codes, user display, and API payloads.
+
+### Generation Address (Long Address)
 
 ```typescript
-const key = wallet.deriveKey(0);
-const addr = key.toAddress();
+const genKey = wallet.deriveKey(0);
+const genAddr = genKey.toAddress();
 
 // Encode to bech32
-const bech32 = addr.toBech32(XntNetwork.Main);
+const bech32 = genAddr.toBech32(XntNetwork.Main);
 // "xntnwm1..."
 
 // Decode from bech32
 const decoded = XntAddress.fromBech32(bech32, XntNetwork.Main);
+
+// Subaddress with payment ID
+const sub = genAddr.withPaymentId(12345); // returns XntSubAddress
+sub.toBech32(XntNetwork.Main);            // "xntnsm1..."
+sub.paymentId();                          // 12345
+sub.toReceivingAddress();                 // for addOutput()
+```
+
+### dCTIDH Address (Short Address)
+
+Recommended for new integrations.
+
+```typescript
+const key = wallet.derivedCTIDHKey(0);
+const addr = key.toAddress();
+
+// Encode to bech32
+const bech32 = addr.toBech32(XntNetwork.Main);
+// "xntctm1..."
+
+// Decode from bech32
+const decoded = XntAddress.fromBech32(bech32, XntNetwork.Main);
+
+// Subaddress with payment ID
+const sub = addr.dCTIDHSubaddress(12345); // returns XntReceivingAddress
+sub.toBech32(XntNetwork.Main);            // "xntctam1..."
+sub.paymentId();                          // 12345
 
 // Address methods
 addr.toReceivingAddress();  // for transaction outputs
 addr.privacyDigestHex();    // for pending incoming display
 ```
 
-### Subaddress with Payment ID
-
-Generate unique deposit addresses per customer using payment IDs:
-
-```typescript
-// Create subaddress (payment_id must be > 0)
-const customerId = 12345;
-const sub = addr.withPaymentId(customerId);
-const depositAddr = sub.toBech32(XntNetwork.Main);
-// "xntnsm1..." (subaddress prefix)
-
-// Get payment ID
-sub.paymentId(); // 12345
-
-// payment_id=0 is rejected
-try { addr.withPaymentId(0); } catch { /* rejected */ }
-```
+> **Note:** `withPaymentId()` returns `XntSubAddress` (Generation), while `dCTIDHSubaddress()` returns `XntReceivingAddress` (dCTIDH). Both work with `builder.addOutput()`.
 
 ---
 
@@ -142,7 +245,7 @@ const height = client.chainHeight(); // negative if failed
 
 ## Sync
 
-Block scanning and UTXO queries with range filter.
+Block scanning and UTXO queries with range filter. Works with both Generation and dCTIDH keys.
 
 ### Interfaces
 
@@ -165,7 +268,7 @@ interface SyncResult {
 ```typescript
 function syncWallet(
   client: XntRpcClient,
-  key: ReturnType<XntWalletEntropy["deriveKey"]>
+  key: ReturnType<XntWalletEntropy["derivedCTIDHKey"]>
 ): SyncResult | null {
   const ridHashHex = key.receiverIdHashHex();
   const receiverPreimageHex = key.receiverPreimageHex();
@@ -259,16 +362,17 @@ Full transaction build, prove, and submit.
 ### Amount Helpers
 
 ```typescript
-const CONVERSION_FACTOR = 4n * 10n ** 30n; // 1 XNT = 4 * 10^30 NAU
+const FACTOR = 4n * 10n ** 30n; // 1 XNT = 4 * 10^30 NAU
 
-const toNau = (xnt: number) =>
-  BigInt(Math.round(xnt * 1e8)) * CONVERSION_FACTOR / 100000000n;
+function toNau(xnt: number): bigint {
+  return BigInt(Math.round(xnt * 1e8)) * FACTOR / 100000000n;
+}
 
-const formatAmount = (nau: bigint) => {
+function formatAmount(nau: bigint): string {
   const abs = nau < 0n ? -nau : nau;
   const sign = nau < 0n ? "-" : "";
-  return `${sign}${abs / CONVERSION_FACTOR}.${((abs % CONVERSION_FACTOR) * 100000000n / CONVERSION_FACTOR).toString().padStart(8, "0")} XNT`;
-};
+  return `${sign}${abs / FACTOR}.${((abs % FACTOR) * 100000000n / FACTOR).toString().padStart(8, "0")} XNT`;
+}
 ```
 
 ### Build Transaction
@@ -308,7 +412,7 @@ for (let i = 0; i < selected.length; i++) {
   builder.addInput(selectedUtxos[i].decrypted.utxo, key, proof);
 }
 
-// Add output (recipient)
+// Add output — accepts any address type (Generation or dCTIDH)
 const recipient = XntAddress.fromBech32(recipientBech32, XntNetwork.Main);
 builder.addOutput(recipient.toReceivingAddress(), sendAmount, xntRandomSenderRandomness());
 
@@ -386,9 +490,11 @@ xntComputeCommitmentForOutput(
 
 ### Deposit Tracking
 
-1. Generate subaddress per customer: `addr.withPaymentId(customerId)`
+1. Generate subaddress per user:
+   - Generation (long): `genAddr.withPaymentId(userId)`
+   - dCTIDH (short): `addr.dCTIDHSubaddress(userId)`
 2. Scan new blocks: `xntFetchUtxos(client, receiverIdHashHex, fromHeight, toHeight)`
-3. Match `paymentId` to customer
+3. Match `paymentId` to user
 4. Wait for confirmations
 
 ### Withdrawal

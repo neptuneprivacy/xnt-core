@@ -24,13 +24,21 @@ The SDK is open source and intended as foundational infrastructure for:
 
 Builders, the next phase is in your hands.
 
-## dCTIDH-512 keys (post-quantum)
+## Address Types
 
-The SDK supports **dCTIDH-512** receiving addresses and spending keys (the same implementation as `neptune-privacy` core).
+The SDK supports two address families, both derived from the same wallet seed:
 
+**Generation (long address)**
+- **Rust**: `WalletEntropy::derive_spending_key(index)`
+- **Node.js (NAPI)**: `wallet.deriveKey(index)`
+- **C FFI**: `xnt_wallet_derive_key(wallet, index)`
+
+**dCTIDH-512 (short address)**
 - **Rust**: `WalletEntropy::derive_dctidh_spending_key(index)`
 - **Node.js (NAPI)**: `wallet.derivedCTIDHKey(index)`
 - **C FFI**: `xnt_wallet_derive_dctidh_key(wallet, index)`
+
+Both support subaddresses with payment IDs for deposit tracking.
 
 We’ll continue improving the SDK and releasing updates as the ecosystem grows.
 If you’re building privacy preserving applications and care about non-custodial design, this is for you!
