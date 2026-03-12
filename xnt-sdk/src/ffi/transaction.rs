@@ -3,10 +3,20 @@
 //! Wraps core transaction types for C FFI.
 
 use std::ffi::c_char;
+use std::sync::OnceLock;
 
 use crate::core::{
     timestamp_now, BuiltTransaction, Transaction, TransactionBuilder,
 };
+
+/// Persistent tokio runtime shared across all prove() calls.
+/// Keeps the TritonVmJobQueue background task alive between calls.
+fn global_tokio_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("failed to create global tokio runtime")
+    })
+}
 
 use super::address::{AddressHandle, ReceivingAddressHandle, XntNetwork};
 use super::error::{set_last_error, XntErrorCode};
@@ -172,14 +182,7 @@ pub extern "C" fn xnt_built_transaction_prove(handle: *const BuiltTransactionHan
 
     let built = ffi_ref!(handle);
 
-    // Create a new runtime for async operations
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            set_last_error(&format!("failed to create runtime: {e}"));
-            return std::ptr::null_mut();
-        }
-    };
+    let runtime = global_tokio_runtime();
 
     // Block on the async prove function
     match runtime.block_on(built.0.prove()) {
