@@ -4,6 +4,8 @@
 //! No manual *_free calls required.
 //! Uses shared core module for business logic.
 
+use std::sync::OnceLock;
+
 use napi::bindgen_prelude::*;
 use napi::bindgen_prelude::BigInt;
 use napi_derive::napi;
@@ -12,6 +14,15 @@ use crate::core::{
     Address, MembershipProof, MutatorSet, Network, ReceivingAddress, RpcClient, SpendingKey,
     SubAddress, TransactionBuilder, Utxo, WalletEntropy,
 };
+
+/// Persistent tokio runtime shared across all prove() calls.
+/// Keeps the TritonVmJobQueue background task alive between calls.
+fn global_tokio_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("failed to create global tokio runtime")
+    })
+}
 
 /// Network type for address encoding
 #[napi]
@@ -1111,8 +1122,7 @@ impl XntBuiltTransaction {
     /// WARNING: This is CPU-intensive and requires ~16GB RAM
     #[napi]
     pub fn prove(&self) -> Result<XntTransaction> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| Error::from_reason(format!("runtime: {e}")))?;
+        let rt = global_tokio_runtime();
 
         rt.block_on(async {
             self.inner
