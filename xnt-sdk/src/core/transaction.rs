@@ -175,11 +175,12 @@ impl TransactionBuilder {
             return Err(XntError::TransactionError("no inputs".into()));
         }
 
-        // Check for duplicate inputs (same UTXO spent twice)
-        let mut seen_utxos = std::collections::HashSet::new();
+        // Check for duplicate inputs (same UTXO spent twice).
+        // Use AOCL leaf index which is unique per UTXO, matching how the
+        // core wallet checks via removal record absolute_indices.
+        let mut seen_indices = std::collections::HashSet::new();
         for input in &self.inputs {
-            let hash = input.utxo.hash().to_hex();
-            if !seen_utxos.insert(hash) {
+            if !seen_indices.insert(input.membership_proof.aocl_leaf_index()) {
                 return Err(XntError::TransactionError("duplicate input UTXO".into()));
             }
         }
