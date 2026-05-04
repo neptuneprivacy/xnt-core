@@ -6644,7 +6644,7 @@ mod tests {
 
         mod worker {
             use super::*;
-            use crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey;
+            use crate::state::wallet::address::dctidh_address::{dCTIDHSpendingKey, dCTIDHSubAddress};
             use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
             use crate::state::wallet::address::symmetric_key::SymmetricKey;
             use crate::state::wallet::address::SpendingKey;
@@ -6745,6 +6745,14 @@ mod tests {
                         GenerationSubAddress::new(gen_addr, payment_id).unwrap().into()
                     }
                     KeyType::dCTIDH => dCTIDHSpendingKey::keygen().to_address().into(),
+                    KeyType::dCTIDHSubAddr => {
+                        let addr = dCTIDHSpendingKey::keygen().to_address();
+                        let mut payment_id: BFieldElement = rng.random();
+                        if payment_id.is_zero() {
+                            payment_id = BFieldElement::new(1);
+                        }
+                        dCTIDHSubAddress::new(addr, payment_id).unwrap().into()
+                    }
                 };
                 let output1: OutputFormat = (
                     external_receiving_address.clone(),

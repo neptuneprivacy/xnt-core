@@ -47,6 +47,14 @@ pub struct dCTIDHReceivingAddress {
     lock_postimage: Digest,
 }
 
+#[cfg(any(test, feature = "arbitrary-impls"))]
+impl<'a> arbitrary::Arbitrary<'a> for dCTIDHReceivingAddress {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let seed = Digest::arbitrary(u)?;
+        Ok(dCTIDHSpendingKey::derive_from_seed(seed).to_address())
+    }
+}
+
 /// A subaddress combining a base CTIDH receiving address with a payment_id.
 ///
 /// dCTIDHSubAddress = dCTIDHReceivingAddress + payment_id
@@ -60,6 +68,18 @@ pub struct dCTIDHSubAddress {
 
     /// The payment identifier for this subaddress
     payment_id: BFieldElement,
+}
+
+#[cfg(any(test, feature = "arbitrary-impls"))]
+impl<'a> arbitrary::Arbitrary<'a> for dCTIDHSubAddress {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let base = dCTIDHReceivingAddress::arbitrary(u)?;
+        let mut payment_id = BFieldElement::arbitrary(u)?;
+        if payment_id.is_zero() {
+            payment_id = BFieldElement::new(1);
+        }
+        Ok(Self::new(base, payment_id).unwrap())
+    }
 }
 
 impl dCTIDHSubAddress {
