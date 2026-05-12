@@ -85,6 +85,7 @@ use crate::protocol::peer::SyncChallenge;
 use crate::protocol::peer::SyncChallengeResponse;
 use crate::protocol::peer::SYNC_CHALLENGE_POW_WITNESS_LENGTH;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
@@ -344,8 +345,12 @@ impl GlobalStateLock {
             .await;
 
         // insert transaction into mempool
-        gsm.mempool_insert((*transaction).clone(), UpgradePriority::Critical)
-            .await;
+        gsm.mempool_insert(
+            (*transaction).clone(),
+            UpgradePriority::Critical,
+            AddReason::Submitted,
+        )
+        .await;
 
         tracing::debug!("flush dbs");
         gsm.flush_databases().await.expect("flushed DBs");
@@ -2350,26 +2355,36 @@ impl GlobalState {
 
     /// Remove one transaction from the mempool and notify wallet of changes.
     pub(crate) async fn mempool_remove(&mut self, transaction_id: TransactionKernelId) {
-        let events = self.mempool.remove(transaction_id);
-        self.wallet_state.handle_mempool_events(events).await;
+        let event = self.mempool.remove(transaction_id);
+        if let Some(ref e) = event {
+            self.mempool.log_events(&[e.clone()]);
+        }
+        self.wallet_state.handle_mempool_events(event).await;
     }
 
     /// clears all Tx from mempool and notifies wallet of changes.
     pub async fn mempool_clear(&mut self) {
         let events = self.mempool.clear();
+        self.mempool.log_events(&events);
         self.wallet_state.handle_mempool_events(events).await
     }
 
-    /// adds Tx to mempool and notifies wallet of change. value represents
-    /// the value that the transaction has to caller.
-    pub async fn mempool_insert(&mut self, transaction: Transaction, priority: UpgradePriority) {
-        let events = self.mempool.insert(transaction, priority);
+    /// adds Tx to mempool and notifies wallet of change.
+    pub async fn mempool_insert(
+        &mut self,
+        transaction: Transaction,
+        priority: UpgradePriority,
+        add_reason: AddReason,
+    ) {
+        let events = self.mempool.insert(transaction, priority, add_reason);
+        self.mempool.log_events(&events);
         self.wallet_state.handle_mempool_events(events).await
     }
 
     /// prunes stale tx in mempool and notifies wallet of changes.
     pub async fn mempool_prune_stale_transactions(&mut self) {
         let events = self.mempool.prune_stale_transactions();
+        self.mempool.log_events(&events);
         self.wallet_state.handle_mempool_events(events).await
     }
 
@@ -2383,6 +2398,7 @@ impl GlobalState {
         let events = self
             .mempool
             .update_primitive_witness(transaction_id, new_primitive_witness);
+        self.mempool.log_events(&events);
         self.wallet_state.handle_mempool_events(events).await
     }
 

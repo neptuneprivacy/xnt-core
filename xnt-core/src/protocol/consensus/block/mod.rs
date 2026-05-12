@@ -1012,6 +1012,7 @@ pub(crate) mod tests {
     use crate::protocol::consensus::transaction::TransactionProof;
     use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
     use crate::protocol::consensus::type_scripts::TypeScript;
+    use crate::state::mempool::mempool_event::AddReason;
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
     use crate::state::transaction::tx_proving_capability::TxProvingCapability;
@@ -2222,7 +2223,7 @@ pub(crate) mod tests {
                 alice
                     .lock_guard_mut()
                     .await
-                    .mempool_insert(transaction.clone().into(), UpgradePriority::Critical)
+                    .mempool_insert(transaction.clone().into(), UpgradePriority::Critical, AddReason::Submitted)
                     .await;
             }
 

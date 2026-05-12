@@ -525,7 +525,7 @@ impl WalletState {
     /// double spent.
     pub(in crate::state) async fn handle_mempool_event(&mut self, event: MempoolEvent) {
         match event {
-            MempoolEvent::AddTx(tx_kernel) => {
+            MempoolEvent::AddTx(tx_kernel, _reason) => {
                 debug!(r"handling mempool AddTx event.  details:\n{}", tx_kernel);
 
                 let spent_utxos = self.scan_for_spent_utxos(&tx_kernel).await;
@@ -548,7 +548,7 @@ impl WalletState {
                 self.mempool_spent_utxos.insert(tx_id, spent_utxos);
                 self.mempool_unspent_utxos.insert(tx_id, own_utxos);
             }
-            MempoolEvent::RemoveTx(tx_kernel) => {
+            MempoolEvent::RemoveTx(tx_kernel, _reason) => {
                 let tx_id = tx_kernel.txid();
                 debug!("handling mempool RemoveTx event.  tx: {}", tx_id);
                 self.mempool_spent_utxos.remove(&tx_id);
@@ -2134,6 +2134,7 @@ pub(crate) mod tests {
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
     use crate::protocol::consensus::transaction::utxo::Coin;
     use crate::protocol::consensus::transaction::utxo_triple::UtxoTriple;
+    use crate::state::mempool::mempool_event::AddReason;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
     use crate::state::transaction::tx_proving_capability::TxProvingCapability;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
@@ -3594,7 +3595,7 @@ pub(crate) mod tests {
             global_state_lock
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*tx).clone(), UpgradePriority::Critical)
+                .mempool_insert((*tx).clone(), UpgradePriority::Critical, AddReason::Submitted)
                 .await;
 
             {
@@ -3728,7 +3729,7 @@ pub(crate) mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*tx1).clone(), UpgradePriority::Critical)
+                .mempool_insert((*tx1).clone(), UpgradePriority::Critical, AddReason::Submitted)
                 .await;
 
             // generate a second transaction
@@ -3747,7 +3748,7 @@ pub(crate) mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*tx2).clone(), UpgradePriority::Critical)
+                .mempool_insert((*tx2).clone(), UpgradePriority::Critical, AddReason::Submitted)
                 .await;
 
             // verify that the mempool contains two transactions

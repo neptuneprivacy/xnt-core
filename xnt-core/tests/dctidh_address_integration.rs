@@ -120,6 +120,7 @@ async fn alice_sends_to_bob_dctidh_address() -> anyhow::Result<()> {
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 
@@ -221,6 +222,7 @@ async fn alice_sends_to_bob_dctidh_bech32m_address() -> anyhow::Result<()> {
             fee_amount,
             Timestamp::now(),
             0,
+            None,
         )
         .await?;
 

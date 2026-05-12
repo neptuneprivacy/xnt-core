@@ -52,6 +52,7 @@ use crate::protocol::consensus::transaction::validity::proof_collection::ProofCo
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::peer::transfer_transaction::TransferTransaction;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::expected_utxo::UtxoNotifier;
@@ -238,6 +239,10 @@ pub(crate) async fn run_rpc_server(
             .route(
                 "/rpc/mempool/{start_index}/{number}",
                 axum::routing::get(get_mempool),
+            )
+            .route(
+                "/rpc/mempool/events",
+                axum::routing::get(get_mempool_events),
             )
             .route(
                 "/rpc/blocks_time/{start}/{end}",
@@ -434,6 +439,30 @@ async fn get_mempool(
         .collect_vec();
 
     Ok(ErasedJson::pretty(mempool_transactions))
+}
+
+async fn get_mempool_events(
+    State(rpcstate): State<NeptuneRPCServer>,
+    Query(params): Query<HashMap<String, u64>>,
+) -> Result<ErasedJson, RestError> {
+    let global_state = rpcstate.state.lock_guard().await;
+    let since_height = params.get("since_height").copied();
+
+    let events: Vec<_> = global_state
+        .mempool
+        .event_log()
+        .iter()
+        .filter(|entry| {
+            since_height.map_or(true, |h| {
+                entry
+                    .block_height
+                    .map_or(true, |bh| u64::from(bh) > h)
+            })
+        })
+        .cloned()
+        .collect();
+
+    Ok(ErasedJson::pretty(events))
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -671,7 +700,7 @@ async fn broadcast_transaction(
     info!("broadcasted insert tx: {}", tx.kernel.txid().to_string());
 
     state
-        .mempool_insert(tx.clone(), UpgradePriority::Critical)
+        .mempool_insert(tx.clone(), UpgradePriority::Critical, AddReason::Submitted)
         .await;
     let _ = rpcstate
         .rpc_server_to_main_tx

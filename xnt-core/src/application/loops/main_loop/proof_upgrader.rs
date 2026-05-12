@@ -11,6 +11,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::api::tx_initiation::builder::transaction_proof_builder::TransactionProofBuilder;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
 use crate::application::config::fee_notification_policy::FeeNotificationPolicy;
 use crate::application::config::network::Network;
@@ -510,7 +511,7 @@ impl UpgradeJob {
                     // Insert tx into mempool before notifying peers, so we're
                     // sure to have it when they ask.
                     global_state
-                        .mempool_insert(upgraded.clone(), upgrade_incentive.into())
+                        .mempool_insert(upgraded.clone(), upgrade_incentive.into(), AddReason::Upgraded)
                         .await;
 
                     global_state
@@ -975,6 +976,7 @@ mod tests {
     use crate::application::config::cli_args;
     use crate::application::config::network::Network;
     use crate::protocol::consensus::block::Block;
+    use crate::state::mempool::mempool_event::AddReason;
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
@@ -1055,7 +1057,7 @@ mod tests {
                 mock_genesis_global_state(2, WalletEntropy::new_random(), cli_args.clone()).await;
             let mut rando = rando.lock_guard_mut().await;
             rando
-                .mempool_insert(pc_tx_low_fee.clone().into(), upgrade_priority)
+                .mempool_insert(pc_tx_low_fee.clone().into(), upgrade_priority, AddReason::Submitted)
                 .await;
             assert!(
                 !upgrade_priority.is_irrelevant()
@@ -1074,7 +1076,7 @@ mod tests {
             )
             .await;
             rando
-                .mempool_insert(pc_tx_high_fee.clone().into(), UpgradePriority::Irrelevant)
+                .mempool_insert(pc_tx_high_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted)
                 .await;
             let job = get_upgrade_task_from_mempool(&mut rando).await.unwrap();
             let UpgradeJob::ProofCollectionToSingleProof(ProofCollectionToSingleProof {
@@ -1120,7 +1122,7 @@ mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*pwtx).clone(), UpgradePriority::Critical)
+                .mempool_insert((*pwtx).clone(), UpgradePriority::Critical, AddReason::Submitted)
                 .await;
             let TransactionProof::Witness(pw) = &pwtx.proof else {
                 panic!("Expected PW-backed tx");
@@ -1212,7 +1214,7 @@ mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*pwtx).clone(), UpgradePriority::Critical)
+                .mempool_insert((*pwtx).clone(), UpgradePriority::Critical, AddReason::Submitted)
                 .await;
             let TransactionProof::Witness(pw) = &pwtx.proof else {
                 panic!("Expected PW-backed tx");
@@ -1319,7 +1321,7 @@ mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert(single_proof_tx.clone().into(), UpgradePriority::Critical)
+                .mempool_insert(single_proof_tx.clone().into(), UpgradePriority::Critical, AddReason::Submitted)
                 .await;
             transactions.push(single_proof_tx);
         }

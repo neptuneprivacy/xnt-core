@@ -679,6 +679,28 @@ impl RpcApi for RpcServer {
         })
     }
 
+    async fn get_mempool_events_call(
+        &self,
+        request: GetMempoolEventsRequest,
+    ) -> RpcResult<GetMempoolEventsResponse> {
+        let state = self.state.lock_guard().await;
+        let since_height = request.since_height;
+
+        let events = state
+            .mempool
+            .event_log()
+            .iter()
+            .filter(|entry| {
+                since_height.map_or(true, |h| {
+                    entry.block_height.map_or(true, |bh| u64::from(bh) > h)
+                })
+            })
+            .cloned()
+            .collect();
+
+        Ok(GetMempoolEventsResponse { events })
+    }
+
     async fn get_block_template_call(
         &self,
         request: GetBlockTemplateRequest,
@@ -1401,6 +1423,7 @@ pub mod tests {
     use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
     use crate::protocol::consensus::transaction::Transaction;
     use crate::protocol::consensus::transaction::TransactionProof;
+    use crate::state::mempool::mempool_event::AddReason;
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::mining::block_proposal::BlockProposal;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
@@ -1867,7 +1890,7 @@ pub mod tests {
                 .state
                 .lock_guard_mut()
                 .await
-                .mempool_insert(tx.clone(), UpgradePriority::Irrelevant)
+                .mempool_insert(tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
                 .await;
         }
 

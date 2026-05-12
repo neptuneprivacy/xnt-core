@@ -18,6 +18,7 @@ use crate::application::json_rpc::core::model::wallet::transaction::RpcTransacti
 
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::mempool::mempool_event::MempoolEventBatch;
 
 use crate::api::export::BlockHeight;
 
@@ -443,6 +444,18 @@ pub struct GetTransactionProofRequest {
 #[serde(rename_all = "camelCase")]
 pub struct GetTransactionProofResponse {
     pub proof: Option<RpcTransactionProof>,
+}
+
+#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMempoolEventsRequest {
+    pub since_height: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMempoolEventsResponse {
+    pub events: Vec<MempoolEventBatch>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
