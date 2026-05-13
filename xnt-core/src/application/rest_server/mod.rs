@@ -443,26 +443,36 @@ async fn get_mempool(
 
 async fn get_mempool_events(
     State(rpcstate): State<NeptuneRPCServer>,
-    Query(params): Query<HashMap<String, u64>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<ErasedJson, RestError> {
     let global_state = rpcstate.state.lock_guard().await;
-    let since_height = params.get("since_height").copied();
 
-    let events: Vec<_> = global_state
-        .mempool
-        .event_log()
-        .iter()
-        .filter(|entry| {
-            since_height.map_or(true, |h| {
-                entry
-                    .block_height
-                    .map_or(true, |bh| u64::from(bh) > h)
-            })
-        })
-        .cloned()
-        .collect();
+    let from_height = params.get("from_height").and_then(|v| v.parse().ok());
+    let to_height = params.get("to_height").and_then(|v| v.parse().ok());
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50usize);
+    let page = params
+        .get("page")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0usize);
+    let canonical_commitment = params.get("canonical_commitment").cloned();
 
-    Ok(ErasedJson::pretty(events))
+    let (events, total) = global_state.mempool.query_events(
+        from_height,
+        to_height,
+        canonical_commitment.as_deref(),
+        limit,
+        page,
+    );
+
+    Ok(ErasedJson::pretty(serde_json::json!({
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "events": events,
+    })))
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]

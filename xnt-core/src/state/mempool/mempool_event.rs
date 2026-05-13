@@ -7,13 +7,14 @@ use tasm_lib::prelude::Digest;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
+use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 
 /// Reason why a transaction was removed from the mempool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemovalReason {
-    /// Conflicting transaction was confirmed in a block (double spend)
-    DoubleSpend,
+    /// Transaction removed due to new block being mined
+    Merged,
 
     /// ProofCollection from peer with no primitive witness — cannot update
     StaleNoUpdate,
@@ -163,10 +164,12 @@ impl MempoolEventBatch {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MempoolEventInfo {
     Add {
+        txid: TransactionKernelId,
         kernel: TransactionKernel,
         reason: AddReason,
     },
     Remove {
+        txid: TransactionKernelId,
         kernel: TransactionKernel,
         reason: RemovalReason,
     },
@@ -176,10 +179,12 @@ impl From<&MempoolEvent> for MempoolEventInfo {
     fn from(event: &MempoolEvent) -> Self {
         match event {
             MempoolEvent::AddTx(kernel, reason) => MempoolEventInfo::Add {
+                txid: kernel.txid(),
                 kernel: kernel.clone(),
                 reason: *reason,
             },
             MempoolEvent::RemoveTx(kernel, reason) => MempoolEventInfo::Remove {
+                txid: kernel.txid(),
                 kernel: kernel.clone(),
                 reason: *reason,
             },

@@ -446,15 +446,27 @@ pub struct GetTransactionProofResponse {
     pub proof: Option<RpcTransactionProof>,
 }
 
-#[derive(Clone, Debug, Serialize_tuple, Deserialize_tuple)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMempoolEventsRequest {
-    pub since_height: Option<u64>,
+    #[serde(default)]
+    pub from_height: Option<u64>,
+    #[serde(default)]
+    pub to_height: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub canonical_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMempoolEventsResponse {
+    pub total: usize,
+    pub page: usize,
+    pub limit: usize,
     pub events: Vec<MempoolEventBatch>,
 }
 

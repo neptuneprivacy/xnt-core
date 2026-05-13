@@ -383,13 +383,6 @@ pub trait RpcApi: Sync + Send {
         request: SubmitTransactionRequest,
     ) -> RpcResult<SubmitTransactionResponse>;
 
-    async fn get_mempool_events(
-        &self,
-        since_height: Option<u64>,
-    ) -> RpcResult<GetMempoolEventsResponse> {
-        self.get_mempool_events_call(GetMempoolEventsRequest { since_height })
-            .await
-    }
     async fn get_mempool_events_call(
         &self,
         request: GetMempoolEventsRequest,

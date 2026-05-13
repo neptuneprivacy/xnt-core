@@ -830,6 +830,77 @@ impl Mempool {
         &self.event_log
     }
 
+    /// Query event log with filters and pagination.
+    pub fn query_events(
+        &self,
+        from_height: Option<u64>,
+        to_height: Option<u64>,
+        canonical_commitment: Option<&str>,
+        limit: usize,
+        page: usize,
+    ) -> (Vec<MempoolEventBatch>, usize) {
+        // Parse commitment hex once upfront
+        let commitment_digest = canonical_commitment
+            .and_then(|hex| tasm_lib::prelude::Digest::try_from_hex(hex).ok());
+
+        let filtered: Vec<MempoolEventBatch> = self
+            .event_log
+            .iter()
+            .filter(|batch| {
+                if let Some(from) = from_height {
+                    if !batch.block_height.map_or(true, |bh| u64::from(bh) >= from) {
+                        return false;
+                    }
+                }
+                if let Some(to) = to_height {
+                    if !batch.block_height.map_or(true, |bh| u64::from(bh) <= to) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .filter_map(|batch| {
+                if let Some(digest) = commitment_digest {
+                    let filtered_events: Vec<_> = batch
+                        .events
+                        .iter()
+                        .filter(|event| {
+                            let kernel = match event {
+                                MempoolEventInfo::Add { kernel, .. } => kernel,
+                                MempoolEventInfo::Remove { kernel, .. } => kernel,
+                            };
+                            kernel
+                                .outputs
+                                .iter()
+                                .any(|o| o.canonical_commitment == digest)
+                                || kernel.inputs.iter().any(|i| {
+                                    tasm_lib::prelude::Tip5::hash(&i.absolute_indices) == digest
+                                })
+                        })
+                        .cloned()
+                        .collect();
+                    if filtered_events.is_empty() {
+                        None
+                    } else {
+                        Some(MempoolEventBatch {
+                            block_height: batch.block_height,
+                            block_digest: batch.block_digest,
+                            events: filtered_events,
+                        })
+                    }
+                } else {
+                    Some(batch.clone())
+                }
+            })
+            .collect();
+
+        let total = filtered.len();
+        let start = page.saturating_mul(limit);
+        let paged = filtered.into_iter().skip(start).take(limit).collect();
+
+        (paged, total)
+    }
+
     /// Push an event batch to the log, evicting old entries if needed.
     fn push_event_batch(&mut self, batch: MempoolEventBatch) {
         self.event_log.push_back(batch);
@@ -1039,7 +1110,7 @@ impl Mempool {
 
         // Remove the transactions that become invalid with this block
         {
-            let removed = self.retain(still_valid, RemovalReason::DoubleSpend);
+            let removed = self.retain(still_valid, RemovalReason::Merged);
             events.extend(removed);
         }
 

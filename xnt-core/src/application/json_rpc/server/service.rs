@@ -684,21 +684,23 @@ impl RpcApi for RpcServer {
         request: GetMempoolEventsRequest,
     ) -> RpcResult<GetMempoolEventsResponse> {
         let state = self.state.lock_guard().await;
-        let since_height = request.since_height;
+        let limit = request.limit.unwrap_or(50);
+        let page = request.page.unwrap_or(0);
 
-        let events = state
-            .mempool
-            .event_log()
-            .iter()
-            .filter(|entry| {
-                since_height.map_or(true, |h| {
-                    entry.block_height.map_or(true, |bh| u64::from(bh) > h)
-                })
-            })
-            .cloned()
-            .collect();
+        let (events, total) = state.mempool.query_events(
+            request.from_height,
+            request.to_height,
+            request.canonical_commitment.as_deref(),
+            limit,
+            page,
+        );
 
-        Ok(GetMempoolEventsResponse { events })
+        Ok(GetMempoolEventsResponse {
+            total,
+            page,
+            limit,
+            events,
+        })
     }
 
     async fn get_block_template_call(
