@@ -467,12 +467,20 @@ async fn get_mempool_events(
         page,
     );
 
-    Ok(ErasedJson::pretty(serde_json::json!({
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "events": events,
-    })))
+    #[derive(Serialize)]
+    struct Response {
+        total: usize,
+        page: usize,
+        limit: usize,
+        events: Vec<crate::state::mempool::mempool_event::MempoolEventBatch>,
+    }
+
+    Ok(ErasedJson::pretty(Response {
+        total,
+        page,
+        limit,
+        events,
+    }))
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
