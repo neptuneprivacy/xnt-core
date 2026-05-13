@@ -459,6 +459,8 @@ pub struct GetMempoolEventsRequest {
     pub page: Option<usize>,
     #[serde(default)]
     pub canonical_commitment: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

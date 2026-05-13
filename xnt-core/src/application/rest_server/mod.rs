@@ -458,11 +458,13 @@ async fn get_mempool_events(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0usize);
     let canonical_commitment = params.get("canonical_commitment").cloned();
+    let reason = params.get("reason").cloned();
 
     let (events, total) = global_state.mempool.query_events(
         from_height,
         to_height,
         canonical_commitment.as_deref(),
+        reason.as_deref(),
         limit,
         page,
     );

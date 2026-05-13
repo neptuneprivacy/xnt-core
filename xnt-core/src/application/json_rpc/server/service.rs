@@ -691,6 +691,7 @@ impl RpcApi for RpcServer {
             request.from_height,
             request.to_height,
             request.canonical_commitment.as_deref(),
+            request.reason.as_deref(),
             limit,
             page,
         );
