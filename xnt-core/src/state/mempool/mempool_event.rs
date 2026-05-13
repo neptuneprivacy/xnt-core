@@ -124,36 +124,18 @@ impl MempoolEvent {
     }
 }
 
-/// A batch of mempool events, optionally triggered by a specific block.
+/// A batch of mempool events at a specific chain height.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolEventBatch {
-    /// The block that triggered these events, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_height: Option<BlockHeight>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_digest: Option<Digest>,
+    /// The chain height when these events occurred.
+    pub block_height: BlockHeight,
     pub events: Vec<MempoolEventInfo>,
 }
 
 impl MempoolEventBatch {
-    /// Create a batch triggered by a block.
-    pub fn from_block(
-        block_height: BlockHeight,
-        block_digest: Digest,
-        events: Vec<MempoolEventInfo>,
-    ) -> Self {
+    pub fn new(block_height: BlockHeight, events: Vec<MempoolEventInfo>) -> Self {
         Self {
-            block_height: Some(block_height),
-            block_digest: Some(block_digest),
-            events,
-        }
-    }
-
-    /// Create a batch not tied to any block.
-    pub fn standalone(events: Vec<MempoolEventInfo>) -> Self {
-        Self {
-            block_height: None,
-            block_digest: None,
+            block_height,
             events,
         }
     }

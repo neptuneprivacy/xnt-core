@@ -54,6 +54,7 @@ use tracing::warn;
 
 use crate::api::export::NeptuneProof;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
+use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
@@ -847,13 +848,14 @@ impl Mempool {
             .event_log
             .iter()
             .filter(|batch| {
+                let h = u64::from(batch.block_height);
                 if let Some(from) = from_height {
-                    if !batch.block_height.map_or(true, |bh| u64::from(bh) >= from) {
+                    if h < from {
                         return false;
                     }
                 }
                 if let Some(to) = to_height {
-                    if !batch.block_height.map_or(true, |bh| u64::from(bh) <= to) {
+                    if h > to {
                         return false;
                     }
                 }
@@ -884,7 +886,6 @@ impl Mempool {
                     } else {
                         Some(MempoolEventBatch {
                             block_height: batch.block_height,
-                            block_digest: batch.block_digest,
                             events: filtered_events,
                         })
                     }
@@ -909,12 +910,17 @@ impl Mempool {
         }
     }
 
-    /// Log mempool events not tied to a block.
-    pub(super) fn log_events(&mut self, events: &[MempoolEvent]) {
+    /// Log mempool events at the current tip height.
+    pub(super) fn log_events(
+        &mut self,
+        events: &[MempoolEvent],
+        tip_height: BlockHeight,
+    ) {
         if events.is_empty() {
             return;
         }
-        let batch = MempoolEventBatch::standalone(
+        let batch = MempoolEventBatch::new(
+            tip_height,
             events.iter().map(MempoolEventInfo::from).collect(),
         );
         self.push_event_batch(batch);
@@ -1233,9 +1239,8 @@ impl Mempool {
 
         // Store events for this block
         if !events.is_empty() {
-            let batch = MempoolEventBatch::from_block(
+            let batch = MempoolEventBatch::new(
                 new_block.header().height,
-                new_block.hash(),
                 events.iter().map(MempoolEventInfo::from).collect(),
             );
             self.push_event_batch(batch);

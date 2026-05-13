@@ -2355,17 +2355,19 @@ impl GlobalState {
 
     /// Remove one transaction from the mempool and notify wallet of changes.
     pub(crate) async fn mempool_remove(&mut self, transaction_id: TransactionKernelId) {
+        let tip_height = self.chain.light_state().header().height;
         let event = self.mempool.remove(transaction_id);
         if let Some(ref e) = event {
-            self.mempool.log_events(&[e.clone()]);
+            self.mempool.log_events(&[e.clone()], tip_height);
         }
         self.wallet_state.handle_mempool_events(event).await;
     }
 
     /// clears all Tx from mempool and notifies wallet of changes.
     pub async fn mempool_clear(&mut self) {
+        let tip_height = self.chain.light_state().header().height;
         let events = self.mempool.clear();
-        self.mempool.log_events(&events);
+        self.mempool.log_events(&events, tip_height);
         self.wallet_state.handle_mempool_events(events).await
     }
 
@@ -2376,15 +2378,17 @@ impl GlobalState {
         priority: UpgradePriority,
         add_reason: AddReason,
     ) {
+        let tip_height = self.chain.light_state().header().height;
         let events = self.mempool.insert(transaction, priority, add_reason);
-        self.mempool.log_events(&events);
+        self.mempool.log_events(&events, tip_height);
         self.wallet_state.handle_mempool_events(events).await
     }
 
     /// prunes stale tx in mempool and notifies wallet of changes.
     pub async fn mempool_prune_stale_transactions(&mut self) {
+        let tip_height = self.chain.light_state().header().height;
         let events = self.mempool.prune_stale_transactions();
-        self.mempool.log_events(&events);
+        self.mempool.log_events(&events, tip_height);
         self.wallet_state.handle_mempool_events(events).await
     }
 
@@ -2395,10 +2399,11 @@ impl GlobalState {
         transaction_id: TransactionKernelId,
         new_primitive_witness: PrimitiveWitness,
     ) {
+        let tip_height = self.chain.light_state().header().height;
         let events = self
             .mempool
             .update_primitive_witness(transaction_id, new_primitive_witness);
-        self.mempool.log_events(&events);
+        self.mempool.log_events(&events, tip_height);
         self.wallet_state.handle_mempool_events(events).await
     }
 
