@@ -82,7 +82,7 @@ pub const MEMPOOL_TX_THRESHOLD_AGE_IN_SECS: u64 = 72 * 60 * 60;
 
 pub const TRANSACTION_NOTIFICATION_AGE_LIMIT_IN_SECS: u64 = 60 * 60 * 24;
 
-pub const MAX_BLOCK_EVENT_LOG_SIZE: usize = 128;
+pub const MAX_BLOCK_EVENT_LOG_SIZE: usize = 256;
 
 type LookupItem<'a> = (TransactionKernelId, &'a Transaction);
 
