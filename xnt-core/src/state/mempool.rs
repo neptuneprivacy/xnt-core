@@ -82,7 +82,7 @@ pub const MEMPOOL_TX_THRESHOLD_AGE_IN_SECS: u64 = 72 * 60 * 60;
 
 pub const TRANSACTION_NOTIFICATION_AGE_LIMIT_IN_SECS: u64 = 60 * 60 * 24;
 
-pub const MAX_EVENT_LOG_SIZE: usize = 1024;
+pub const MAX_BLOCK_EVENT_LOG_SIZE: usize = 128;
 
 type LookupItem<'a> = (TransactionKernelId, &'a Transaction);
 
@@ -898,7 +898,7 @@ impl Mempool {
     /// Push an event batch to the log, evicting old entries if needed.
     fn push_event_batch(&mut self, batch: MempoolEventBatch) {
         self.event_log.push_back(batch);
-        while self.event_log.len() > MAX_EVENT_LOG_SIZE {
+        while self.event_log.len() > MAX_BLOCK_EVENT_LOG_SIZE {
             self.event_log.pop_front();
         }
     }
