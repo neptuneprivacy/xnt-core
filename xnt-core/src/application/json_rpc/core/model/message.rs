@@ -19,7 +19,10 @@ use crate::application::json_rpc::core::model::wallet::transaction::RpcTransacti
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_event::MempoolEventBatch;
+use crate::state::mempool::mempool_event::MempoolEventInfo;
+use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
@@ -449,20 +452,13 @@ pub struct GetTransactionProofResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMempoolEventsRequest {
-    #[serde(default)]
     pub from_height: Option<BlockHeight>,
-    #[serde(default)]
     pub to_height: Option<BlockHeight>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub page: Option<usize>,
-    #[serde(default)]
     pub commitment: Option<Digest>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
     pub txid: Option<TransactionKernelId>,
+    pub reason: Option<String>,
+    pub limit: Option<usize>,
+    pub page: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -471,7 +467,55 @@ pub struct GetMempoolEventsResponse {
     pub total: usize,
     pub page: usize,
     pub limit: usize,
-    pub events: Vec<MempoolEventBatch>,
+    pub events: Vec<RpcMempoolEventBatch>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcMempoolEventBatch {
+    pub block_height: BlockHeight,
+    pub events: Vec<RpcMempoolEventInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RpcMempoolEventInfo {
+    Add {
+        txid: RpcTransactionKernelId,
+        kernel: RpcTransactionKernel,
+        reason: AddReason,
+    },
+    Remove {
+        txid: RpcTransactionKernelId,
+        kernel: RpcTransactionKernel,
+        reason: RemovalReason,
+    },
+}
+
+impl From<&MempoolEventBatch> for RpcMempoolEventBatch {
+    fn from(batch: &MempoolEventBatch) -> Self {
+        Self {
+            block_height: batch.block_height,
+            events: batch.events.iter().map(RpcMempoolEventInfo::from).collect(),
+        }
+    }
+}
+
+impl From<&MempoolEventInfo> for RpcMempoolEventInfo {
+    fn from(event: &MempoolEventInfo) -> Self {
+        match event {
+            MempoolEventInfo::Add { txid, kernel, reason } => RpcMempoolEventInfo::Add {
+                txid: (*txid).into(),
+                kernel: RpcTransactionKernel::from(kernel),
+                reason: *reason,
+            },
+            MempoolEventInfo::Remove { txid, kernel, reason } => RpcMempoolEventInfo::Remove {
+                txid: (*txid).into(),
+                kernel: RpcTransactionKernel::from(kernel),
+                reason: *reason,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

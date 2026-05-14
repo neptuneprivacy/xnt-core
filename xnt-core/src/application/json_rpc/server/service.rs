@@ -701,7 +701,7 @@ impl RpcApi for RpcServer {
             total,
             page,
             limit,
-            events,
+            events: events.iter().map(RpcMempoolEventBatch::from).collect(),
         })
     }
 
