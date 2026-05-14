@@ -447,24 +447,23 @@ async fn get_mempool_events(
 ) -> Result<ErasedJson, RestError> {
     let global_state = rpcstate.state.lock_guard().await;
 
-    let from_height = params.get("from_height").and_then(|v| v.parse().ok());
-    let to_height = params.get("to_height").and_then(|v| v.parse().ok());
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50usize);
-    let page = params
-        .get("page")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0usize);
-    let canonical_commitment = params.get("canonical_commitment").cloned();
+    use crate::protocol::consensus::block::block_height::BlockHeight;
+    use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
+
+    let from_height: Option<BlockHeight> = params.get("from_height").and_then(|v| v.parse::<u64>().ok()).map(BlockHeight::from);
+    let to_height: Option<BlockHeight> = params.get("to_height").and_then(|v| v.parse::<u64>().ok()).map(BlockHeight::from);
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50usize);
+    let page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    let commitment = params.get("commitment").and_then(|v| Digest::try_from_hex(v).ok());
     let reason = params.get("reason").cloned();
+    let txid: Option<TransactionKernelId> = params.get("txid").and_then(|v| v.parse().ok());
 
     let (events, total) = global_state.mempool.query_events(
         from_height,
         to_height,
-        canonical_commitment.as_deref(),
+        commitment,
         reason.as_deref(),
+        txid,
         limit,
         page,
     );

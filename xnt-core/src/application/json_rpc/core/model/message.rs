@@ -16,11 +16,11 @@ use crate::application::json_rpc::core::model::wallet::mutator_set::*;
 use crate::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
 use crate::application::json_rpc::core::model::wallet::transaction::RpcTransactionProof;
 
+use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::MempoolEventBatch;
-
-use crate::api::export::BlockHeight;
+use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
 #[serde(rename_all = "camelCase")]
@@ -450,17 +450,19 @@ pub struct GetTransactionProofResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GetMempoolEventsRequest {
     #[serde(default)]
-    pub from_height: Option<u64>,
+    pub from_height: Option<BlockHeight>,
     #[serde(default)]
-    pub to_height: Option<u64>,
+    pub to_height: Option<BlockHeight>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
     pub page: Option<usize>,
     #[serde(default)]
-    pub canonical_commitment: Option<String>,
+    pub commitment: Option<Digest>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub txid: Option<TransactionKernelId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

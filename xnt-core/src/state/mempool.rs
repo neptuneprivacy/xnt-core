@@ -834,77 +834,45 @@ impl Mempool {
     /// Query event log with filters and pagination.
     pub fn query_events(
         &self,
-        from_height: Option<u64>,
-        to_height: Option<u64>,
-        canonical_commitment: Option<&str>,
+        from_height: Option<BlockHeight>,
+        to_height: Option<BlockHeight>,
+        commitment: Option<Digest>,
         reason: Option<&str>,
+        txid: Option<TransactionKernelId>,
         limit: usize,
         page: usize,
     ) -> (Vec<MempoolEventBatch>, usize) {
-        let commitment_digest = canonical_commitment
-            .and_then(|hex| tasm_lib::prelude::Digest::try_from_hex(hex).ok());
-
-        let has_event_filter = commitment_digest.is_some() || reason.is_some();
-
         let filtered: Vec<MempoolEventBatch> = self
             .event_log
             .iter()
             .filter(|batch| {
-                let h = u64::from(batch.block_height);
-                if let Some(from) = from_height {
-                    if h < from {
-                        return false;
-                    }
-                }
-                if let Some(to) = to_height {
-                    if h > to {
-                        return false;
-                    }
-                }
-                true
+                from_height.map_or(true, |from| batch.block_height >= from)
+                    && to_height.map_or(true, |to| batch.block_height <= to)
             })
             .filter_map(|batch| {
-                if !has_event_filter {
-                    return Some(batch.clone());
-                }
-
                 let filtered_events: Vec<_> = batch
                     .events
                     .iter()
                     .filter(|event| {
-                        if let Some(r) = reason {
-                            let event_reason = match event {
-                                MempoolEventInfo::Add { reason, .. } => {
-                                    serde_json::to_value(reason).ok()
-                                }
-                                MempoolEventInfo::Remove { reason, .. } => {
-                                    serde_json::to_value(reason).ok()
-                                }
-                            };
-                            let matches = event_reason
-                                .and_then(|v| v.as_str().map(|s| s == r))
-                                .unwrap_or(false);
-                            if !matches {
-                                return false;
+                        let (event_txid, kernel, event_reason_str) = match event {
+                            MempoolEventInfo::Add { txid, kernel, reason } => {
+                                (txid, kernel, serde_json::to_value(reason).ok())
                             }
-                        }
-                        if let Some(digest) = commitment_digest {
-                            let kernel = match event {
-                                MempoolEventInfo::Add { kernel, .. } => kernel,
-                                MempoolEventInfo::Remove { kernel, .. } => kernel,
-                            };
-                            let matches_output = kernel
-                                .outputs
-                                .iter()
-                                .any(|o| o.canonical_commitment == digest);
-                            let matches_input = kernel.inputs.iter().any(|i| {
-                                tasm_lib::prelude::Tip5::hash(&i.absolute_indices) == digest
-                            });
-                            if !matches_output && !matches_input {
-                                return false;
+                            MempoolEventInfo::Remove { txid, kernel, reason } => {
+                                (txid, kernel, serde_json::to_value(reason).ok())
                             }
-                        }
-                        true
+                        };
+
+                        txid.map_or(true, |tid| *event_txid == tid)
+                            && reason.map_or(true, |r| {
+                                event_reason_str
+                                    .as_ref()
+                                    .and_then(|v| v.as_str())
+                                    .map_or(false, |s| s == r)
+                            })
+                            && commitment.map_or(true, |digest| {
+                                kernel.outputs.iter().any(|o| o.canonical_commitment == digest)
+                            })
                     })
                     .cloned()
                     .collect();

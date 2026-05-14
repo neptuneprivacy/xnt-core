@@ -690,8 +690,9 @@ impl RpcApi for RpcServer {
         let (events, total) = state.mempool.query_events(
             request.from_height,
             request.to_height,
-            request.canonical_commitment.as_deref(),
+            request.commitment,
             request.reason.as_deref(),
+            request.txid,
             limit,
             page,
         );
