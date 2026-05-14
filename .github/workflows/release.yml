@@ -134,6 +134,11 @@ jobs:
         if: "runner.os == 'Windows'"
         run: "echo \"RUSTFLAGS=$Env:RUSTFLAGS --cfg tokio_unstable\" >> $Env:GITHUB_ENV"
         shell: "pwsh"
+      - name: "Set clang as C/C++ compiler (Linux)"
+        if: "runner.os == 'Linux'"
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
       - uses: swatinem/rust-cache@v2
         with:
           key: ${{ join(matrix.targets, '-') }}

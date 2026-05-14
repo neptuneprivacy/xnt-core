@@ -11,3 +11,11 @@
   shell: pwsh
   run: echo "RUSTFLAGS=$Env:RUSTFLAGS --cfg tokio_unstable" >> $Env:GITHUB_ENV
 
+# Use clang on Linux to avoid gcc rejecting -Wthread-safety (clang-only)
+# in leveldb-sys's cmake build
+- name: Set clang as C/C++ compiler (Linux)
+  if: runner.os == 'Linux'
+  run: |
+    echo "CC=clang" >> "$GITHUB_ENV"
+    echo "CXX=clang++" >> "$GITHUB_ENV"
+
