@@ -52,6 +52,7 @@ use crate::protocol::consensus::transaction::validity::proof_collection::ProofCo
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::peer::transfer_transaction::TransferTransaction;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
+use crate::application::json_rpc::core::model::message::RpcMempoolEventBatch;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
@@ -473,14 +474,14 @@ async fn get_mempool_events(
         total: usize,
         page: usize,
         limit: usize,
-        events: Vec<crate::state::mempool::mempool_event::MempoolEventBatch>,
+        events: Vec<RpcMempoolEventBatch>,
     }
 
     Ok(ErasedJson::pretty(Response {
         total,
         page,
         limit,
-        events,
+        events: events.iter().map(RpcMempoolEventBatch::from).collect(),
     }))
 }
 
