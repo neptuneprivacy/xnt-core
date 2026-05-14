@@ -1207,7 +1207,7 @@ impl Mempool {
             }
 
             if !keep_in_mempool {
-                kick_outs.push((*tx_id, RemovalReason::StaleNoUpdate));
+                kick_outs.push((*tx_id, RemovalReason::Abandoned));
                 if !tx.upgrade_priority.is_irrelevant() {
                     warn!("Unable to update own transaction to new mutator set. You may need to create this transaction again. Removing {tx_id} from mempool.");
                 }

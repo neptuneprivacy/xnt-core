@@ -17,7 +17,7 @@ pub enum RemovalReason {
     Merged,
 
     /// ProofCollection from peer with no primitive witness — cannot update
-    StaleNoUpdate,
+    Abandoned,
 
     /// Transaction had empty inputs
     EmptyInputs,
