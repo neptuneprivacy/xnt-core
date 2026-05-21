@@ -1028,6 +1028,7 @@ pub(crate) mod tests {
     use crate::protocol::proof_abstractions::mast_hash::MastHash;
     use crate::protocol::proof_abstractions::timestamp::Timestamp;
     use crate::protocol::proof_abstractions::verifier::verify;
+    use crate::state::mempool::mempool_event::AddReason;
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::mining::mining_status::MiningStatus;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
@@ -1254,7 +1255,7 @@ pub(crate) mod tests {
         alice
             .lock_guard_mut()
             .await
-            .mempool_insert(tx_from_alice.clone(), UpgradePriority::Irrelevant)
+            .mempool_insert(tx_from_alice.clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
             .await;
 
         // Update state with block that does not include mempool-transaction
@@ -1408,7 +1409,7 @@ pub(crate) mod tests {
             {
                 let mut alice_gsm = alice.lock_guard_mut().await;
                 alice_gsm
-                    .mempool_insert(tx_from_alice.clone(), UpgradePriority::Critical)
+                    .mempool_insert(tx_from_alice.clone(), UpgradePriority::Critical, AddReason::Submitted)
                     .await;
                 assert_eq!(1, alice_gsm.mempool.len());
             }

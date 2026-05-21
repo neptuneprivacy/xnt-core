@@ -2068,6 +2068,7 @@ mod tests {
     use crate::protocol::peer::peer_block_notifications::PeerBlockNotification;
     use crate::protocol::peer::transaction_notification::TransactionNotification;
     use crate::protocol::peer::Sanction;
+    use crate::state::mempool::mempool_event::AddReason;
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
     use crate::state::transaction::tx_proving_capability::TxProvingCapability;
@@ -3868,7 +3869,7 @@ mod tests {
                     state_lock
                         .lock_guard_mut()
                         .await
-                        .mempool_insert(dummy_tx.clone(), UpgradePriority::Irrelevant)
+                        .mempool_insert(dummy_tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
                         .await;
                 }
 
@@ -4055,7 +4056,7 @@ mod tests {
             state_lock
                 .lock_guard_mut()
                 .await
-                .mempool_insert(transaction_1.clone(), UpgradePriority::Irrelevant)
+                .mempool_insert(transaction_1.clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
                 .await;
             assert!(
                 !state_lock.lock_guard().await.mempool.is_empty(),
@@ -4152,7 +4153,7 @@ mod tests {
                 state_lock
                     .lock_guard_mut()
                     .await
-                    .mempool_insert(tx_synced_to_genesis, UpgradePriority::Irrelevant)
+                    .mempool_insert(tx_synced_to_genesis, UpgradePriority::Irrelevant, AddReason::Submitted)
                     .await;
 
                 // Mempool should now contain the unsynced transaction. Tip is block 1.
@@ -4601,7 +4602,7 @@ mod tests {
                 alice
                     .lock_guard_mut()
                     .await
-                    .mempool_insert((*own_tx).to_owned(), UpgradePriority::Irrelevant)
+                    .mempool_insert((*own_tx).to_owned(), UpgradePriority::Irrelevant, AddReason::Submitted)
                     .await;
 
                 let tx_notification: TransactionNotification = new_tx.try_into().unwrap();

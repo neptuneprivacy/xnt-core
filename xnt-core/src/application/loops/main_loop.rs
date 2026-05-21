@@ -60,6 +60,7 @@ use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::peer::PeerSynchronizationState;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::mempool_update_job_result::MempoolUpdateJobResult;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
@@ -607,7 +608,7 @@ impl MainLoopHandler {
                                 .await;
                         }
                         state
-                            .mempool_insert(*new_transaction.to_owned(), UpgradePriority::Critical)
+                            .mempool_insert(*new_transaction.to_owned(), UpgradePriority::Critical, AddReason::Updated)
                             .await;
                     }
                 }
@@ -1031,6 +1032,7 @@ impl MainLoopHandler {
                         .mempool_insert(
                             pt2m_transaction.transaction.to_owned(),
                             UpgradePriority::Irrelevant,
+                            AddReason::FromPeer,
                         )
                         .await;
                 }
@@ -2077,7 +2079,7 @@ impl MainLoopHandler {
                     let mut state = self.global_state_lock.lock_guard_mut().await;
 
                     state
-                        .mempool_insert(*transaction, UpgradePriority::Critical)
+                        .mempool_insert(*transaction, UpgradePriority::Critical, AddReason::Submitted)
                         .await;
                 }
 
@@ -2343,9 +2345,9 @@ mod tests {
                 let tx = genesis_tx_with_proof_type(tx_proving_capability, network, fee).await;
                 let update_jobs = {
                     let mut gsl = main_loop_handler.global_state_lock.lock_guard_mut().await;
-                    gsl.mempool_insert(pw_tx.into(), UpgradePriority::Critical)
+                    gsl.mempool_insert(pw_tx.into(), UpgradePriority::Critical, AddReason::Submitted)
                         .await;
-                    gsl.mempool_insert(tx.clone().into(), UpgradePriority::Critical)
+                    gsl.mempool_insert(tx.clone().into(), UpgradePriority::Critical, AddReason::Submitted)
                         .await;
                     gsl.set_new_tip(block1.clone()).await.unwrap()
                 };
@@ -2646,7 +2648,7 @@ mod tests {
                 .global_state_lock
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*proof_collection_tx).clone(), UpgradePriority::Irrelevant)
+                .mempool_insert((*proof_collection_tx).clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
                 .await;
             assert!(
                 main_loop_handler

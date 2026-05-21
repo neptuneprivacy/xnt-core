@@ -383,6 +383,11 @@ pub trait RpcApi: Sync + Send {
         request: SubmitTransactionRequest,
     ) -> RpcResult<SubmitTransactionResponse>;
 
+    async fn get_mempool_events_call(
+        &self,
+        request: GetMempoolEventsRequest,
+    ) -> RpcResult<GetMempoolEventsResponse>;
+
     /* Wallet */
 
     async fn generate_address(&self) -> RpcResult<GenerateAddressResponse> {

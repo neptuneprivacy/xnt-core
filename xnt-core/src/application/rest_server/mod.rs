@@ -52,6 +52,8 @@ use crate::protocol::consensus::transaction::validity::proof_collection::ProofCo
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::peer::transfer_transaction::TransferTransaction;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
+use crate::application::json_rpc::core::model::message::RpcMempoolEventBatch;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::expected_utxo::UtxoNotifier;
@@ -238,6 +240,10 @@ pub(crate) async fn run_rpc_server(
             .route(
                 "/rpc/mempool/{start_index}/{number}",
                 axum::routing::get(get_mempool),
+            )
+            .route(
+                "/rpc/mempool/events",
+                axum::routing::get(get_mempool_events),
             )
             .route(
                 "/rpc/blocks_time/{start}/{end}",
@@ -434,6 +440,49 @@ async fn get_mempool(
         .collect_vec();
 
     Ok(ErasedJson::pretty(mempool_transactions))
+}
+
+async fn get_mempool_events(
+    State(rpcstate): State<NeptuneRPCServer>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<ErasedJson, RestError> {
+    let global_state = rpcstate.state.lock_guard().await;
+
+    use crate::protocol::consensus::block::block_height::BlockHeight;
+    use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
+
+    let from_height: Option<BlockHeight> = params.get("from_height").and_then(|v| v.parse::<u64>().ok()).map(BlockHeight::from);
+    let to_height: Option<BlockHeight> = params.get("to_height").and_then(|v| v.parse::<u64>().ok()).map(BlockHeight::from);
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50usize);
+    let page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    let commitment = params.get("commitment").and_then(|v| Digest::try_from_hex(v).ok());
+    let reason = params.get("reason").cloned();
+    let txid: Option<TransactionKernelId> = params.get("txid").and_then(|v| v.parse().ok());
+
+    let (events, total) = global_state.mempool.query_events(
+        from_height,
+        to_height,
+        commitment,
+        reason.as_deref(),
+        txid,
+        limit,
+        page,
+    );
+
+    #[derive(Serialize)]
+    struct Response {
+        total: usize,
+        page: usize,
+        limit: usize,
+        events: Vec<RpcMempoolEventBatch>,
+    }
+
+    Ok(ErasedJson::pretty(Response {
+        total,
+        page,
+        limit,
+        events: events.iter().map(RpcMempoolEventBatch::from).collect(),
+    }))
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -671,7 +720,7 @@ async fn broadcast_transaction(
     info!("broadcasted insert tx: {}", tx.kernel.txid().to_string());
 
     state
-        .mempool_insert(tx.clone(), UpgradePriority::Critical)
+        .mempool_insert(tx.clone(), UpgradePriority::Critical, AddReason::Submitted)
         .await;
     let _ = rpcstate
         .rpc_server_to_main_tx

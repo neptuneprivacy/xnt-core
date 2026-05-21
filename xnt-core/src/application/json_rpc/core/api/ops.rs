@@ -127,6 +127,9 @@ pub enum RpcMethods {
     #[namespace(Namespace::Mempool)]
     SubmitTransaction,
 
+    #[namespace(Namespace::Mempool)]
+    GetMempoolEvents,
+
     #[namespace(Namespace::Wallet)]
     GenerateAddress,
 

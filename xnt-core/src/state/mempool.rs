@@ -20,6 +20,7 @@ pub mod upgrade_priority;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use bytesize::ByteSize;
 use get_size2::GetSize;
@@ -53,6 +54,7 @@ use tracing::warn;
 
 use crate::api::export::NeptuneProof;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
+use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
@@ -63,6 +65,10 @@ use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::transfer_transaction::TransactionProofQuality;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::MempoolEvent;
+use crate::state::mempool::mempool_event::AddReason;
+use crate::state::mempool::mempool_event::MempoolEventBatch;
+use crate::state::mempool::mempool_event::MempoolEventInfo;
+use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::merge_input_cache::MergeInputCache;
 use crate::state::mempool::merge_input_cache::MergeInputCacheElement;
@@ -75,6 +81,8 @@ use crate::state::transaction::tx_proving_capability::TxProvingCapability;
 pub const MEMPOOL_TX_THRESHOLD_AGE_IN_SECS: u64 = 72 * 60 * 60;
 
 pub const TRANSACTION_NOTIFICATION_AGE_LIMIT_IN_SECS: u64 = 60 * 60 * 24;
+
+pub const MAX_BLOCK_EVENT_LOG_SIZE: usize = 256;
 
 type LookupItem<'a> = (TransactionKernelId, &'a Transaction);
 
@@ -186,6 +194,10 @@ pub struct Mempool {
     /// "unconflicted" again. This list can only grow when [`Self::insert`] is
     /// called and can shrink when [`Self::update_with_block`] is called.
     merge_input_cache: MergeInputCache,
+
+    /// Recent mempool events. Keeps last N batches in memory only.
+    #[get_size(ignore)]
+    event_log: VecDeque<MempoolEventBatch>,
 }
 
 /// note that all methods that modify state and result in a MempoolEvent
@@ -221,6 +233,7 @@ impl Mempool {
             tip_mutator_set_hash,
             tx_proving_capability,
             merge_input_cache,
+            event_log: VecDeque::new(),
         }
     }
 
@@ -553,6 +566,7 @@ impl Mempool {
         &mut self,
         new_tx: Transaction,
         priority: UpgradePriority,
+        add_reason: AddReason,
     ) -> Vec<MempoolEvent> {
         fn new_tx_has_higher_proof_quality_than_conflicts(
             new_tx: &Transaction,
@@ -651,10 +665,12 @@ impl Mempool {
             let should_replace_conflict = new_tx_has_higher_proof_quality || better_fee_density;
             if should_replace_conflict {
                 for (conflicting_txid, single_proof) in conflicts {
-                    let e = self.remove(conflicting_txid).unwrap_or_else(|| {
-                        panic!("Reported conflict {conflicting_txid} must exist")
-                    });
-                    let MempoolEvent::RemoveTx(removed) = &e else {
+                    let e = self
+                        .remove_with_reason(conflicting_txid, RemovalReason::Replaced)
+                        .unwrap_or_else(|| {
+                            panic!("Reported conflict {conflicting_txid} must exist")
+                        });
+                    let MempoolEvent::RemoveTx(removed, _) = &e else {
                         panic!("remove must return remove event");
                     };
 
@@ -697,9 +713,15 @@ impl Mempool {
         // existed, add the implied removal to events list.
         self.fee_densities
             .push(txid, new_tx.transaction.fee_density());
-        events.push(MempoolEvent::AddTx(new_tx.transaction.kernel.clone()));
+        events.push(MempoolEvent::AddTx(
+            new_tx.transaction.kernel.clone(),
+            add_reason,
+        ));
         if let Some(removed) = self.tx_dictionary.insert(txid, new_tx) {
-            events.push(MempoolEvent::RemoveTx(removed.transaction.kernel));
+            events.push(MempoolEvent::RemoveTx(
+                removed.transaction.kernel,
+                RemovalReason::Updated,
+            ));
         }
 
         if !priority.is_irrelevant() {
@@ -735,13 +757,24 @@ impl Mempool {
     /// remove a transaction from the `Mempool`
     ///
     /// Does nothing if the transaction cannot be found in the mempool.
-    pub(super) fn remove(&mut self, transaction_id: TransactionKernelId) -> Option<MempoolEvent> {
+    pub(super) fn remove_with_reason(
+        &mut self,
+        transaction_id: TransactionKernelId,
+        reason: RemovalReason,
+    ) -> Option<MempoolEvent> {
         self.tx_dictionary.remove(&transaction_id).map(|tx| {
             self.fee_densities.remove(&transaction_id);
             self.upgrade_priorities.remove(&transaction_id);
             debug_assert_eq!(self.tx_dictionary.len(), self.fee_densities.len());
-            MempoolEvent::RemoveTx(tx.transaction.kernel)
+            MempoolEvent::RemoveTx(tx.transaction.kernel, reason)
         })
+    }
+
+    /// remove a transaction from the `Mempool` with [`RemovalReason::Explicit`]
+    ///
+    /// Does nothing if the transaction cannot be found in the mempool.
+    pub(super) fn remove(&mut self, transaction_id: TransactionKernelId) -> Option<MempoolEvent> {
+        self.remove_with_reason(transaction_id, RemovalReason::Explicit)
     }
 
     /// Update the primitive witness of a transaction already in the mempool.
@@ -764,7 +797,7 @@ impl Mempool {
             // All transactions where the primitive witness is known are
             // considered critical, because knowing the primitive witness
             // implies that the transaction originated from this node.
-            self.insert(new_primitive_witness.into(), UpgradePriority::Critical)
+            self.insert(new_primitive_witness.into(), UpgradePriority::Critical, AddReason::Updated)
         }
     }
 
@@ -777,16 +810,113 @@ impl Mempool {
     ///
     /// If the mem usage ever becomes a problem we could accept a closure
     /// to handle the events individually as each Tx is removed.
-    pub(super) fn clear(&mut self) -> Vec<MempoolEvent> {
+    pub(super) fn clear_with_reason(&mut self, reason: RemovalReason) -> Vec<MempoolEvent> {
         // note: this causes event listeners to be notified of each removed tx.
         self.merge_input_cache.clear();
-        self.retain(|_| false)
+        self.retain(|_| false, reason)
+    }
+
+    pub(super) fn clear(&mut self) -> Vec<MempoolEvent> {
+        self.clear_with_reason(RemovalReason::Explicit)
     }
 
     /// Return the number of transactions currently stored in the Mempool.
     /// Computes in O(1)
     pub fn len(&self) -> usize {
         self.tx_dictionary.len()
+    }
+
+    /// Return recent mempool event batches.
+    pub fn event_log(&self) -> &VecDeque<MempoolEventBatch> {
+        &self.event_log
+    }
+
+    /// Query event log with filters and pagination.
+    pub fn query_events(
+        &self,
+        from_height: Option<BlockHeight>,
+        to_height: Option<BlockHeight>,
+        commitment: Option<Digest>,
+        reason: Option<&str>,
+        txid: Option<TransactionKernelId>,
+        limit: usize,
+        page: usize,
+    ) -> (Vec<MempoolEventBatch>, usize) {
+        let filtered: Vec<MempoolEventBatch> = self
+            .event_log
+            .iter()
+            .filter(|batch| {
+                from_height.map_or(true, |from| batch.block_height >= from)
+                    && to_height.map_or(true, |to| batch.block_height <= to)
+            })
+            .filter_map(|batch| {
+                let filtered_events: Vec<_> = batch
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        let (event_txid, kernel, event_reason_str) = match event {
+                            MempoolEventInfo::Add { txid, kernel, reason } => {
+                                (txid, kernel, serde_json::to_value(reason).ok())
+                            }
+                            MempoolEventInfo::Remove { txid, kernel, reason } => {
+                                (txid, kernel, serde_json::to_value(reason).ok())
+                            }
+                        };
+
+                        txid.map_or(true, |tid| *event_txid == tid)
+                            && reason.map_or(true, |r| {
+                                event_reason_str
+                                    .as_ref()
+                                    .and_then(|v| v.as_str())
+                                    .map_or(false, |s| s == r)
+                            })
+                            && commitment.map_or(true, |digest| {
+                                kernel.outputs.iter().any(|o| o.canonical_commitment == digest)
+                            })
+                    })
+                    .cloned()
+                    .collect();
+
+                if filtered_events.is_empty() {
+                    None
+                } else {
+                    Some(MempoolEventBatch {
+                        block_height: batch.block_height,
+                        events: filtered_events,
+                    })
+                }
+            })
+            .collect();
+
+        let total = filtered.len();
+        let start = page.saturating_mul(limit);
+        let paged = filtered.into_iter().skip(start).take(limit).collect();
+
+        (paged, total)
+    }
+
+    /// Push an event batch to the log, evicting old entries if needed.
+    fn push_event_batch(&mut self, batch: MempoolEventBatch) {
+        self.event_log.push_back(batch);
+        while self.event_log.len() > MAX_BLOCK_EVENT_LOG_SIZE {
+            self.event_log.pop_front();
+        }
+    }
+
+    /// Log mempool events at the current tip height.
+    pub(super) fn log_events(
+        &mut self,
+        events: &[MempoolEvent],
+        tip_height: BlockHeight,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        let batch = MempoolEventBatch::new(
+            tip_height,
+            events.iter().map(MempoolEventInfo::from).collect(),
+        );
+        self.push_event_batch(batch);
     }
 
     /// Return the number of transaction stored in the mempool that are deemed
@@ -863,7 +993,8 @@ impl Mempool {
 
                 debug_assert_eq!(self.tx_dictionary.len(), self.fee_densities.len());
 
-                let event = MempoolEvent::RemoveTx(tx.transaction.kernel);
+                let event =
+                    MempoolEvent::RemoveTx(tx.transaction.kernel, RemovalReason::MempoolFull);
 
                 return Some((event, fee_density));
             }
@@ -876,7 +1007,11 @@ impl Mempool {
     /// Modelled after [HashMap::retain](std::collections::HashMap::retain())
     ///
     /// Computes in O(capacity) >= O(N)
-    fn retain<F>(&mut self, mut predicate: F) -> Vec<MempoolEvent>
+    fn retain<F>(
+        &mut self,
+        mut predicate: F,
+        reason: RemovalReason,
+    ) -> Vec<MempoolEvent>
     where
         F: FnMut(LookupItem) -> bool,
     {
@@ -891,7 +1026,7 @@ impl Mempool {
 
         let mut events = Vec::with_capacity(victims.len());
         for t in victims {
-            if let Some(e) = self.remove(t) {
+            if let Some(e) = self.remove_with_reason(t, reason) {
                 events.push(e);
             }
         }
@@ -901,6 +1036,7 @@ impl Mempool {
 
         events
     }
+
 
     /// Remove transactions from mempool that are older than the specified
     /// timestamp. Prunes base on the transaction's timestamp.
@@ -913,7 +1049,7 @@ impl Mempool {
             cutoff < transaction.kernel.timestamp
         };
 
-        self.retain(keep)
+        self.retain(keep, RemovalReason::Pruned)
     }
 
     /// Remove from the mempool all transactions that become invalid because
@@ -939,7 +1075,7 @@ impl Mempool {
         let mut events: Vec<_> = vec![];
         let previous_block_digest = new_block.header().prev_block_digest;
         if self.tip_digest != previous_block_digest {
-            let removed = self.clear();
+            let removed = self.clear_with_reason(RemovalReason::Orphaned);
             events.extend(removed);
         }
 
@@ -973,7 +1109,7 @@ impl Mempool {
 
         // Remove the transactions that become invalid with this block
         {
-            let removed = self.retain(still_valid);
+            let removed = self.retain(still_valid, RemovalReason::Merged);
             events.extend(removed);
         }
 
@@ -994,18 +1130,19 @@ impl Mempool {
                 kernel: tx_kernel,
                 proof: TransactionProof::SingleProof(single_proof),
             };
-            let inserted = self.insert(restored_tx, upgrade_priority);
+            let inserted = self.insert(restored_tx, upgrade_priority, AddReason::Restored);
             events.extend(inserted);
         }
 
         // Build a list of jobs to update critical transactions to the mutator
         // set of the new block.
         let mut update_jobs = vec![];
-        let mut kick_outs = Vec::with_capacity(self.tx_dictionary.len());
+        let mut kick_outs: Vec<(TransactionKernelId, RemovalReason)> =
+            Vec::with_capacity(self.tx_dictionary.len());
         for (tx_id, tx) in &self.tx_dictionary {
             if tx.transaction.kernel.inputs.is_empty() {
                 debug!("Not updating transaction since empty transactions cannot be updated.");
-                kick_outs.push(*tx_id);
+                kick_outs.push((*tx_id, RemovalReason::EmptyInputs));
                 continue;
             }
 
@@ -1070,16 +1207,17 @@ impl Mempool {
             }
 
             if !keep_in_mempool {
-                kick_outs.push(*tx_id);
+                kick_outs.push((*tx_id, RemovalReason::Abandoned));
                 if !tx.upgrade_priority.is_irrelevant() {
                     warn!("Unable to update own transaction to new mutator set. You may need to create this transaction again. Removing {tx_id} from mempool.");
                 }
             }
         }
 
-        {
-            let removed = self.retain(|(tx_id, _)| !kick_outs.contains(&tx_id));
-            events.extend(removed);
+        for (tx_id, reason) in kick_outs {
+            if let Some(e) = self.remove_with_reason(tx_id, reason) {
+                events.push(e);
+            }
         }
 
         {
@@ -1091,6 +1229,15 @@ impl Mempool {
         self.set_sync_labels(new_block)?;
 
         let events = MempoolEvent::normalize(events);
+
+        // Store events for this block
+        if !events.is_empty() {
+            let batch = MempoolEventBatch::new(
+                new_block.header().height,
+                events.iter().map(MempoolEventInfo::from).collect(),
+            );
+            self.push_event_batch(batch);
+        }
 
         Ok((events, update_jobs))
     }
@@ -1266,7 +1413,7 @@ mod tests {
         let transaction_digests = txs.iter().map(|tx| tx.kernel.txid()).collect_vec();
         assert!(!mempool.contains(transaction_digests[0]));
         assert!(!mempool.contains(transaction_digests[1]));
-        mempool.insert(txs[0].clone(), UpgradePriority::Irrelevant);
+        mempool.insert(txs[0].clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
         assert!(mempool.contains(transaction_digests[0]));
         assert!(!mempool.contains(transaction_digests[1]));
 
@@ -1277,7 +1424,7 @@ mod tests {
 
         let remove_event = mempool.remove(transaction_digests[0]);
         assert_eq!(
-            Some(MempoolEvent::RemoveTx(txs[0].kernel.clone())),
+            Some(MempoolEvent::RemoveTx(txs[0].kernel.clone(), RemovalReason::Explicit)),
             remove_event
         );
         for tx_id in &transaction_digests {
@@ -1313,7 +1460,7 @@ mod tests {
             tx.kernel = TransactionKernelModifier::default()
                 .mutator_set_hash(mutator_set_hash)
                 .modify(tx.kernel);
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
 
         assert_eq!(transactions_count, mempool.len());
@@ -1421,7 +1568,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            mempool.insert(new_tx, upgrade_priority);
+            mempool.insert(new_tx, upgrade_priority, AddReason::Submitted);
         }
     }
 
@@ -1676,7 +1823,7 @@ mod tests {
         );
 
         let tx_by_bob_txid = tx_by_bob.kernel.txid();
-        mempool.insert(tx_by_bob.into(), UpgradePriority::Irrelevant);
+        mempool.insert(tx_by_bob.into(), UpgradePriority::Irrelevant, AddReason::Submitted);
         assert_eq!(
             mempool
                 .preferred_proof_collection(bob.cli.max_num_proofs, TxUpgradeFilter::match_all())
@@ -1743,7 +1890,7 @@ mod tests {
             let mut txs = make_plenty_mock_transaction_supported_by_invalid_single_proofs(i);
 
             for tx in txs.clone() {
-                mempool.insert(tx, UpgradePriority::Irrelevant);
+                mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
             }
 
             let max_total_tx_size = 1_000_000_000;
@@ -1761,7 +1908,7 @@ mod tests {
                 tx.kernel = TransactionKernelModifier::default()
                     .mutator_set_hash(mutator_set_hash)
                     .modify(tx.kernel.clone());
-                mempool.insert(tx.to_owned(), UpgradePriority::Irrelevant);
+                mempool.insert(tx.to_owned(), UpgradePriority::Irrelevant, AddReason::Submitted);
             }
             assert_eq!(
                 i,
@@ -1793,13 +1940,13 @@ mod tests {
         let old_txs = make_mock_txs_with_primitive_witness_with_timestamp(6, eight_days_ago);
 
         for tx in old_txs {
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
 
         let new_txs = make_mock_txs_with_primitive_witness_with_timestamp(5, now);
 
         for tx in new_txs {
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
 
         assert_eq!(mempool.len(), 11);
@@ -1901,7 +2048,7 @@ mod tests {
 
         // Add this transaction to a mempool
         let mut mempool = Mempool::new(ByteSize::gb(1), TxProvingCapability::SingleProof, &block_1);
-        mempool.insert(tx_by_bob.clone(), UpgradePriority::Irrelevant);
+        mempool.insert(tx_by_bob.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
 
         // Create another transaction that's valid to be included in block 2, but isn't actually
         // included by the miner. This transaction is inserted into the mempool, but since it's
@@ -1931,7 +2078,7 @@ mod tests {
             .await
             .unwrap()
             .transaction;
-        mempool.insert(tx_from_alice_original.into(), UpgradePriority::Critical);
+        mempool.insert(tx_from_alice_original.into(), UpgradePriority::Critical, AddReason::Submitted);
 
         {
             // Verify that `most_dense_single_proof_pair` returns expected value
@@ -2074,8 +2221,8 @@ mod tests {
         );
 
         let (((left, right), merged), _) = merge_tx_triplet(consensus_rule_set).await;
-        mempool.insert(left.clone(), UpgradePriority::Irrelevant);
-        mempool.insert(right.clone(), UpgradePriority::Irrelevant);
+        mempool.insert(left.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+        mempool.insert(right.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
         assert_eq!(2, mempool.len());
 
         // mock that tip's mutator set hash matches that of transactions
@@ -2095,7 +2242,7 @@ mod tests {
                 .to_vec()
         );
 
-        mempool.insert(merged.clone(), UpgradePriority::Irrelevant);
+        mempool.insert(merged.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
         assert_eq!(1, mempool.len());
         assert_eq!(&merged, mempool.get(merged.kernel.txid()).unwrap());
 
@@ -2159,7 +2306,7 @@ mod tests {
                 ),
                 "must accept transaction as it hasn't been inserted yet"
             );
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
         for tx in middle.clone() {
             assert!(
@@ -2170,7 +2317,7 @@ mod tests {
                 ),
                 "must accept transaction as it hasn't been inserted yet"
             );
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
 
         let final_txid = final_tx.txid();
@@ -2182,7 +2329,7 @@ mod tests {
             ),
             "must accept transaction as it hasn't been inserted yet"
         );
-        mempool.insert(final_tx.clone(), UpgradePriority::Irrelevant);
+        mempool.insert(final_tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
         assert!(mempool.contains(final_txid));
         assert_eq!(1, mempool.len());
 
@@ -2196,7 +2343,7 @@ mod tests {
                 ),
                 "may not accept transaction as all have already been inserted"
             );
-            let events = mempool.insert(tx, UpgradePriority::Irrelevant);
+            let events = mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
             assert_eq!(0, events.len());
             assert!(mempool.contains(final_txid));
             assert_eq!(1, mempool.len());
@@ -2210,7 +2357,7 @@ mod tests {
                 ),
                 "may not accept transaction as all have already been inserted"
             );
-            let events = mempool.insert(tx.clone(), UpgradePriority::Irrelevant);
+            let events = mempool.insert(tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert_eq!(0, events.len());
             assert!(mempool.contains(final_txid));
             assert_eq!(1, mempool.len());
@@ -2224,7 +2371,7 @@ mod tests {
             ),
             "may not accept transaction as all have already been inserted"
         );
-        let events = mempool.insert(final_tx, UpgradePriority::Irrelevant);
+        let events = mempool.insert(final_tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         assert_eq!(0, events.len());
         assert!(mempool.contains(final_txid));
         assert_eq!(1, mempool.len());
@@ -2249,9 +2396,9 @@ mod tests {
         let mut mempool =
             Mempool::new(ByteSize::gb(1), TxProvingCapability::SingleProof, &block_1a);
         let (((a, b), c), _) = merge_tx_triplet(consensus_rule_set).await;
-        mempool.insert(a.clone(), UpgradePriority::Irrelevant);
-        mempool.insert(b.clone(), UpgradePriority::Irrelevant);
-        mempool.insert(c.clone(), UpgradePriority::Irrelevant);
+        mempool.insert(a.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+        mempool.insert(b.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+        mempool.insert(c.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
 
         assert!(
             !mempool.is_empty(),
@@ -2339,7 +2486,7 @@ mod tests {
             .lock_guard_mut()
             .await
             .mempool
-            .insert(never_mined_tx.into(), UpgradePriority::Irrelevant);
+            .insert(never_mined_tx.into(), UpgradePriority::Irrelevant, AddReason::Submitted);
 
         // Add some blocks. The transaction must stay in the mempool, since it
         // is not being mined.
@@ -2500,7 +2647,7 @@ mod tests {
         .transaction;
         {
             let mempool = &mut preminer.lock_guard_mut().await.mempool;
-            let events = mempool.insert(tx_low_fee.clone().into(), UpgradePriority::Irrelevant);
+            let events = mempool.insert(tx_low_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert_eq!(1, events.len());
             assert_eq!(1, MempoolEvent::num_adds(&events));
             assert_eq!(1, mempool.len());
@@ -2518,7 +2665,7 @@ mod tests {
         .transaction;
         {
             let mempool = &mut preminer.lock_guard_mut().await.mempool;
-            let events = mempool.insert(tx_high_fee.clone().into(), UpgradePriority::Irrelevant);
+            let events = mempool.insert(tx_high_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert_eq!(2, events.len());
             assert_eq!(1, MempoolEvent::num_removes(&events));
             assert_eq!(1, MempoolEvent::num_adds(&events));
@@ -2540,7 +2687,7 @@ mod tests {
             .await
             .transaction;
             let mempool = &mut preminer.lock_guard_mut().await.mempool;
-            let events = mempool.insert(tx_medium_fee.clone().into(), UpgradePriority::Irrelevant);
+            let events = mempool.insert(tx_medium_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert!(events.is_empty());
             assert_eq!(1, mempool.len());
             assert_eq!(
@@ -2574,7 +2721,7 @@ mod tests {
             tx.kernel = TransactionKernelModifier::default()
                 .mutator_set_hash(mutator_set_hash)
                 .modify(tx.kernel);
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
 
         assert!(!mempool.is_empty());
@@ -2598,7 +2745,7 @@ mod tests {
         for tx in txs {
             let txid = tx.txid();
             assert!(!mempool.contains(txid));
-            let events = mempool.insert(tx, UpgradePriority::Irrelevant);
+            let events = mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
             assert_eq!(1, events.len());
             assert!(mempool.contains(txid));
         }
@@ -2629,7 +2776,7 @@ mod tests {
             &genesis_block,
         );
         for tx in txs.clone() {
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
             println!("mempool len: {}", mempool.len());
             println!("mempool size: {}", mempool.get_size());
         }
@@ -2665,12 +2812,12 @@ mod tests {
         txs.sort_unstable_by_key(|x| x.fee_density());
         let mut all_events = vec![];
         for tx in txs {
-            all_events.extend(mempool.insert(tx, UpgradePriority::Critical));
+            all_events.extend(mempool.insert(tx, UpgradePriority::Critical, AddReason::Submitted));
         }
 
         let removal_events = all_events
             .into_iter()
-            .filter(|x| matches!(x, MempoolEvent::RemoveTx(_)))
+            .filter(|x| matches!(x, MempoolEvent::RemoveTx(..)))
             .collect_vec();
         let num_removal_events = removal_events.len();
         assert_ne!(
@@ -2745,9 +2892,9 @@ mod tests {
             );
             mempool.tip_digest = block1.header().prev_block_digest;
 
-            mempool.insert(a.clone(), UpgradePriority::Irrelevant);
-            mempool.insert(b.clone(), UpgradePriority::Irrelevant);
-            mempool.insert(c.clone(), UpgradePriority::Irrelevant);
+            mempool.insert(a.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+            mempool.insert(b.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+            mempool.insert(c.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert!(!mempool.contains(a.txid()));
             assert!(!mempool.contains(b.txid()));
             assert!(mempool.contains(c.txid()));
@@ -2781,9 +2928,9 @@ mod tests {
             );
             mempool.tip_digest = block1.header().prev_block_digest;
 
-            mempool.insert(a.clone(), UpgradePriority::Irrelevant);
-            mempool.insert(b.clone(), UpgradePriority::Irrelevant);
-            mempool.insert(c.clone(), UpgradePriority::Irrelevant);
+            mempool.insert(a.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+            mempool.insert(b.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+            mempool.insert(c.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert!(!mempool.contains(a.txid()));
             assert!(!mempool.contains(b.txid()));
             assert!(mempool.contains(c.txid()));
@@ -2825,7 +2972,7 @@ mod tests {
             mempool.tip_digest = block_bottom.header().prev_block_digest;
 
             for tx in &bottom {
-                let events = mempool.insert(tx.clone(), UpgradePriority::Irrelevant);
+                let events = mempool.insert(tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
                 assert_eq!(1, events.len());
                 assert_eq!(1, MempoolEvent::num_adds(&events));
             }
@@ -2833,7 +2980,7 @@ mod tests {
             assert_eq!(0, mempool.merge_input_cache.len());
 
             for tx in [&left, &right] {
-                let events = mempool.insert(tx.clone(), UpgradePriority::Irrelevant);
+                let events = mempool.insert(tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
                 assert_eq!(3, events.len());
                 assert_eq!(1, MempoolEvent::num_adds(&events));
                 assert_eq!(2, MempoolEvent::num_removes(&events));
@@ -2841,7 +2988,7 @@ mod tests {
             assert_eq!(2, mempool.len());
             assert_eq!(4, mempool.merge_input_cache.len());
 
-            let events = mempool.insert(final_tx.clone(), UpgradePriority::Irrelevant);
+            let events = mempool.insert(final_tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert_eq!(3, events.len());
             assert_eq!(1, MempoolEvent::num_adds(&events));
             assert_eq!(2, MempoolEvent::num_removes(&events));
@@ -2910,11 +3057,11 @@ mod tests {
                 let pw_tx =
                     genesis_tx_with_proof_type(TxProvingCapability::PrimitiveWitness, network, fee)
                         .await;
-                mempool.insert(pw_tx.into(), UpgradePriority::Critical);
+                mempool.insert(pw_tx.into(), UpgradePriority::Critical, AddReason::Submitted);
                 let tx = genesis_tx_with_proof_type(tx_proving_capability, network, fee).await;
                 let txid = tx.txid();
 
-                mempool.insert(tx.into(), UpgradePriority::Critical);
+                mempool.insert(tx.into(), UpgradePriority::Critical, AddReason::Submitted);
 
                 let (_, update_jobs) = mempool.update_with_block(&block1).unwrap();
                 assert_eq!(1, update_jobs.len(), "Must return 1 job for MS-updating");
@@ -2970,7 +3117,7 @@ mod tests {
 
             // Insert synced transaction into mempool, verify no transaction
             // is returned.
-            mempool.insert(sp_tx.into(), UpgradePriority::Irrelevant);
+            mempool.insert(sp_tx.into(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert!(mempool
                 .preferred_update(TxUpgradeFilter::match_all())
                 .is_none());
@@ -3027,8 +3174,8 @@ mod tests {
                 TxProvingCapability::SingleProof,
                 &Block::genesis(Network::Main),
             );
-            mempool.insert(tx_a.clone(), upgrade_priority_a);
-            mempool.insert(tx_b.clone(), upgrade_priority_b);
+            mempool.insert(tx_a.clone(), upgrade_priority_a, AddReason::Submitted);
+            mempool.insert(tx_b.clone(), upgrade_priority_b, AddReason::Submitted);
 
             // All transactions in the mempool should be considered unsynced at
             // this point, so a transaction will be returned from below call.
@@ -3062,7 +3209,7 @@ mod tests {
                 &Block::genesis(Network::Main),
             );
             mempool.tip_mutator_set_hash = tx.kernel.mutator_set_hash;
-            mempool.insert(tx, UpgradePriority::Irrelevant);
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
 
             let accept_all = TxUpgradeFilter::match_all();
             let accept_first_third = TxUpgradeFilter::from_str("3:0").unwrap();
@@ -3115,12 +3262,12 @@ mod tests {
 
             let genesis_block = Block::genesis(network);
             let mut mempool = setup_mock_mempool(0, &genesis_block);
-            mempool.insert(pw_tx.into(), UpgradePriority::Critical);
+            mempool.insert(pw_tx.into(), UpgradePriority::Critical, AddReason::Submitted);
 
             let pc_tx =
                 genesis_tx_with_proof_type(TxProvingCapability::ProofCollection, network, fee)
                     .await;
-            mempool.insert(pc_tx.into(), UpgradePriority::Critical);
+            mempool.insert(pc_tx.into(), UpgradePriority::Critical, AddReason::Submitted);
             assert_eq!(
                 1,
                 mempool.len(),
@@ -3134,7 +3281,7 @@ mod tests {
 
             let sp_tx =
                 genesis_tx_with_proof_type(TxProvingCapability::SingleProof, network, fee).await;
-            mempool.insert(sp_tx.into(), UpgradePriority::Critical);
+            mempool.insert(sp_tx.into(), UpgradePriority::Critical, AddReason::Submitted);
             assert_eq!(
                 1,
                 mempool.len(),
@@ -3160,7 +3307,7 @@ mod tests {
             .await;
             let genesis_block = Block::genesis(network);
             let mut mempool = setup_mock_mempool(0, &genesis_block);
-            mempool.insert(pw_high_fee.into(), UpgradePriority::Critical);
+            mempool.insert(pw_high_fee.into(), UpgradePriority::Critical, AddReason::Submitted);
             assert!(mempool.len().is_one(), "One tx after insertion");
 
             let low_fee = NativeCurrencyAmount::coins(1);
@@ -3168,7 +3315,7 @@ mod tests {
                 genesis_tx_with_proof_type(TxProvingCapability::SingleProof, network, low_fee)
                     .await;
             let txid = sp_low_fee.kernel.txid();
-            mempool.insert(sp_low_fee.into(), UpgradePriority::Critical);
+            mempool.insert(sp_low_fee.into(), UpgradePriority::Critical, AddReason::Submitted);
             assert!(
                 mempool.len().is_one(),
                 "One tx after 2nd insertion. Because pw-tx was replaced."
@@ -3192,7 +3339,7 @@ mod tests {
             .await;
             let genesis_block = Block::genesis(network);
             let mut mempool = setup_mock_mempool(0, &genesis_block);
-            mempool.insert(pc_high_fee.into(), UpgradePriority::Irrelevant);
+            mempool.insert(pc_high_fee.into(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert!(mempool.len().is_one(), "One tx after insertion");
 
             let low_fee = NativeCurrencyAmount::coins(1);
@@ -3200,7 +3347,7 @@ mod tests {
                 genesis_tx_with_proof_type(TxProvingCapability::SingleProof, network, low_fee)
                     .await;
             let txid = sp_low_fee.kernel.txid();
-            mempool.insert(sp_low_fee.into(), UpgradePriority::Irrelevant);
+            mempool.insert(sp_low_fee.into(), UpgradePriority::Irrelevant, AddReason::Submitted);
             assert!(
                 mempool.len().is_one(),
                 "One tx after 2nd insertion. Because pc-tx was replaced."
@@ -3224,7 +3371,7 @@ mod tests {
             .await;
             let genesis_block = Block::genesis(network);
             let mut mempool = setup_mock_mempool(0, &genesis_block);
-            mempool.insert(pc_high_fee.into(), UpgradePriority::Critical);
+            mempool.insert(pc_high_fee.into(), UpgradePriority::Critical, AddReason::Submitted);
             assert!(mempool.len().is_one(), "One tx after insertion");
 
             let low_fee = NativeCurrencyAmount::coins(1);
@@ -3232,7 +3379,7 @@ mod tests {
                 genesis_tx_with_proof_type(TxProvingCapability::ProofCollection, network, low_fee)
                     .await;
             let txid = sp_low_fee.kernel.txid();
-            mempool.insert(sp_low_fee.into(), UpgradePriority::Critical);
+            mempool.insert(sp_low_fee.into(), UpgradePriority::Critical, AddReason::Submitted);
             assert!(
                 mempool.len().is_one(),
                 "One tx after 2nd insertion. Because pw-tx was replaced."
@@ -3309,7 +3456,7 @@ mod tests {
                 ),
                 "Must return true since tx not known"
             );
-            mempool.insert(original_tx.clone(), upgrade_priority);
+            mempool.insert(original_tx.clone(), upgrade_priority, AddReason::Submitted);
             let in_mempool_start = mempool.get(txid).map(|tx| tx.to_owned()).unwrap();
             prop_assert_eq!(&original_tx, &in_mempool_start);
             prop_assert_ne!(&updated_tx, &in_mempool_start);
@@ -3331,7 +3478,7 @@ mod tests {
                 mempool.len(),
                 "Mempool length must be 1 prior to MS update insertion"
             );
-            let events = mempool.insert(updated_tx.clone(), upgrade_priority);
+            let events = mempool.insert(updated_tx.clone(), upgrade_priority, AddReason::Submitted);
             assert_eq!(
                 1,
                 mempool.len(),
