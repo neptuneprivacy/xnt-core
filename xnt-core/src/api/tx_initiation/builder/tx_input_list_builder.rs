@@ -110,6 +110,15 @@ impl TxInputListBuilder {
     }
 
     /// Build the list of transaction inputs.
+    ///
+    /// When `max_inputs` is set, automatically chooses a strategy based on the
+    /// number of spendable inputs:
+    /// - **≥ 50 inputs** — consolidation: fills slots with the smallest UTXOs
+    ///   and swaps in large ones from the tail as needed to cover the amount.
+    /// - **< 50 inputs** — sliding window: finds the best contiguous window of
+    ///   up to `limit` inputs that covers the spend amount.
+    ///
+    /// When `max_inputs` is `None`, uses a greedy scan with no input cap.
     pub fn build(self) -> Vec<TxInput> {
         let Self {
             mut spendable_inputs,
@@ -117,6 +126,10 @@ impl TxInputListBuilder {
             spend_amount,
             max_inputs,
         } = self;
+
+        if spend_amount.is_zero() {
+            return Vec::new();
+        }
 
         // apply ordering
         match policy {
@@ -140,8 +153,14 @@ impl TxInputListBuilder {
         }
 
         match max_inputs {
-            Some(limit) => Self::select_with_consolidation(spendable_inputs, spend_amount, limit),
-            None => Self::select_without_consolidation(spendable_inputs, spend_amount),
+            Some(limit) => {
+                if spendable_inputs.len() >= 50 {
+                    Self::select_with_consolidation(spendable_inputs, spend_amount, limit)
+                } else {
+                    Self::select_best_window(spendable_inputs, spend_amount, limit)
+                }
+            }
+            None => Self::select_greedy(spendable_inputs, spend_amount),
         }
     }
 
@@ -188,8 +207,38 @@ impl TxInputListBuilder {
         }
     }
 
-    /// Collect inputs in policy order until the spend target is met.
-    fn select_without_consolidation(
+    /// Find the fewest inputs (up to `limit`) that cover the spend amount,
+    /// preferring the tightest fit. Tries sizes 1, 2, 3, ... and for each
+    /// size slides from the small end to find the first (smallest-valued)
+    /// window that covers the target.
+    fn select_best_window(
+        spendable_inputs: Vec<TxInput>,
+        spend_amount: NativeCurrencyAmount,
+        limit: usize,
+    ) -> Vec<TxInput> {
+        let n = spendable_inputs.len();
+        let max_window = limit.min(n);
+
+        for size in 1..=max_window {
+            for start in 0..=(n - size) {
+                let window = &spendable_inputs[start..start + size];
+                let sum = window
+                    .iter()
+                    .fold(NativeCurrencyAmount::zero(), |acc, input| {
+                        acc + input.utxo.get_native_currency_amount()
+                    });
+                if sum >= spend_amount {
+                    return window.to_vec();
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Greedy scan: collect inputs in policy order until the target is met.
+    /// No input count limit.
+    fn select_greedy(
         spendable_inputs: Vec<TxInput>,
         spend_amount: NativeCurrencyAmount,
     ) -> Vec<TxInput> {
@@ -250,9 +299,12 @@ mod tests {
             .collect()
     }
 
+    // --- best_window tests (< 50 inputs, limit=10) ---
+
     #[test]
-    fn consolidation_takes_smalls_and_swaps_in_bigs() {
-        let inputs: Vec<TxInput> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 50, 200]
+    fn best_window_tightest_single_fit() {
+        // target=25, picks [35] (smallest single ≥ 25), not [300]
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
             .into_iter()
             .map(make_input)
             .collect();
@@ -260,20 +312,19 @@ mod tests {
         let result = TxInputListBuilder::new()
             .spendable_inputs(inputs)
             .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
-            .spend_amount(coins(60))
+            .spend_amount(coins(25))
             .max_inputs(Some(10))
             .build();
 
-        let amts = amounts(&result);
-        assert_eq!(result.len(), 10);
-        assert!(amts.contains(&coins(1)));
-        assert!(amts.contains(&coins(2)));
-        assert!(amts.contains(&coins(200)));
+        // size=1: scans 1,2,3,5,8,12,20 all < 25, then [35] ≥ 25 ✓
+        assert_eq!(result.len(), 1);
+        assert_eq!(amounts(&result), vec![coins(35)]);
     }
 
     #[test]
-    fn consolidation_all_smalls_sufficient() {
-        let inputs: Vec<TxInput> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    fn best_window_tightest_single_large_target() {
+        // target=140, picks [150] not [300]
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
             .into_iter()
             .map(make_input)
             .collect();
@@ -281,18 +332,19 @@ mod tests {
         let result = TxInputListBuilder::new()
             .spendable_inputs(inputs)
             .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
-            .spend_amount(coins(20))
+            .spend_amount(coins(140))
             .max_inputs(Some(10))
             .build();
 
-        assert_eq!(result.len(), 10);
-        let expected: Vec<NativeCurrencyAmount> = (1..=10).map(coins).collect();
-        assert_eq!(amounts(&result), expected);
+        // size=1: scans... [150] ≥ 140 ✓
+        assert_eq!(result.len(), 1);
+        assert_eq!(amounts(&result), vec![coins(150)]);
     }
 
     #[test]
-    fn consolidation_single_big_enough() {
-        let inputs: Vec<TxInput> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 200]
+    fn best_window_two_inputs_needed() {
+        // target=350, no single input covers, need 2
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
             .into_iter()
             .map(make_input)
             .collect();
@@ -300,32 +352,132 @@ mod tests {
         let result = TxInputListBuilder::new()
             .spendable_inputs(inputs)
             .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
-            .spend_amount(coins(250))
+            .spend_amount(coins(350))
             .max_inputs(Some(10))
             .build();
 
-        let amts = amounts(&result);
-        assert_eq!(result.len(), 10);
-        assert!(amts.contains(&coins(200)));
-        assert!(amts.contains(&coins(1)));
+        // size=1: max is 300 < 350
+        // size=2: slides... [150,300]=450 ≥ 350 ✓
+        assert_eq!(result.len(), 2);
+        assert_eq!(amounts(&result), vec![coins(150), coins(300)]);
     }
 
     #[test]
-    fn consolidation_impossible_returns_empty() {
-        let inputs: Vec<TxInput> = [1, 1, 1, 1].into_iter().map(make_input).collect();
+    fn best_window_three_inputs_needed() {
+        // target=500, need 3
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
+            .into_iter()
+            .map(make_input)
+            .collect();
 
         let result = TxInputListBuilder::new()
             .spendable_inputs(inputs)
             .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
-            .spend_amount(coins(10))
-            .max_inputs(Some(4))
+            .spend_amount(coins(500))
+            .max_inputs(Some(10))
+            .build();
+
+        // size=2: max pair [150,300]=450 < 500
+        // size=3: slides... [80,150,300]=530 ≥ 500 ✓
+        assert_eq!(result.len(), 3);
+        assert_eq!(amounts(&result), vec![coins(80), coins(150), coins(300)]);
+    }
+
+    #[test]
+    fn best_window_five_inputs_needed() {
+        // target=600, need 5
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
+            .into_iter()
+            .map(make_input)
+            .collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(600))
+            .max_inputs(Some(10))
+            .build();
+
+        // size=4: [50,80,150,300]=580 < 600
+        // size=5: slides... [35,50,80,150,300]=615 ≥ 600 ✓
+        assert_eq!(result.len(), 5);
+        assert_eq!(
+            amounts(&result),
+            vec![coins(35), coins(50), coins(80), coins(150), coins(300)]
+        );
+    }
+
+    #[test]
+    fn best_window_nine_inputs_exact_fit() {
+        // target=660, needs 9 to exactly hit
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
+            .into_iter()
+            .map(make_input)
+            .collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(660))
+            .max_inputs(Some(10))
+            .build();
+
+        // size=9: slides... [5,8,12,20,35,50,80,150,300]=660 ≥ 660 ✓
+        assert_eq!(result.len(), 9);
+        assert_eq!(
+            amounts(&result),
+            vec![
+                coins(5),
+                coins(8),
+                coins(12),
+                coins(20),
+                coins(35),
+                coins(50),
+                coins(80),
+                coins(150),
+                coins(300)
+            ]
+        );
+    }
+
+    #[test]
+    fn best_window_impossible_total_insufficient() {
+        // target=670, total of all 12 = 666 < 670
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
+            .into_iter()
+            .map(make_input)
+            .collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(670))
+            .max_inputs(Some(10))
             .build();
 
         assert!(result.is_empty());
     }
 
     #[test]
-    fn consolidation_limit_larger_than_inputs() {
+    fn best_window_impossible_limit_too_tight() {
+        // target=640, top 3 = 530 < 640, limit=3
+        let inputs: Vec<TxInput> = [1, 2, 3, 5, 8, 12, 20, 35, 50, 80, 150, 300]
+            .into_iter()
+            .map(make_input)
+            .collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(640))
+            .max_inputs(Some(3))
+            .build();
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn best_window_limit_larger_than_inputs() {
         let inputs: Vec<TxInput> = [10, 20, 30].into_iter().map(make_input).collect();
 
         let result = TxInputListBuilder::new()
@@ -335,12 +487,14 @@ mod tests {
             .max_inputs(Some(10))
             .build();
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(amounts(&result), vec![coins(10), coins(20), coins(30)]);
+        // size=1: 30 < 50
+        // size=2: slides... [10,20]=30 < 50, [20,30]=50 ≥ 50 ✓
+        assert_eq!(result.len(), 2);
+        assert_eq!(amounts(&result), vec![coins(20), coins(30)]);
     }
 
     #[test]
-    fn consolidation_empty_inputs() {
+    fn best_window_empty_inputs() {
         let result = TxInputListBuilder::new()
             .spendable_inputs(vec![])
             .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
@@ -352,8 +506,64 @@ mod tests {
     }
 
     #[test]
+    fn best_window_exact_match_prefers_tight() {
+        // target=50, picks [50] exactly, not [80] or [300]
+        let inputs: Vec<TxInput> = [5, 10, 25, 50, 80].into_iter().map(make_input).collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(50))
+            .max_inputs(Some(10))
+            .build();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(amounts(&result), vec![coins(50)]);
+    }
+
+    #[test]
+    fn best_window_all_equal_values() {
+        let inputs: Vec<TxInput> = [10, 10, 10, 10, 10].into_iter().map(make_input).collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(25))
+            .max_inputs(Some(10))
+            .build();
+
+        // size=1: 10 < 25
+        // size=2: 20 < 25
+        // size=3: [10,10,10]=30 ≥ 25 ✓
+        assert_eq!(result.len(), 3);
+        assert_eq!(amounts(&result), vec![coins(10), coins(10), coins(10)]);
+    }
+
+    #[test]
+    fn best_window_tightest_pair() {
+        // target=90, could use [80,150]=230 or just [150]=150
+        // size=1 finds [150] first since it's the smallest single ≥ 90
+        let inputs: Vec<TxInput> = [5, 10, 20, 50, 80, 150, 300]
+            .into_iter()
+            .map(make_input)
+            .collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(90))
+            .max_inputs(Some(10))
+            .build();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(amounts(&result), vec![coins(150)]);
+    }
+
+    // --- consolidation tests (>= 50 inputs) ---
+
+    #[test]
     fn consolidation_many_dust_utxos() {
-        // 100 incremental inputs [1..=100] + 1 big one.
+        // 101 inputs >= 50 → consolidation (small front + big tail)
         let mut inputs: Vec<TxInput> = (1..=100).map(make_input).collect();
         inputs.push(make_input(5000));
 
@@ -372,7 +582,48 @@ mod tests {
     }
 
     #[test]
-    fn without_consolidation_greedy_scan() {
+    fn consolidation_swaps_in_bigs_as_needed() {
+        // 60 inputs >= 50 → consolidation
+        let mut inputs: Vec<TxInput> = (1..=58).map(make_input).collect();
+        inputs.push(make_input(500));
+        inputs.push(make_input(1000));
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(520))
+            .max_inputs(Some(10))
+            .build();
+
+        let amts = amounts(&result);
+        assert_eq!(result.len(), 10);
+        // keeps smallest dust [1..=9] and swaps in 1000
+        assert!(amts.contains(&coins(1)));
+        assert!(amts.contains(&coins(9)));
+        assert!(amts.contains(&coins(1000)));
+    }
+
+    #[test]
+    fn consolidation_all_smalls_sufficient() {
+        // 50 inputs >= 50 → consolidation, but all smalls cover it
+        let inputs: Vec<TxInput> = (1..=50).map(make_input).collect();
+
+        let result = TxInputListBuilder::new()
+            .spendable_inputs(inputs)
+            .policy(InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending))
+            .spend_amount(coins(10))
+            .max_inputs(Some(10))
+            .build();
+
+        assert_eq!(result.len(), 10);
+        let expected: Vec<NativeCurrencyAmount> = (1..=10).map(coins).collect();
+        assert_eq!(amounts(&result), expected);
+    }
+
+    // --- greedy tests (no limit) ---
+
+    #[test]
+    fn greedy_scan_no_limit() {
         let inputs: Vec<TxInput> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
             .into_iter()
             .map(make_input)
