@@ -1114,14 +1114,9 @@ fn test_tx_dctidh_multi() {
 
     let mutator_set = get_mutator_set(&client).expect("mutator set");
     let ts = xnt_timestamp_now();
-    // Network drives the consensus-rule-set inference in prove() (post-fork
-    // => produce_v2). Override via XNT_NETWORK (e.g. "testnet-99").
-    let network: CoreNetwork = match std::env::var("XNT_NETWORK").as_deref() {
-        Ok("testnet") | Ok("testnet-0") => CoreNetwork::Testnet,
-        Ok("testnet-mock") => CoreNetwork::TestnetMock,
-        Ok("regtest") => CoreNetwork::RegTest,
-        _ => CoreNetwork::Main,
-    };
+    // Network drives the consensus-rule-set inference in prove()
+    // (mainnet TimelockExtension => produce_v2).
+    let network = CoreNetwork::Main;
     let built = builder
         .build(&mutator_set, ts, network)
         .expect("build");

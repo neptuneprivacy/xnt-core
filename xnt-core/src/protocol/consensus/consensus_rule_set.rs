@@ -10,19 +10,9 @@ pub const BLOCK_HEIGHT_HARDFORK_XNT_MAIN_NET: BlockHeight =
     BlockHeight::new(BFieldElement::new(15256u64));
 
 /// Height of the 1st block that follows the `TimelockExtension` consensus
-/// ruleset on mainnet. Set to a far-future value as a placeholder; the
-/// operator must update this to the actual activation height before deployment.
+/// ruleset on mainnet.
 pub const BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(u64::MAX));
-
-/// Height of the 1st block that follows the `TimelockExtension` consensus
-/// ruleset on Testnet (any sub-index). Operators can lower this for local
-/// hardfork dry-runs on a single-node testnet.
-///
-/// TEMPORARILY LOWERED to 3 for the SDK digest-filter live-test on testnet-0.
-/// V2 active by ~height 4 so we don't wait 20 blocks. RESTORE before release.
-pub const BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(3u64));
+    BlockHeight::new(BFieldElement::new(52333u64));
 
 
 /// Enumerates all possible sets of consensus rules.
@@ -44,8 +34,7 @@ pub enum ConsensusRuleSet {
     /// The +1 year timelock extension hard fork.
     ///
     /// Activated at [`BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET`] on
-    /// Main and [`BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET`] on
-    /// `Testnet(_)`. Under this ruleset, any coin still tagged with the
+    /// Main (mainnet-only). Under this ruleset, any coin still tagged with the
     /// legacy `TimeLock` hash is governed by `TimeLockV2`, which enforces
     /// `release_date + 1 year < timestamp` instead of the original
     /// `release_date < timestamp`. New post-fork timelock UTXOs use
@@ -86,15 +75,8 @@ impl ConsensusRuleSet {
                     ConsensusRuleSet::TimelockExtension
                 }
             }
-            Network::TestnetMock => ConsensusRuleSet::Xnt,
-            Network::RegTest => ConsensusRuleSet::Xnt,
-            Network::Testnet(_) => {
-                if block_height < BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET {
-                    ConsensusRuleSet::Xnt
-                } else {
-                    ConsensusRuleSet::TimelockExtension
-                }
-            }
+            // The TimelockExtension hard fork is mainnet-only.
+            Network::TestnetMock | Network::RegTest | Network::Testnet(_) => ConsensusRuleSet::Xnt,
         }
     }
 
@@ -379,18 +361,8 @@ pub(crate) mod tests {
         }
     }
 
-    // ============================================================
-    // Phase 7 - TimelockExtension activation boundary tests
-    // ============================================================
-    //
-    // These tests verify only the rule-set selection, not the full block
-    // validation path. End-to-end validation under TimelockExtension is
-    // exercised by the SingleProofV2 / CollectTypeScriptsV2 / TimeLockV2
-    // unit tests in their respective modules.
-
     #[test]
     fn timelock_extension_inactive_on_main_below_activation_height() {
-        // Below the activation height on mainnet -> still Xnt (or Reboot).
         let below = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET
             .previous()
             .expect("activation height should not be genesis");
@@ -414,47 +386,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn timelock_extension_inactive_on_testnet_below_activation_height() {
-        let below = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET
-            .previous()
-            .expect("activation height should not be genesis");
-        let rule_set = ConsensusRuleSet::infer_from(Network::Testnet(0), below);
-        assert_eq!(rule_set, ConsensusRuleSet::Xnt);
-    }
-
-    #[test]
-    fn timelock_extension_active_on_testnet_at_activation_height() {
-        let activation = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET;
-        let rule_set = ConsensusRuleSet::infer_from(Network::Testnet(0), activation);
-        assert_eq!(rule_set, ConsensusRuleSet::TimelockExtension);
-    }
-
-    #[test]
-    fn timelock_extension_active_for_all_testnet_subindices() {
-        // Same activation height applies regardless of Testnet sub-index.
-        let activation = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET;
-        for sub in [0u8, 1, 42, 255] {
-            let rule_set = ConsensusRuleSet::infer_from(Network::Testnet(sub), activation);
+    fn timelock_extension_never_activates_off_mainnet() {
+        // The fork is mainnet-only: Testnet, RegTest and TestnetMock stay on Xnt
+        // regardless of block height.
+        let high = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET;
+        for nw in [
+            Network::Testnet(0),
+            Network::Testnet(255),
+            Network::RegTest,
+            Network::TestnetMock,
+        ] {
             assert_eq!(
-                rule_set,
-                ConsensusRuleSet::TimelockExtension,
-                "Testnet({sub}) should activate TimelockExtension at the testnet activation height"
+                ConsensusRuleSet::infer_from(nw, high),
+                ConsensusRuleSet::Xnt,
+                "{nw:?} must never activate TimelockExtension"
             );
         }
-    }
-
-    #[test]
-    fn timelock_extension_never_activates_on_regtest_or_mock() {
-        // RegTest and TestnetMock stay on Xnt regardless of block height.
-        let high = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_TESTNET;
-        assert_eq!(
-            ConsensusRuleSet::infer_from(Network::RegTest, high),
-            ConsensusRuleSet::Xnt
-        );
-        assert_eq!(
-            ConsensusRuleSet::infer_from(Network::TestnetMock, high),
-            ConsensusRuleSet::Xnt
-        );
     }
 
     #[test]
@@ -470,21 +417,21 @@ pub(crate) mod tests {
         let timelock_v2 = TimeLockV2.hash().to_hex();
         assert_eq!(
             timelock_v2,
-            "ee9480d4ce5819982c30cc4d03f4694bc71ae9bfaedeae10c7042b5d014d9cef144ae34aebe75af9",
+            "ac58ee89b7d8635d29b257a9ab3c34e7dcf54de25f3d43d7d0fa562ee1156803d7cbe98e874d1c16",
             "TimeLockV2 program hash drifted"
         );
 
         let cts_v2 = CollectTypeScriptsV2.hash().to_hex();
         assert_eq!(
             cts_v2,
-            "ca53726dacc48bd91435ee999ff9bf77db28ab422b687706a2a2b8ba196505d40dda8d057e2009e3",
+            "ef4f3158bc49614f2a38c41a5a0179bd8e89a0f0ff940d1180d84d5a3d7fe7bc8d9bcb02845fe491",
             "CollectTypeScriptsV2 program hash drifted"
         );
 
         let sp_v2 = SingleProofV2.hash().to_hex();
         assert_eq!(
             sp_v2,
-            "e2855ffa6f556f0e88af876f5aeed12895e011df5f309affdb984fcfe8325511d1caba0b019682fe",
+            "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b",
             "SingleProofV2 program hash drifted"
         );
     }

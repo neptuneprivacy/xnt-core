@@ -1335,6 +1335,6 @@ pub(crate) mod tests {
         // so SingleProofV2 verifies a CollectTypeScriptsV2 proof instead of
         // a V1 proof. Used by BlockAppendix consensus_claims under
         // ConsensusRuleSet::TimelockExtension.
-        "e2855ffa6f556f0e88af876f5aeed12895e011df5f309affdb984fcfe8325511d1caba0b019682fe"
+        "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b"
     );
 }
