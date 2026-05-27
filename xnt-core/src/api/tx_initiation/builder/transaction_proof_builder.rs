@@ -40,6 +40,8 @@ use crate::protocol::consensus::transaction::validity::single_proof::produce_sin
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof_mock;
 use crate::protocol::consensus::transaction::validity::single_proof::SingleProof;
 use crate::protocol::consensus::transaction::validity::single_proof::SingleProofWitness;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
+use crate::triton_vm::prelude::Program;
 use crate::protocol::consensus::transaction::validity::tasm::single_proof::update_branch::UpdateWitness;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
@@ -274,27 +276,46 @@ impl<'a> TransactionProofBuilder<'a> {
         // note: evaluation order must match order stated in the method doc-comment.
 
         if proof_job_options.job_settings.proof_type.is_single_proof() {
-            #[expect(unused_variables, reason = "anticipate future fork")]
             let consensus_rule_set =
                 consensus_rule_set.ok_or(ProofRequirement::ConsensusRuleSet)?;
+            let is_v2 = matches!(consensus_rule_set, ConsensusRuleSet::TimelockExtension);
 
+            let single_proof_program = if is_v2 {
+                SingleProofV2.program()
+            } else {
+                SingleProof.program()
+            };
             // claim, nondeterminism --> single proof
             if let Some((c, nd)) = claim_and_nondeterminism {
-                return gen_single(c, || nd, job_queue, proof_job_options, valid_mock).await;
+                return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
             }
             // update-witness --> single proof
             else if let Some(w) = update_witness {
+                if is_v2 {
+                    use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
+                    let spw = SingleProofV2Witness::from_update(w.clone());
+                    let c = spw.claim();
+                    let nd = spw.nondeterminism();
+                    return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
+                }
                 let spw = SingleProofWitness::from_update(w.clone());
                 let c = spw.claim();
                 let nd = spw.nondeterminism();
-                return gen_single(c, || nd, job_queue, proof_job_options, valid_mock).await;
+                return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
             }
             // proof-collection --> single proof
             else if let Some(pc) = proof_collection {
+                if is_v2 {
+                    use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
+                    let spw = SingleProofV2Witness::from_collection(pc);
+                    let c = spw.claim();
+                    let nd = spw.nondeterminism();
+                    return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
+                }
                 let spw = SingleProofWitness::from_collection(pc);
                 let c = spw.claim();
                 let nd = spw.nondeterminism();
-                return gen_single(c, || nd, job_queue, proof_job_options, valid_mock).await;
+                return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
             }
         }
 
@@ -324,6 +345,7 @@ impl<'a> TransactionProofBuilder<'a> {
                     job_queue,
                     proof_job_options,
                     valid_mock,
+                    consensus_rule_set,
                 )
                 .await?;
                 Ok(TransactionProof::ProofCollection(pc))
@@ -349,6 +371,7 @@ impl<'a> TransactionProofBuilder<'a> {
 //
 // will generate a mock proof if Network::use_mock_proof() is true.
 async fn gen_single<'a, F>(
+    program: Program,
     claim: Claim,
     nondeterminism: F,
     job_queue: Arc<TritonVmJobQueue>,
@@ -360,7 +383,7 @@ where
 {
     Ok(TransactionProof::SingleProof(
         ProofBuilder::new()
-            .program(SingleProof.program())
+            .program(program)
             .claim(claim)
             .nondeterminism(nondeterminism)
             .job_queue(job_queue)
@@ -384,6 +407,7 @@ async fn proof_collection_from_witness(
     job_queue: Arc<TritonVmJobQueue>,
     proof_job_options: TritonVmProofJobOptions,
     valid_mock: bool,
+    consensus_rule_set: Option<ConsensusRuleSet>,
 ) -> Result<ProofCollection, CreateProofError> {
     let proof_type = TransactionProofType::ProofCollection;
     assert_eq!(proof_type, proof_job_options.job_settings.proof_type);
@@ -403,7 +427,15 @@ async fn proof_collection_from_witness(
         });
     }
 
-    let pc = ProofCollection::produce(witness_cow.borrow(), job_queue, proof_job_options).await?;
+    // Route through produce_v2 when TimelockExtension is active so the
+    // CollectTypeScripts proof inside ProofCollection commits to the V2
+    // program hash. A V1 ProofCollection cannot be merged into a V2 block.
+    let pc = match consensus_rule_set {
+        Some(ConsensusRuleSet::TimelockExtension) => {
+            ProofCollection::produce_v2(witness_cow.borrow(), job_queue, proof_job_options).await?
+        }
+        _ => ProofCollection::produce(witness_cow.borrow(), job_queue, proof_job_options).await?,
+    };
 
     Ok(pc)
 }

@@ -146,9 +146,16 @@ impl TransactionProof {
                 let claim = single_proof_claim(kernel_mast_hash, consensus_rule_set);
                 verify(claim, single_proof.clone(), network).await
             }
-            TransactionProof::ProofCollection(proof_collection) => {
-                proof_collection.verify(kernel_mast_hash, network).await
-            }
+            TransactionProof::ProofCollection(proof_collection) => match consensus_rule_set {
+                ConsensusRuleSet::Reboot
+                | ConsensusRuleSet::HardforkAlpha
+                | ConsensusRuleSet::Xnt => {
+                    proof_collection.verify(kernel_mast_hash, network).await
+                }
+                ConsensusRuleSet::TimelockExtension => {
+                    proof_collection.verify_v2(kernel_mast_hash, network).await
+                }
+            },
         }
     }
 }

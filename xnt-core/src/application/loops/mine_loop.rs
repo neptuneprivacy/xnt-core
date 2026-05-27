@@ -389,7 +389,12 @@ pub(crate) async fn make_coinbase_transaction_stateless(
 
     let kernel = witness.kernel.clone();
 
-    let target_block_height = latest_block.header().height;
+    // The block we are about to *mine* is `latest_block`'s child, so use the
+    // child's height when picking the consensus rule set. Using the parent's
+    // height keeps the rule set frozen at the parent and produces a V1
+    // SingleProof for the first post-fork block, which then fails to verify
+    // against the V2 SingleProof claim that block-validation builds.
+    let target_block_height = latest_block.header().height.next();
     let consensus_rule_set = ConsensusRuleSet::infer_from(network, target_block_height);
     let proof = TransactionProofBuilder::new()
         .consensus_rule_set(consensus_rule_set)

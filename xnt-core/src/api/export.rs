@@ -52,6 +52,7 @@ pub use crate::triton_vm::proof::Claim;
 pub use crate::triton_vm::vm::NonDeterminism;
 pub use crate::util_types::mutator_set::addition_record::AdditionRecord;
 pub use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+pub use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 pub use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 pub use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 pub use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;

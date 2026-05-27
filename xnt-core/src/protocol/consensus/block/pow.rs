@@ -376,6 +376,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
     ) -> GuesserBuffer<MERKLE_TREE_HEIGHT> {
         let bud_prefix = if consensus_rule_set == ConsensusRuleSet::Reboot
             || consensus_rule_set == ConsensusRuleSet::Xnt
+            || consensus_rule_set == ConsensusRuleSet::TimelockExtension
         {
             // Commitment to all the fields in the block that are not pow
             mast_auth_paths.commit()
@@ -458,6 +459,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
 
         if consensus_rule_set != ConsensusRuleSet::Reboot
             && consensus_rule_set != ConsensusRuleSet::Xnt
+            && consensus_rule_set != ConsensusRuleSet::TimelockExtension
         {
             // The index swapping could be done here, or in each guess. Since
             // we're optimizing for fast guessing, the index swapping is done
@@ -526,13 +528,14 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
         let leaf_prefix = match consensus_rule_set {
             ConsensusRuleSet::Reboot => auth_paths.commit(),
             ConsensusRuleSet::HardforkAlpha => parent_digest,
-            ConsensusRuleSet::Xnt => auth_paths.commit(),
+            ConsensusRuleSet::Xnt | ConsensusRuleSet::TimelockExtension => auth_paths.commit(),
         };
         let index_picker_preimage = Tip5::hash_pair(self.root, auth_paths.commit());
         let (index_a, index_b) = Self::indices(index_picker_preimage, self.nonce);
 
         let (leaf_a, leaf_b) = if consensus_rule_set == ConsensusRuleSet::Reboot
             || consensus_rule_set == ConsensusRuleSet::Xnt
+            || consensus_rule_set == ConsensusRuleSet::TimelockExtension
         {
             (
                 Self::leaf(leaf_prefix, index_a),

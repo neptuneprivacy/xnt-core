@@ -95,7 +95,8 @@ impl Network {
     pub fn genesis_difficulty(&self) -> Difficulty {
         match *self {
             Self::RegTest => Difficulty::MINIMUM,
-            Self::Testnet(_) | Self::TestnetMock => Difficulty::new([100_000, 0, 0, 0, 0]),
+            Self::Testnet(_) => Difficulty::MINIMUM,
+            Self::TestnetMock => Difficulty::new([100_000, 0, 0, 0, 0]),
             Self::Main => Difficulty::new([100_000_000, 0, 0, 0, 0]),
         }
     }
@@ -111,7 +112,8 @@ impl Network {
         match *self {
             Self::RegTest => Timestamp::millis(1),
             Self::TestnetMock => Timestamp::millis(100),
-            Self::Main | Self::Testnet(_) => Timestamp::seconds(60),
+            Self::Testnet(_) => Timestamp::seconds(5),
+            Self::Main => Timestamp::seconds(60),
         }
     }
 
@@ -122,7 +124,8 @@ impl Network {
     pub fn target_block_interval(&self) -> Timestamp {
         match *self {
             Self::RegTest => Timestamp::millis(100),
-            Self::Main | Self::Testnet(_) | Self::TestnetMock => Timestamp::millis(300000),
+            Self::Testnet(_) => Timestamp::millis(30000),
+            Self::Main | Self::TestnetMock => Timestamp::millis(300000),
         }
     }
 
