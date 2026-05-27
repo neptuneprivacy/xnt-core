@@ -12,7 +12,7 @@ pub const BLOCK_HEIGHT_HARDFORK_XNT_MAIN_NET: BlockHeight =
 /// Height of the 1st block that follows the `TimelockExtension` consensus
 /// ruleset on mainnet.
 pub const BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(52333u64));
+    BlockHeight::new(BFieldElement::new(52540u64));
 
 
 /// Enumerates all possible sets of consensus rules.
