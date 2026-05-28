@@ -1118,18 +1118,15 @@ impl XntBuiltTransaction {
             .collect()
     }
 
-    /// Prove the transaction (creates ProofCollection)
-    /// WARNING: This is CPU-intensive and requires ~16GB RAM
-    ///
-    /// `tipHeight` is the current chain tip height (from `chain_height`); the
-    /// proof targets the next block, so post-fork txs use the V2 proof path.
+    /// Prove the transaction (creates ProofCollection).
+    /// WARNING: CPU-intensive, requires ~16 GB RAM.
     #[napi]
-    pub fn prove(&self, tip_height: u32) -> Result<XntTransaction> {
+    pub fn prove(&self) -> Result<XntTransaction> {
         let rt = global_tokio_runtime();
 
         rt.block_on(async {
             self.inner
-                .prove(u64::from(tip_height))
+                .prove()
                 .await
                 .map(|tx| XntTransaction { inner: tx })
                 .map_err(|e| Error::from_reason(format!("prove: {e}")))
