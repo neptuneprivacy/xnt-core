@@ -629,8 +629,7 @@ fn test_tx() {
 
     println!("Proving...");
     let start = std::time::Instant::now();
-    let tip = xnt_rpc_chain_height(client).max(0) as u64;
-    let proven = xnt_built_transaction_prove(built, tip);
+    let proven = xnt_built_transaction_prove(built);
     let elapsed = start.elapsed();
     check!(proven, "prove");
 
@@ -955,8 +954,7 @@ fn test_tx_dctidh() {
 
     println!("Proving (mixed tx)...");
     let start = std::time::Instant::now();
-    let tip = xnt_rpc_chain_height(client).max(0) as u64;
-    let proven = xnt_built_transaction_prove(built, tip);
+    let proven = xnt_built_transaction_prove(built);
     let elapsed = start.elapsed();
     check!(proven, "prove");
 
@@ -1149,7 +1147,7 @@ fn test_tx_dctidh_multi() {
     println!("Proving (multi-input tx)...");
     let start = std::time::Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let proven = rt.block_on(built.prove(tip)).expect("prove");
+    let proven = rt.block_on(built.prove()).expect("prove");
     let elapsed = start.elapsed();
     if proven.has_proof_collection() {
         ok!("proven in {:.1}s", elapsed.as_secs_f64());

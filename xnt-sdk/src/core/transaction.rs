@@ -286,7 +286,7 @@ impl TransactionBuilder {
         // Create PrimitiveWitness
         let witness = PrimitiveWitness::from_transaction_details(&details);
 
-        Ok(BuiltTransaction { details, witness, network })
+        Ok(BuiltTransaction { details, witness })
     }
 }
 
@@ -319,7 +319,6 @@ pub struct TxOutputInfo {
 pub struct BuiltTransaction {
     pub(crate) details: TransactionDetails,
     pub(crate) witness: PrimitiveWitness,
-    pub(crate) network: Network,
 }
 
 impl BuiltTransaction {
@@ -390,15 +389,7 @@ impl BuiltTransaction {
     }
 
     /// Prove transaction (creates ProofCollection).
-    ///
-    /// `tip_height` is the current chain tip height (query `chain_height` over
-    /// JSON-RPC). The proof is built for the NEXT block, so the consensus rule
-    /// set is inferred from `tip_height + 1`: post-fork (`TimelockExtension`)
-    /// transactions are proved with `produce_v2` (CollectTypeScriptsV2 + the
-    /// TimeLock->TimeLockV2 remap); pre-fork transactions use `produce`.
-    pub async fn prove(&self, tip_height: u64) -> Result<Transaction> {
-        use neptune_privacy::api::export::BlockHeight;
-        use neptune_privacy::api::export::ConsensusRuleSet;
+    pub async fn prove(&self) -> Result<Transaction> {
         use neptune_privacy::api::export::ProofCollection;
         use neptune_privacy::api::export::TritonVmJobQueue;
         use neptune_privacy::api::export::TritonVmProofJobOptionsBuilder;
@@ -409,17 +400,10 @@ impl BuiltTransaction {
             .proving_capability(TxProvingCapability::ProofCollection)
             .build();
 
-        let next_height = BlockHeight::from(tip_height).next();
-        let consensus_rule_set =
-            ConsensusRuleSet::infer_from(self.network.into(), next_height);
-
-        let proof_collection = match consensus_rule_set {
-            ConsensusRuleSet::TimelockExtension => {
-                ProofCollection::produce_v2(&self.witness, job_queue, options).await
-            }
-            _ => ProofCollection::produce(&self.witness, job_queue, options).await,
-        }
-        .map_err(|e| XntError::TransactionError(format!("proving failed: {e}")))?;
+        let proof_collection =
+            ProofCollection::produce_v2(&self.witness, job_queue, options)
+                .await
+                .map_err(|e| XntError::TransactionError(format!("proving failed: {e}")))?;
 
         let tx = CoreTransaction {
             kernel: self.witness.kernel.clone(),

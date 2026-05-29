@@ -38,8 +38,6 @@ use crate::protocol::consensus::transaction::transaction_proof::TransactionProof
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof;
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof_mock;
-use crate::protocol::consensus::transaction::validity::single_proof::SingleProof;
-use crate::protocol::consensus::transaction::validity::single_proof::SingleProofWitness;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
 use crate::triton_vm::prelude::Program;
 use crate::protocol::consensus::transaction::validity::tasm::single_proof::update_branch::UpdateWitness;
@@ -276,43 +274,24 @@ impl<'a> TransactionProofBuilder<'a> {
         // note: evaluation order must match order stated in the method doc-comment.
 
         if proof_job_options.job_settings.proof_type.is_single_proof() {
-            let consensus_rule_set =
-                consensus_rule_set.ok_or(ProofRequirement::ConsensusRuleSet)?;
-            let is_v2 = matches!(consensus_rule_set, ConsensusRuleSet::TimelockExtension);
+            let _ = consensus_rule_set;
+            use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
+            let single_proof_program = SingleProofV2.program();
 
-            let single_proof_program = if is_v2 {
-                SingleProofV2.program()
-            } else {
-                SingleProof.program()
-            };
             // claim, nondeterminism --> single proof
             if let Some((c, nd)) = claim_and_nondeterminism {
                 return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
             }
             // update-witness --> single proof
             else if let Some(w) = update_witness {
-                if is_v2 {
-                    use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
-                    let spw = SingleProofV2Witness::from_update(w.clone());
-                    let c = spw.claim();
-                    let nd = spw.nondeterminism();
-                    return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
-                }
-                let spw = SingleProofWitness::from_update(w.clone());
+                let spw = SingleProofV2Witness::from_update(w.clone());
                 let c = spw.claim();
                 let nd = spw.nondeterminism();
                 return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
             }
             // proof-collection --> single proof
             else if let Some(pc) = proof_collection {
-                if is_v2 {
-                    use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
-                    let spw = SingleProofV2Witness::from_collection(pc);
-                    let c = spw.claim();
-                    let nd = spw.nondeterminism();
-                    return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
-                }
-                let spw = SingleProofWitness::from_collection(pc);
+                let spw = SingleProofV2Witness::from_collection(pc);
                 let c = spw.claim();
                 let nd = spw.nondeterminism();
                 return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
@@ -427,15 +406,8 @@ async fn proof_collection_from_witness(
         });
     }
 
-    // Route through produce_v2 when TimelockExtension is active so the
-    // CollectTypeScripts proof inside ProofCollection commits to the V2
-    // program hash. A V1 ProofCollection cannot be merged into a V2 block.
-    let pc = match consensus_rule_set {
-        Some(ConsensusRuleSet::TimelockExtension) => {
-            ProofCollection::produce_v2(witness_cow.borrow(), job_queue, proof_job_options).await?
-        }
-        _ => ProofCollection::produce(witness_cow.borrow(), job_queue, proof_job_options).await?,
-    };
+    let _ = consensus_rule_set;
+    let pc = ProofCollection::produce_v2(witness_cow.borrow(), job_queue, proof_job_options).await?;
 
     Ok(pc)
 }

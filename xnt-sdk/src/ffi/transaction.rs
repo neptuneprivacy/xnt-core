@@ -176,7 +176,7 @@ ffi_free!(xnt_built_transaction_free, BuiltTransactionHandle);
 /// Prove the built transaction (creates ProofCollection)
 /// This is a blocking operation that can take significant time and memory
 #[no_mangle]
-pub extern "C" fn xnt_built_transaction_prove(handle: *const BuiltTransactionHandle, tip_height: u64) -> *mut TransactionHandle {
+pub extern "C" fn xnt_built_transaction_prove(handle: *const BuiltTransactionHandle) -> *mut TransactionHandle {
     ffi_begin!();
     check_null!(handle, "null pointer");
 
@@ -184,9 +184,7 @@ pub extern "C" fn xnt_built_transaction_prove(handle: *const BuiltTransactionHan
 
     let runtime = global_tokio_runtime();
 
-    // Block on the async prove function. tip_height selects V1/V2 proof path
-    // (post-fork transactions use produce_v2).
-    match runtime.block_on(built.0.prove(tip_height)) {
+    match runtime.block_on(built.0.prove()) {
         Ok(tx) => Box::into_raw(Box::new(TransactionHandle(tx))),
         Err(e) => {
             set_last_error(&format!("{e}"));

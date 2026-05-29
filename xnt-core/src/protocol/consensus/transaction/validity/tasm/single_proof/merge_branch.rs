@@ -35,8 +35,6 @@ use crate::protocol::consensus::block::block_transaction::BlockOrRegularTransact
 use crate::protocol::consensus::block::block_transaction::BlockTransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
-use crate::protocol::consensus::transaction::validity::single_proof::SingleProof;
-use crate::protocol::consensus::transaction::validity::single_proof::SingleProofWitness;
 use crate::protocol::consensus::transaction::validity::single_proof::DISCRIMINANT_FOR_MERGE;
 use crate::protocol::consensus::transaction::validity::tasm::authenticate_txk_field::AuthenticateTxkField;
 use crate::protocol::consensus::transaction::validity::tasm::claims::generate_single_proof_claim::GenerateSingleProofClaim;
@@ -167,39 +165,23 @@ impl MergeWitness {
         proof_job_options: TritonVmProofJobOptions,
         consensus_rule_set: crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet,
     ) -> Result<Transaction> {
-        use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+        let _ = consensus_rule_set;
         let new_kernel = self.new_kernel.clone();
 
         info!("Start: creating new single proof through merge");
-        let new_single_proof = match consensus_rule_set {
-            ConsensusRuleSet::Reboot
-            | ConsensusRuleSet::HardforkAlpha
-            | ConsensusRuleSet::Xnt => {
-                let new_single_proof_witness = SingleProofWitness::from_merge(self);
-                let new_single_proof_claim = new_single_proof_witness.claim();
-                SingleProof
-                    .prove(
-                        new_single_proof_claim,
-                        new_single_proof_witness.nondeterminism(),
-                        triton_vm_job_queue,
-                        proof_job_options,
-                    )
-                    .await?
-            }
-            ConsensusRuleSet::TimelockExtension => {
-                use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
-                use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
-                let new_single_proof_witness = SingleProofV2Witness::from_merge(self);
-                let new_single_proof_claim = new_single_proof_witness.claim();
-                SingleProofV2
-                    .prove(
-                        new_single_proof_claim,
-                        new_single_proof_witness.nondeterminism(),
-                        triton_vm_job_queue,
-                        proof_job_options,
-                    )
-                    .await?
-            }
+        let new_single_proof = {
+            use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
+            use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
+            let new_single_proof_witness = SingleProofV2Witness::from_merge(self);
+            let new_single_proof_claim = new_single_proof_witness.claim();
+            SingleProofV2
+                .prove(
+                    new_single_proof_claim,
+                    new_single_proof_witness.nondeterminism(),
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await?
         };
 
         info!("Done: creating new single proof through merge");
