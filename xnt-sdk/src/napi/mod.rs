@@ -1118,6 +1118,14 @@ impl XntBuiltTransaction {
             .collect()
     }
 
+    /// Check the (unproven) transaction is still confirmable against `mutator_set`.
+    /// Fetch the current tip via getMutatorSet and call this BEFORE prove() to
+    /// avoid proving a stale snapshot.
+    #[napi]
+    pub fn is_confirmable(&self, mutator_set: &XntMutatorSet) -> bool {
+        self.inner.is_confirmable(mutator_set.inner())
+    }
+
     /// Prove the transaction (creates ProofCollection).
     /// WARNING: CPU-intensive, requires ~16 GB RAM.
     #[napi]
@@ -1171,9 +1179,18 @@ impl XntTransaction {
         self.inner.has_single_proof()
     }
 
-    /// Submit transaction to node
+    /// Check the transaction is confirmable against `mutator_set` (mirrors the
+    /// node submit gate). Fetch the current tip via getMutatorSet and call this
+    /// before submit() to detect a transaction that went stale while proving.
     #[napi]
-    pub fn submit(&self, client: &XntRpcClient) -> Result<()> {
+    pub fn is_confirmable(&self, mutator_set: &XntMutatorSet) -> bool {
+        self.inner.is_confirmable(mutator_set.inner())
+    }
+
+    /// Submit transaction to node. Returns the node's `success` field: `true`
+    /// if accepted + queued, `false` if rejected. Throws on RPC/transport error.
+    #[napi]
+    pub fn submit(&self, client: &XntRpcClient) -> Result<bool> {
         self.inner
             .submit(client.inner())
             .map_err(|e| Error::from_reason(format!("submit: {e}")))

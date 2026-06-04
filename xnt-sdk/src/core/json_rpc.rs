@@ -99,7 +99,13 @@ impl RpcClient {
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
-            return Err(XntError::RpcError(format!("RPC error: {msg}")));
+
+            let detail = error
+                .get("data")
+                .filter(|d| !d.is_null())
+                .map(|d| format!(" (data: {d})"))
+                .unwrap_or_default();
+            return Err(XntError::RpcError(format!("{msg}{detail}")));
         }
 
         json.get("result")

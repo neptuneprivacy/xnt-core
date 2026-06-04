@@ -1158,7 +1158,7 @@ fn test_tx_dctidh_multi() {
 
     println!("\nSubmitting (multi Generation + CTIDH tx)...");
     match proven.submit(&client) {
-        Ok(()) => ok!("submitted"),
+        Ok(success) => ok!("submit result: success={success}"),
         Err(e) => println!("  submit failed: {e}"),
     }
 }

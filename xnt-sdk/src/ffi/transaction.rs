@@ -238,6 +238,21 @@ pub extern "C" fn xnt_built_transaction_serialize(handle: *const BuiltTransactio
     }
 }
 
+/// Check the (unproven) transaction is still confirmable against a mutator set.
+/// Returns true if it can still be proven & submitted. Call BEFORE prove() with
+/// the current tip mutator set (xnt_sync_get_mutator_set) to avoid proving a
+/// stale snapshot.
+#[no_mangle]
+pub extern "C" fn xnt_built_transaction_is_confirmable(
+    handle: *const BuiltTransactionHandle,
+    mutator_set: *const MutatorSetHandle,
+) -> bool {
+    if handle.is_null() || mutator_set.is_null() {
+        return false;
+    }
+    ffi_ref!(handle).0.is_confirmable(&ffi_ref!(mutator_set).0)
+}
+
 // Transaction (final)
 
 /// Opaque handle to final Transaction
@@ -290,6 +305,20 @@ pub extern "C" fn xnt_transaction_has_single_proof(handle: *const TransactionHan
     ffi_ref!(handle).0.has_single_proof()
 }
 
+/// Check the transaction is confirmable against a mutator set (mirrors the node
+/// submit gate). Call with the current tip mutator set (xnt_sync_get_mutator_set)
+/// before submit() to detect a transaction that went stale while proving.
+#[no_mangle]
+pub extern "C" fn xnt_transaction_is_confirmable(
+    handle: *const TransactionHandle,
+    mutator_set: *const MutatorSetHandle,
+) -> bool {
+    if handle.is_null() || mutator_set.is_null() {
+        return false;
+    }
+    ffi_ref!(handle).0.is_confirmable(&ffi_ref!(mutator_set).0)
+}
+
 /// Submit transaction to node via RPC
 #[no_mangle]
 pub extern "C" fn xnt_transaction_submit(
@@ -304,7 +333,11 @@ pub extern "C" fn xnt_transaction_submit(
     let client = &ffi_ref!(client).0;
 
     match tx.submit(client) {
-        Ok(_) => XntErrorCode::Ok,
+        Ok(true) => XntErrorCode::Ok,
+        Ok(false) => {
+            set_last_error("transaction submission rejected by node (success=false)");
+            XntErrorCode::RpcError
+        }
         Err(e) => {
             set_last_error(&format!("{e}"));
             XntErrorCode::RpcError

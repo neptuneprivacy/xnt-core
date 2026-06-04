@@ -5,6 +5,8 @@
  * Commands: version, seed, address [payment-id], shortaddress [payment-id], rpc, sync, utils, tx <recipient> <amount> <fee>
  */
 
+import * as fs from "fs";
+import * as path from "path";
 import {
   XntNetwork,
   XntWalletEntropy,
@@ -45,6 +47,15 @@ interface SyncResult {
   pendingIncoming: XntPendingUtxo[];
 }
 
+// Outcome of a single tx build→prove→submit attempt. "stale" is retryable
+// (re-prove); everything else is terminal.
+type AttemptResult =
+  | { status: "submitted"; success: boolean }
+  | { status: "stale"; where: "preflight" | "submit" }
+  | { status: "empty" }
+  | { status: "insufficient"; need: bigint; have: bigint }
+  | { status: "rejected"; error: string };
+
 // ── Logger ─────────────────────────────────────────────────────────────────
 
 class Logger {
@@ -70,6 +81,29 @@ class Logger {
     this.skipCount++;
     this.write("skip", msg, data);
     return false;
+  }
+}
+
+// ── Prover path ──────────────────────────────────────────────────────────────
+
+// The NAPI prover spawns an external `triton-vm-prover` binary. When run via
+// node it would look next to the node executable, so point it at the repo build.
+// Respects TRITON_VM_PROVER_PATH if already set; otherwise picks the repo's
+// release build (falling back to debug).
+function ensureProverPath(log: Logger): void {
+  if (process.env.TRITON_VM_PROVER_PATH) return;
+  const candidates = [
+    path.resolve(__dirname, "../../target/release/triton-vm-prover"),
+    path.resolve(__dirname, "../../target/debug/triton-vm-prover"),
+  ];
+  const found = candidates.find(p => fs.existsSync(p));
+  if (found) {
+    process.env.TRITON_VM_PROVER_PATH = found;
+    log.info("prover", { path: found });
+  } else {
+    log.info("prover not found in target/, relying on PATH/TRITON_VM_PROVER_PATH", {
+      looked: candidates,
+    });
   }
 }
 
@@ -291,50 +325,64 @@ class TestRunner {
     const client = this.wallet.connectRpc();
     if (!client) return false;
 
-    const { key, addr } = this.wallet.loadTestWallet();
-    const result = this.wallet.sync(client, key);
-    if (!result) return this.log.skip("sync failed");
-
-    this.log.ok("synced", { unspent: result.unspent.length });
+    const { genKey, genAddr, key, addr } = this.wallet.loadTestWallet();
+    // Funds can land on either the Generation or the dCTIDH address; scan both.
+    const accounts = [
+      { kind: "generation", key: genKey, addr: genAddr },
+      { kind: "dctidh", key, addr },
+    ];
 
     let total = 0n;
-    const receiverPreimage = key.receiverPreimageHex();
-    const privacyDigest = addr.privacyDigestHex();
-
-    for (let i = 0; i < result.unspent.length; i++) {
-      const u = result.unspent[i];
-      const d = u.decrypted;
-      total += d.amount;
-      const pending = result.pendingSpending.includes(i);
-      const c = xntComputeCommitment(d.utxo.hashHex(), d.senderRandomnessHex, receiverPreimage);
-      this.log.info("utxo", {
-        aocl: u.aoclIndex, height: d.blockHeight,
-        amount: AmountUtil.format(d.amount),
-        ...(d.paymentId ? { pid: d.paymentId } : {}),
-        ...(pending ? { pendingSpend: true } : {}),
-        commitment: c,
-      });
-    }
-
     let incomingTotal = 0n;
-    for (const p of result.pendingIncoming) {
-      incomingTotal += p.amount;
-      const c = xntComputeCommitmentForOutput(p.utxo.hashHex(), p.senderRandomnessHex, privacyDigest);
-      this.log.info("pending-incoming", {
-        amount: AmountUtil.format(p.amount),
-        ...(p.paymentId > 0 ? { pid: p.paymentId } : {}),
-        commitment: c,
-      });
-    }
-
     let spendingTotal = 0n;
-    for (const idx of result.pendingSpending) {
-      spendingTotal += result.unspent[idx].decrypted.amount;
+    let unspentCount = 0;
+
+    for (const acct of accounts) {
+      const result = this.wallet.sync(client, acct.key);
+      if (!result) return this.log.skip("sync failed");
+
+      unspentCount += result.unspent.length;
+      this.log.ok("synced", { kind: acct.kind, unspent: result.unspent.length });
+
+      const receiverPreimage = acct.key.receiverPreimageHex();
+      const privacyDigest = acct.addr.privacyDigestHex();
+
+      for (let i = 0; i < result.unspent.length; i++) {
+        const u = result.unspent[i];
+        const d = u.decrypted;
+        total += d.amount;
+        const pending = result.pendingSpending.includes(i);
+        const c = xntComputeCommitment(d.utxo.hashHex(), d.senderRandomnessHex, receiverPreimage);
+        this.log.info("utxo", {
+          kind: acct.kind,
+          aocl: u.aoclIndex, height: d.blockHeight,
+          amount: AmountUtil.format(d.amount),
+          ...(d.paymentId ? { pid: d.paymentId } : {}),
+          ...(pending ? { pendingSpend: true } : {}),
+          commitment: c,
+        });
+      }
+
+      for (const p of result.pendingIncoming) {
+        incomingTotal += p.amount;
+        const c = xntComputeCommitmentForOutput(p.utxo.hashHex(), p.senderRandomnessHex, privacyDigest);
+        this.log.info("pending-incoming", {
+          kind: acct.kind,
+          amount: AmountUtil.format(p.amount),
+          ...(p.paymentId > 0 ? { pid: p.paymentId } : {}),
+          commitment: c,
+        });
+      }
+
+      for (const idx of result.pendingSpending) {
+        spendingTotal += result.unspent[idx].decrypted.amount;
+      }
     }
 
     const available = total - spendingTotal;
     const unconfirmed = available + incomingTotal;
     this.log.ok("balance", {
+      unspent: unspentCount,
       confirmed: AmountUtil.format(total),
       ...(incomingTotal > 0n || spendingTotal > 0n ? { unconfirmed: AmountUtil.format(unconfirmed) } : {}),
     });
@@ -346,62 +394,118 @@ class TestRunner {
     if (!recipientBech32 || !amountStr || !feeStr) {
       return this.log.fail("tx requires: recipient amount fee");
     }
-    const amountXnt = parseFloat(amountStr);
-    const feeXnt = parseFloat(feeStr);
 
     const client = this.wallet.connectRpc();
     if (!client) return false;
 
-    const { key, addr } = this.wallet.loadTestWallet();
-    const result = this.wallet.sync(client, key);
-    if (!result || result.unspent.length === 0) return this.log.skip("no unspent UTXOs");
-    this.log.ok("synced", { unspent: result.unspent.length });
+    const fee = AmountUtil.toNau(parseFloat(feeStr));
+    const sendAmount = AmountUtil.toNau(parseFloat(amountStr));
 
-    const available = this.wallet.availableUtxos(result);
-    if (available.length === 0) return this.log.skip("all UTXOs pending spend");
-    if (available.length < result.unspent.length) {
-      this.log.info("filtered pending", {
-        available: available.length,
-        pendingSpend: result.unspent.length - available.length,
-      });
+    // Proving takes minutes, so the chain can advance and make the proof stale.
+    // Auto re-prove: rebuild from a fresh sync + proofs and retry. Override the
+    // attempt cap via XNT_TX_MAX_ATTEMPTS (default 5).
+    const maxAttempts = Math.max(1, parseInt(process.env.XNT_TX_MAX_ATTEMPTS ?? "5", 10));
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt > 1) this.log.info("re-proving (previous attempt went stale)", { attempt, maxAttempts });
+
+      const r = this.attemptTx(client, recipientBech32, sendAmount, fee);
+      switch (r.status) {
+        case "submitted":
+          this.log.ok("submit result", { success: r.success, attempt, note: "accepted + queued by node" });
+          return r.success;
+        case "empty":
+          return this.log.skip("no spendable UTXOs");
+        case "insufficient":
+          return this.log.fail("insufficient funds", {
+            need: AmountUtil.format(r.need),
+            have: AmountUtil.format(r.have),
+          });
+        case "rejected":
+          return this.log.fail("submit rejected", { reason: "node rejected — see error", error: r.error });
+        case "stale":
+          if (attempt === maxAttempts) {
+            return this.log.fail("stale after max attempts — chain advancing faster than proving", {
+              attempts: maxAttempts,
+              where: r.where,
+            });
+          }
+          // loop and re-prove
+          break;
+      }
     }
+    return false;
+  }
 
-    const fee = AmountUtil.toNau(feeXnt);
-    const sendAmount = AmountUtil.toNau(amountXnt);
+  // One build→prove→submit attempt. Returns a status the caller uses to decide
+  // whether to re-prove (on "stale") or stop.
+  private attemptTx(
+    client: XntRpcClient,
+    recipientBech32: string,
+    sendAmount: bigint,
+    fee: bigint,
+  ): AttemptResult {
+    const { genKey, genAddr, key, addr } = this.wallet.loadTestWallet();
+    // Spend across both account types; tag each UTXO with its owning key so we
+    // add inputs and restore membership proofs with the correct receiver_preimage.
+    const accounts = [
+      { kind: "generation", key: genKey, addr: genAddr },
+      { kind: "dctidh", key, addr },
+    ];
+
+    type OwnedUtxo = { u: UnspentUtxo; key: typeof genKey; receiverPreimage: string };
+    const available: OwnedUtxo[] = [];
+    for (const acct of accounts) {
+      const result = this.wallet.sync(client, acct.key);
+      if (!result) continue;
+      const avail = this.wallet.availableUtxos(result);
+      const receiverPreimage = acct.key.receiverPreimageHex();
+      for (const u of avail) available.push({ u, key: acct.key, receiverPreimage });
+    }
+    if (available.length === 0) return { status: "empty" };
+    this.log.ok("synced", { available: available.length });
+
     const totalAmount = sendAmount + fee;
-
-    const amounts = available.map(u => u.decrypted.amount);
+    const amounts = available.map(o => o.u.decrypted.amount);
     const selected = xntSelectInputs(amounts, totalAmount, 10);
     if (selected.length === 0) {
-      return this.log.fail("insufficient funds", {
-        need: AmountUtil.format(totalAmount),
-        have: AmountUtil.format(amounts.reduce((s, a) => s + a, 0n)),
-      });
+      return { status: "insufficient", need: totalAmount, have: amounts.reduce((s, a) => s + a, 0n) };
     }
     this.log.ok("inputs selected", { count: selected.length, total: AmountUtil.format(totalAmount) });
 
     const selectedUtxos = selected.map(i => available[i]);
-    const proofBuffers = xntGetMembershipProofs(
-      client,
-      selectedUtxos.map(u => u.decrypted.utxo.hashHex()),
-      selectedUtxos.map(u => u.decrypted.senderRandomnessHex),
-      key.receiverPreimageHex(),
-      selectedUtxos.map(u => u.aoclIndex),
-    );
+
+    // Restore membership proofs per receiver_preimage group (one RPC batch per owning key).
+    const proofBuffers: Buffer[] = new Array(selectedUtxos.length);
+    const groups = new Map<string, number[]>();
+    selectedUtxos.forEach((o, i) => {
+      const g = groups.get(o.receiverPreimage) ?? [];
+      g.push(i);
+      groups.set(o.receiverPreimage, g);
+    });
+    for (const [receiverPreimage, idxs] of groups) {
+      const bufs = xntGetMembershipProofs(
+        client,
+        idxs.map(i => selectedUtxos[i].u.decrypted.utxo.hashHex()),
+        idxs.map(i => selectedUtxos[i].u.decrypted.senderRandomnessHex),
+        receiverPreimage,
+        idxs.map(i => selectedUtxos[i].u.aoclIndex),
+      );
+      idxs.forEach((origIdx, j) => { proofBuffers[origIdx] = bufs[j]; });
+    }
     this.log.ok("membership proofs", { count: proofBuffers.length });
 
     const mutatorSet = xntGetMutatorSet(client);
     const builder = new XntTransactionBuilder();
 
-    for (let i = 0; i < selected.length; i++) {
+    for (let i = 0; i < selectedUtxos.length; i++) {
       const proof = XntMembershipProof.fromBytes(proofBuffers[i]);
-      builder.addInput(selectedUtxos[i].decrypted.utxo, key, proof);
+      builder.addInput(selectedUtxos[i].u.decrypted.utxo, selectedUtxos[i].key, proof);
     }
 
     const recipient = XntAddress.fromBech32(recipientBech32, XntNetwork.Main).toReceivingAddress();
     builder.addOutput(recipient, sendAmount, xntRandomSenderRandomness());
     builder.setFee(fee);
-    builder.setChange(addr, xntRandomSenderRandomness());
+    builder.setChange(genAddr, xntRandomSenderRandomness());
 
     const builtTx = builder.build(mutatorSet, xntTimestampNow(), XntNetwork.Main);
 
@@ -426,20 +530,37 @@ class TestRunner {
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     this.log.ok("proven", { seconds: elapsed, hasProofCollection: provenTx.hasProofCollection() });
 
-    this.log.info("submitting");
-    try {
-      provenTx.submit(client);
-      this.log.ok("submitted");
-    } catch (e) {
-      this.log.fail("submit failed", { error: String(e) });
+    // Confirmable check against the current tip — proving can take minutes, so a
+    // block may have landed (or an input got spent) meanwhile, making it stale.
+    if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+      this.log.info("tx not confirmable (stale) — chain advanced while proving");
+      return { status: "stale", where: "preflight" };
     }
 
-    return true;
+    // NOTE: the node rejects a tx via a JSON-RPC *error* (carrying the reason in
+    // error.data), not via success:false — so submit() returns true on accept and
+    // throws on rejection. We diagnose the throw below.
+    this.log.info("submitting");
+    try {
+      const success = provenTx.submit(client);
+      return { status: "submitted", success };
+    } catch (e) {
+      // Re-check against the current tip: a block landing mid-submit is stale
+      // (retryable); anything else is a real rejection (stop).
+      if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+        this.log.info("submit went stale — chain advanced", { error: String(e) });
+        return { status: "stale", where: "submit" };
+      }
+      return { status: "rejected", error: String(e) };
+    }
   }
 
 }
 
 // ── Entry Point ────────────────────────────────────────────────────────────
 
+const command = process.argv[2] || "help";
+// Resolve the prover binary up-front for the only command that proves.
+if (command === "tx") ensureProverPath(new Logger());
 const runner = new TestRunner();
-runner.run(process.argv[2] || "help", process.argv.slice(3));
+runner.run(command, process.argv.slice(3));

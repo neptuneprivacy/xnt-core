@@ -488,6 +488,14 @@ struct XntByteBuffer *xnt_built_transaction_witness(const struct XntBuiltTransac
 xnt_
 struct XntByteBuffer *xnt_built_transaction_serialize(const struct XntBuiltTransactionHandle *handle);
 
+// Check the (unproven) transaction is still confirmable against a mutator set.
+// Returns true if it can still be proven & submitted. Call BEFORE prove() with
+// the current tip mutator set (xnt_sync_get_mutator_set) to avoid proving a
+// stale snapshot.
+xnt_
+bool xnt_built_transaction_is_confirmable(const struct XntBuiltTransactionHandle *handle,
+                                          const struct XntMutatorSetHandle *mutator_set);
+
 // Deserialize Transaction
 xnt_ struct XntTransactionHandle *xnt_transaction_deserialize(const uint8_t *data, uintptr_t len);
 
@@ -499,6 +507,13 @@ xnt_ bool xnt_transaction_has_proof_collection(const struct XntTransactionHandle
 
 // Check if transaction has SingleProof
 xnt_ bool xnt_transaction_has_single_proof(const struct XntTransactionHandle *handle);
+
+// Check the transaction is confirmable against a mutator set (mirrors the node
+// submit gate). Call with the current tip mutator set (xnt_sync_get_mutator_set)
+// before submit() to detect a transaction that went stale while proving.
+xnt_
+bool xnt_transaction_is_confirmable(const struct XntTransactionHandle *handle,
+                                    const struct XntMutatorSetHandle *mutator_set);
 
 // Submit transaction to node via RPC
 xnt_

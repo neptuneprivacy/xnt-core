@@ -347,6 +347,33 @@ impl BuiltTransaction {
         &self.witness
     }
 
+    /// Check the (still unproven) transaction is confirmable against `mutator_set`.
+    ///
+    /// Confirmability is a property of the transaction kernel's removal records,
+    /// not of the proof, so it can be checked before proving and predicts the
+    /// post-prove result exactly (the kernel is unchanged by [`Self::prove`]).
+    ///
+    /// This mirrors core's `TransactionKernel::is_confirmable_relative_to` (which
+    /// is not exported): every input removal record must validate against the
+    /// mutator set, the inputs must be unique, and none may already be spent.
+    ///
+    /// Intended use: fetch the current tip via [`super::sync::get_mutator_set`] and
+    /// call this BEFORE [`Self::prove`] to avoid spending minutes proving a
+    /// snapshot that has already gone stale.
+    pub fn is_confirmable(&self, mutator_set: &MutatorSet) -> bool {
+        let msa = &mutator_set.inner;
+        let inputs = &self.witness.kernel.inputs;
+        let unique = inputs
+            .iter()
+            .map(|rr| rr.absolute_indices)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == inputs.len();
+        unique
+            && inputs.iter().all(|rr| rr.validate(msa))
+            && inputs.iter().all(|rr| msa.can_remove(rr))
+    }
+
     /// Get all inputs
     pub fn inputs(&self) -> Vec<TxInputInfo> {
         use neptune_privacy::prelude::twenty_first::prelude::Tip5;
@@ -442,8 +469,25 @@ impl Transaction {
         matches!(self.inner.proof, TransactionProof::SingleProof(_))
     }
 
+    /// Check the (proven) transaction is confirmable against `mutator_set`.
+    ///
+    /// Mirrors the node's submit gate: every input removal record must still
+    /// validate against the given mutator set and none of the inputs may
+    /// already be spent. Fetch the current tip via [`super::sync::get_mutator_set`]
+    /// and call this BEFORE [`Self::submit`] to detect a transaction that went
+    /// stale while proving.
+    pub fn is_confirmable(&self, mutator_set: &MutatorSet) -> bool {
+        self.inner.is_confirmable_relative_to(&mutator_set.inner)
+    }
+
     /// Submit to node via RPC
-    pub fn submit(&self, client: &super::json_rpc::RpcClient) -> Result<()> {
+    /// Submit the transaction to the node mempool.
+    ///
+    /// Returns the node's `success` field from the `mempool_submitTransaction`
+    /// response: `true` means the node accepted and queued the tx (validation +
+    /// confirmable checks passed), `false` means it was rejected. RPC/transport
+    /// failures are returned as `Err`.
+    pub fn submit(&self, client: &super::json_rpc::RpcClient) -> Result<bool> {
         use neptune_privacy::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
 
         // Check proof type
@@ -461,13 +505,10 @@ impl Transaction {
 
         let result = client.call("mempool_submitTransaction", params)?;
 
-        if result.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
-            Ok(())
-        } else {
-            Err(XntError::TransactionError(
-                "transaction submission failed".to_string(),
-            ))
-        }
+        Ok(result
+            .get("success")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false))
     }
 }
 

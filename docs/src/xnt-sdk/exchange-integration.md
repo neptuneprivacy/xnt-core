@@ -459,13 +459,74 @@ provenTx.hasProofCollection(); // boolean
 
 ### Submit Transaction
 
+`submit()` returns the node's `success` field (`true` = accepted + queued by the
+mempool, `false` = rejected). It throws only on RPC/transport errors. When the
+node rejects a transaction it does so via a JSON-RPC error whose `data` carries
+the reason (e.g. `{"SubmitTransaction":"NotConfirmable"}`), surfaced in the
+thrown message.
+
 ```typescript
+// Confirmability mirrors the node's submit gate. Check against the current tip
+// BEFORE submit to detect a tx that went stale while proving.
+if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+  // stale — re-prove (see below)
+}
+
 try {
-  provenTx.submit(client);
+  const success = provenTx.submit(client);
+  console.log(`submitted: ${success}`); // true = accepted + queued
 } catch (e) {
-  console.log(`submit error: ${e}`);
+  console.log(`submit error: ${e}`);    // e.g. ... (data: {"SubmitTransaction":"NotConfirmable"})
 }
 ```
+
+### Re-proving on Staleness
+
+Proving takes several minutes. While you prove, the chain can advance (a new
+block lands, or one of your inputs gets spent), which makes the proof's mutator
+set snapshot **stale** — the node then rejects it with `NotConfirmable`.
+
+A transaction proof is only valid against the tip it was built on, so the fix is
+to **rebuild from a fresh sync and re-prove**. Wrap build → prove → submit in a
+retry loop and re-prove whenever the result is stale:
+
+```typescript
+const MAX_ATTEMPTS = 5;
+
+for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  // Rebuild from a CURRENT sync each attempt (fresh UTXOs, proofs, mutator set)
+  const builtTx = buildTransaction(client, key, recipientBech32, sendAmount, fee);
+  const provenTx = builtTx.prove();
+
+  // Pre-flight: did the chain advance during proving?
+  if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+    console.log(`attempt ${attempt}: stale, re-proving...`);
+    continue; // re-prove against the new tip
+  }
+
+  try {
+    const success = provenTx.submit(client);
+    console.log(`submitted: ${success}`);
+    break;
+  } catch (e) {
+    // A block landing mid-submit is also staleness (retryable); anything else
+    // is a real rejection (stop).
+    if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+      console.log(`attempt ${attempt}: went stale on submit, re-proving...`);
+      continue;
+    }
+    throw e; // genuine rejection — do not retry
+  }
+}
+```
+
+> **Caveat:** each retry re-proves from scratch (minutes). If blocks arrive
+> faster than your prove time, every attempt goes stale and the loop exhausts
+> `MAX_ATTEMPTS`. Provision enough CPU/RAM that prove time stays well under the
+> block interval.
+
+The bundled example (`examples/xnt-sdk-test.ts`, `tx` command) implements this
+loop; cap the attempts via `XNT_TX_MAX_ATTEMPTS` (default `5`).
 
 ---
 
@@ -502,7 +563,7 @@ xntComputeCommitmentForOutput(
 1. `syncWallet()` to get available UTXOs
 2. Filter out `pendingSpending` indices
 3. `xntSelectInputs()` to select UTXOs
-4. Build, prove, submit transaction
+4. Build, prove, submit transaction — re-prove on staleness (see [Re-proving on Staleness](#re-proving-on-staleness))
 5. Track `commitmentHex` for confirmation
 
 ---
