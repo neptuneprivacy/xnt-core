@@ -65,6 +65,24 @@ impl Coin {
             state: amount.encode(),
         }
     }
+
+    /// Native-currency coin with an explicitly supplied type-script hash.
+    ///
+    /// Used for the genesis premine, which must pin the launch-era
+    /// `NativeCurrency` hash so the genesis block stays identical across the
+    /// UpgradeVM (triton-vm v3) fork — the v3 `NativeCurrency` program hashes
+    /// differently, which would otherwise change the genesis mutator set.
+    /// Spendability of these legacy-tagged coins is handled by the on-chain
+    /// remap in `CollectTypeScriptsV2`.
+    pub(crate) fn new_native_currency_with_type_script_hash(
+        type_script_hash: Digest,
+        amount: NativeCurrencyAmount,
+    ) -> Self {
+        Self {
+            type_script_hash,
+            state: amount.encode(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, BFieldCodec, TasmObject)]

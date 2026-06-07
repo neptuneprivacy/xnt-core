@@ -1693,6 +1693,6 @@ mod tests {
         // TimeLock.hash(): V2 inserts an OLD_HASH check plus a Tip5(&Utxo) digest
         // filter that grants a +1 year extension to the target UTXOs. Used as
         // NEW_HASH by CollectTypeScriptsV2's remap and SingleProofV2's claim gen.
-        "ac58ee89b7d8635d29b257a9ab3c34e7dcf54de25f3d43d7d0fa562ee1156803d7cbe98e874d1c16"
+        "0fd038a5ab8499c4b174c28166e10f2b6c2cc30754c1fd5c854f6c1398989854e424a33d49f94a28"
     );
 }

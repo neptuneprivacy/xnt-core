@@ -47,6 +47,25 @@ impl NativeCurrency {
     pub(crate) const COINBASE_IS_SET_AND_FEE_IS_NEGATIVE: i128 = 1_000_038;
     pub(crate) const INVALID_COIN_AMOUNT: i128 = 1_000_039;
     pub(crate) const INVALID_COINBASE_DISCRIMINANT: i128 = 1_000_040;
+
+    /// The `type_script_hash` that native-currency coins carried *before* the
+    /// `UpgradeVM` hard fork (Triton VM v3). The VM upgrade re-hashes every
+    /// consensus program, so `Self.hash()` changed from this value to the
+    /// current one.
+    ///
+    /// Coins that were committed to the mutator set before the fork — the
+    /// genesis premine UTXOs and every pre-fork guesser-fee UTXO — embed this
+    /// legacy digest. Reproducing the historical mutator set (e.g. to validate
+    /// or sync legacy blocks) therefore requires re-deriving those UTXOs with
+    /// this value, not with the live `Self.hash()`.
+    pub const LEGACY_TYPE_SCRIPT_HASH_HEX: &'static str =
+        "f8e778e011688c3985f0a5b325e26a19d7d6dc2a50cb8356b569bd9acc98eabc8511bb707d0b7a64";
+
+    /// See [`Self::LEGACY_TYPE_SCRIPT_HASH_HEX`].
+    pub fn legacy_type_script_hash() -> Digest {
+        Digest::try_from_hex(Self::LEGACY_TYPE_SCRIPT_HASH_HEX)
+            .expect("legacy native-currency type-script-hash hex is valid")
+    }
 }
 
 /// `NativeCurrency` is the type script that governs Neptune's native currency,
@@ -1698,6 +1717,6 @@ pub mod tests {
 
     test_program_snapshot!(
         NativeCurrency,
-        "35ab20eaca74e39c97b1b1c6eeb337853babec0d1b4152b6218f12ab673618df11bb3a534af30f64"
+        "21ab58918b98bfee88f30eec7edd371a19e0340cced4145f9b06ff1876effa0ae98e5bf6c96be439"
     );
 }

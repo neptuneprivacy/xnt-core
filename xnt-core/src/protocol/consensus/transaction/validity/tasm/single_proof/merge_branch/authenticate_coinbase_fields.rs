@@ -268,6 +268,7 @@ mod tests {
     use tasm_lib::traits::read_only_algorithm::ReadOnlyAlgorithm;
     use tasm_lib::traits::read_only_algorithm::ReadOnlyAlgorithmInitialState;
     use tasm_lib::traits::read_only_algorithm::ShadowedReadOnlyAlgorithm;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::triton_vm::prelude::BFieldElement;
     use tasm_lib::triton_vm::prelude::Digest;
     use tasm_lib::triton_vm::prelude::Tip5;
@@ -484,7 +485,7 @@ mod tests {
             memory: &HashMap<BFieldElement, BFieldElement>,
             _nd_tokens: VecDeque<BFieldElement>,
             mut nd_digests: VecDeque<Digest>,
-        ) {
+        ) -> Result<(), RustShadowError> {
             let read_digest_from_memory = |alloc: StaticAllocation| {
                 let read_address = alloc.read_address();
                 Digest::new([
@@ -534,6 +535,8 @@ mod tests {
             let maybe_coinbase = &left_txk.coinbase;
 
             assert_eq!(&new_txk.coinbase, maybe_coinbase);
+
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

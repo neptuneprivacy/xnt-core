@@ -14,8 +14,11 @@ use super::block_header::BlockHeader;
 use crate::api::export::AdditionRecord;
 use crate::api::export::Utxo;
 use crate::protocol::consensus::block::block_validation_error::BlockValidationError;
+use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET;
+use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
+use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::util_types::mutator_set::commit;
 
 /// The kernel of a block contains all data that is not proof data
@@ -50,7 +53,23 @@ impl BlockKernel {
         // Without locking for miners
 
         let total_guesser_reward = self.body.total_guesser_reward()?;
-        let coins_unlocked = total_guesser_reward.to_native_coins();
+
+        // The guesser-fee UTXO is *re-derived* (not read back as a stored
+        // addition record) every time the mutator set is advanced past this
+        // block, so its native-currency `type_script_hash` must match what was
+        // committed when the block was produced. Blocks produced before the
+        // `UpgradeVM` fork embed the legacy NativeCurrency hash (Triton VM v3
+        // changed `NativeCurrency.hash()`); reproducing them with the current
+        // hash would make every pre-fork parent's `mutator_set_accumulator_after`
+        // diverge from the child's stored `mutator_set_hash`. Post-fork blocks
+        // use the current hash.
+        let nc_type_script_hash = if self.header.height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET {
+            NativeCurrency::legacy_type_script_hash()
+        } else {
+            NativeCurrency.hash()
+        };
+        let coins_unlocked =
+            total_guesser_reward.to_native_coins_with_type_script_hash(nc_type_script_hash);
         let lock_script_hash = self.header.guesser_receiver_data.lock_script_hash;
         let unlocked_utxo = Utxo::new(lock_script_hash, coins_unlocked);
 

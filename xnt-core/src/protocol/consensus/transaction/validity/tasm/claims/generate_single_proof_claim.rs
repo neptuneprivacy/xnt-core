@@ -70,6 +70,7 @@ mod tests {
     use rand::prelude::StdRng;
     use rand::Rng;
     use tasm_lib::memory::encode_to_memory;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::rust_shadowing_helper_functions;
     use tasm_lib::snippet_bencher::BenchmarkCase;
     use tasm_lib::traits::algorithm::Algorithm;
@@ -88,7 +89,7 @@ mod tests {
             stack: &mut Vec<BFieldElement>,
             memory: &mut HashMap<BFieldElement, BFieldElement>,
             _: &NonDeterminism,
-        ) {
+        ) -> Result<(), RustShadowError> {
             fn pop_digest(stack: &mut Vec<BFieldElement>) -> Digest {
                 Digest::new([
                     stack.pop().unwrap(),
@@ -119,6 +120,8 @@ mod tests {
                 single_proof_digest_location_isolated_run,
                 &single_proof_digest,
             );
+
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

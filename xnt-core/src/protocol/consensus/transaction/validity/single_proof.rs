@@ -286,7 +286,8 @@ pub(crate) async fn produce_single_proof(
         | ConsensusRuleSet::Xnt => {
             SingleProof::produce(primitive_witness, triton_vm_job_queue, proof_job_options).await
         }
-        ConsensusRuleSet::TimelockExtension => {
+        ConsensusRuleSet::TimelockExtension
+        | ConsensusRuleSet::UpgradeVM => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
                 ::produce(primitive_witness, triton_vm_job_queue, proof_job_options)
                 .await
@@ -303,11 +304,40 @@ pub(crate) fn single_proof_claim(
     tx_kernel_mast_hash: Digest,
     consensus_rule_set: ConsensusRuleSet,
 ) -> Claim {
+    // Pre-upgrade SingleProof / SingleProofV2 digests, COMPUTED by building each
+    // historical source tree with its own tasm-lib (`~/xnt-core-v0|v1|v2`); the
+    // in-tree `test_program_snapshot!` literals were stale for these programs.
+    // The v3 tasm-lib (UpgradeVM) builds them to different bytecode, so the
+    // historical digests are hardcoded to keep pre-upgrade blocks verifiable under
+    // the single current verifier.
+    const SINGLE_PROOF_REBOOT_DIGEST: &str = // SingleProof, v0 tree (Reboot/HardforkAlpha)
+        "b975c61c2efd9321bddd99d43d5d25c336054bf70abd6db919cb57dcf27d1427e34365d7ddebc381";
+    const SINGLE_PROOF_XNT_DIGEST: &str = // SingleProof, v1 tree (Xnt)
+        "d69c074e55c4dde6794f65cfcd1d8f5a88904845fa3218d60adbfc134337e03661feede4fa3d4491";
+    const SINGLE_PROOF_V2_TIMELOCK_DIGEST: &str = // SingleProofV2, v2 tree (TimelockExtension)
+        "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b";
+
+    let input = tx_kernel_mast_hash.reversed().values().to_vec();
+    let version = consensus_rule_set.triton_proof_version().claim_version();
     match consensus_rule_set {
-        ConsensusRuleSet::Reboot
-        | ConsensusRuleSet::HardforkAlpha
-        | ConsensusRuleSet::Xnt => SingleProof::claim(tx_kernel_mast_hash),
+        // SingleProof (v1 program), Reboot/Alpha bytecode (proof version 0).
+        ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => {
+            Claim::new(Digest::try_from_hex(SINGLE_PROOF_REBOOT_DIGEST).unwrap())
+                .about_version(version)
+                .with_input(input)
+        }
+        // SingleProof (v1 program), Xnt bytecode (proof version 1).
+        ConsensusRuleSet::Xnt => Claim::new(Digest::try_from_hex(SINGLE_PROOF_XNT_DIGEST).unwrap())
+            .about_version(version)
+            .with_input(input),
+        // SingleProofV2, TimelockExtension (pre-upgrade) bytecode.
         ConsensusRuleSet::TimelockExtension => {
+            Claim::new(Digest::try_from_hex(SINGLE_PROOF_V2_TIMELOCK_DIGEST).unwrap())
+                .about_version(version)
+                .with_input(input)
+        }
+        // SingleProofV2, current (v3) bytecode — recompute from the linked program.
+        ConsensusRuleSet::UpgradeVM => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
                 ::claim(tx_kernel_mast_hash)
         }
@@ -1316,8 +1346,57 @@ pub(crate) mod tests {
         }
     }
 
+    /// Tripwire for the hardcoded pre-upgrade SingleProof / SingleProofV2 program
+    /// digests in `single_proof_claim`. The v3 binary can't recompute old
+    /// bytecode, so these are frozen constants; this pins the digest AND claim
+    /// version each pre-upgrade rule set maps to, so a future edit can't silently
+    /// change a consensus value. Authoritative source: per-era computation in
+    /// `~/xnt-core-v0|v1|v2`.
+    #[test]
+    fn pre_upgrade_single_proof_claim_digests_are_pinned() {
+        use ConsensusRuleSet::*;
+        let txkmh = Digest::default();
+        // (rule set, expected program digest, expected claim version)
+        let cases = [
+            (
+                Reboot,
+                "b975c61c2efd9321bddd99d43d5d25c336054bf70abd6db919cb57dcf27d1427e34365d7ddebc381",
+                0u32,
+            ),
+            (
+                HardforkAlpha,
+                "b975c61c2efd9321bddd99d43d5d25c336054bf70abd6db919cb57dcf27d1427e34365d7ddebc381",
+                0,
+            ),
+            (
+                Xnt,
+                "d69c074e55c4dde6794f65cfcd1d8f5a88904845fa3218d60adbfc134337e03661feede4fa3d4491",
+                1,
+            ),
+            (
+                TimelockExtension,
+                "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b",
+                1,
+            ),
+        ];
+        for (crs, hex, ver) in cases {
+            let claim = single_proof_claim(txkmh, crs);
+            assert_eq!(
+                claim.program_digest,
+                Digest::try_from_hex(hex).unwrap(),
+                "{crs} SingleProof digest drifted"
+            );
+            assert_eq!(claim.version, ver, "{crs} claim version wrong");
+            assert_eq!(
+                claim.input,
+                txkmh.reversed().values().to_vec(),
+                "{crs} claim input wrong"
+            );
+        }
+    }
+
     test_program_snapshot!(
         SingleProof,
-        "9ed47e4aff83681ce46618c59971cc5eca2ef5a063b3f35828946f4810295871338072751af633e0"
+        "578baf8e2c7c6b6bb460347076f2a1768d29f61eb50790b21e287c103305a302e13571985f28f7e8"
     );
 }

@@ -78,6 +78,7 @@ mod tests {
     use tasm_lib::memory::encode_to_memory;
     use tasm_lib::prelude::BasicSnippet;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::prelude::TasmObject;
     use tasm_lib::snippet_bencher::BenchmarkCase;
     use tasm_lib::traits::function::Function;
@@ -99,7 +100,7 @@ mod tests {
             &self,
             stack: &mut Vec<BFieldElement>,
             memory: &mut HashMap<BFieldElement, BFieldElement>,
-        ) {
+        ) -> Result<(), RustShadowError> {
             let proof_collection_pointer = stack.pop().unwrap();
 
             let input_length = bfe!(Digest::LEN);
@@ -107,7 +108,7 @@ mod tests {
 
             stack.push(input_length);
             stack.push(output_length);
-            NewClaim.rust_shadow(stack, memory);
+            NewClaim.rust_shadow(stack, memory)?;
 
             let digest_pointer = stack.pop().unwrap();
             let input_pointer = stack.pop().unwrap();
@@ -119,6 +120,8 @@ mod tests {
             encode_to_memory(memory, input_pointer, &mast_hash_reverse);
 
             stack.push(digest_pointer);
+
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

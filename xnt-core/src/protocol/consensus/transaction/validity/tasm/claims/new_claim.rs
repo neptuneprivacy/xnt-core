@@ -115,6 +115,7 @@ mod tests {
     use rand::SeedableRng;
     use tasm_lib::prelude::BasicSnippet;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::rust_shadowing_helper_functions;
     use tasm_lib::snippet_bencher::BenchmarkCase;
     use tasm_lib::traits::function::Function;
@@ -129,7 +130,7 @@ mod tests {
             &self,
             stack: &mut Vec<BFieldElement>,
             memory: &mut HashMap<BFieldElement, BFieldElement>,
-        ) {
+        ) -> Result<(), RustShadowError> {
             let output_len = stack.pop().unwrap().value() as usize;
             let input_len = stack.pop().unwrap().value() as usize;
 
@@ -177,6 +178,8 @@ mod tests {
                 .with_input(bfe_vec![0; input_len])
                 .with_output(bfe_vec![0; output_len]);
             assert_eq!(empty_claim, the_new_claim);
+
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

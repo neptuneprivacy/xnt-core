@@ -536,6 +536,6 @@ mod tests {
 
     test_program_snapshot!(
         KernelToOutputs,
-        "7b5cdf881ba64ef4d74245da25f4beb1c4b416922af46eacaa17ebc328021e0249a9301505c3223f"
+        "cbcebd905a23309a96f22c5acf57e691cb796078c7b88c2ca50bef35ad74cb3718163a593ca79f26"
     );
 }

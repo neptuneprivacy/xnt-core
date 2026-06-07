@@ -182,6 +182,7 @@ mod tests {
     use rand::RngCore;
     use rand::SeedableRng;
     use tasm_lib::memory::encode_to_memory;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::rust_shadowing_helper_functions;
     use tasm_lib::snippet_bencher::BenchmarkCase;
     use tasm_lib::traits::function::Function;
@@ -208,7 +209,7 @@ mod tests {
             &self,
             stack: &mut Vec<BFieldElement>,
             memory: &mut HashMap<BFieldElement, BFieldElement>,
-        ) {
+        ) -> Result<(), RustShadowError> {
             let proof_collection_pointer = stack.pop().unwrap();
             let proof_collection =
                 *ProofCollection::decode_from_memory(memory, proof_collection_pointer).unwrap();
@@ -221,6 +222,7 @@ mod tests {
             println!("encoded claim: [\n{}\n]", claim.encode().iter().join(", "));
 
             stack.push(claim_pointer);
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

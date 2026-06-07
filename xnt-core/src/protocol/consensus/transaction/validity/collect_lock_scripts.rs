@@ -280,6 +280,6 @@ mod tests {
 
     test_program_snapshot!(
         CollectLockScripts,
-        "7b608d9bbe5b5dc9f3f25af57ebb5a26302e404d0485d8b87abe74d9b339921493922b685efad062"
+        "7df00b46737424a38bd24caa6acb47bf6806eff7da2750f1989158d1f237e6864f05dcb159b09d86"
     );
 }

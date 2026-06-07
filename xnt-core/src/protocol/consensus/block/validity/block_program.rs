@@ -24,6 +24,7 @@ use crate::application::config::network::Network;
 use crate::protocol::consensus::block::block_body::BlockBody;
 use crate::protocol::consensus::block::block_body::BlockBodyField;
 use crate::protocol::consensus::block::BlockAppendix;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
@@ -42,10 +43,36 @@ impl BlockProgram {
     const ILLEGAL_FEE: i128 = 1_000_210;
     const PROOF_SIZE_INDICATOR_TOO_BIG: i128 = 1_000_211;
 
-    pub(crate) fn claim(block_body: &BlockBody, appendix: &BlockAppendix) -> Claim {
-        Claim::new(Self.hash())
+    pub(crate) fn claim(
+        block_body: &BlockBody,
+        appendix: &BlockAppendix,
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> Claim {
+        Claim::new(Self::program_digest_for(consensus_rule_set))
+            .about_version(consensus_rule_set.triton_proof_version().claim_version())
             .with_input(block_body.mast_hash().reversed().values().to_vec())
             .with_output(appendix.claims_as_output())
+    }
+
+    /// Era-correct BlockProgram program digest. Pre-upgrade digests are COMPUTED
+    /// from the historical source trees (`~/xnt-core-v0|v1|v2`) and hardcoded,
+    /// because the v3 tasm-lib builds a different BlockProgram; UpgradeVM
+    /// recomputes from the linked program.
+    pub(crate) fn program_digest_for(consensus_rule_set: ConsensusRuleSet) -> Digest {
+        const BLOCK_PROGRAM_REBOOT_DIGEST: &str = // v0 tree (Reboot/HardforkAlpha)
+            "2a3126ef86970a4a8df02711c2fbb4e5c9e025e257e0d169aab38114737a4cb9c84f9985b679c55a";
+        const BLOCK_PROGRAM_XNT_DIGEST: &str = // v1/v2 tree (Xnt, TimelockExtension)
+            "72d46afed8a1bf162814a432cf1ebe0f16a1cdb84bd339badc6fbd499172c3474c285dd0d5ba4e0c";
+
+        match consensus_rule_set {
+            ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => {
+                Digest::try_from_hex(BLOCK_PROGRAM_REBOOT_DIGEST).unwrap()
+            }
+            ConsensusRuleSet::Xnt | ConsensusRuleSet::TimelockExtension => {
+                Digest::try_from_hex(BLOCK_PROGRAM_XNT_DIGEST).unwrap()
+            }
+            ConsensusRuleSet::UpgradeVM => Self.hash(),
+        }
     }
 
     pub(crate) async fn verify(
@@ -53,8 +80,9 @@ impl BlockProgram {
         appendix: &BlockAppendix,
         proof: &Proof,
         network: Network,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> bool {
-        let claim = Self::claim(block_body, appendix);
+        let claim = Self::claim(block_body, appendix, consensus_rule_set);
         let proof_clone = proof.clone();
 
         debug!("** Calling triton_vm::verify to verify block proof ...");
@@ -602,9 +630,131 @@ pub(crate) mod tests {
         );
     }
 
+    /// Real-data proof of the UpgradeVM premise: feed REAL mainnet block
+    /// proofs (produced by triton-vm v2.0.0, i.e. proof version 1) into the v3
+    /// verifier with the hardcoded per-era BlockProgram digests. Passing ⟹ the
+    /// v3 verifier accepts v2-era proofs, so Xnt/TimelockExtension history is
+    /// trustlessly re-verifiable under a single tasm-lib. Fixtures were pulled
+    /// from a mainnet node via JSON-RPC `archival_getBlock` (test_data/
+    /// hf_upgrade_vm_blocks); the test skips gracefully if they're absent.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn real_mainnet_block_proofs_verify_under_v3() {
+        use crate::application::json_rpc::core::model::block::appendix::RpcBlockAppendix;
+        use crate::application::json_rpc::core::model::block::body::RpcBlockBody;
+        use crate::application::json_rpc::core::model::block::RpcBlockProof;
+        use crate::protocol::consensus::block::block_body::BlockBody;
+        use crate::protocol::consensus::block::BlockProof;
+
+        async fn verify_fixture(file: &str, crs: ConsensusRuleSet) -> Option<bool> {
+            let path = format!(
+                "{}/test_data/hf_upgrade_vm_blocks/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            if !std::path::Path::new(&path).exists() {
+                eprintln!("fixture {path} absent — skipping");
+                return None;
+            }
+            let json = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let block = &v["result"]["block"];
+            // BlockProgram::verify needs only body + appendix + proof; the header
+            // (RpcBlockPow) is skipped — it doesn't round-trip and isn't used here.
+            let body: BlockBody = serde_json::from_value::<RpcBlockBody>(block["kernel"]["body"].clone())
+                .unwrap()
+                .into();
+            let appendix: BlockAppendix =
+                serde_json::from_value::<RpcBlockAppendix>(block["kernel"]["appendix"].clone())
+                    .unwrap()
+                    .into();
+            let rpc_proof: RpcBlockProof = serde_json::from_value(block["proof"].clone()).unwrap();
+            let BlockProof::SingleProof(proof) = BlockProof::from(rpc_proof) else {
+                panic!("expected SingleProof in {file}");
+            };
+            Some(BlockProgram::verify(&body, &appendix, &proof, Network::Main, crs).await)
+        }
+
+        // proof version 1 (triton-vm v2.0.0) blocks MUST verify under v3.
+        if let Some(ok) =
+            verify_fixture("block_timelock_54000.json", ConsensusRuleSet::TimelockExtension).await
+        {
+            assert!(ok, "real TimelockExtension block proof must verify under v3");
+        }
+        if let Some(ok) = verify_fixture("block_xnt_30000.json", ConsensusRuleSet::Xnt).await {
+            assert!(ok, "real Xnt block proof must verify under v3");
+        }
+
+        // Reboot is proof version 0 (triton-vm v1.0.0). The v3 verifier CANNOT
+        // check a version-0 proof — which is exactly why Reboot/HardforkAlpha are
+        // checkpointed (`proofs_are_trusted`) rather than re-verified. Lock that
+        // in: if a future change made v3 accept v0 proofs, or wrongly stopped
+        // checkpointing Reboot, this fails.
+        if let Some(ok) = verify_fixture("block_reboot_5000.json", ConsensusRuleSet::Reboot).await {
+            assert!(
+                !ok,
+                "Reboot (proof v0) must NOT verify under the v3 verifier — this is \
+                 why it is checkpointed instead of re-verified"
+            );
+        }
+
+        // Negative control: the SAME real TimelockExtension proof verified under
+        // the WRONG rule set (UpgradeVM → the v3-recomputed BlockProgram
+        // digest a7de94e8…) must FAIL. This proves the verifier actually runs and
+        // checks the program digest, ruling out a spurious/short-circuited pass.
+        if let Some(ok) =
+            verify_fixture("block_timelock_54000.json", ConsensusRuleSet::UpgradeVM).await
+        {
+            assert!(
+                !ok,
+                "TimelockExtension proof must NOT verify under UpgradeVM's (wrong) digest"
+            );
+        }
+    }
+
+    /// Tripwire for the hardcoded pre-upgrade BlockProgram digests. Pins each
+    /// pre-upgrade rule set to its computed era digest (from `~/xnt-core-v0|v1|v2`)
+    /// so a future edit can't silently change a consensus value. UpgradeVM recomputes
+    /// from the linked v3 program.
+    #[test]
+    fn pre_upgrade_block_program_digests_are_pinned() {
+        use ConsensusRuleSet::*;
+        let cases = [
+            (
+                Reboot,
+                "2a3126ef86970a4a8df02711c2fbb4e5c9e025e257e0d169aab38114737a4cb9c84f9985b679c55a",
+            ),
+            (
+                HardforkAlpha,
+                "2a3126ef86970a4a8df02711c2fbb4e5c9e025e257e0d169aab38114737a4cb9c84f9985b679c55a",
+            ),
+            (
+                Xnt,
+                "72d46afed8a1bf162814a432cf1ebe0f16a1cdb84bd339badc6fbd499172c3474c285dd0d5ba4e0c",
+            ),
+            (
+                TimelockExtension,
+                "72d46afed8a1bf162814a432cf1ebe0f16a1cdb84bd339badc6fbd499172c3474c285dd0d5ba4e0c",
+            ),
+        ];
+        for (crs, hex) in cases {
+            assert_eq!(
+                BlockProgram::program_digest_for(crs),
+                Digest::try_from_hex(hex).unwrap(),
+                "{crs} BlockProgram digest drifted"
+            );
+        }
+        // UpgradeVM recomputes from the linked (v3) program.
+        assert_eq!(
+            BlockProgram::program_digest_for(UpgradeVM),
+            BlockProgram.hash()
+        );
+    }
+
     test_program_snapshot!(
         BlockProgram,
         // snapshot taken from master on 2025-04-11 e2a712efc34f78c6a28801544418e7051127d284
-        "2a3126ef86970a4a8df02711c2fbb4e5c9e025e257e0d169aab38114737a4cb9c84f9985b679c55a"
+        // Program hash updated for UpgradeVM (triton-vm v3); the pre-upgrade
+        // digest (2a3126ef…) lives on as BLOCK_PROGRAM_REBOOT_DIGEST in claim().
+        "a7de94e8df6bba118dd6561d0e2ed391915e52b090330d6213cfb7160883e57b303a2481f11b85ab"
     );
 }

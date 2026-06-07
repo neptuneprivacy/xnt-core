@@ -52,7 +52,14 @@ impl MockBlockGenerator {
         let (appendix, proof) = {
             let block_proof_witness = BlockProofWitness::produce(primitive_witness);
             let appendix = block_proof_witness.appendix();
-            let claim = BlockProgram::claim(&body, &appendix);
+            let claim = BlockProgram::claim(
+                &body,
+                &appendix,
+                crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+                    network,
+                    header.height,
+                ),
+            );
             (appendix, BlockProof::SingleProof(Proof::valid_mock(claim)))
         };
 

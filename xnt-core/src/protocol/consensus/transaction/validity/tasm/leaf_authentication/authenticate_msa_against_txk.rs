@@ -166,6 +166,7 @@ mod tests {
     use tasm_lib::traits::mem_preserver::MemPreserverInitialState;
     use tasm_lib::traits::mem_preserver::ShadowedMemPreserver;
     use tasm_lib::traits::rust_shadow::RustShadow;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::twenty_first::prelude::MerkleTreeInclusionProof;
     use tasm_lib::twenty_first::prelude::Mmr;
     use tasm_lib::twenty_first::prelude::Sponge;
@@ -183,7 +184,7 @@ mod tests {
             nd_digests: VecDeque<Digest>,
             _stdin: VecDeque<BFieldElement>,
             sponge: &mut Option<Tip5>,
-        ) -> Vec<BFieldElement> {
+        ) -> Result<Vec<BFieldElement>, RustShadowError> {
             let txk_digest = Digest::new([
                 stack.pop().unwrap(),
                 stack.pop().unwrap(),
@@ -226,7 +227,7 @@ mod tests {
             };
             assert!(mt_proof.verify(txk_digest));
 
-            vec![]
+            Ok(vec![])
         }
 
         fn pseudorandom_initial_state(

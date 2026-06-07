@@ -152,7 +152,8 @@ impl TransactionProof {
                 | ConsensusRuleSet::Xnt => {
                     proof_collection.verify(kernel_mast_hash, network).await
                 }
-                ConsensusRuleSet::TimelockExtension => {
+                ConsensusRuleSet::TimelockExtension
+                | ConsensusRuleSet::UpgradeVM => {
                     proof_collection.verify_v2(kernel_mast_hash, network).await
                 }
             },

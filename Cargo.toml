@@ -10,6 +10,9 @@ members = [
     "xnt-sdk",
 ]
 
+# Vendored tasm-lib is its own workspace; keep it out of this one so its
+# `*.workspace = true` inheritance resolves against tasm-lib/Cargo.toml.
+exclude = ["tasm-lib"]
 [workspace.lints.rust]
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"

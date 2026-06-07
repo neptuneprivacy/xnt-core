@@ -149,6 +149,7 @@ mod tests {
     use rand::Rng;
     use rand::SeedableRng;
     use tasm_lib::memory::encode_to_memory;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::push_encodable;
     use tasm_lib::test_helpers::test_assertion_failure;
     use tasm_lib::traits::function::Function;
@@ -191,7 +192,7 @@ mod tests {
             &self,
             stack: &mut Vec<BFieldElement>,
             memory: &mut std::collections::HashMap<BFieldElement, BFieldElement>,
-        ) {
+        ) -> Result<(), RustShadowError> {
             type CoinbaseAmount = Option<NativeCurrencyAmount>;
 
             let coinbase_ptr = stack.pop().unwrap();
@@ -220,6 +221,8 @@ mod tests {
             for word in coinbase_amount.encode().into_iter().rev() {
                 stack.push(word)
             }
+
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

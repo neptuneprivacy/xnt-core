@@ -1316,6 +1316,6 @@ mod tests {
     test_program_snapshot!(
         TimeLock,
         // snapshot taken from master on 2025-04-11 e2a712efc34f78c6a28801544418e7051127d284
-        "4b4d251947a07f9f2c016c1c271c04ce41013ff50031bd42854919be6e0e4849ebf931e856b542ad"
+        "b35f7f6d9da987ae482f09b9dedf9178fc6e23e10d4320d02596e1a459a21627b1c04197d9e1c210"
     );
 }

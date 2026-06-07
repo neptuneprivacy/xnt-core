@@ -14,6 +14,13 @@ pub const BLOCK_HEIGHT_HARDFORK_XNT_MAIN_NET: BlockHeight =
 pub const BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET: BlockHeight =
     BlockHeight::new(BFieldElement::new(52540u64));
 
+/// Height of the 1st block that follows the `UpgradeVM` consensus ruleset on
+/// mainnet. UpgradeVM is the triton-vm v3 / tasm-lib upgrade: it changes the
+/// bytecode (hence program digest) of every consensus program. Pre-upgrade history
+/// stays verifiable under the single v3 verifier via hardcoded per-era program
+/// digests; UpgradeVM blocks use the recomputed v3 digests.
+pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET: BlockHeight =
+    BlockHeight::new(BFieldElement::new(55500u64));
 
 /// Enumerates all possible sets of consensus rules.
 ///
@@ -40,16 +47,74 @@ pub enum ConsensusRuleSet {
     /// `release_date < timestamp`. New post-fork timelock UTXOs use
     /// `TimeLockV2`'s own hash and follow normal release rules.
     TimelockExtension,
+    /// The triton-vm v3 / tasm-lib upgrade hard fork.
+    ///
+    /// Activated at [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET`] on Main. The VM
+    /// upgrade changes the bytecode — and therefore the program digest — of
+    /// every consensus program. The single (v3) verifier still validates
+    /// pre-upgrade proofs because their program digests are hardcoded per era and
+    /// the proof version is carried in the `Claim`; UpgradeVM blocks use the
+    /// recomputed v3 program digests.
+    UpgradeVM,
+}
+
+/// The triton-vm crate major a rule set's proofs were produced under. The
+/// program digest changes per era, but a single (current) verifier can check
+/// every era's proofs given the era-correct digest + claim version, because the
+/// version is absorbed into the verifier's Fiat-Shamir transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::Display)]
+pub enum TritonProofVersion {
+    /// triton-vm v1.0.0 (proof format version 0) — Reboot, HardforkAlpha.
+    V1,
+    /// triton-vm v2.0.0 (proof format version 1) — Xnt, TimelockExtension.
+    V2,
+    /// triton-vm v3.0.0 (proof format version 1) — UpgradeVM.
+    V3,
+}
+
+impl TritonProofVersion {
+    /// The `version` field stamped into a [`Claim`]: triton-vm's own
+    /// proof-format version (0 for v1.0.0, 1 for v2.0.0+), which is distinct
+    /// from the crate major named by this enum.
+    pub(crate) fn claim_version(self) -> u32 {
+        match self {
+            TritonProofVersion::V1 => 0,
+            TritonProofVersion::V2 | TritonProofVersion::V3 => 1,
+        }
+    }
 }
 
 impl ConsensusRuleSet {
+    /// triton-vm crate major the blocks of this rule set were produced under.
+    pub(crate) fn triton_proof_version(&self) -> TritonProofVersion {
+        match self {
+            ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => TritonProofVersion::V1,
+            ConsensusRuleSet::Xnt | ConsensusRuleSet::TimelockExtension => TritonProofVersion::V2,
+            ConsensusRuleSet::UpgradeVM => TritonProofVersion::V3,
+        }
+    }
+
+    /// Rule sets whose proofs the current verifier cannot check, so their
+    /// blocks are trusted (checkpointed) rather than re-verified. These are the
+    /// proof-version-0 eras (triton-vm v1.0.0): the v3 verifier only handles
+    /// proof version 1, so Reboot/HardforkAlpha proofs are unverifiable here.
+    /// Xnt and TimelockExtension are proof version 1 and ARE re-verified, using
+    /// their hardcoded pre-upgrade program digests.
+    pub(crate) fn proofs_are_trusted(&self) -> bool {
+        matches!(
+            self,
+            ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha
+        )
+    }
+
     /// Maximum block size in number of BFieldElements
     pub(crate) const fn max_block_size(&self) -> usize {
         match self {
             ConsensusRuleSet::Reboot
             | ConsensusRuleSet::HardforkAlpha
             | ConsensusRuleSet::Xnt
-            | ConsensusRuleSet::TimelockExtension => {
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM => {
                 // This size is 8MB which should keep it feasible to run archival nodes for
                 // many years without requiring excessive disk space.
                 1_000_000
@@ -71,12 +136,13 @@ impl ConsensusRuleSet {
                     ConsensusRuleSet::Reboot
                 } else if block_height < BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET {
                     ConsensusRuleSet::Xnt
-                } else {
+                } else if block_height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET {
                     ConsensusRuleSet::TimelockExtension
+                } else {
+                    ConsensusRuleSet::UpgradeVM
                 }
             }
-            // The TimelockExtension hard fork is mainnet-only.
-            Network::TestnetMock | Network::RegTest | Network::Testnet(_) => ConsensusRuleSet::Xnt,
+            Network::TestnetMock | Network::RegTest | Network::Testnet(_) => ConsensusRuleSet::UpgradeVM,
         }
     }
 
@@ -85,7 +151,8 @@ impl ConsensusRuleSet {
             ConsensusRuleSet::Reboot
             | ConsensusRuleSet::HardforkAlpha
             | ConsensusRuleSet::Xnt
-            | ConsensusRuleSet::TimelockExtension => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
     pub(crate) fn max_num_outputs(&self) -> usize {
@@ -93,7 +160,8 @@ impl ConsensusRuleSet {
             ConsensusRuleSet::Reboot
             | ConsensusRuleSet::HardforkAlpha
             | ConsensusRuleSet::Xnt
-            | ConsensusRuleSet::TimelockExtension => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
     pub(crate) fn max_num_announcements(&self) -> usize {
@@ -101,7 +169,8 @@ impl ConsensusRuleSet {
             ConsensusRuleSet::Reboot
             | ConsensusRuleSet::HardforkAlpha
             | ConsensusRuleSet::Xnt
-            | ConsensusRuleSet::TimelockExtension => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
 }
@@ -387,8 +456,9 @@ pub(crate) mod tests {
 
     #[test]
     fn timelock_extension_never_activates_off_mainnet() {
-        // The fork is mainnet-only: Testnet, RegTest and TestnetMock stay on Xnt
-        // regardless of block height.
+        // The fork is mainnet-only. Off-mainnet networks (Testnet, RegTest,
+        // TestnetMock) run UpgradeVM from genesis, so they never pass through
+        // the TimelockExtension ruleset regardless of block height.
         let high = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET;
         for nw in [
             Network::Testnet(0),
@@ -398,10 +468,21 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 ConsensusRuleSet::infer_from(nw, high),
-                ConsensusRuleSet::Xnt,
+                ConsensusRuleSet::UpgradeVM,
                 "{nw:?} must never activate TimelockExtension"
             );
         }
+    }
+
+    #[test]
+    fn upgrade_vm_active_on_main_at_activation_height() {
+        let activation = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET;
+        let rule_set = ConsensusRuleSet::infer_from(Network::Main, activation);
+        assert_eq!(
+            rule_set,
+            ConsensusRuleSet::UpgradeVM,
+            "UpgradeVM must activate at exactly its mainnet activation height"
+        );
     }
 
     #[test]
@@ -417,21 +498,21 @@ pub(crate) mod tests {
         let timelock_v2 = TimeLockV2.hash().to_hex();
         assert_eq!(
             timelock_v2,
-            "ac58ee89b7d8635d29b257a9ab3c34e7dcf54de25f3d43d7d0fa562ee1156803d7cbe98e874d1c16",
+            "0fd038a5ab8499c4b174c28166e10f2b6c2cc30754c1fd5c854f6c1398989854e424a33d49f94a28",
             "TimeLockV2 program hash drifted"
         );
 
         let cts_v2 = CollectTypeScriptsV2.hash().to_hex();
         assert_eq!(
             cts_v2,
-            "ef4f3158bc49614f2a38c41a5a0179bd8e89a0f0ff940d1180d84d5a3d7fe7bc8d9bcb02845fe491",
+            "0304f97bde3df8b92c6f5a36485ca18a76641e823c97236000f586baaf46b5eb9984317bbfeec9d5",
             "CollectTypeScriptsV2 program hash drifted"
         );
 
         let sp_v2 = SingleProofV2.hash().to_hex();
         assert_eq!(
             sp_v2,
-            "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b",
+            "f04fb7585a00b2a925cf31e1746f7524899b52302807a9e7b4d1e47b68b1bfbbc1ae582209fa5af8",
             "SingleProofV2 program hash drifted"
         );
     }

@@ -409,7 +409,12 @@ mod tests {
             b_new.body(),
             ConsensusRuleSet::infer_from(network, b_prev.header().height),
         ));
-        cache_true_claim(BlockProgram::claim(b_new.body(), &b_new.kernel.appendix)).await;
+        cache_true_claim(BlockProgram::claim(
+            b_new.body(),
+            &b_new.kernel.appendix,
+            ConsensusRuleSet::infer_from(network, b_prev.header().height),
+        ))
+        .await;
 
         prop_assert_eq!(
             BlockValidationError::TransactionTimestamp,
@@ -436,7 +441,12 @@ mod tests {
             b_new.body(),
             ConsensusRuleSet::infer_from(network, b_prev.header().height),
         ));
-        cache_true_claim(BlockProgram::claim(b_new.body(), &b_new.kernel.appendix)).await;
+        cache_true_claim(BlockProgram::claim(
+            b_new.body(),
+            &b_new.kernel.appendix,
+            ConsensusRuleSet::infer_from(network, b_prev.header().height),
+        ))
+        .await;
 
         prop_assert_eq!(
             BlockValidationError::CoinbaseTooBig,
@@ -462,7 +472,12 @@ mod tests {
             b_new.body(),
             ConsensusRuleSet::infer_from(network, b_prev.header().height),
         ));
-        cache_true_claim(BlockProgram::claim(b_new.body(), &b_new.kernel.appendix)).await;
+        cache_true_claim(BlockProgram::claim(
+            b_new.body(),
+            &b_new.kernel.appendix,
+            ConsensusRuleSet::infer_from(network, b_prev.header().height),
+        ))
+        .await;
 
         prop_assert_eq!(
             BlockValidationError::NegativeCoinbase,
@@ -487,7 +502,12 @@ mod tests {
             b_new.body(),
             ConsensusRuleSet::infer_from(network, b_prev.header().height),
         ));
-        cache_true_claim(BlockProgram::claim(b_new.body(), &b_new.kernel.appendix)).await;
+        cache_true_claim(BlockProgram::claim(
+            b_new.body(),
+            &b_new.kernel.appendix,
+            ConsensusRuleSet::infer_from(network, b_prev.header().height),
+        ))
+        .await;
 
         prop_assert_eq!(
             BlockValidationError::NegativeFee,

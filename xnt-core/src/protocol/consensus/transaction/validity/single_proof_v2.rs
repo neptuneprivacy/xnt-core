@@ -284,8 +284,8 @@ pub(crate) async fn produce_single_proof(
         ConsensusRuleSet::Reboot
         | ConsensusRuleSet::HardforkAlpha
         | ConsensusRuleSet::Xnt
-        | ConsensusRuleSet::TimelockExtension => {
-            // TODO(phase 6): TimelockExtension should produce a SingleProofV2
+        | ConsensusRuleSet::TimelockExtension
+        | ConsensusRuleSet::UpgradeVM => {
             // backed by CollectTypeScriptsV2's hash. For now it shares V1 so
             // the variant is wired and the rest of the cascade can be built.
             SingleProofV2::produce(primitive_witness, triton_vm_job_queue, proof_job_options).await
@@ -302,16 +302,34 @@ pub(crate) fn single_proof_claim(
     tx_kernel_mast_hash: Digest,
     consensus_rule_set: ConsensusRuleSet,
 ) -> Claim {
+    // Pre-upgrade SingleProof / SingleProofV2 digests, COMPUTED by building each
+    // historical source tree with its own tasm-lib (`~/xnt-core-v0|v1|v2`); the
+    // in-tree snapshot literals were stale for these programs.
+    const SINGLE_PROOF_REBOOT_DIGEST: &str = // SingleProof, v0 tree (Reboot/HardforkAlpha)
+        "b975c61c2efd9321bddd99d43d5d25c336054bf70abd6db919cb57dcf27d1427e34365d7ddebc381";
+    const SINGLE_PROOF_XNT_DIGEST: &str = // SingleProof, v1 tree (Xnt)
+        "d69c074e55c4dde6794f65cfcd1d8f5a88904845fa3218d60adbfc134337e03661feede4fa3d4491";
+    const SINGLE_PROOF_V2_TIMELOCK_DIGEST: &str = // SingleProofV2, v2 tree (TimelockExtension)
+        "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b";
+
+    let input = tx_kernel_mast_hash.reversed().values().to_vec();
+    let version = consensus_rule_set.triton_proof_version().claim_version();
     match consensus_rule_set {
-        ConsensusRuleSet::Reboot
-        | ConsensusRuleSet::HardforkAlpha
-        | ConsensusRuleSet::Xnt
-        | ConsensusRuleSet::TimelockExtension => {
-            // TODO(phase 6): TimelockExtension should return SingleProofV2's
-            // claim. For now it shares V1; this still wires every downstream
-            // consumer through ConsensusRuleSet so the V2 swap is localised.
-            SingleProofV2::claim(tx_kernel_mast_hash)
+        ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => {
+            Claim::new(Digest::try_from_hex(SINGLE_PROOF_REBOOT_DIGEST).unwrap())
+                .about_version(version)
+                .with_input(input)
         }
+        ConsensusRuleSet::Xnt => Claim::new(Digest::try_from_hex(SINGLE_PROOF_XNT_DIGEST).unwrap())
+            .about_version(version)
+            .with_input(input),
+        ConsensusRuleSet::TimelockExtension => {
+            Claim::new(Digest::try_from_hex(SINGLE_PROOF_V2_TIMELOCK_DIGEST).unwrap())
+                .about_version(version)
+                .with_input(input)
+        }
+        // Current (v3) bytecode — recompute from the linked program.
+        ConsensusRuleSet::UpgradeVM => SingleProofV2::claim(tx_kernel_mast_hash),
     }
 }
 
@@ -1335,6 +1353,8 @@ pub(crate) mod tests {
         // so SingleProofV2 verifies a CollectTypeScriptsV2 proof instead of
         // a V1 proof. Used by BlockAppendix consensus_claims under
         // ConsensusRuleSet::TimelockExtension.
-        "19d8f2cf2dfcf917772f27fbc9762419512a4e628775ef64d4cab55ea5e157faa7e1ea4507dc1b6b"
+        // Program hash updated for UpgradeVM (triton-vm v3); the pre-upgrade
+        // digest (19d8f2cf…) lives on as a hardcoded constant in single_proof_claim.
+        "f04fb7585a00b2a925cf31e1746f7524899b52302807a9e7b4d1e47b68b1bfbbc1ae582209fa5af8"
     );
 }

@@ -83,6 +83,7 @@ mod tests {
     use tasm_lib::hashing::merkle_verify::MerkleVerify;
     use tasm_lib::memory::encode_to_memory;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::snippet_bencher::BenchmarkCase;
     use tasm_lib::test_helpers::test_assertion_failure;
     use tasm_lib::traits::read_only_algorithm::ReadOnlyAlgorithm;
@@ -229,7 +230,7 @@ mod tests {
             memory: &HashMap<BFieldElement, BFieldElement>,
             _nd_tokens: std::collections::VecDeque<BFieldElement>,
             nd_digests: std::collections::VecDeque<Digest>,
-        ) {
+        ) -> Result<(), RustShadowError> {
             let field_size = stack.pop().unwrap().value();
             let field_ptr = stack.pop().unwrap();
             let txk_digest = Digest::new([
@@ -259,6 +260,7 @@ mod tests {
                 authentication_structure: auth_path,
             };
             assert!(mt_proof.verify(txk_digest));
+            Ok(())
         }
 
         fn pseudorandom_initial_state(

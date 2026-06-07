@@ -21,6 +21,7 @@ use num_traits::Zero;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
+use tasm_lib::prelude::Digest;
 use tasm_lib::structure::tasm_object::TasmObject;
 use tasm_lib::triton_vm::prelude::LabelledInstruction;
 use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
@@ -132,11 +133,20 @@ impl NativeCurrencyAmount {
 
     /// Create a `coins` object for use in a UTXO
     pub fn to_native_coins(&self) -> Vec<Coin> {
-        let dictionary = vec![Coin {
-            type_script_hash: NativeCurrency.hash(),
+        self.to_native_coins_with_type_script_hash(NativeCurrency.hash())
+    }
+
+    /// Like [`Self::to_native_coins`], but with an explicit type-script hash.
+    ///
+    /// Needed when re-deriving UTXOs that were committed to the mutator set
+    /// before the `UpgradeVM` fork: those embed the legacy
+    /// [`NativeCurrency::legacy_type_script_hash`] rather than the current
+    /// `NativeCurrency.hash()`.
+    pub fn to_native_coins_with_type_script_hash(&self, type_script_hash: Digest) -> Vec<Coin> {
+        vec![Coin {
+            type_script_hash,
             state: self.encode(),
-        }];
-        dictionary
+        }]
     }
 
     /// Convert the amount to Neptune atomic units (nau) as a 64-bit floating

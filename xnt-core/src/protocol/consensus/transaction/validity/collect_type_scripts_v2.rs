@@ -857,6 +857,6 @@ mod tests {
         // tagged with the legacy TimeLock hash to TimeLockV2.hash() before
         // both the de-duplication check and the list push. Used by
         // SingleProofV2's GenerateCollectTypeScriptsClaim (phase 6).
-        "ef4f3158bc49614f2a38c41a5a0179bd8e89a0f0ff940d1180d84d5a3d7fe7bc8d9bcb02845fe491"
+        "0304f97bde3df8b92c6f5a36485ca18a76641e823c97236000f586baaf46b5eb9984317bbfeec9d5"
     );
 }

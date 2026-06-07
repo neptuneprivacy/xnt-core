@@ -65,6 +65,7 @@ use crate::protocol::consensus::block::pow::PowMastPaths;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::utxo::Coin;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
@@ -238,7 +239,11 @@ impl Block {
         let (appendix, proof) = {
             let block_proof_witness = BlockProofWitness::produce(primitive_witness);
             let appendix = block_proof_witness.appendix();
-            let claim = BlockProgram::claim(&body, &appendix);
+            let claim = BlockProgram::claim(
+                &body,
+                &appendix,
+                ConsensusRuleSet::infer_from(network, header.height),
+            );
 
             let proof = ProofBuilder::new()
                 .program(BlockProgram.program())
@@ -504,12 +509,20 @@ impl Block {
     }
 
     pub fn premine_utxos() -> Vec<Utxo> {
-        // Premine will be unlocked at genesis
+        // Premine will be unlocked at genesis.
+        //
+        // The native-currency type-script hash is pinned to the launch-era value
+        // so the genesis block stays identical to the live chain across the
+        // UpgradeVM fork (the v3 NativeCurrency program hashes differently, which
+        // would otherwise change the genesis mutator set and break sync).
+        // Spendability of these legacy-tagged coins is handled by the on-chain
+        // remap in CollectTypeScriptsV2.
+        let nc_hash = NativeCurrency::legacy_type_script_hash();
 
         let mut utxos = vec![];
         for (receiving_address, amount) in Self::premine_distribution() {
             let coins = vec![
-                Coin::new_native_currency(amount),
+                Coin::new_native_currency_with_type_script_hash(nc_hash, amount),
                 //TimeLock::until(premine_release_date),
             ];
             let utxo = Utxo::new(receiving_address.lock_script_hash(), coins);
@@ -624,8 +637,9 @@ impl Block {
         }
 
         // 1.a)
-        // Skip claim validation for old Neptune blocks (Reboot consensus) 
-        if consensus_rule_set != ConsensusRuleSet::Reboot {
+        // Skip claim validation for proof-version-0 blocks (Reboot/HardforkAlpha),
+        // whose proofs the current (v3) verifier cannot reproduce.
+        if !consensus_rule_set.proofs_are_trusted() {
             for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
                 if !self.appendix().contains(&required_claim) {
                     return Err(BlockValidationError::AppendixMissingClaim);
@@ -644,9 +658,17 @@ impl Block {
         };
 
         // 1.d)
-        // Skip proof verification for old Neptune blocks (Reboot consensus)
-        if consensus_rule_set != ConsensusRuleSet::Reboot {
-            if !BlockProgram::verify(self.body(), self.appendix(), block_proof, network).await {
+        // Skip proof verification for proof-version-0 blocks (Reboot/HardforkAlpha).
+        if !consensus_rule_set.proofs_are_trusted() {
+            if !BlockProgram::verify(
+                self.body(),
+                self.appendix(),
+                block_proof,
+                network,
+                consensus_rule_set,
+            )
+            .await
+            {
                 return Err(BlockValidationError::ProofValidity);
             }
         }
@@ -670,6 +692,17 @@ impl Block {
 
         // 2.m)
         if msa_before.hash() != self.body().transaction_kernel.mutator_set_hash {
+            tracing::warn!(
+                "MUTATOR-SET MISMATCH at block height {} ({})\n  rule_set            = {:?}\n  parent height       = {} ({})\n  parent.msa_after    = {}\n  this.kernel.ms_hash = {}\n  num inputs          = {}",
+                self.header().height,
+                self.hash().to_hex(),
+                consensus_rule_set,
+                previous_block.header().height,
+                previous_block.hash().to_hex(),
+                msa_before.hash().to_hex(),
+                self.body().transaction_kernel.mutator_set_hash.to_hex(),
+                inputs.len(),
+            );
             return Err(BlockValidationError::TransactionMutatorSetMismatch);
         }
         
@@ -1138,6 +1171,49 @@ pub(crate) mod tests {
                 .map(Block::premine_sender_randomness)
                 .all_unique(),
             "All genesis blocks must have unique sender randomness for the premine UTXOs",
+        );
+    }
+
+    #[test]
+    fn diag_nativecurrency_drives_genesis() {
+        use crate::protocol::consensus::transaction::utxo::Coin;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
+        use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+        use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
+
+        let nc_v3 = NativeCurrency.hash();
+        let nc_live = Digest::try_from_hex(
+            "f8e778e011688c3985f0a5b325e26a19d7d6dc2a50cb8356b569bd9acc98eabc8511bb707d0b7a64",
+        )
+        .unwrap();
+        println!("NativeCurrency.hash() (this binary) = {}", nc_v3.to_hex());
+        println!("NativeCurrency.hash() (live chain)  = {}", nc_live.to_hex());
+
+        let amount = PREMINE_MAX_SIZE;
+        let lock = Digest::default();
+        let utxo_v3 = Utxo::new(lock, vec![Coin::new_native_currency(amount)]);
+        let utxo_live = Utxo::new(
+            lock,
+            vec![Coin {
+                type_script_hash: nc_live,
+                state: amount.encode(),
+            }],
+        );
+        println!(
+            "premine UTXO digest (v3 NC)   = {}",
+            Tip5::hash(&utxo_v3).to_hex()
+        );
+        println!(
+            "premine UTXO digest (live NC) = {}",
+            Tip5::hash(&utxo_live).to_hex()
+        );
+
+        // With the genesis pin in place, this should equal the live chain's
+        // block-0 digest: 3b012c9abf353d9201bc3328391bbd0d43c5edb91da1085be15a3fc52ad55f65ea115d255922b5a4
+        println!(
+            "genesis.hash() (this binary) = {}",
+            Block::genesis(Network::Main).hash().to_hex()
         );
     }
 

@@ -247,6 +247,8 @@ mod tests {
     use rand::SeedableRng;
     use tasm_lib::memory::encode_to_memory;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
+    use tasm_lib::pop_encodable;
     use tasm_lib::push_encodable;
     use tasm_lib::rust_shadowing_helper_functions;
     use tasm_lib::snippet_bencher::BenchmarkCase;
@@ -257,7 +259,6 @@ mod tests {
     use tasm_lib::triton_vm::prelude::BFieldElement;
 
     use super::*;
-    use crate::tests::shared::pop_encodable;
     use crate::twenty_first::bfe;
     use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
 
@@ -266,11 +267,11 @@ mod tests {
             &self,
             stack: &mut Vec<BFieldElement>,
             memory: &mut HashMap<BFieldElement, BFieldElement>,
-        ) {
-            let item = pop_encodable::<Digest>(stack);
-            let sender_randomness = pop_encodable::<Digest>(stack);
-            let receiver_preimage = pop_encodable::<Digest>(stack);
-            let aocl_leaf_index = pop_encodable::<u64>(stack);
+        ) -> Result<(), RustShadowError> {
+            let item = pop_encodable::<Digest>(stack)?;
+            let sender_randomness = pop_encodable::<Digest>(stack)?;
+            let receiver_preimage = pop_encodable::<Digest>(stack)?;
+            let aocl_leaf_index = pop_encodable::<u64>(stack)?;
 
             let absolute_index_set = AbsoluteIndexSet::compute(
                 item,
@@ -287,7 +288,9 @@ mod tests {
             // Unused artifact left on memory address immediately below struct
             encode_to_memory(memory, free_page, &NUM_TRIALS);
 
-            stack.push(struct_pointer)
+            stack.push(struct_pointer);
+
+            Ok(())
         }
 
         fn pseudorandom_initial_state(
