@@ -23,6 +23,10 @@ pub enum DigestSource {
 pub struct TotalAmountMainLoop {
     pub digest_source: DigestSource,
     pub release_date: StaticAllocation,
+    /// Optional additional (legacy) type-script hash counted as native
+    /// currency alongside `digest_source`. See
+    /// [`AddAllAmountsAndCheckTimeLock::legacy_digest`]. `None` is byte-neutral.
+    pub legacy_digest: Option<Digest>,
 }
 
 impl BasicSnippet for TotalAmountMainLoop {
@@ -56,7 +60,18 @@ impl BasicSnippet for TotalAmountMainLoop {
     }
 
     fn entrypoint(&self) -> String {
-        "neptune_type_script_total_amount_main_loop".to_string()
+        // The emitted code differs by `legacy_digest` (it threads the digest into
+        // the imported `AddAllAmountsAndCheckTimeLock`, whose code varies). Since
+        // `Library::import` dedups snippets by entrypoint name only, the name must
+        // vary with the digest — otherwise importing two variants into one library
+        // would silently reuse whichever was imported first. Mirrors
+        // [`AddAllAmountsAndCheckTimeLock::entrypoint`]; `None` keeps the original
+        // base name, so non-remap users emit byte-identical code.
+        let base = "neptune_type_script_total_amount_main_loop";
+        match self.legacy_digest {
+            Some(digest) => format!("{base}_legacy_{}", digest.to_hex()),
+            None => base.to_string(),
+        }
     }
 
     fn code(&self, library: &mut Library) -> Vec<LabelledInstruction> {
@@ -65,6 +80,7 @@ impl BasicSnippet for TotalAmountMainLoop {
             library.import(Box::new(AddAllAmountsAndCheckTimeLock {
                 digest_source: self.digest_source,
                 release_date: self.release_date,
+                legacy_digest: self.legacy_digest,
             }));
 
         let field_coins = field!(Utxo::coins);

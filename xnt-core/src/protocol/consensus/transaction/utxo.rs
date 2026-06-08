@@ -18,6 +18,7 @@ use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 
 use crate::protocol::consensus::type_scripts::known_type_scripts::is_known_type_script_with_valid_state;
+use crate::protocol::consensus::type_scripts::known_type_scripts::is_timelock_type_script_hash;
 use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
@@ -33,13 +34,13 @@ pub struct Coin {
 
 impl Display for Coin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let output = if self.type_script_hash == NativeCurrency.hash() {
+        let output = if NativeCurrency::is_native_currency(self.type_script_hash) {
             let amount = match NativeCurrencyAmount::decode(&self.state) {
                 Ok(boxed_amount) => boxed_amount.to_string(),
                 Err(_) => "Error: Unable to decode amount".to_owned(),
             };
             format!("Native currency: {amount}")
-        } else if self.type_script_hash == TimeLock.hash() {
+        } else if is_timelock_type_script_hash(self.type_script_hash) {
             let release_date = self.release_date().unwrap();
             format!("Timelock until: {release_date}")
         } else {
@@ -52,7 +53,7 @@ impl Display for Coin {
 
 impl Coin {
     pub fn release_date(&self) -> Option<Timestamp> {
-        if self.type_script_hash == TimeLock.hash() {
+        if is_timelock_type_script_hash(self.type_script_hash) {
             Timestamp::decode(&self.state).ok().map(|b| *b)
         } else {
             None
@@ -152,7 +153,7 @@ impl Utxo {
         let remove = self
             .coins
             .iter()
-            .find_position(|coin| coin.type_script_hash == NativeCurrency.hash());
+            .find_position(|coin| NativeCurrency::is_native_currency(coin.type_script_hash));
         if let Some((idx, _)) = remove {
             self.coins[idx] = new_amount;
         } else {
@@ -165,7 +166,7 @@ impl Utxo {
     pub fn has_native_currency(&self) -> bool {
         self.coins
             .iter()
-            .any(|coin| coin.type_script_hash == NativeCurrency.hash())
+            .any(|coin| NativeCurrency::is_native_currency(coin.type_script_hash))
     }
 
     /// Return all type script hashes referenced by any coin in any UTXO,
@@ -191,7 +192,7 @@ impl Utxo {
         crate::macros::log_slow_scope!();
         self.coins
             .iter()
-            .filter(|coin| coin.type_script_hash == NativeCurrency.hash())
+            .filter(|coin| NativeCurrency::is_native_currency(coin.type_script_hash))
             .map(|coin| match NativeCurrencyAmount::decode(&coin.state) {
                 Ok(boxed_amount) => *boxed_amount,
                 Err(_) => NativeCurrencyAmount::zero(),
@@ -224,7 +225,7 @@ impl Utxo {
         for state in self
             .coins
             .iter()
-            .filter(|c| c.type_script_hash == TimeLock.hash())
+            .filter(|c| is_timelock_type_script_hash(c.type_script_hash))
             .map(|c| c.state.clone())
         {
             match Timestamp::decode(&state) {
@@ -406,5 +407,59 @@ mod tests {
             coins: vec![],
         };
         assert!(Utxo::type_script_hashes([utxo].iter()).contains(&NativeCurrency.hash()));
+    }
+
+    #[test]
+    fn legacy_native_currency_coin_counts_toward_balance() {
+        // A pre-UpgradeVM UTXO carries the legacy native-currency hash. Now that
+        // the on-chain remap makes it spendable, the wallet must also see its
+        // value (balance + input selection) instead of treating it as zero.
+        let amount = NativeCurrencyAmount::coins(42);
+        let legacy_coin = Coin::new_native_currency_with_type_script_hash(
+            NativeCurrency::legacy_type_script_hash(),
+            amount,
+        );
+        let utxo = Utxo::new(Digest::default(), vec![legacy_coin]);
+
+        assert!(utxo.has_native_currency());
+        assert_eq!(amount, utxo.get_native_currency_amount());
+    }
+
+    #[test]
+    fn legacy_native_currency_utxo_is_known_and_spendable() {
+        // A legacy native-currency UTXO with no time lock must be a recognized
+        // type script and spendable now — so the wallet lists it as "available",
+        // not just "found". (Regression: it was classified as an unknown type
+        // script, so can_spend_at returned false and available stayed 0.)
+        let legacy_coin = Coin::new_native_currency_with_type_script_hash(
+            NativeCurrency::legacy_type_script_hash(),
+            NativeCurrencyAmount::coins(1),
+        );
+        let utxo = Utxo::new(Digest::default(), vec![legacy_coin]);
+
+        assert!(utxo.all_type_script_states_are_valid());
+        assert!(utxo.can_spend_at(Timestamp::now()));
+    }
+
+    #[test]
+    fn legacy_timelocked_utxo_respects_release_date() {
+        // A legacy-time-locked UTXO must still be honored: known, but not
+        // spendable until its release date.
+        let release = Timestamp::now() + Timestamp::days(30);
+        let legacy_timelock = Coin {
+            type_script_hash: TimeLock::legacy_type_script_hash(),
+            state: vec![release.0],
+        };
+        let utxo = Utxo::new(
+            Digest::default(),
+            vec![
+                Coin::new_native_currency(NativeCurrencyAmount::coins(1)),
+                legacy_timelock,
+            ],
+        );
+
+        assert!(utxo.all_type_script_states_are_valid());
+        assert!(!utxo.can_spend_at(Timestamp::now()));
+        assert!(utxo.can_spend_at(release + Timestamp::days(1)));
     }
 }

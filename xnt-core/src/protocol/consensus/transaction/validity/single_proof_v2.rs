@@ -1355,6 +1355,6 @@ pub(crate) mod tests {
         // ConsensusRuleSet::TimelockExtension.
         // Program hash updated for UpgradeVM (triton-vm v3); the pre-upgrade
         // digest (19d8f2cf…) lives on as a hardcoded constant in single_proof_claim.
-        "f04fb7585a00b2a925cf31e1746f7524899b52302807a9e7b4d1e47b68b1bfbbc1ae582209fa5af8"
+        "6f6ea3083e506c048203a8505f8793aa70e4b1f610a352b14360f9e3fde21aa9373d607ddcf69888"
     );
 }

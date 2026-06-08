@@ -51,6 +51,23 @@ impl TimeLock {
             .find_map(Coin::release_date)
             .unwrap_or_else(Timestamp::zero)
     }
+
+    /// The `type_script_hash` that `TimeLock` coins carried *before* the
+    /// `UpgradeVM` hard fork (Triton VM v3). Stable across triton-vm v1 and v2
+    /// (`f8e778e0…`-era), it changed to `Self.hash()` only at the v3 VM upgrade,
+    /// which re-hashes every consensus program.
+    ///
+    /// Coins committed to the mutator set before the fork embed this legacy
+    /// digest, so spending or collecting them post-fork requires remapping this
+    /// value to the current `TimeLockV2.hash()` (the +1-year remap target).
+    pub const LEGACY_TYPE_SCRIPT_HASH_HEX: &'static str =
+        "4b4d251947a07f9f2c016c1c271c04ce41013ff50031bd42854919be6e0e4849ebf931e856b542ad";
+
+    /// See [`Self::LEGACY_TYPE_SCRIPT_HASH_HEX`].
+    pub fn legacy_type_script_hash() -> Digest {
+        Digest::try_from_hex(Self::LEGACY_TYPE_SCRIPT_HASH_HEX)
+            .expect("legacy time-lock type-script-hash hex is valid")
+    }
 }
 
 impl ConsensusProgram for TimeLock {

@@ -37,6 +37,7 @@ impl BasicSnippet for GetTotalAndTimeLockedAmounts {
         let total_amount_main_loop = TotalAmountMainLoop {
             digest_source: DigestSource::Hardcode(self.type_script_hash),
             release_date: release_date_allocation,
+            legacy_digest: None,
         };
         let total_amount_main_loop_label = library.import(Box::new(total_amount_main_loop));
 

@@ -142,7 +142,9 @@ impl ConsensusRuleSet {
                     ConsensusRuleSet::UpgradeVM
                 }
             }
-            Network::TestnetMock | Network::RegTest | Network::Testnet(_) => ConsensusRuleSet::UpgradeVM,
+            Network::TestnetMock | Network::RegTest | Network::Testnet(_) => {
+                ConsensusRuleSet::UpgradeVM
+            }
         }
     }
 
@@ -347,7 +349,7 @@ pub(crate) mod tests {
 
     #[traced_test]
     #[test]
-    fn new_blocks_at_block_height_10_000() {
+    fn new_blocks_at_upgrade_vm_height() {
         // We want to use the following block primitive witness generator (which
         // uses async code on the inside) in combination with async code. We
         // make this test function async because we would be entering into the
@@ -355,15 +357,18 @@ pub(crate) mod tests {
         // witness once, in this synchronous wrapper, and continue
         // asynchronously with the helper function.
 
-        let init_block_heigth = BlockHeight::from(10_000u64);
+        // Build on top of a chain at the UpgradeVM fork height. Producing new
+        // blocks only works under the current (v3) rule set: pre-UpgradeVM
+        // history is verifiable via hardcoded per-era program digests but cannot
+        // be *extended*, since those claims reference digests that no v3
+        // bytecode reproduces.
+        let init_block_heigth = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET;
         let bpw = BlockPrimitiveWitness::deterministic_with_block_height(init_block_heigth);
 
-        tokio_runtime().block_on(new_blocks_at_block_height_10_000_async(bpw));
+        tokio_runtime().block_on(new_blocks_at_upgrade_vm_height_async(bpw));
     }
 
-    async fn new_blocks_at_block_height_10_000_async(
-        block_primitive_witness: BlockPrimitiveWitness,
-    ) {
+    async fn new_blocks_at_upgrade_vm_height_async(block_primitive_witness: BlockPrimitiveWitness) {
         // 1. generate state synced to height
         let mut rng = StdRng::seed_from_u64(55512345);
         let network = Network::Main;
@@ -385,7 +390,10 @@ pub(crate) mod tests {
         bob.set_new_tip(block_10_000.clone()).await.unwrap();
 
         let observed_block_height = bob.lock_guard().await.chain.light_state().header().height;
-        assert_eq!(BlockHeight::from(10_000u64), observed_block_height,);
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET,
+            observed_block_height,
+        );
 
         // 2. get a positive balance, by mining.
         let blocks_to_mine = 5;
@@ -401,7 +409,10 @@ pub(crate) mod tests {
         }
 
         let hopefully_plus_5 = bob.lock_guard().await.chain.light_state().header().height;
-        assert_eq!(BlockHeight::from(10_005u64), hopefully_plus_5);
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET + 5,
+            hopefully_plus_5
+        );
         assert!(
             bob.api()
                 .wallet()
@@ -498,21 +509,21 @@ pub(crate) mod tests {
         let timelock_v2 = TimeLockV2.hash().to_hex();
         assert_eq!(
             timelock_v2,
-            "0fd038a5ab8499c4b174c28166e10f2b6c2cc30754c1fd5c854f6c1398989854e424a33d49f94a28",
+            "f4a43667f051636c8c7e0c8d25cc7eeecfc8f8d2e8aa8d9f36e51eaa473219b20950f2844ea504ce",
             "TimeLockV2 program hash drifted"
         );
 
         let cts_v2 = CollectTypeScriptsV2.hash().to_hex();
         assert_eq!(
             cts_v2,
-            "0304f97bde3df8b92c6f5a36485ca18a76641e823c97236000f586baaf46b5eb9984317bbfeec9d5",
+            "253714df987bb7ff9c017de9cd25683274ec0597f9879a31dfc6a7faac10a7e32ca2fc8e26316575",
             "CollectTypeScriptsV2 program hash drifted"
         );
 
         let sp_v2 = SingleProofV2.hash().to_hex();
         assert_eq!(
             sp_v2,
-            "f04fb7585a00b2a925cf31e1746f7524899b52302807a9e7b4d1e47b68b1bfbbc1ae582209fa5af8",
+            "6f6ea3083e506c048203a8505f8793aa70e4b1f610a352b14360f9e3fde21aa9373d607ddcf69888",
             "SingleProofV2 program hash drifted"
         );
     }

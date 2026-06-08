@@ -32,6 +32,7 @@ use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
 use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
 use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::push_digest_reversed;
 use crate::protocol::proof_abstractions::SecretWitness;
 
 /// Maximum number of inputs/outputs allowed. Number of UTXOs must be strictly
@@ -41,6 +42,38 @@ const MAX_NUM_INPUTS_AND_OUTPUTS: usize = 100_000;
 /// Maximum number of coins per UTXO allowed. Number of coins must be strictly
 /// less than this number.
 const MAX_NUM_COINS_PER_UTXOS: usize = 100_000;
+
+/// The V3 remap table — single source of truth.
+///
+/// Coins committed before the `UpgradeVM` hard fork carry pre-v3 type-script
+/// hashes that no runnable program reproduces. Each entry maps such a hash onto
+/// its current counterpart so the SingleProof layer demands a satisfiable proof:
+///   legacy NativeCurrency        -> NativeCurrency.hash()
+///   current + legacy TimeLock    -> TimeLockV2.hash()
+///   legacy TimeLockV2            -> TimeLockV2.hash()
+///
+/// Consumed in lockstep by three mirrors that must agree: the host-side
+/// [`CollectTypeScriptsV2Witness::output`], the TASM `v2_remap_block`, and the
+/// rust `source()` shadow. Order is load-bearing for the TASM (it sets the
+/// chained comparison order); the targets are distinct from every old hash, so
+/// the chaining is order-independent for correctness.
+fn v3_remap_pairs() -> [(Digest, Digest); 4] {
+    [
+        (NativeCurrency::legacy_type_script_hash(), NativeCurrency.hash()),
+        (TimeLock.hash(), TimeLockV2.hash()),
+        (TimeLock::legacy_type_script_hash(), TimeLockV2.hash()),
+        (TimeLockV2::legacy_type_script_hash(), TimeLockV2.hash()),
+    ]
+}
+
+/// Fold a collected type-script hash onto its current counterpart per
+/// [`v3_remap_pairs`]; identity if unrecognised.
+fn v3_remap(hash: Digest) -> Digest {
+    v3_remap_pairs()
+        .into_iter()
+        .find_map(|(old, new)| (old == hash).then_some(new))
+        .unwrap_or(hash)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, GetSize, BFieldCodec, TasmObject)]
 pub struct CollectTypeScriptsV2Witness {
@@ -57,12 +90,10 @@ impl SecretWitness for CollectTypeScriptsV2Witness {
     }
 
     fn output(&self) -> Vec<BFieldElement> {
-        // V2: collect type-script hashes from input + output UTXOs, then remap
-        // any hash that still matches the legacy TimeLock (OLD_HASH) to the
-        // current TimeLockV2 (NEW_HASH). This is the host-side mirror of the
-        // TASM remap performed in push_digest_from_coin_to_list.
-        let old_timelock_hash = TimeLock.hash();
-        let new_timelock_hash = TimeLockV2.hash();
+        // V3: collect type-script hashes from input + output UTXOs, folding every
+        // recognised pre-UpgradeVM hash onto its current counterpart via the
+        // shared `v3_remap` table. Host-side mirror of the TASM remap performed
+        // in push_digest_from_coin_to_list.
         let type_script_hashes = Utxo::type_script_hashes(
             self.salted_input_utxos
                 .utxos
@@ -71,19 +102,12 @@ impl SecretWitness for CollectTypeScriptsV2Witness {
         );
         let mut deduped: Vec<Digest> = vec![];
         for hash in type_script_hashes {
-            let remapped = if hash == old_timelock_hash {
-                new_timelock_hash
-            } else {
-                hash
-            };
+            let remapped = v3_remap(hash);
             if !deduped.contains(&remapped) {
                 deduped.push(remapped);
             }
         }
-        deduped
-            .into_iter()
-            .flat_map(|d| d.values())
-            .collect_vec()
+        deduped.into_iter().flat_map(|d| d.values()).collect_vec()
     }
 
     fn program(&self) -> Program {
@@ -146,29 +170,59 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
         let push_digest_from_coin_to_list =
             "neptune_consensus_transaction_push_digest_to_list".to_string();
         let write_all_digests = "netpune_consensus_transaction_write_all_digests".to_string();
-        let v2_remap_to_new_hash =
-            "neptune_consensus_transaction_v2_remap_to_new_timelock_hash".to_string();
+        let remap_to_native_currency_hash =
+            "neptune_consensus_transaction_v3_remap_to_native_currency_hash".to_string();
+        let remap_to_timelock_v2_hash =
+            "neptune_consensus_transaction_v3_remap_to_timelock_v2_hash".to_string();
         let v2_remap_no_op = "neptune_consensus_transaction_v2_remap_no_op".to_string();
 
-        // V2: push instructions for OLD_HASH (= TimeLock.hash()) and NEW_HASH
-        // (= TimeLockV2.hash()), used by the remap inside
-        // push_digest_from_coin_to_list. Pushed in reverse order so that
-        // values()[0] ends on the stack top, matching what read_mem 5; pop 1
-        // produces for digests stored in memory.
-        let push_old_timelock_hash = TimeLock
-            .hash()
-            .values()
-            .iter()
-            .rev()
-            .map(|elem| triton_instr!(push elem.value()))
-            .collect_vec();
-        let push_new_timelock_hash = TimeLockV2
-            .hash()
-            .values()
-            .iter()
-            .rev()
-            .map(|elem| triton_instr!(push elem.value()))
-            .collect_vec();
+        // V3 REMAP: coins committed before the UpgradeVM hard fork carry pre-v3
+        // type-script hashes that no runnable program reproduces. Fold each onto
+        // its current counterpart so the SingleProof layer demands a satisfiable
+        // proof:
+        //   legacy NativeCurrency       -> NativeCurrency.hash()
+        //   legacy + current TimeLock   -> TimeLockV2.hash()
+        //   legacy TimeLockV2           -> TimeLockV2.hash()
+        // Each hash is pushed in reverse value order (see `push_digest_reversed`)
+        // so values()[0] ends on the stack top, matching what read_mem 5; pop 1
+        // produces for digests in memory.
+        let push_native_currency_hash = push_digest_reversed(NativeCurrency.hash());
+        let push_timelock_v2_hash = push_digest_reversed(TimeLockV2.hash());
+
+        // In-place remap applied to a `[digest]` on the stack top: compare it
+        // against each recognised pre-v3 hash and, on a match, swap in the
+        // current counterpart. Targets are distinct from every old hash, so the
+        // comparisons can be chained order-independently. Reused verbatim at the
+        // de-duplication check and the list-push site below.
+        let make_remap_compare = |push_old: &[LabelledInstruction], target_label: &str| {
+            let mut block = triton_asm! {
+                // _ [digest]
+                dup 4 dup 4 dup 4 dup 4 dup 4
+            };
+            block.extend_from_slice(push_old);
+            block.extend(triton_asm! {
+                {&eq_digest}
+                // _ [digest] (digest == old)
+                push 1
+                swap 1
+                skiz call {target_label}
+                skiz call {v2_remap_no_op}
+                // _ [digest_or_remapped]
+            });
+            block
+        };
+        // Build the chained comparison from the shared `v3_remap_pairs` table so
+        // the TASM, the host `output()`, and the rust `source()` can never drift.
+        // The target subroutine is picked from the pair's target hash.
+        let mut v2_remap_block: Vec<LabelledInstruction> = vec![];
+        for (old_hash, target_hash) in v3_remap_pairs() {
+            let target_label = if target_hash == NativeCurrency.hash() {
+                &remap_to_native_currency_hash
+            } else {
+                &remap_to_timelock_v2_hash
+            };
+            v2_remap_block.extend(make_remap_compare(&push_digest_reversed(old_hash), target_label));
+        }
         let authenticate_salted_utxos_and_collect_hashes = triton_asm! {
             // BEFORE:
             // _ *ctsw *type_script_hashes *salted_utxos size
@@ -377,19 +431,12 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
                 addi {Digest::LEN-1} read_mem {Digest::LEN} pop 1
                 // _ *type_script_hashes * * * len j size *coin[j] *type_script_hashes *type_script_hashes [digest]
 
-                /* V2 REMAP: if [digest] == OLD_HASH, replace with NEW_HASH so
-                   the de-duplication check below operates on the post-remap
-                   value. Without this, multiple OLD_HASH coins would each
-                   pass the `contains` check (the list never holds OLD_HASH
-                   after remap) and push NEW_HASH duplicates. */
-                dup 4 dup 4 dup 4 dup 4 dup 4
-                {&push_old_timelock_hash}
-                {&eq_digest}
-                push 1
-                swap 1
-                skiz call {v2_remap_to_new_hash}
-                skiz call {v2_remap_no_op}
-                /* end V2 REMAP */
+                /* V3 REMAP: fold every recognised pre-v3 type-script hash onto
+                   its current counterpart before the de-duplication check, so
+                   legacy-tagged coins collapse onto the live program hash
+                   instead of each pushing a duplicate. */
+                {&v2_remap_block}
+                /* end V3 REMAP */
 
                 call {contains}
                 // _ *type_script_hashes * * * len j size *coin[j] *type_script_hashes ([digest] in type_script_hashes)
@@ -417,10 +464,11 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
             // BEFORE: _ *coin[j] *type_script_hashes
             // AFTER:  _ *coin[j] *
             //
-            // V2: after reading the coin's type_script_hash, compare it to the
-            // legacy TimeLock hash. If equal, swap it out for the TimeLockV2
-            // hash before appending to the list. This is the on-chain part of
-            // the +1 year hard-fork remap; the host-side mirror lives in
+            // After reading the coin's type_script_hash, fold it through the v3
+            // remap (`v3_remap_pairs`): every recognized pre-v3 hash — legacy
+            // NativeCurrency, current TimeLock, legacy TimeLock, legacy TimeLockV2
+            // — is swapped for its current program hash before appending, so the
+            // list holds only live program hashes. The host-side mirror lives in
             // CollectTypeScriptsV2Witness::output().
             {push_digest_from_coin_to_list}:
                 dup 1
@@ -432,24 +480,11 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
                 addi {Digest::LEN-1} read_mem {Digest::LEN} pop 1
                 // _ *coin[j] *type_script_hashes [digest]
 
-                /* V2 REMAP: if [digest] == OLD_HASH, replace with NEW_HASH */
-                dup 4 dup 4 dup 4 dup 4 dup 4
-                // _ *coin[j] *type_script_hashes [digest] [digest]
-
-                {&push_old_timelock_hash}
-                // _ *coin[j] *type_script_hashes [digest] [digest] [OLD_HASH]
-
-                {&eq_digest}
-                // _ *coin[j] *type_script_hashes [digest] (digest == OLD_HASH)
-
-                push 1
-                swap 1
-                // _ *coin[j] *type_script_hashes [digest] 1 (digest == OLD_HASH)
-
-                skiz call {v2_remap_to_new_hash}
-                skiz call {v2_remap_no_op}
+                /* V3 REMAP: fold recognised pre-v3 hashes onto current ones
+                   before appending, so the list holds only live program hashes. */
+                {&v2_remap_block}
                 // _ *coin[j] *type_script_hashes [digest_or_remapped]
-                /* end V2 REMAP */
+                /* end V3 REMAP */
 
                 call {push_digest}
                 // _ *coin[j]
@@ -458,18 +493,30 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
 
                 return
 
-            // V2: if invoked, replace the OLD_HASH on the stack with NEW_HASH.
+            // V3: if invoked, replace the matched old digest with the current
+            // NativeCurrency hash.
             // BEFORE: _ ... [old_digest] 1
-            // AFTER:  _ ... [new_digest] 0
-            {v2_remap_to_new_hash}:
+            // AFTER:  _ ... [native_currency_hash] 0
+            {remap_to_native_currency_hash}:
                 pop 1
                 pop 5
-                {&push_new_timelock_hash}
+                {&push_native_currency_hash}
                 push 0
                 return
 
-            // V2: invoked when the digest is not OLD_HASH. The outer skiz dance
-            // already left the original digest in place, so this is a no-op.
+            // V3: if invoked, replace the matched old digest with the current
+            // TimeLockV2 hash.
+            // BEFORE: _ ... [old_digest] 1
+            // AFTER:  _ ... [timelock_v2_hash] 0
+            {remap_to_timelock_v2_hash}:
+                pop 1
+                pop 5
+                {&push_timelock_v2_hash}
+                push 0
+                return
+
+            // V3: invoked when the digest did not match this rule's old hash.
+            // The outer skiz dance already left the digest in place: no-op.
             {v2_remap_no_op}:
                 return
 
@@ -535,6 +582,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
+    use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
     use crate::protocol::consensus::type_scripts::time_lock::neptune_arbitrary::arbitrary_primitive_witness_with_active_timelocks;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::protocol::proof_abstractions::tasm::program::tests::test_program_snapshot;
@@ -569,11 +617,10 @@ mod tests {
             let salted_output_utxos_hash: Digest = Tip5::hash(salted_output_utxos);
             assert_eq!(sou_digest, salted_output_utxos_hash);
 
-            // V2: any coin still tagged with the legacy TimeLock hash gets
-            // remapped to the TimeLockV2 hash before being appended to the
-            // output list. Mirrors the TASM remap in push_digest_from_coin_to_list.
-            let old_timelock_hash = TimeLock.hash();
-            let new_timelock_hash = TimeLockV2.hash();
+            // V3: every coin still tagged with a recognised pre-UpgradeVM hash
+            // gets folded onto its current counterpart (shared `v3_remap` table)
+            // before being appended. Mirrors the TASM remap in
+            // push_digest_from_coin_to_list.
 
             // iterate over all input UTXOs and collect the type script hashes
             // Because of fees, the native currency type script must *always*
@@ -589,11 +636,7 @@ mod tests {
                 let mut j = 0;
                 while j < num_coins {
                     let coin: &Coin = &utxo.coins()[j];
-                    let remapped = if coin.type_script_hash == old_timelock_hash {
-                        new_timelock_hash
-                    } else {
-                        coin.type_script_hash
-                    };
+                    let remapped = v3_remap(coin.type_script_hash);
                     if !type_script_hashes.contains(&remapped) {
                         type_script_hashes.push(remapped);
                     }
@@ -614,11 +657,7 @@ mod tests {
                 let mut j = 0;
                 while j < num_coins {
                     let coin: &Coin = &utxo.coins()[j];
-                    let remapped = if coin.type_script_hash == old_timelock_hash {
-                        new_timelock_hash
-                    } else {
-                        coin.type_script_hash
-                    };
+                    let remapped = v3_remap(coin.type_script_hash);
                     if !type_script_hashes.contains(&remapped) {
                         type_script_hashes.push(remapped);
                     }
@@ -702,6 +741,204 @@ mod tests {
             NativeCurrency.hash().values().to_vec(),
             tasm_result.into_iter().take(5).collect_vec()
         );
+    }
+
+    #[test]
+    fn legacy_native_currency_coin_is_remapped_to_current_hash() {
+        // PROVES THE UpgradeVM-FORK COLLECT-TYPE-SCRIPTS BUG (expected to FAIL
+        // until the native-currency legacy-hash remap lands).
+        //
+        // A pre-fork native-currency coin carries
+        // `NativeCurrency::legacy_type_script_hash()`. CollectTypeScriptsV2 must
+        // fold that legacy hash into the current `NativeCurrency.hash()` — just
+        // like it already remaps legacy TimeLock -> TimeLockV2 — so the
+        // SingleProof layer demands a proof for a program we can actually run.
+        //
+        // Today there is no native-currency remap, so the legacy hash is
+        // collected verbatim as a *distinct* type-script hash, for which no
+        // satisfiable type-script proof exists post-fork.
+        let amount = NativeCurrencyAmount::from_nau(100);
+        let legacy_hash = NativeCurrency::legacy_type_script_hash();
+        let input = Utxo::new(
+            Digest::default(),
+            amount.to_native_coins_with_type_script_hash(legacy_hash),
+        );
+        let witness = CollectTypeScriptsV2Witness {
+            salted_input_utxos: SaltedUtxos {
+                utxos: vec![input],
+                salt: Default::default(),
+            },
+            salted_output_utxos: SaltedUtxos::empty(),
+        };
+
+        let tasm_result = CollectTypeScriptsV2
+            .run_tasm(&witness.standard_input(), witness.nondeterminism())
+            .unwrap();
+
+        let current_values = NativeCurrency.hash().values().to_vec();
+        let legacy_values = legacy_hash.values().to_vec();
+
+        assert!(
+            tasm_result
+                .windows(Digest::LEN)
+                .any(|window| window == current_values),
+            "current native-currency hash must be present"
+        );
+        assert!(
+            !tasm_result
+                .windows(Digest::LEN)
+                .any(|window| window == legacy_values),
+            "legacy native-currency hash must be remapped, not collected verbatim"
+        );
+    }
+
+    /// Asserts CollectTypeScriptsV2 folds a pre-v3 timelock coin into the
+    /// current `TimeLockV2.hash()` instead of collecting its legacy hash
+    /// verbatim. Shared by the legacy-TimeLock and legacy-TimeLockV2 cases.
+    fn assert_legacy_timelock_hash_is_remapped(legacy_hash: Digest) {
+        let coin = Coin {
+            type_script_hash: legacy_hash,
+            state: vec![bfe!(0)],
+        };
+        let input = Utxo::new(Digest::default(), vec![coin]);
+        let witness = CollectTypeScriptsV2Witness {
+            salted_input_utxos: SaltedUtxos {
+                utxos: vec![input],
+                salt: Default::default(),
+            },
+            salted_output_utxos: SaltedUtxos::empty(),
+        };
+
+        let tasm_result = CollectTypeScriptsV2
+            .run_tasm(&witness.standard_input(), witness.nondeterminism())
+            .unwrap();
+
+        let target_values = TimeLockV2.hash().values().to_vec();
+        let legacy_values = legacy_hash.values().to_vec();
+
+        assert!(
+            tasm_result
+                .windows(Digest::LEN)
+                .any(|window| window == target_values),
+            "pre-v3 timelock coin must be remapped to current TimeLockV2 hash"
+        );
+        assert!(
+            !tasm_result
+                .windows(Digest::LEN)
+                .any(|window| window == legacy_values),
+            "legacy timelock hash must be remapped, not collected verbatim"
+        );
+    }
+
+    #[test]
+    fn legacy_timelock_coin_is_remapped_to_current_timelock_v2_hash() {
+        // PROVES THE UpgradeVM-FORK BREAK for pre-v3 TimeLock coins (expected to
+        // FAIL until the remap keys off the legacy hashes).
+        //
+        // On-chain pre-v3 TimeLock coins carry
+        // `TimeLock::legacy_type_script_hash()` (4b4d2519…). The existing remap
+        // only matches the *current* `TimeLock.hash()` (b35f7f6d…) — a post-v3
+        // value no pre-fork coin carries — so the legacy hash is collected
+        // verbatim and no satisfiable type-script proof exists for it.
+        assert_legacy_timelock_hash_is_remapped(TimeLock::legacy_type_script_hash());
+    }
+
+    #[test]
+    fn legacy_timelock_v2_coin_is_remapped_to_current_timelock_v2_hash() {
+        // PROVES THE UpgradeVM-FORK BREAK for pre-v3 TimeLockV2 coins (expected
+        // to FAIL until the remap keys off the legacy hashes).
+        //
+        // On-chain pre-v3 TimeLockV2 coins carry
+        // `TimeLockV2::legacy_type_script_hash()` (ac58ee89…); the current
+        // `TimeLockV2.hash()` is the post-v3 0fd038a5…. The existing remap does
+        // not touch the legacy TimeLockV2 hash at all, so it is collected
+        // verbatim.
+        assert_legacy_timelock_hash_is_remapped(TimeLockV2::legacy_type_script_hash());
+    }
+
+    #[test]
+    fn all_old_hashes_in_one_witness_remap_and_dedup_consistently() {
+        // The full remap exercised on a SINGLE witness carrying every old hash the
+        // v3 remap recognizes — legacy NativeCurrency, current TimeLock, legacy
+        // TimeLock, and legacy TimeLockV2 — plus a duplicate, spread across two
+        // UTXOs. The arbitrary proptests never produce legacy-tagged coins and the
+        // other unit tests use one old hash in isolation, so this is the only test
+        // that pins (a) host `output()` == rust shadow == TASM on legacy inputs,
+        // (b) the chained remap + dedup collapsing to exactly {NativeCurrency,
+        // TimeLockV2}, and (c) no old hash surviving verbatim.
+        let nc_amount = NativeCurrencyAmount::from_nau(100);
+        let timelock_coin = |h: Digest| Coin {
+            type_script_hash: h,
+            state: vec![bfe!(0)],
+        };
+
+        let utxo0 = Utxo::new(
+            Digest::default(),
+            nc_amount
+                .to_native_coins_with_type_script_hash(NativeCurrency::legacy_type_script_hash())
+                .into_iter()
+                .chain([timelock_coin(TimeLock::legacy_type_script_hash())])
+                .collect_vec(),
+        );
+        let utxo1 = Utxo::new(
+            Digest::default(),
+            vec![
+                timelock_coin(TimeLock.hash()), // current TimeLock -> TimeLockV2
+                timelock_coin(TimeLockV2::legacy_type_script_hash()), // legacy V2 -> TimeLockV2
+                timelock_coin(TimeLock::legacy_type_script_hash()), // duplicate
+            ],
+        );
+
+        let witness = CollectTypeScriptsV2Witness {
+            salted_input_utxos: SaltedUtxos {
+                utxos: vec![utxo0, utxo1],
+                salt: Default::default(),
+            },
+            salted_output_utxos: SaltedUtxos::empty(),
+        };
+
+        let expected_output = witness.output();
+        let rust_result = CollectTypeScriptsV2
+            .run_rust(&witness.standard_input(), witness.nondeterminism())
+            .unwrap();
+        assert_eq!(
+            expected_output, rust_result,
+            "host output() must match the rust shadow on legacy inputs"
+        );
+        let tasm_result = CollectTypeScriptsV2
+            .run_tasm(&witness.standard_input(), witness.nondeterminism())
+            .unwrap();
+        assert_eq!(
+            rust_result, tasm_result,
+            "rust shadow must match TASM on legacy inputs"
+        );
+
+        // Deduped to exactly {NativeCurrency, TimeLockV2}: two digests.
+        assert_eq!(
+            tasm_result.len(),
+            2 * Digest::LEN,
+            "remap must dedup to exactly two type scripts, got {:?}",
+            tasm_result
+        );
+        for present in [NativeCurrency.hash(), TimeLockV2.hash()] {
+            let values = present.values().to_vec();
+            assert!(
+                tasm_result.windows(Digest::LEN).any(|w| w == values),
+                "remapped target must be present: {present}"
+            );
+        }
+        for old in [
+            NativeCurrency::legacy_type_script_hash(),
+            TimeLock::legacy_type_script_hash(),
+            TimeLockV2::legacy_type_script_hash(),
+            TimeLock.hash(),
+        ] {
+            let values = old.values().to_vec();
+            assert!(
+                !tasm_result.windows(Digest::LEN).any(|w| w == values),
+                "old hash must be remapped, not collected verbatim: {old}"
+            );
+        }
     }
 
     #[proptest(cases = 8)]
@@ -857,6 +1094,6 @@ mod tests {
         // tagged with the legacy TimeLock hash to TimeLockV2.hash() before
         // both the de-duplication check and the list push. Used by
         // SingleProofV2's GenerateCollectTypeScriptsClaim (phase 6).
-        "0304f97bde3df8b92c6f5a36485ca18a76641e823c97236000f586baaf46b5eb9984317bbfeec9d5"
+        "253714df987bb7ff9c017de9cd25683274ec0597f9879a31dfc6a7faac10a7e32ca2fc8e26316575"
     );
 }

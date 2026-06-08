@@ -191,11 +191,21 @@ impl PrimitiveWitness {
         let salted_output_utxos = SaltedUtxos::new_with_rng(output_utxos.to_vec(), &mut rng);
         let salted_input_utxos = SaltedUtxos::new_with_rng(input_utxos.clone(), &mut rng);
 
+        // Fold each coin's (possibly legacy) type-script hash onto its current
+        // program hash and de-duplicate, so exactly one witness is produced per
+        // current program and the set matches what `validate` requires. Without
+        // the fold, a legacy-tagged coin yields a witness keyed by the current
+        // program hash while the required-hash set still holds the legacy hash,
+        // so validation reports a "missing typescript witness".
         let type_script_hashes =
-            Utxo::type_script_hashes(input_utxos.iter().chain(output_utxos.iter()));
+            Utxo::type_script_hashes(input_utxos.iter().chain(output_utxos.iter()))
+                .into_iter()
+                .map(known_type_scripts::current_program_hash)
+                .unique()
+                .collect_vec();
         let type_scripts_and_witnesses = type_script_hashes
-            .into_iter()
-            .map(|type_script_hash| {
+            .iter()
+            .map(|&type_script_hash| {
                 match_type_script_and_generate_witness(
                     type_script_hash,
                     transaction_kernel.clone(),
@@ -311,13 +321,22 @@ impl PrimitiveWitness {
             witnessed_removal_records.push(removal_record);
         }
 
-        // verify that all type required scripts are present.
+        // verify that all required type scripts are present. Fold each coin's
+        // (possibly legacy) hash onto its current program hash and de-duplicate,
+        // exactly as `generate_primitive_witness` does, so the required set lines
+        // up with the witnesses (which are keyed by the current program hash).
+        // Same input-then-output ordering as generation, so required[j] matches
+        // type_scripts_and_witnesses[j].
         let required_type_script_hashes = Utxo::type_script_hashes(
-            self.output_utxos
+            self.input_utxos
                 .utxos
                 .iter()
-                .chain(&self.input_utxos.utxos),
-        );
+                .chain(&self.output_utxos.utxos),
+        )
+        .into_iter()
+        .map(known_type_scripts::current_program_hash)
+        .unique()
+        .collect_vec();
         let type_script_dictionary = self
             .type_scripts_and_witnesses
             .iter()
@@ -1091,6 +1110,7 @@ mod tests {
     use crate::protocol::consensus::transaction::announcement::Announcement;
     use crate::protocol::consensus::transaction::lock_script::LockScript;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+    use crate::protocol::consensus::transaction::utxo::Coin;
     use crate::protocol::consensus::transaction::utxo_triple::UtxoTriple;
     use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
     use crate::protocol::consensus::type_scripts::native_currency::NativeCurrencyWitness;
@@ -1815,6 +1835,188 @@ mod tests {
         let updated_pw = PrimitiveWitness::update_with_new_ms_data(own_pw, ms_update);
 
         prop_assert!(updated_pw.validate().await.is_ok());
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn legacy_native_currency_input_primitive_witness_is_valid() {
+        // Reproduces the wallet "missing typescript witness for: native currency"
+        // error when sending a pre-fork coin: a transaction that spends a
+        // legacy-hashed native-currency UTXO must build a PrimitiveWitness and
+        // validate. The legacy hash must fold to NativeCurrency in both witness
+        // generation and validation, otherwise the required-hash set holds the
+        // legacy hash while the witness is keyed by the current program hash.
+        use crate::protocol::consensus::transaction::lock_script::LockScript;
+        use crate::protocol::consensus::transaction::lock_script::LockScriptAndWitness;
+        use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
+
+        let amount = NativeCurrencyAmount::coins(1);
+        let lock = LockScript::anyone_can_spend();
+        let lock_and_witness = LockScriptAndWitness::new(lock.program.clone());
+        let legacy_input = Utxo::new(
+            lock.hash(),
+            amount.to_native_coins_with_type_script_hash(NativeCurrency::legacy_type_script_hash()),
+        );
+        let output = Utxo::new_native_currency(lock.hash(), amount);
+
+        let mut test_runner = TestRunner::deterministic();
+        let primitive_witness = PrimitiveWitness::arbitrary_primitive_witness_with(
+            &[legacy_input],
+            &[lock_and_witness],
+            &[output],
+            &[],
+            NativeCurrencyAmount::zero(),
+            None,
+        )
+        .new_tree(&mut test_runner)
+        .unwrap()
+        .current();
+
+        primitive_witness
+            .validate()
+            .await
+            .expect("tx spending a legacy native-currency UTXO must validate");
+    }
+
+    /// Build a `PrimitiveWitness` spending one legacy-tagged input the way the
+    /// production wallet does. The arbitrary builder supplies the mutator-set
+    /// plumbing; we then regenerate the type-script witnesses with the exact
+    /// production fold + dispatch (`current_program_hash` +
+    /// `match_type_script_and_generate_witness`) that `generate_primitive_witness`
+    /// runs. This matters because the arbitrary builder only ever emits a v1
+    /// `TimeLock` witness, which is the wrong program for a `TimeLockV2` coin and
+    /// would make `validate` report a missing `time lock v2` witness.
+    fn legacy_input_primitive_witness(
+        input_coins: Vec<Coin>,
+        output_amount: NativeCurrencyAmount,
+        now: Timestamp,
+    ) -> PrimitiveWitness {
+        use crate::protocol::consensus::transaction::lock_script::LockScript;
+        use crate::protocol::consensus::transaction::lock_script::LockScriptAndWitness;
+        use crate::protocol::consensus::type_scripts::known_type_scripts::current_program_hash;
+        use crate::protocol::consensus::type_scripts::known_type_scripts::match_type_script_and_generate_witness;
+
+        let lock = LockScript::anyone_can_spend();
+        let lock_and_witness = LockScriptAndWitness::new(lock.program.clone());
+        let input = Utxo::new(lock.hash(), input_coins);
+        let output = Utxo::new_native_currency(lock.hash(), output_amount);
+
+        let mut test_runner = TestRunner::deterministic();
+        let mut primitive_witness = PrimitiveWitness::arbitrary_primitive_witness_with_timestamp_and(
+            &[input],
+            &[lock_and_witness],
+            &[output],
+            &[],
+            NativeCurrencyAmount::zero(),
+            None,
+            now,
+            false,
+        )
+        .new_tree(&mut test_runner)
+        .unwrap()
+        .current();
+
+        // Regenerate the type-script witnesses exactly as production does, so the
+        // set lines up with what `validate` requires.
+        let type_script_hashes = Utxo::type_script_hashes(
+            primitive_witness
+                .input_utxos
+                .utxos
+                .iter()
+                .chain(&primitive_witness.output_utxos.utxos),
+        )
+        .into_iter()
+        .map(current_program_hash)
+        .unique()
+        .collect_vec();
+        primitive_witness.type_scripts_and_witnesses = type_script_hashes
+            .into_iter()
+            .map(|type_script_hash| {
+                match_type_script_and_generate_witness(
+                    type_script_hash,
+                    primitive_witness.kernel.clone(),
+                    primitive_witness.input_utxos.clone(),
+                    primitive_witness.output_utxos.clone(),
+                )
+                .expect("legacy hash must dispatch to a type-script witness")
+            })
+            .collect();
+        primitive_witness
+    }
+
+    /// Spend a pre-fork time-locked UTXO whose time-lock coin carries the legacy
+    /// `TimeLock` hash. Building the `PrimitiveWitness` and validating it must not
+    /// hit a "missing typescript witness" — the legacy hash folds onto the V1
+    /// `TimeLock` program (see `current_program_hash`), keeping the required-hash
+    /// set and the witness set aligned.
+    ///
+    /// Note: the V1 `TimeLock` program matches coins by its own (current) hash, so
+    /// it silently skips a legacy-tagged coin and does NOT enforce the lock here.
+    /// Lock enforcement for legacy `TimeLock` coins lives in the V2 path
+    /// (`produce_v2` -> `TimeLockV2`), exercised directly by
+    /// `time_lock_v2::tests::legacy_tagged_timelock_coins_are_lock_enforced`.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn legacy_timelock_input_primitive_witness_is_valid() {
+        let amount = NativeCurrencyAmount::coins(1);
+        let now = Timestamp::now();
+        let legacy_timelock = Coin {
+            type_script_hash: TimeLock::legacy_type_script_hash(),
+            state: vec![(now - Timestamp::days(1)).0],
+        };
+        let primitive_witness = legacy_input_primitive_witness(
+            vec![Coin::new_native_currency(amount), legacy_timelock],
+            amount,
+            now,
+        );
+        primitive_witness
+            .validate()
+            .await
+            .expect("tx spending a legacy TimeLock-tagged UTXO must validate");
+    }
+
+    /// Spend a pre-fork UTXO whose time-lock coin carries the legacy `TimeLockV2`
+    /// hash. The v1 `PrimitiveWitness` path folds it onto the current `TimeLockV2`
+    /// program, which *does* recognize the legacy hash (Layer C), so the lock is
+    /// enforced end-to-end: a released coin validates, a still-locked one is
+    /// rejected.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn legacy_timelock_v2_input_primitive_witness_is_valid() {
+        use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
+
+        let amount = NativeCurrencyAmount::coins(1);
+        let now = Timestamp::now();
+
+        // (a) released: release date in the past -> validates.
+        let released = Coin {
+            type_script_hash: TimeLockV2::legacy_type_script_hash(),
+            state: vec![(now - Timestamp::days(1)).0],
+        };
+        let primitive_witness = legacy_input_primitive_witness(
+            vec![Coin::new_native_currency(amount), released],
+            amount,
+            now,
+        );
+        primitive_witness
+            .validate()
+            .await
+            .expect("released legacy TimeLockV2-tagged UTXO must validate");
+
+        // (b) still locked: release date in the future -> rejected.
+        let locked = Coin {
+            type_script_hash: TimeLockV2::legacy_type_script_hash(),
+            state: vec![(now + Timestamp::days(1)).0],
+        };
+        let primitive_witness = legacy_input_primitive_witness(
+            vec![Coin::new_native_currency(amount), locked],
+            amount,
+            now,
+        );
+        assert!(
+            primitive_witness.validate().await.is_err(),
+            "still-locked legacy TimeLockV2-tagged UTXO must be rejected"
+        );
     }
 
     #[traced_test]

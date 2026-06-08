@@ -119,9 +119,8 @@ mod tests {
     use rand::Rng;
     use rand::SeedableRng;
     use tasm_lib::memory::encode_to_memory;
-    use tasm_lib::traits::rust_shadow::RustShadowError;
-    use tasm_lib::prelude::TasmObject;
     use tasm_lib::pop_encodable;
+    use tasm_lib::prelude::TasmObject;
     use tasm_lib::push_encodable;
     use tasm_lib::snippet_bencher::BenchmarkCase;
     use tasm_lib::test_helpers::test_assertion_failure;
@@ -129,6 +128,7 @@ mod tests {
     use tasm_lib::traits::accessor::AccessorInitialState;
     use tasm_lib::traits::accessor::ShadowedAccessor;
     use tasm_lib::traits::rust_shadow::RustShadow;
+    use tasm_lib::traits::rust_shadow::RustShadowError;
     use tasm_lib::triton_vm::prelude::BFieldElement;
     use tasm_lib::twenty_first::bfe;
 
@@ -232,13 +232,25 @@ mod tests {
                 .get(&(coin_si_ptr + bfe!(2)))
                 .copied()
                 .unwrap_or_default();
-            assert_eq!(coin_size as u64, state_size.value());
+            // Mirror the TASM assertions as graceful `Err`s (rather than panics)
+            // so the test framework's negative-case `expect_err` sees them: the
+            // bumped tasm-lib's rust-shadow wrapper propagates `Err` and does not
+            // catch panics.
+            if coin_size as u64 != state_size.value() {
+                return Err(RustShadowError::AssertionError(BAD_STATE_SIZE_ERROR));
+            }
 
             let coin_amount = *u128::decode_from_memory(memory, coin_si_ptr + bfe!(3)).unwrap();
 
-            assert!(coin_amount <= NativeCurrencyAmount::max().to_nau().try_into().unwrap());
+            if coin_amount > NativeCurrencyAmount::max().to_nau().try_into().unwrap() {
+                return Err(RustShadowError::AssertionError(
+                    NativeCurrency::INVALID_COIN_AMOUNT,
+                ));
+            }
 
-            let utxo_amount = utxo_amount.checked_add(coin_amount).unwrap();
+            let utxo_amount = utxo_amount
+                .checked_add(coin_amount)
+                .ok_or(RustShadowError::ArithmeticOverflow)?;
 
             push_encodable(stack, &coin_si_ptr);
             push_encodable(stack, &amount);

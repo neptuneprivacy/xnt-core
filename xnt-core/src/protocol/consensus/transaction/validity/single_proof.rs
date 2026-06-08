@@ -338,8 +338,9 @@ pub(crate) fn single_proof_claim(
         }
         // SingleProofV2, current (v3) bytecode — recompute from the linked program.
         ConsensusRuleSet::UpgradeVM => {
-            crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
-                ::claim(tx_kernel_mast_hash)
+            crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2::claim(
+                tx_kernel_mast_hash,
+            )
         }
     }
 }
@@ -1397,6 +1398,6 @@ pub(crate) mod tests {
 
     test_program_snapshot!(
         SingleProof,
-        "578baf8e2c7c6b6bb460347076f2a1768d29f61eb50790b21e287c103305a302e13571985f28f7e8"
+        "57d5611749cebfc29070e9badfec5d3f444127a58b09e9fcf17c24437b1bb60afce9d7c96b2c7c2a"
     );
 }
