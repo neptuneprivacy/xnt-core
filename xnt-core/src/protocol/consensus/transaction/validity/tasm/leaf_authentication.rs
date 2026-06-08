@@ -1,2 +1,0 @@
-pub mod authenticate_inputs_against_txk;
-pub mod authenticate_msa_against_txk;

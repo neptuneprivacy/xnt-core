@@ -1,5 +1,0 @@
-# Git Message
-
-```
-{{#include .gitmessage}}
-```
