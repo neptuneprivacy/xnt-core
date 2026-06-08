@@ -20,7 +20,7 @@ pub const BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET: BlockHeight =
 /// stays verifiable under the single v3 verifier via hardcoded per-era program
 /// digests; UpgradeVM blocks use the recomputed v3 digests.
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(55500u64));
+    BlockHeight::new(BFieldElement::new(55800u64));
 
 /// Enumerates all possible sets of consensus rules.
 ///
