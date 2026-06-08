@@ -3,7 +3,7 @@ name = "xnt-core-cli"
 description = "cli client for interfacing with xnt-core"
 authors = ["Triton Software"]
 
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 

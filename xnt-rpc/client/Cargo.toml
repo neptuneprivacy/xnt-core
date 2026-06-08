@@ -2,7 +2,7 @@
 name = "xnt-rpc-client"
 description = "library for interacting with neptune-privacy's JSON-RPC"
 authors = ["Triton Software"]
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
