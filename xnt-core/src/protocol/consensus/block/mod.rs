@@ -989,6 +989,19 @@ impl Block {
         self.kernel.guesser_fee_addition_records(block_hash)
     }
 
+    /// Guesser-fee addition records computed for every historical NativeCurrency
+    /// era hash (legacy / v3 / current). Used by mutator-set rollback to revert a
+    /// block whose guesser fee was committed under a different fork configuration
+    /// than this binary currently derives (e.g. blocks mined past the v4 fork by a
+    /// node still running the v3 binary, then upgraded). See
+    /// [`BlockKernel::guesser_fee_addition_records_all_eras`].
+    pub(crate) fn guesser_fee_addition_records_all_eras(
+        &self,
+    ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        let block_hash = self.hash();
+        self.kernel.guesser_fee_addition_records_all_eras(block_hash)
+    }
+
     /// Return the mutator set update corresponding to this block, which sends
     /// the mutator set accumulator after the predecessor to the mutator set
     /// accumulator after self.

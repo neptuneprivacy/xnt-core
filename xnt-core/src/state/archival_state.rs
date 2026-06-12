@@ -1343,19 +1343,60 @@ impl ArchivalState {
                     .await;
             }
 
-            // Roll back all addition records contained in block
+            // Roll back all addition records contained in block.
+            //
+            // Transaction-output records are stored verbatim in the block and are
+            // always reversible. The guesser-fee record, however, is RE-DERIVED
+            // from the era-specific NativeCurrency hash (legacy / v3 / current)
+            // selected by block height. A chain may contain blocks whose guesser
+            // fee was committed under a *different* fork configuration than this
+            // binary currently derives — e.g. a node that kept mining past the v4
+            // fork height while still running the v3 binary, then upgraded. For
+            // such a block the height-derived guesser record is not the one
+            // actually in the mutator set, so fall back to trying every historical
+            // era candidate and revert whichever one is present.
+            let era_candidates = rollback_block
+                .guesser_fee_addition_records_all_eras()
+                .expect("guesser-fee addition records (all eras) must be computable");
             for addition_record in additions.iter().rev() {
-                assert!(
+                if self
+                    .archival_mutator_set
+                    .ams_mut()
+                    .add_is_reversible(addition_record)
+                    .await
+                {
                     self.archival_mutator_set
                         .ams_mut()
-                        .add_is_reversible(addition_record)
-                        .await,
-                    "Addition record must be in sync with block being rolled back."
+                        .revert_add(addition_record)
+                        .await;
+                    continue;
+                }
+
+                // Height-derived record is not the committed one. Try the
+                // legacy / v3 / current guesser-fee candidates.
+                let mut reverted_via_candidate = false;
+                for candidate in &era_candidates {
+                    if self
+                        .archival_mutator_set
+                        .ams_mut()
+                        .add_is_reversible(candidate)
+                        .await
+                    {
+                        self.archival_mutator_set
+                            .ams_mut()
+                            .revert_add(candidate)
+                            .await;
+                        reverted_via_candidate = true;
+                        break;
+                    }
+                }
+                assert!(
+                    reverted_via_candidate,
+                    "Addition record at height {} must be in sync with block being rolled \
+                     back; not reversible by the height-derived derivation nor by any \
+                     historical guesser-fee era candidate (legacy / v3 / current).",
+                    rollback_block.header().height
                 );
-                self.archival_mutator_set
-                    .ams_mut()
-                    .revert_add(addition_record)
-                    .await;
             }
         }
 

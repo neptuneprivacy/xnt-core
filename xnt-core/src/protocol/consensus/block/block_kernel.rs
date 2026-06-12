@@ -106,6 +106,65 @@ impl BlockKernel {
             })
             .collect_vec())
     }
+
+    /// Guesser-fee UTXOs computed with an explicit `NativeCurrency`
+    /// `type_script_hash` instead of the height-derived era hash. Used by
+    /// rollback to tolerate blocks committed under a different fork
+    /// configuration than the one this binary currently derives.
+    fn guesser_fee_utxos_with_nc_hash(
+        &self,
+        nc_type_script_hash: Digest,
+    ) -> Result<Vec<Utxo>, BlockValidationError> {
+        if self.header.height.is_genesis() {
+            return Ok(vec![]);
+        }
+        let total_guesser_reward = self.body.total_guesser_reward()?;
+        let coins_unlocked =
+            total_guesser_reward.to_native_coins_with_type_script_hash(nc_type_script_hash);
+        let lock_script_hash = self.header.guesser_receiver_data.lock_script_hash;
+        Ok(vec![Utxo::new(lock_script_hash, coins_unlocked)])
+    }
+
+    /// [`Self::guesser_fee_addition_records`] for an explicit `NativeCurrency`
+    /// `type_script_hash`.
+    fn guesser_fee_addition_records_with_nc_hash(
+        &self,
+        block_hash: Digest,
+        nc_type_script_hash: Digest,
+    ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        Ok(self
+            .guesser_fee_utxos_with_nc_hash(nc_type_script_hash)?
+            .into_iter()
+            .map(|utxo| {
+                let item = Tip5::hash(&utxo);
+                let sender_randomness = block_hash;
+                let receiver_digest = self.header.guesser_receiver_data.receiver_digest;
+                commit(item, sender_randomness, receiver_digest)
+            })
+            .collect_vec())
+    }
+
+    /// Candidate guesser-fee addition records computed for EVERY historical
+    /// `NativeCurrency` era hash (legacy / v3 / current).
+    ///
+    /// The guesser-fee record is re-derived (not stored), so a chain whose
+    /// blocks were committed under a different fork configuration may carry a
+    /// different era's hash in the mutator set. Rollback reverts whichever of
+    /// these candidates is actually present in the append-only commitment list.
+    pub(crate) fn guesser_fee_addition_records_all_eras(
+        &self,
+        block_hash: Digest,
+    ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        let mut out = vec![];
+        for nc_hash in [
+            NativeCurrency::legacy_type_script_hash(),
+            NativeCurrency::v3_type_script_hash(),
+            NativeCurrency.hash(),
+        ] {
+            out.extend(self.guesser_fee_addition_records_with_nc_hash(block_hash, nc_hash)?);
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Copy, Clone, EnumCount)]
