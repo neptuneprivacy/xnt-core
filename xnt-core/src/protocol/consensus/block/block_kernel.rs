@@ -66,19 +66,38 @@ impl BlockKernel {
         //   pre-UpgradeVM (pre-v3) -> legacy hash,
         //   UpgradeVM (v3)         -> v3 hash,
         //   UpgradeVMv4 (current)  -> current hash.
-        let nc_type_script_hash = if self.header.height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET {
+        let nc_type_script_hash = self.era_native_currency_hash();
+        self.guesser_fee_utxos_with_nc_hash(nc_type_script_hash)
+    }
+
+    /// The era-correct `NativeCurrency` type-script hash for this block's height
+    /// (legacy pre-UpgradeVM / v3 UpgradeVM / current UpgradeVMv4).
+    fn era_native_currency_hash(&self) -> Digest {
+        if self.header.height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET {
             NativeCurrency::legacy_type_script_hash()
         } else if self.header.height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V4_MAIN_NET {
             NativeCurrency::v3_type_script_hash()
         } else {
             NativeCurrency.hash()
-        };
+        }
+    }
+
+    /// Like [`Self::guesser_fee_utxos`] but with an explicit `NativeCurrency`
+    /// hash instead of the height-derived era hash. Used by rollback to tolerate
+    /// blocks committed under a different fork configuration than the one
+    /// currently in effect.
+    fn guesser_fee_utxos_with_nc_hash(
+        &self,
+        nc_type_script_hash: Digest,
+    ) -> Result<Vec<Utxo>, BlockValidationError> {
+        if self.header.height.is_genesis() {
+            return Ok(vec![]);
+        }
+        let total_guesser_reward = self.body.total_guesser_reward()?;
         let coins_unlocked =
             total_guesser_reward.to_native_coins_with_type_script_hash(nc_type_script_hash);
         let lock_script_hash = self.header.guesser_receiver_data.lock_script_hash;
-        let unlocked_utxo = Utxo::new(lock_script_hash, coins_unlocked);
-
-        Ok(vec![unlocked_utxo])
+        Ok(vec![Utxo::new(lock_script_hash, coins_unlocked)])
     }
 
     /// Compute the addition records that correspond to the UTXOs generated for
@@ -89,8 +108,18 @@ impl BlockKernel {
         &self,
         block_hash: Digest,
     ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        self.guesser_fee_addition_records_with_nc_hash(block_hash, self.era_native_currency_hash())
+    }
+
+    /// [`Self::guesser_fee_addition_records`] for an explicit `NativeCurrency`
+    /// hash.
+    pub(crate) fn guesser_fee_addition_records_with_nc_hash(
+        &self,
+        block_hash: Digest,
+        nc_hash: Digest,
+    ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
         Ok(self
-            .guesser_fee_utxos()?
+            .guesser_fee_utxos_with_nc_hash(nc_hash)?
             .into_iter()
             .map(|utxo| {
                 let item = Tip5::hash(&utxo);
@@ -105,6 +134,27 @@ impl BlockKernel {
                 commit(item, sender_randomness, receiver_digest)
             })
             .collect_vec())
+    }
+
+    /// Candidate guesser-fee addition records computed for EVERY historical
+    /// `NativeCurrency` era hash (legacy / v3 / current). The guesser-fee record
+    /// is re-derived (not stored), so a chain whose blocks were synced under a
+    /// different fork configuration may have committed a different era's hash to
+    /// the mutator set. Rollback reverts whichever of these candidates is the one
+    /// actually present in the append-only commitment list.
+    pub(crate) fn guesser_fee_addition_records_all_eras(
+        &self,
+        block_hash: Digest,
+    ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        let mut out = vec![];
+        for nc_hash in [
+            NativeCurrency::legacy_type_script_hash(),
+            NativeCurrency::v3_type_script_hash(),
+            NativeCurrency.hash(),
+        ] {
+            out.extend(self.guesser_fee_addition_records_with_nc_hash(block_hash, nc_hash)?);
+        }
+        Ok(out)
     }
 }
 

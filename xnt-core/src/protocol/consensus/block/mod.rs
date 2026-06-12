@@ -989,6 +989,17 @@ impl Block {
         self.kernel.guesser_fee_addition_records(block_hash)
     }
 
+    /// Guesser-fee addition records computed for every historical
+    /// `NativeCurrency` era hash (legacy / v3 / current). Used by mutator-set
+    /// rollback to be tolerant of which era hash was committed when the block was
+    /// applied (see [`BlockKernel::guesser_fee_addition_records_all_eras`]).
+    pub(crate) fn guesser_fee_addition_records_all_eras(
+        &self,
+    ) -> Result<Vec<AdditionRecord>, BlockValidationError> {
+        let block_hash = self.hash();
+        self.kernel.guesser_fee_addition_records_all_eras(block_hash)
+    }
+
     /// Return the mutator set update corresponding to this block, which sends
     /// the mutator set accumulator after the predecessor to the mutator set
     /// accumulator after self.

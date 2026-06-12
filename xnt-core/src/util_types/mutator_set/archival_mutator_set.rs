@@ -461,6 +461,24 @@ where
         addition_record.canonical_commitment == digest
     }
 
+    /// The canonical commitment of the last (most-recently-added) AOCL leaf.
+    /// Diagnostic helper for rollback mismatches.
+    pub async fn last_aocl_leaf(&mut self) -> Digest {
+        let leaf_index = self.aocl.num_leafs().await - 1;
+        self.aocl.get_leaf_async(leaf_index).await
+    }
+
+    /// The last `n` AOCL leaves (oldest-first). Diagnostic helper.
+    pub async fn last_aocl_leaves(&mut self, n: u64) -> Vec<Digest> {
+        let total = self.aocl.num_leafs().await;
+        let start = total.saturating_sub(n);
+        let mut leaves = Vec::new();
+        for i in start..total {
+            leaves.push(self.aocl.get_leaf_async(i).await);
+        }
+        leaves
+    }
+
     /// Revert the `AdditionRecord`s in a block by
     ///
     /// - Removing the last leaf in the append-only commitment list

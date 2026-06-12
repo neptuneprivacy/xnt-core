@@ -669,11 +669,64 @@ impl GlobalState {
         cli: cli_args::Args,
         wallet_state: WalletState,
     ) -> Result<Self> {
-        let archival_state = ArchivalState::new(data_directory.clone(), genesis, cli.network).await;
+        let mut archival_state =
+            ArchivalState::new(data_directory.clone(), genesis, cli.network).await;
         debug!("Got archival state");
 
         // Get latest block. Use hardcoded genesis block if nothing is in database.
         let latest_block: Block = archival_state.get_tip().await;
+
+        // Rebuild the mutator set from the locally-stored blocks if its database is
+        // behind the chain tip. This happens when the `mutator_set` DB is deleted to
+        // force a rebuild while KEEPING the block index + block store. Blocks are
+        // replayed one at a time so memory stays bounded; `update_mutator_set`'s
+        // per-block consistency assert pinpoints any block this binary cannot
+        // reproduce (it will panic with that block's height). If the whole chain is
+        // reproducible, the mutator set is rebuilt cleanly and the node continues.
+        {
+            let ms_sync_label = archival_state.archival_mutator_set.get_sync_label();
+            if ms_sync_label != latest_block.hash() {
+                info!(
+                    "Mutator set DB is behind the chain tip (sync label != tip at height \
+                     {}). Rebuilding the mutator set from stored blocks...",
+                    latest_block.header().height
+                );
+
+                // Walk the canonical chain from the tip back to the mutator set's
+                // current sync point, collecting block digests (light: digests only).
+                let mut path = Vec::new();
+                let mut cursor = latest_block.clone();
+                loop {
+                    if cursor.hash() == ms_sync_label {
+                        break;
+                    }
+                    path.push(cursor.hash());
+                    if cursor.header().height.is_genesis() {
+                        break;
+                    }
+                    let parent = cursor.header().prev_block_digest;
+                    cursor = archival_state
+                        .get_block(parent)
+                        .await?
+                        .expect("parent block must be stored while rebuilding mutator set");
+                }
+                path.reverse();
+
+                let total = path.len();
+                info!("Replaying {total} blocks to rebuild the mutator set...");
+                for (i, digest) in path.into_iter().enumerate() {
+                    let block = archival_state
+                        .get_block(digest)
+                        .await?
+                        .expect("block must be stored while rebuilding mutator set");
+                    archival_state.update_mutator_set(&block).await?;
+                    if (i + 1) % 500 == 0 || i + 1 == total {
+                        info!("  mutator set rebuild: {}/{} blocks", i + 1, total);
+                    }
+                }
+                info!("Mutator set rebuild complete; now synced to tip.");
+            }
+        }
 
         let peer_map: HashMap<SocketAddr, PeerInfo> = HashMap::new();
         let peer_databases = NetworkingState::initialize_peer_databases(&data_directory).await?;

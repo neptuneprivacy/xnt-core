@@ -1343,19 +1343,119 @@ impl ArchivalState {
                     .await;
             }
 
-            // Roll back all addition records contained in block
+            // Roll back all addition records contained in block.
+            //
+            // The guesser-fee addition records are RE-DERIVED with the era-correct
+            // NativeCurrency hash (chosen by block height). A chain whose blocks
+            // were synced/applied under a different fork configuration may have
+            // committed a *different* era's hash to the mutator set, so the
+            // height-derived record won't be reversible. When that happens, fall
+            // back to the per-era candidate records (legacy / v3 / current) and
+            // revert whichever one is actually present in the commitment list.
+            let mut guesser_fee_candidates: Option<Vec<AdditionRecord>> = None;
             for addition_record in additions.iter().rev() {
-                assert!(
+                if self
+                    .archival_mutator_set
+                    .ams_mut()
+                    .add_is_reversible(addition_record)
+                    .await
+                {
                     self.archival_mutator_set
                         .ams_mut()
-                        .add_is_reversible(addition_record)
-                        .await,
-                    "Addition record must be in sync with block being rolled back."
-                );
-                self.archival_mutator_set
-                    .ams_mut()
-                    .revert_add(addition_record)
-                    .await;
+                        .revert_add(addition_record)
+                        .await;
+                    continue;
+                }
+
+                // Height-derived record is not the one in the AOCL: try the
+                // era-hash candidates for this block's guesser fee.
+                let candidates = guesser_fee_candidates.get_or_insert_with(|| {
+                    rollback_block
+                        .guesser_fee_addition_records_all_eras()
+                        .expect("guesser-fee era candidates must compute")
+                });
+                let mut reverted = false;
+                for (era_idx, candidate) in candidates.iter().enumerate() {
+                    if self
+                        .archival_mutator_set
+                        .ams_mut()
+                        .add_is_reversible(candidate)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Rollback: block at height {} committed its guesser-fee \
+                             record under a different NativeCurrency era hash than its \
+                             height derives (era candidate #{era_idx} of [legacy, v3, \
+                             current]). Reverting the matching record.",
+                            rollback_block.header().height
+                        );
+                        self.archival_mutator_set
+                            .ams_mut()
+                            .revert_add(candidate)
+                            .await;
+                        reverted = true;
+                        break;
+                    }
+                }
+                if !reverted {
+                    // DIAGNOSTIC: the non-reversible record is not a guesser-fee era
+                    // variant. Determine what the AOCL's last leaf actually is — in
+                    // particular whether it is a stored transaction output (meaning the
+                    // guesser fee was never the last addition for this block, e.g. the
+                    // block was applied without / with a structurally different guesser
+                    // fee) or something else entirely (earlier AOCL divergence, or the
+                    // stored block differs from what was applied to the mutator set).
+                    use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
+                    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+                    let outputs = rollback_block.body().transaction_kernel.outputs.clone();
+                    let n_leaves = (additions.len() as u64) + 2;
+                    let last_leaves = self
+                        .archival_mutator_set
+                        .ams_mut()
+                        .last_aocl_leaves(n_leaves)
+                        .await;
+                    let guesser_cands: Vec<Digest> = candidates
+                        .iter()
+                        .map(|c| c.canonical_commitment)
+                        .collect();
+                    let tx_outs: Vec<Digest> =
+                        outputs.iter().map(|o| o.canonical_commitment).collect();
+                    let hdr = rollback_block.header().clone();
+                    tracing::error!(
+                        "ROLLBACK_MISMATCH_FULL h={h} additions={na} tx_count={no}\n\
+                         last_{nl}_aocl_leaves={leaves:?}\n\
+                         guesser_commitments[legacy,v3,current]={gc:?}\n\
+                         tx_output_commitments={tc:?}\n\
+                         block_hash(sender_randomness)={bh}\n\
+                         prev_block_digest={pbd}\n\
+                         receiver_digest={rd}\n\
+                         guesser_lock_script_hash={ls}\n\
+                         guesser_amount={amt:?}\n\
+                         nc_legacy={ncl}\n\
+                         nc_v3={ncv3}\n\
+                         nc_current={ncc}",
+                        h = hdr.height,
+                        na = additions.len(),
+                        no = outputs.len(),
+                        nl = n_leaves,
+                        leaves = last_leaves,
+                        gc = guesser_cands,
+                        tc = tx_outs,
+                        bh = rollback_block.hash(),
+                        pbd = hdr.prev_block_digest,
+                        rd = hdr.guesser_receiver_data.receiver_digest,
+                        ls = hdr.guesser_receiver_data.lock_script_hash,
+                        amt = rollback_block.body().total_guesser_reward(),
+                        ncl = NativeCurrency::legacy_type_script_hash(),
+                        ncv3 = NativeCurrency::v3_type_script_hash(),
+                        ncc = NativeCurrency.hash(),
+                    );
+                    panic!(
+                        "Addition record at height {} not reversible by guesser-fee era \
+                         candidates or tx outputs — see ROLLBACK MISMATCH DIAGNOSTIC above.",
+                        rollback_block.header().height
+                    );
+                }
             }
         }
 
@@ -1747,6 +1847,169 @@ pub(super) mod tests {
         assert_eq!(mock_block_1b.hash(), archival_state.get_tip().await.hash());
 
         Ok(())
+    }
+
+    /// Proves the era-tolerant rollback fix.
+    ///
+    /// Reproduces the `set-tip` panic ("Addition record must be in sync with
+    /// block being rolled back"): a block's guesser-fee addition record was
+    /// committed to the mutator set under a DIFFERENT NativeCurrency era hash
+    /// than the one its height now derives — the situation that arises when a
+    /// chain is synced under a different fork configuration. Then it shows that:
+    ///   1. the height-derived record is NOT reversible (this is exactly the
+    ///      assertion that used to panic), but
+    ///   2. the matching candidate from `guesser_fee_addition_records_all_eras`
+    ///      IS reversible and reverts cleanly — which is the fallback the rollback
+    ///      loop now performs.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn rollback_recovers_guesser_fee_committed_under_other_era_hash() {
+        let mut rng = rand::rng();
+        let network = Network::Main;
+        let (mut archival_state, _peer_db_lock, _data_dir) =
+            mock_genesis_archival_state(network).await;
+        let own_key = WalletEntropy::new_random().nth_generation_spending_key_for_tests(0);
+
+        let (block, _) = make_mock_block(
+            &archival_state.genesis_block,
+            None,
+            own_key,
+            rng.random(),
+            network,
+        )
+        .await;
+
+        // What the rollback re-derives by default (height-derived era hash).
+        let height_derived = block
+            .guesser_fee_addition_records()
+            .unwrap()
+            .swap_remove(0);
+
+        // The per-era candidates (legacy / v3 / current NC hash).
+        let candidates = block.guesser_fee_addition_records_all_eras().unwrap();
+        assert!(
+            candidates.iter().any(|c| *c != height_derived),
+            "the three era hashes must yield distinct guesser-fee records"
+        );
+
+        // Simulate "synced under a different fork config": the mutator set
+        // committed a DIFFERENT era's record than the current height derives.
+        let committed = candidates
+            .into_iter()
+            .find(|c| *c != height_derived)
+            .expect("an era candidate distinct from the height-derived record");
+        archival_state
+            .archival_mutator_set
+            .ams_mut()
+            .add(&committed)
+            .await;
+
+        // 1. Bug condition: the height-derived record is NOT the AOCL leaf, so the
+        //    old `assert!(add_is_reversible(height_derived))` would panic.
+        assert!(
+            !archival_state
+                .archival_mutator_set
+                .ams_mut()
+                .add_is_reversible(&height_derived)
+                .await,
+            "reproduces the panic: height-derived guesser-fee record is not reversible"
+        );
+
+        // 2. Fix: the matching era candidate IS reversible, and reverting succeeds.
+        assert!(
+            archival_state
+                .archival_mutator_set
+                .ams_mut()
+                .add_is_reversible(&committed)
+                .await,
+            "the committed era candidate must be reversible"
+        );
+        archival_state
+            .archival_mutator_set
+            .ams_mut()
+            .revert_add(&committed)
+            .await;
+    }
+
+    /// END-TO-END proof that a STALE-fork block is TRULY reverted with no stale
+    /// leaves. Applies a block whose guesser-fee record is committed under a
+    /// different NativeCurrency era hash than its height derives (the `set-tip`
+    /// scenario), then rolls it back via the FULL `update_mutator_set` and verifies
+    /// the resulting mutator set equals the new tip's committed mutator set — i.e.
+    /// every leaf of the stale block was removed and the UTXO set is exactly the
+    /// new tip's. Without the era-tolerant fallback this panics during rollback.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn stale_fork_block_truly_reverted_end_to_end() {
+        let mut rng = rand::rng();
+        let network = Network::Main;
+        let (mut archival_state, _peer_db_lock, _data_dir) =
+            mock_genesis_archival_state(network).await;
+        let own_key = WalletEntropy::new_random().nth_generation_spending_key_for_tests(0);
+        let genesis = archival_state.genesis_block.clone();
+        let genesis_ms_hash = archival_state.archival_mutator_set.ams().hash().await;
+
+        // Block 1a: a "stale" block, committed with the WRONG era hash for its
+        // guesser fee. A mock block is coinbase-only (no removal records).
+        let (block_1a, _) =
+            make_mock_block(&genesis, None, own_key, rng.random(), network).await;
+        archival_state.write_block_as_tip(&block_1a).await.unwrap();
+        assert!(
+            block_1a.mutator_set_update().unwrap().removals.is_empty(),
+            "test assumes a coinbase-only (no-input) block"
+        );
+
+        // Advance the MS past 1a, but swap its (single) height-derived guesser-fee
+        // record for a different era's — simulating a chain synced under another
+        // fork configuration.
+        let height_derived = block_1a.guesser_fee_addition_records().unwrap();
+        let wrong_era = block_1a
+            .guesser_fee_addition_records_all_eras()
+            .unwrap()
+            .into_iter()
+            .find(|c| !height_derived.contains(c))
+            .expect("a non-height-derived era candidate must exist");
+        let mut additions = block_1a.mutator_set_update().unwrap().additions;
+        additions.pop(); // drop the height-derived guesser record
+        additions.push(wrong_era); // commit the wrong-era one instead
+        {
+            let ams = archival_state.archival_mutator_set.ams_mut();
+            for ar in &additions {
+                ams.add(ar).await;
+            }
+        }
+        archival_state
+            .archival_mutator_set
+            .set_sync_label(block_1a.hash())
+            .await;
+        assert_ne!(
+            genesis_ms_hash,
+            archival_state.archival_mutator_set.ams().hash().await,
+            "stale block 1a must have advanced the mutator set"
+        );
+
+        // Block 1b: the competing tip. Applying it rolls back the stale 1a.
+        let (block_1b, _) =
+            make_mock_block(&genesis, None, own_key, rng.random(), network).await;
+        archival_state.write_block_as_tip(&block_1b).await.unwrap();
+
+        // FULL rollback of stale 1a + forward-apply of 1b. update_mutator_set's
+        // internal assert_eq! is a whole-state checksum (MS == 1b's committed MS):
+        // if any of 1a's stale leaves survived, it would panic here.
+        archival_state.update_mutator_set(&block_1b).await.unwrap();
+
+        // Explicit confirmation: the UTXO/mutator set is EXACTLY the new tip's,
+        // with no leftover from the stale block.
+        assert_eq!(
+            block_1b.mutator_set_accumulator_after().unwrap().hash(),
+            archival_state.archival_mutator_set.ams().hash().await,
+            "after rollback, the mutator set must equal the new tip's committed MS (no stale leaves)"
+        );
+        assert_eq!(
+            block_1b.hash(),
+            archival_state.archival_mutator_set.get_sync_label(),
+            "sync label must point at the new tip after the reorg"
+        );
     }
 
     #[traced_test]
