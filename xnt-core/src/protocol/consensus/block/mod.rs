@@ -637,8 +637,8 @@ impl Block {
         }
 
         // 1.a)
-        // Skip claim validation for checkpointed (pre-v4) blocks, whose superseded
-        // proof format the current (v4) verifier cannot check.
+        // Skip claim validation for checkpointed (pre-v5) blocks, whose superseded
+        // proof format the current (v5) verifier cannot check.
         if !consensus_rule_set.proofs_are_trusted() {
             for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
                 if !self.appendix().contains(&required_claim) {
@@ -658,7 +658,7 @@ impl Block {
         };
 
         // 1.d)
-        // Skip proof verification for checkpointed (pre-v4) blocks.
+        // Skip proof verification for checkpointed (pre-v5) blocks.
         if !consensus_rule_set.proofs_are_trusted() {
             if !BlockProgram::verify(
                 self.body(),

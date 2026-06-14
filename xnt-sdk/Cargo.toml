@@ -1,6 +1,6 @@
 [package]
 name = "xnt-sdk"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Multi-platform SDK for Neptune Privacy - C FFI, Node.js (NAPI), and WASM"
@@ -24,7 +24,7 @@ ffi = ["dep:cbindgen"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 
 [dependencies]
-neptune-privacy = { version = "0.2.3", path = "../xnt-core" }
+neptune-privacy = { version = "0.2.4", path = "../xnt-core" }
 libc = "0.2"
 thiserror = "1.0"
 reqwest = { version = "0.12", features = ["blocking", "json"] }

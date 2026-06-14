@@ -62,10 +62,12 @@ impl BlockKernel {
         // `NativeCurrency`, so the embedded hash is era-specific and reproducing a
         // block with the wrong-era hash would make that parent's
         // `mutator_set_accumulator_after` diverge from the child's stored
-        // `mutator_set_hash`. Three eras:
-        //   pre-UpgradeVM (pre-v3) -> legacy hash,
-        //   UpgradeVM (v3)         -> v3 hash,
-        //   UpgradeVMv4 (current)  -> current hash.
+        // `mutator_set_hash`. Three eras (the v5 upgrade re-hashed only the proof
+        // programs, NOT `NativeCurrency`, so the v4 and v5 eras share the current
+        // hash and need no separate branch):
+        //   pre-UpgradeVM (pre-v3)        -> legacy hash,
+        //   UpgradeVM (v3)                -> v3 hash,
+        //   UpgradeVMv4 / UpgradeVMv5     -> current hash.
         let nc_type_script_hash = if self.header.height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_MAIN_NET {
             NativeCurrency::legacy_type_script_hash()
         } else if self.header.height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V4_MAIN_NET {

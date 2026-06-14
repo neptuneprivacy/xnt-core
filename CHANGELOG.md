@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-06-14
+
+### Breaking Changes
+
+- **Hardfork at block height 57650 (`UpgradeVMv5`)**: upgrade to Triton VM v5.0.0. The proof programs that embed the STARK verifier (`SingleProofV2`, `BlockProgram`) are re-hashed by the new ISA; blocks before the fork — including the entire `UpgradeVMv4` era — are checkpointed (trusted, not re-verified) because their proof format is incompatible with the v5 verifier.
+- Updated package version from 0.2.3 to 0.2.4 (workspace-wide).
+
+### Added
+
+- **`UpgradeVMv5` consensus rule set**: activation height `BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V5_MAIN_NET = 57650`, with `TritonProofVersion::V5` whose claim version tracks the live triton-vm `CURRENT_VERSION`, and pinned pre-v5 program digests (`BlockProgram` `1a4df646…`, `SingleProofV2` `15312e1a…`).
+- **Pre-v5 proof checkpointing**: the `UpgradeVMv4` era is now trusted without re-verification (its v4 proofs cannot be checked by the v5 verifier).
+
+### Changed
+
+- Proof production, transaction verification, and proof-of-work now select the `UpgradeVMv5` programs at and above the fork height.
+
+### Notes
+
+- Verified end-to-end: blocks 57651/57652 compose + prove + validate + mine under `UpgradeVMv5`, with composer and guesser earning unlocked, spendable rewards.
+
 ## [0.2.3] - 2026-06-11
 
 ### Breaking Changes
