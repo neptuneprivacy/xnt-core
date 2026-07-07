@@ -82,7 +82,9 @@ pub const MEMPOOL_TX_THRESHOLD_AGE_IN_SECS: u64 = 72 * 60 * 60;
 
 pub const TRANSACTION_NOTIFICATION_AGE_LIMIT_IN_SECS: u64 = 60 * 60 * 24;
 
-pub const MAX_BLOCK_EVENT_LOG_SIZE: usize = 256;
+pub const MAX_BLOCK_EVENT_LOG_SIZE: usize = 512;
+
+pub const ABANDONED_EVENT_MATURITY: u64 = 10;
 
 type LookupItem<'a> = (TransactionKernelId, &'a Transaction);
 
@@ -198,6 +200,15 @@ pub struct Mempool {
     /// Recent mempool events. Keeps last N batches in memory only.
     #[get_size(ignore)]
     event_log: VecDeque<MempoolEventBatch>,
+
+    /// `Abandoned` removal events awaiting their verdict. An entry is
+    /// dropped if the transaction is resurrected (an `Add` event with an
+    /// overlapping output commitment is recorded) within
+    /// [`ABANDONED_EVENT_MATURITY`] blocks of the abandonment, and otherwise
+    /// committed to the event log once the window has elapsed. Either way
+    /// the event log itself stays append-only.
+    #[get_size(ignore)]
+    pending_abandoned: Vec<(BlockHeight, MempoolEventInfo)>,
 }
 
 /// note that all methods that modify state and result in a MempoolEvent
@@ -234,6 +245,7 @@ impl Mempool {
             tx_proving_capability,
             merge_input_cache,
             event_log: VecDeque::new(),
+            pending_abandoned: Vec::new(),
         }
     }
 
@@ -832,6 +844,11 @@ impl Mempool {
     }
 
     /// Query event log with filters and pagination.
+    ///
+    /// The log is append-only: `Abandoned` events are withheld by
+    /// [`Self::record_event_batch`] until their verdict is final, so any
+    /// event served here stays in the log (until old-age eviction) and is
+    /// never retracted.
     pub fn query_events(
         &self,
         from_height: Option<BlockHeight>,
@@ -895,9 +912,81 @@ impl Mempool {
         (paged, total)
     }
 
-    /// Push an event batch to the log, evicting old entries if needed.
-    fn push_event_batch(&mut self, batch: MempoolEventBatch) {
-        self.event_log.push_back(batch);
+    /// Returns true if the two kernels share an output canonical commitment.
+    ///
+    /// This is how a transaction is recognized across proof upgrades:
+    /// upgraders merge in a fee-gobbler transaction, so the upgraded
+    /// transaction comes back with a different txid but retains the original
+    /// outputs.
+    fn shares_output_commitment(a: &TransactionKernel, b: &TransactionKernel) -> bool {
+        a.outputs.iter().any(|x| {
+            b.outputs
+                .iter()
+                .any(|y| x.canonical_commitment == y.canonical_commitment)
+        })
+    }
+
+    /// Record mempool events at the given block height, deciding the fate of
+    /// pending `Abandoned` events along the way.
+    ///
+    /// Fresh `Abandoned` removals are not written to the event log directly;
+    /// they are parked in [`Self::pending_abandoned`]. An `Add` event
+    /// recorded within [`ABANDONED_EVENT_MATURITY`] blocks whose kernel
+    /// shares an output commitment discards the pending entry (the
+    /// transaction was resurrected by a proof upgrade). Pending entries
+    /// that survive the window are committed to the log at the current
+    /// height. Decisions are final, which keeps the event log append-only.
+    fn record_event_batch(&mut self, block_height: BlockHeight, events: Vec<MempoolEventInfo>) {
+        let (abandoned, mut kept): (Vec<_>, Vec<_>) = events.into_iter().partition(|event| {
+            matches!(
+                event,
+                MempoolEventInfo::Remove {
+                    reason: RemovalReason::Abandoned,
+                    ..
+                }
+            )
+        });
+        self.pending_abandoned
+            .extend(abandoned.into_iter().map(|event| (block_height, event)));
+
+        // Resurrections: adds recorded within the window discard pending
+        // entries. The window check guards against reorgs replaying lower
+        // heights; entries past their window can't be discarded anymore
+        // (they are committed below, in this same call).
+        for add in &kept {
+            let MempoolEventInfo::Add { kernel, .. } = add else {
+                continue;
+            };
+            self.pending_abandoned.retain(|(abandoned_at, pending)| {
+                let MempoolEventInfo::Remove {
+                    kernel: pending_kernel,
+                    ..
+                } = pending
+                else {
+                    return true;
+                };
+                block_height.value() > abandoned_at.value() + ABANDONED_EVENT_MATURITY
+                    || !Self::shares_output_commitment(kernel, pending_kernel)
+            });
+        }
+
+        // Commit pending entries that reached maturity. Discards above ran
+        // first, so an add at exactly the maturity height still wins.
+        let mut still_pending = Vec::new();
+        for (abandoned_at, pending) in std::mem::take(&mut self.pending_abandoned) {
+            if block_height.value() >= abandoned_at.value() + ABANDONED_EVENT_MATURITY {
+                kept.push(pending);
+            } else {
+                still_pending.push((abandoned_at, pending));
+            }
+        }
+        self.pending_abandoned = still_pending;
+
+        if kept.is_empty() {
+            return;
+        }
+        self.event_log
+            .push_back(MempoolEventBatch::new(block_height, kept));
         while self.event_log.len() > MAX_BLOCK_EVENT_LOG_SIZE {
             self.event_log.pop_front();
         }
@@ -912,11 +1001,10 @@ impl Mempool {
         if events.is_empty() {
             return;
         }
-        let batch = MempoolEventBatch::new(
+        self.record_event_batch(
             tip_height,
             events.iter().map(MempoolEventInfo::from).collect(),
         );
-        self.push_event_batch(batch);
     }
 
     /// Return the number of transaction stored in the mempool that are deemed
@@ -1230,14 +1318,12 @@ impl Mempool {
 
         let events = MempoolEvent::normalize(events);
 
-        // Store events for this block
-        if !events.is_empty() {
-            let batch = MempoolEventBatch::new(
-                new_block.header().height,
-                events.iter().map(MempoolEventInfo::from).collect(),
-            );
-            self.push_event_batch(batch);
-        }
+        // Store events for this block. Called even when empty so that
+        // pending `Abandoned` events reaching maturity get committed.
+        self.record_event_batch(
+            new_block.header().height,
+            events.iter().map(MempoolEventInfo::from).collect(),
+        );
 
         Ok((events, update_jobs))
     }
@@ -1440,6 +1526,132 @@ mod tests {
 
         assert!(mempool.is_empty());
         assert!(mempool.len().is_zero());
+    }
+
+    #[test]
+    fn abandoned_events_shown_only_after_maturity_and_without_resurrection() {
+        let network = Network::Main;
+        let genesis_block = Block::genesis(network);
+        let mut mempool = Mempool::new(
+            ByteSize::gb(1),
+            TxProvingCapability::ProofCollection,
+            &genesis_block,
+        );
+
+        let txs = make_plenty_mock_transaction_supported_by_primitive_witness(3);
+        let kernel_a = txs[0].kernel.clone();
+        let kernel_b = txs[1].kernel.clone();
+        let kernel_c = txs[2].kernel.clone();
+
+        // A tx that resurrects tx c under a *different* txid but sharing one
+        // of tx c's output commitments, as happens when the upgrade merges
+        // the transaction with another one.
+        let kernel_c_merged = TransactionKernelModifier::default()
+            .outputs(
+                [kernel_b.outputs.clone(), kernel_c.outputs.clone()]
+                    .concat(),
+            )
+            .modify(kernel_b.clone());
+        assert_ne!(kernel_c.txid(), kernel_c_merged.txid());
+
+        // All three txs abandoned at height 100; tx b resurrected at height
+        // 103 with the same kernel, tx c at height 104 via merge (different
+        // txid, shared output commitment).
+        mempool.record_event_batch(
+            100u64.into(),
+            vec![
+                MempoolEventInfo::Remove {
+                    txid: kernel_a.txid(),
+                    kernel: kernel_a.clone(),
+                    reason: RemovalReason::Abandoned,
+                },
+                MempoolEventInfo::Remove {
+                    txid: kernel_b.txid(),
+                    kernel: kernel_b.clone(),
+                    reason: RemovalReason::Abandoned,
+                },
+                MempoolEventInfo::Remove {
+                    txid: kernel_c.txid(),
+                    kernel: kernel_c.clone(),
+                    reason: RemovalReason::Abandoned,
+                },
+            ],
+        );
+        mempool.record_event_batch(
+            103u64.into(),
+            vec![MempoolEventInfo::Add {
+                txid: kernel_b.txid(),
+                kernel: kernel_b.clone(),
+                reason: AddReason::Upgraded,
+            }],
+        );
+        mempool.record_event_batch(
+            104u64.into(),
+            vec![MempoolEventInfo::Add {
+                txid: kernel_c_merged.txid(),
+                kernel: kernel_c_merged.clone(),
+                reason: AddReason::Upgraded,
+            }],
+        );
+
+        let abandoned_events = |mempool: &Mempool| -> Vec<(u64, TransactionKernelId)> {
+            let (batches, _) =
+                mempool.query_events(None, None, None, Some("abandoned"), None, 100, 0);
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch.events.iter().map(|event| {
+                        let txid = match event {
+                            MempoolEventInfo::Remove { txid, .. } => *txid,
+                            MempoolEventInfo::Add { txid, .. } => *txid,
+                        };
+                        (batch.block_height.value(), txid)
+                    })
+                })
+                .collect()
+        };
+
+        // Within the maturity window: no abandoned events in the log. Txs b
+        // and c were discarded from the pending buffer by their
+        // resurrections, tx a still awaits its verdict.
+        assert!(abandoned_events(&mempool).is_empty());
+        assert_eq!(1, mempool.pending_abandoned.len());
+
+        // Empty blocks pass; nothing gets committed before maturity.
+        for height in 105..110 {
+            mempool.record_event_batch(height.into(), vec![]);
+        }
+        assert!(abandoned_events(&mempool).is_empty());
+
+        // At height 110 (= 100 + maturity) tx a's abandoned event is
+        // committed to the log at the height of commitment. Txs b and c are
+        // gone for good.
+        mempool.record_event_batch(110u64.into(), vec![]);
+        assert_eq!(vec![(110, kernel_a.txid())], abandoned_events(&mempool));
+        assert!(mempool.pending_abandoned.is_empty());
+
+        // The verdict is final: a late resurrection of tx a does not retract
+        // the already-served abandoned event.
+        mempool.record_event_batch(
+            111u64.into(),
+            vec![MempoolEventInfo::Add {
+                txid: kernel_a.txid(),
+                kernel: kernel_a.clone(),
+                reason: AddReason::FromPeer,
+            }],
+        );
+        assert_eq!(vec![(110, kernel_a.txid())], abandoned_events(&mempool));
+
+        // The resurrection events themselves are in the log.
+        let (batches, _) = mempool.query_events(None, None, None, None, None, 100, 0);
+        let upgraded_visible = batches.iter().flat_map(|batch| &batch.events).any(|event| {
+            matches!(
+                event,
+                MempoolEventInfo::Add { txid, reason: AddReason::Upgraded, .. }
+                    if *txid == kernel_b.txid()
+            )
+        });
+        assert!(upgraded_visible);
     }
 
     /// Create a mempool with n transactions, all "synced" to the provided
