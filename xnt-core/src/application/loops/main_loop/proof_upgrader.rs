@@ -450,7 +450,7 @@ impl UpgradeJob {
             /* Perform upgrade */
             // No locks may be held here!
             let offchain_notifications = global_state_lock.cli().fee_notification;
-            let (upgraded, expected_utxos) = match upgrade_job
+            let (upgraded, gobbler_expected_utxo) = match upgrade_job
                 .clone()
                 .upgrade(
                     triton_vm_job_queue.clone(),
@@ -461,12 +461,12 @@ impl UpgradeJob {
                 )
                 .await
             {
-                Ok((upgraded_tx, expected_utxos)) => {
+                Ok((upgraded_tx, expected_utxo)) => {
                     info!(
                         "Successfully upgraded transaction {}",
                         upgraded_tx.kernel.txid()
                     );
-                    (upgraded_tx, expected_utxos)
+                    (upgraded_tx, expected_utxo)
                 }
                 Err(e) => {
                     error!(
@@ -495,12 +495,17 @@ impl UpgradeJob {
             /* Check if upgrade resulted in valid transaction */
             upgrade_job = {
                 let mut global_state = global_state_lock.lock_guard_mut().await;
+                // Notify wallet of gobbler UTXO
+                global_state
+                    .wallet_state
+                    .add_expected_utxos(gobbler_expected_utxo)
+                    .await;
+
                 let tip_mutator_set = global_state
                     .chain
                     .light_state()
                     .mutator_set_accumulator_after()
                     .expect("Block from state must have mutator set after");
-
                 let transaction_is_up_to_date =
                     upgraded.kernel.mutator_set_hash == tip_mutator_set.hash();
 
@@ -524,11 +529,6 @@ impl UpgradeJob {
                     // sure to have it when they ask.
                     global_state
                         .mempool_insert(upgraded.clone(), upgrade_incentive.into(), AddReason::Upgraded)
-                        .await;
-
-                    global_state
-                        .wallet_state
-                        .add_expected_utxos(expected_utxos)
                         .await;
                     drop(global_state); // sooner is better.
 
@@ -642,6 +642,9 @@ impl UpgradeJob {
 
     /// Build a single-proof backed gobbler transaction that can be used to
     /// charge another transaction for upgrading a proof.
+    ///
+    /// Returns the transaction and the to-be-expected UTXO if node uses
+    /// off-chain fee notificaitons.
     #[expect(clippy::too_many_arguments)]
     async fn build_gobbler(
         gobbling_fee: NativeCurrencyAmount,
@@ -652,7 +655,7 @@ impl UpgradeJob {
         fee_notification_policy: FeeNotificationPolicy,
         mutator_set: MutatorSetAccumulator,
         old_tx_timestamp: Timestamp,
-    ) -> anyhow::Result<(Transaction, Vec<ExpectedUtxo>)> {
+    ) -> anyhow::Result<(Transaction, Option<ExpectedUtxo>)> {
         info!("Producing gobbler-transaction for a value of {gobbling_fee}");
         let (utxo_notification_method, receiver_preimage) =
             Self::gobbler_notification_method_with_receiver_preimage(
@@ -671,12 +674,17 @@ impl UpgradeJob {
 
         let gobbler_witness = gobbler.primitive_witness();
 
-        let expected_utxos = if fee_notification_policy == FeeNotificationPolicy::OffChain {
+        let expected_utxo = if fee_notification_policy == FeeNotificationPolicy::OffChain {
             gobbler
                 .tx_outputs
                 .expected_utxos(UtxoNotifier::FeeGobbler, receiver_preimage)
         } else {
             vec![]
+        };
+        let expected_utxo = match expected_utxo.len() {
+            0 => None,
+            1 => Some(expected_utxo[0].clone()),
+            _ => panic!("Fee gobbler can maximum create one known output"),
         };
 
         // ensure that proof-type is SingleProof
@@ -703,17 +711,18 @@ impl UpgradeJob {
             proof,
         };
 
-        Ok((gobbler_tx, expected_utxos))
+        Ok((gobbler_tx, expected_utxo))
     }
 
     /// Execute the proof upgrade.
     ///
     /// Upgrades transactions to a proof of higher quality that is more likely
     /// to be picked up by a miner. Returns the upgraded proof, or an error if
-    /// the prover is already in use and the proof_job_options is set to not wait if
-    /// prover is busy.
+    /// the prover is already in use and the proof_job_options is set to not
+    /// wait if prover is busy.
     ///
-    /// Charges a fee for the upgrade task if this is desirable.
+    /// Charges a fee for the upgrade task if this is desirable, and returns
+    /// the to-be-expected UTXO associated with this fee.
     pub(crate) async fn upgrade(
         self,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
@@ -721,15 +730,15 @@ impl UpgradeJob {
         own_wallet_entropy: &WalletEntropy,
         current_block_height: BlockHeight,
         fee_notification_policy: FeeNotificationPolicy,
-    ) -> anyhow::Result<(Transaction, Vec<ExpectedUtxo>)> {
+    ) -> anyhow::Result<(Transaction, Option<ExpectedUtxo>)> {
         let gobbling_fee = self.gobbling_fee();
         let mutator_set = self.mutator_set();
         let old_tx_timestamp = self.old_tx_timestamp();
         let network = proof_job_options.job_settings.network;
         let consensus_rule_set = ConsensusRuleSet::infer_from(network, current_block_height);
 
-        let (maybe_gobbler, expected_utxos) = if gobbling_fee.is_positive() {
-            let (gobbler, eutxos) = Self::build_gobbler(
+        let (maybe_gobbler, gobbler_expected_utxo) = if gobbling_fee.is_positive() {
+            let (gobbler, gobbler_eutxo) = Self::build_gobbler(
                 gobbling_fee,
                 triton_vm_job_queue.clone(),
                 proof_job_options.clone(),
@@ -741,9 +750,9 @@ impl UpgradeJob {
             )
             .await?;
 
-            (Some(gobbler), eutxos)
+            (Some(gobbler), gobbler_eutxo)
         } else {
-            (None, vec![])
+            (None, None)
         };
 
         let mut rng: StdRng =
@@ -790,7 +799,7 @@ impl UpgradeJob {
                     upgraded_tx
                 };
 
-                Ok((tx, expected_utxos))
+                Ok((tx, gobbler_expected_utxo))
             }
             UpgradeJob::Merge {
                 left_kernel,
@@ -834,13 +843,13 @@ impl UpgradeJob {
                     info!("Proof-upgrader merging with gobbler: Done");
                 };
 
-                Ok((ret, expected_utxos))
+                Ok((ret, gobbler_expected_utxo))
             }
             UpgradeJob::PrimitiveWitnessToProofCollection(pw_to_pc) => Ok((
                 pw_to_pc
                     .upgrade(triton_vm_job_queue.clone(), &proof_job_options)
                     .await?,
-                expected_utxos,
+                gobbler_expected_utxo,
             )),
             UpgradeJob::PrimitiveWitnessToSingleProof(pw_to_sp) => Ok((
                 pw_to_sp
@@ -850,13 +859,13 @@ impl UpgradeJob {
                         consensus_rule_set,
                     )
                     .await?,
-                expected_utxos,
+                gobbler_expected_utxo,
             )),
             UpgradeJob::UpdateMutatorSetData(update_job) => {
                 let ret = update_job
                     .upgrade(triton_vm_job_queue, proof_job_options)
                     .await?;
-                Ok((ret, expected_utxos))
+                Ok((ret, gobbler_expected_utxo))
             }
         }
     }
