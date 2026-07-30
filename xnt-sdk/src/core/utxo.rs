@@ -133,11 +133,54 @@ pub fn decrypt_announcement(
         .decrypt(&ciphertext)
         .map_err(|e| XntError::CryptoError(format!("decryption failed: {e}")))?;
 
+    let utxo = Utxo::from_core(utxo);
+    if utxo.lock_script_hash() != spending_key.lock_script_hash() {
+        return Err(XntError::CryptoError(
+            "announced UTXO is not spendable by this key (foreign lock script)".to_string(),
+        ));
+    }
+
     Ok(DecryptedUtxo {
-        utxo: Utxo::from_core(utxo),
+        utxo,
         sender_randomness: Digest::from_core(sender_randomness),
         payment_id: payment_id.value(),
         block_height: 0, // Not available from announcement
         block_digest: Digest::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use neptune_privacy::api::export::TxOutput;
+    use neptune_privacy::prelude::tasm_lib::prelude::Digest as CoreDigest;
+
+    use super::*;
+    use crate::core::wallet::WalletEntropy;
+
+    /// The lock-script check in [decrypt_announcement] must not reject
+    /// announcements that are locked to the decrypting key.
+    #[test]
+    fn decrypt_announcement_accepts_own_lock_script() {
+        let wallet = WalletEntropy::generate().unwrap();
+        let keys = [
+            wallet.derive_spending_key(0),
+            wallet.derive_dctidh_spending_key(0),
+        ];
+
+        for key in keys {
+            let receiving_address = key.to_address().inner;
+            let sender_randomness: CoreDigest = rand::random();
+            let tx_output = TxOutput::onchain_native_currency(
+                NativeCurrencyAmount::coins(5),
+                sender_randomness,
+                receiving_address,
+                false,
+            );
+            let announcement = tx_output.announcement().unwrap();
+
+            let decrypted = decrypt_announcement(&key, &announcement.message)
+                .expect("announcement locked to own key must decrypt");
+            assert_eq!(decrypted.utxo.lock_script_hash(), key.lock_script_hash());
+        }
+    }
 }

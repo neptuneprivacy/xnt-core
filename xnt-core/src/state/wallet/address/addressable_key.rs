@@ -261,6 +261,9 @@ impl SpendingKey {
     /// Scans all announcements in a `Transaction` and return all
     /// UTXOs that are recognized by this spending key.
     ///
+    /// Announcements whose UTXO is not locked to this key are ignored, as the
+    /// key cannot spend such UTXOs.
+    ///
     /// Note that a single `Transaction` may represent an entire block.
     ///
     /// # Side Effects
@@ -298,6 +301,12 @@ impl SpendingKey {
                 let (utxo, sender_randomness, payment_id) = self.ok_warn(self.decrypt(&c))?;
                 Some((utxo, sender_randomness, payment_id))
             })
+
+            // ... and whose lock script this key can actually satisfy. A third
+            // party can craft an announcement that decrypts under this key but
+            // whose UTXO is locked by a foreign script; tracking it would
+            // inflate the wallet balance with unspendable funds.
+            .filter(|(utxo, _, _)| utxo.lock_script_hash() == self.lock_script_hash())
 
             // ... map to IncomingUtxo
             .map(move |(utxo, sender_randomness, payment_id)| {

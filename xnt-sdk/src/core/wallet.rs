@@ -102,6 +102,14 @@ impl SpendingKey {
         Digest::from_core(self.inner.privacy_preimage())
     }
 
+    /// Get the hash of the lock script this key can satisfy.
+    ///
+    /// Announced UTXOs whose lock script hash differs from this cannot be
+    /// spent by this key and must not be counted towards the balance.
+    pub fn lock_script_hash(&self) -> Digest {
+        Digest::from_core(self.inner.clone().to_address().lock_script_hash())
+    }
+
     /// Returns true if this is a CTIDH spending key.
     pub fn is_dctidh(&self) -> bool {
         matches!(self.inner, CoreSpendingKey::dCTIDH(_))

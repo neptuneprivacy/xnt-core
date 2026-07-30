@@ -298,6 +298,7 @@ pub fn collect_spendable_inputs_for_key(
     }
 
     // Decrypt UTXOs using core SpendingKey::decrypt (works for Generation and dCTIDH)
+    let own_lock_script_hash = key.lock_script_hash();
     let mut utxos: Vec<(Utxo, Digest, i128, u64, Digest)> = Vec::new();
     for idx in indexed {
         // ciphertext_bfes are encoded little-endian u64s; convert back to BFieldElements
@@ -322,8 +323,16 @@ pub fn collect_spendable_inputs_for_key(
             .decrypt(&bfes)
             .map_err(|e| XntError::CryptoError(format!("decryption failed: {e}")))?;
         {
-            let amount = core_utxo.get_native_currency_amount().to_nau();
             let utxo = Utxo::from_core(core_utxo);
+
+            // A third party can craft an announcement that decrypts under
+            // this key but whose UTXO is locked by a foreign script; counting
+            // it would inflate the balance with unspendable funds.
+            if utxo.lock_script_hash() != own_lock_script_hash {
+                continue;
+            }
+
+            let amount = utxo.amount();
             utxos.push((utxo, Digest::from_core(sr), amount, idx.block_height, idx.block_digest));
         }
     }
@@ -545,8 +554,15 @@ pub fn decrypt_indexed_utxo(
         .decrypt(&ciphertext)
         .map_err(|e| XntError::CryptoError(format!("decryption failed: {e}")))?;
 
+    let utxo = Utxo::from_core(utxo);
+    if utxo.lock_script_hash() != spending_key.lock_script_hash() {
+        return Err(XntError::CryptoError(
+            "announced UTXO is not spendable by this key (foreign lock script)".to_string(),
+        ));
+    }
+
     Ok(super::utxo::DecryptedUtxo {
-        utxo: Utxo::from_core(utxo),
+        utxo,
         sender_randomness: Digest::from_core(sender_randomness),
         payment_id: payment_id.value(),
         block_height,
@@ -729,11 +745,21 @@ pub fn decrypt_mempool_announcement(
 
     // Decrypt ciphertext (skip key_type and receiver_id)
     match spending_key.inner.decrypt(&bfes[2..]) {
-        Ok((utxo, sender_randomness, payment_id)) => Ok(Some((
-            Utxo::from_core(utxo),
-            Digest::from_core(sender_randomness),
-            payment_id.value(),
-        ))),
+        Ok((utxo, sender_randomness, payment_id)) => {
+            let utxo = Utxo::from_core(utxo);
+
+            // Ignore announced UTXOs this key cannot spend; they must not
+            // show up as pending incoming funds.
+            if utxo.lock_script_hash() != spending_key.lock_script_hash() {
+                return Ok(None);
+            }
+
+            Ok(Some((
+                utxo,
+                Digest::from_core(sender_randomness),
+                payment_id.value(),
+            )))
+        }
         Err(_) => Ok(None),
     }
 }
