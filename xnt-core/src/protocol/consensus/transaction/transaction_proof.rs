@@ -12,7 +12,7 @@ use crate::protocol::consensus::transaction::PrimitiveWitness;
 use crate::protocol::consensus::transaction::ProofCollection;
 use crate::protocol::peer::transfer_transaction::TransactionProofQuality;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::protocol::proof_abstractions::verifier::verify;
+use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 
 /// represents available types of transaction proofs
 ///
@@ -144,7 +144,7 @@ impl TransactionProof {
             }
             TransactionProof::SingleProof(single_proof) => {
                 let claim = single_proof_claim(kernel_mast_hash, consensus_rule_set);
-                verify(claim, single_proof.clone(), network).await
+                verify_transaction_proof(claim, single_proof.clone(), network).await
             }
             TransactionProof::ProofCollection(proof_collection) => match consensus_rule_set {
                 ConsensusRuleSet::Reboot

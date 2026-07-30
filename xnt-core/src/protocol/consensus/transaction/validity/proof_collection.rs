@@ -29,7 +29,7 @@ use crate::protocol::consensus::transaction::BFieldCodec;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
-use crate::protocol::proof_abstractions::verifier::verify;
+use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 use crate::protocol::proof_abstractions::SecretWitness;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, GetSize, BFieldCodec, TasmObject)]
@@ -493,7 +493,7 @@ impl ProofCollection {
 
         // verify
         debug!("verifying removal records integrity ...");
-        let rri = verify(
+        let rri = verify_transaction_proof(
             removal_records_integrity_claim.clone(),
             self.removal_records_integrity.clone(),
             network,
@@ -501,7 +501,7 @@ impl ProofCollection {
         .await;
         debug!("{rri}");
         debug!("verifying kernel to outputs ...");
-        let k2o = verify(
+        let k2o = verify_transaction_proof(
             kernel_to_outputs_claim.clone(),
             self.kernel_to_outputs.clone(),
             network,
@@ -509,7 +509,7 @@ impl ProofCollection {
         .await;
         debug!("{k2o}");
         debug!("verifying collect lock scripts ...");
-        let cls = verify(
+        let cls = verify_transaction_proof(
             collect_lock_scripts_claim.clone(),
             self.collect_lock_scripts.clone(),
             network,
@@ -517,7 +517,7 @@ impl ProofCollection {
         .await;
         debug!("{cls}");
         debug!("verifying collect type scripts ...");
-        let cts = verify(
+        let cts = verify_transaction_proof(
             collect_type_scripts_claim.clone(),
             self.collect_type_scripts.clone(),
             network,
@@ -527,13 +527,13 @@ impl ProofCollection {
         debug!("verifying that all lock scripts halt ...");
         let mut lsh = true;
         for (cl, pr) in lock_script_claims.iter().zip(self.lock_scripts_halt.iter()) {
-            lsh &= verify(cl.clone(), pr.clone(), network).await;
+            lsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
         }
         debug!("{lsh}");
         debug!("verifying that all type scripts halt ...");
         let mut tsh = true;
         for (cl, pr) in type_script_claims.iter().zip(self.type_scripts_halt.iter()) {
-            tsh &= verify(cl.clone(), pr.clone(), network).await;
+            tsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
         }
         debug!("{tsh}");
 
@@ -561,20 +561,20 @@ impl ProofCollection {
         let lock_script_claims = self.lock_script_claims();
         let type_script_claims = self.type_script_claims();
 
-        let rri = verify(
+        let rri = verify_transaction_proof(
             removal_records_integrity_claim,
             self.removal_records_integrity.clone(),
             network,
         )
         .await;
-        let k2o = verify(kernel_to_outputs_claim, self.kernel_to_outputs.clone(), network).await;
-        let cls = verify(
+        let k2o = verify_transaction_proof(kernel_to_outputs_claim, self.kernel_to_outputs.clone(), network).await;
+        let cls = verify_transaction_proof(
             collect_lock_scripts_claim,
             self.collect_lock_scripts.clone(),
             network,
         )
         .await;
-        let cts = verify(
+        let cts = verify_transaction_proof(
             collect_type_scripts_claim,
             self.collect_type_scripts.clone(),
             network,
@@ -583,11 +583,11 @@ impl ProofCollection {
 
         let mut lsh = true;
         for (cl, pr) in lock_script_claims.iter().zip(self.lock_scripts_halt.iter()) {
-            lsh &= verify(cl.clone(), pr.clone(), network).await;
+            lsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
         }
         let mut tsh = true;
         for (cl, pr) in type_script_claims.iter().zip(self.type_scripts_halt.iter()) {
-            tsh &= verify(cl.clone(), pr.clone(), network).await;
+            tsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
         }
 
         rri && k2o && cls && cts && lsh && tsh

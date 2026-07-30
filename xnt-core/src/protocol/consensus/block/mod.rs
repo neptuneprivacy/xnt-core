@@ -817,6 +817,14 @@ impl Block {
             return true;
         }
 
+        // Reject values that the difficulty control mechanism can never
+        // produce, rather than dividing by zero. The derived decoders build a
+        // `Difficulty` field-by-field, bypassing the constructor that enforces
+        // the minimum, so a peer can put any value on the wire.
+        if previous_block_header.difficulty < Difficulty::MINIMUM {
+            return false;
+        }
+
         let threshold = previous_block_header.difficulty.target();
         if network.allows_mock_pow() && self.is_valid_mock_pow(threshold) {
             return true;
@@ -1242,6 +1250,39 @@ pub(crate) mod tests {
         assert!(
             Network::all_networks().map(mutator_set_hash).all_unique(),
             "All genesis blocks must have unique MSA digests, else replay attacks are possible",
+        );
+    }
+
+    #[test]
+    fn pow_check_rejects_difficulty_below_minimum() {
+        let network = Network::Testnet(42);
+        assert!(
+            network.difficulty_reset_interval().is_none(),
+            "test assumption: no difficulty reset, so the PoW check is reached"
+        );
+        let genesis = Block::genesis(network);
+
+        // `Difficulty`'s derived decoders build the value field-by-field,
+        // without going through the constructor that enforces the minimum. A
+        // peer can therefore put any value on the wire, including zero.
+        let encoding_len = Difficulty::MINIMUM.encode().len();
+        let zero_difficulty =
+            *Difficulty::decode(&vec![BFieldElement::new(0); encoding_len]).unwrap();
+        assert!(
+            zero_difficulty < Difficulty::MINIMUM,
+            "test assumption: decoding bypasses the minimum difficulty"
+        );
+
+        // The difficulty that the PoW check divides by is the *parent's*.
+        let mut parent = genesis.clone();
+        parent.kernel.header.difficulty = zero_difficulty;
+        parent.unset_digest();
+
+        let block = invalid_empty_block(&parent, network);
+
+        assert!(
+            !block.has_proof_of_work(network, parent.header()),
+            "block whose parent has zero difficulty must be rejected, not panicked on"
         );
     }
 

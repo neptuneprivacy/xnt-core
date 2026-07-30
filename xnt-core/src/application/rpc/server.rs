@@ -2136,6 +2136,12 @@ impl NeptuneRPCServer {
             return Err(err);
         }
 
+        if incoming_utxo.utxo.lock_script_hash() != spending_key.lock_script_hash() {
+            let err = error::ClaimError::ForeignLockScript;
+            warn!("{}", err.to_string());
+            return Err(err);
+        }
+
         // check if wallet is already expecting this utxo.
         let addition_record = incoming_utxo.addition_record();
         let has_expected_utxo = state.wallet_state.has_expected_utxo(addition_record).await;
@@ -4367,6 +4373,9 @@ pub mod error {
         #[error("invalid type script in claim utxo")]
         InvalidTypeScript,
 
+        #[error("claimed utxo is not spendable by the matching wallet key")]
+        ForeignLockScript,
+
         // catch-all error, eg for anyhow errors
         #[error("claim unsuccessful")]
         Failed(String),
@@ -6109,6 +6118,59 @@ mod tests {
 
     mod claim_utxo_tests {
         use super::*;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn foreign_lock_script_fails() {
+            // Verify that UTXO must match that of the key decrypting the
+            // off-chain notification.
+            let network = Network::Main;
+            let mut rpc_server = test_rpc_server(
+                WalletEntropy::new_random(),
+                2,
+                cli_args::Args::default_with_network(network),
+            )
+            .await;
+
+            let own_address = rpc_server
+                .state
+                .lock_guard_mut()
+                .await
+                .wallet_state
+                .next_unused_spending_key(KeyType::Generation)
+                .await
+                .to_address();
+
+            let sender_randomness: Digest = rand::random();
+            let off_chain_notification = |utxo: Utxo| {
+                let payload = UtxoNotificationPayload::new(utxo, sender_randomness);
+                own_address.private_notification(payload, network)
+            };
+
+            let foreign_utxo =
+                Utxo::new_native_currency(rand::random(), NativeCurrencyAmount::coins(5));
+            let foreign_utxo_result = rpc_server
+                .claim_utxo_inner(off_chain_notification(foreign_utxo), None)
+                .await;
+            assert!(
+                matches!(foreign_utxo_result, Err(error::ClaimError::ForeignLockScript)),
+                "claiming a UTXO with a foreign lock script must fail"
+            );
+
+            let own_utxo = Utxo::new_native_currency(
+                own_address.lock_script_hash(),
+                NativeCurrencyAmount::coins(5),
+            );
+            let own_utxo_result = rpc_server
+                .claim_utxo_inner(off_chain_notification(own_utxo), None)
+                .await;
+            assert!(
+                own_utxo_result.is_ok_and(|claim_data| claim_data.is_some()),
+                "claiming a UTXO with own lock script must succeed"
+            );
+        }
 
         #[traced_test]
         #[apply(shared_tokio_runtime)]

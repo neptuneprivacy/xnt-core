@@ -33,6 +33,7 @@ use crate::application::loops::main_loop::MAX_NUM_DIGESTS_IN_BATCH_REQUEST;
 use crate::macros::fn_name;
 use crate::macros::log_slow_scope;
 use crate::protocol::consensus::block::block_height::BlockHeight;
+use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
@@ -327,12 +328,19 @@ impl PeerLoopHandler {
                     "Received invalid proof-of-work for block of height {} from peer with IP {}",
                     new_block.kernel.header.height, self.peer_address
                 );
-                warn!("Difficulty is {}.", previous_block.kernel.header.difficulty);
-                warn!(
-                    "Proof of work should be {:x} (or more) but was {:x}.",
-                    previous_block.kernel.header.difficulty.target(),
-                    new_block.hash()
-                );
+                let difficulty = previous_block.kernel.header.difficulty;
+                warn!("Difficulty is {difficulty}.");
+                if difficulty < Difficulty::MINIMUM {
+                    // `target()` divides by the difficulty, so it must not be
+                    // called on a value below the minimum.
+                    warn!("Difficulty is below the minimum of {}.", Difficulty::MINIMUM);
+                } else {
+                    warn!(
+                        "Proof of work should be {:x} (or more) but was {:x}.",
+                        difficulty.target(),
+                        new_block.hash()
+                    );
+                }
                 self.punish(NegativePeerSanction::InvalidBlock((
                     new_block.kernel.header.height,
                     new_block.hash(),
