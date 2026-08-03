@@ -198,6 +198,19 @@ pub struct Mempool {
     /// called and can shrink when [`Self::update_with_block`] is called.
     merge_input_cache: MergeInputCache,
 
+    /// Transactions whose proof upgrade was attempted and failed since the
+    /// last block.
+    ///
+    /// Proof upgrade candidate selection is deterministic, so a transaction
+    /// whose upgrade fails is picked again on every following attempt, and no
+    /// other transaction behind it is ever upgraded. Recording the failure
+    /// keeps the upgrader moving and gives other txs a chance. Cleared whenever
+    /// a new block is processed such that a transient failure doesn't prevent
+    /// the transaction from ever being upgraded. A transaction is never dropped
+    /// on account of upgrade failures.
+    #[get_size(ignore)]
+    upgrade_failures: HashSet<TransactionKernelId>,
+
     /// Recent mempool events. Keeps last N batches in memory only.
     #[get_size(ignore)]
     event_log: VecDeque<MempoolEventBatch>,
@@ -245,9 +258,23 @@ impl Mempool {
             tip_mutator_set_hash,
             tx_proving_capability,
             merge_input_cache,
+            upgrade_failures: HashSet::default(),
             event_log: VecDeque::new(),
             pending_abandoned: Vec::new(),
         }
+    }
+
+    /// Record that upgrading the proofs of these transactions failed, so that
+    /// they are passed over when picking the next upgrade candidate.
+    ///
+    /// The transactions are not removed, and the record is discarded by
+    /// [`Self::update_with_block`], so a failure that was transient only delays
+    /// an upgrade by one block.
+    pub(super) fn record_upgrade_failure(
+        &mut self,
+        txids: impl IntoIterator<Item = TransactionKernelId>,
+    ) {
+        self.upgrade_failures.extend(txids);
     }
 
     /// Update mempool with chain information.
@@ -336,6 +363,10 @@ impl Mempool {
             .chain(self.fee_density_iter().map(|(txid, _)| txid))
         {
             let candidate = self.tx_dictionary.get(&candidate_txid).unwrap();
+            if self.upgrade_failures.contains(&candidate_txid) {
+                continue;
+            }
+
             if self.tx_is_synced(&candidate.transaction.kernel) {
                 continue;
             }
@@ -389,6 +420,10 @@ impl Mempool {
             .chain(self.fee_density_iter().map(|(txid, _)| txid))
         {
             let candidate = self.tx_dictionary.get(&candidate_txid).unwrap();
+            if self.upgrade_failures.contains(&candidate_txid) {
+                continue;
+            }
+
             if !self.tx_is_synced(&candidate.transaction.kernel) {
                 continue;
             }
@@ -441,6 +476,10 @@ impl Mempool {
             .chain(self.fee_density_iter().map(|(txid, _)| txid))
         {
             let candidate = self.tx_dictionary.get(&candidate_txid).unwrap();
+
+            if self.upgrade_failures.contains(&candidate_txid) {
+                continue;
+            }
 
             if !self.tx_is_synced(&candidate.transaction.kernel) {
                 continue;
@@ -1182,6 +1221,10 @@ impl Mempool {
         &mut self,
         new_block: &Block,
     ) -> anyhow::Result<(Vec<MempoolEvent>, Vec<MempoolUpdateJob>)> {
+        // Ensure transactions are not permanently blocked on transient upgrade
+        // failures.
+        self.upgrade_failures.clear();
+
         // If the mempool is empty, there is nothing to do.
         if self.is_empty() && self.merge_input_cache.is_empty() {
             self.set_sync_labels(new_block)?;
@@ -1515,6 +1558,67 @@ mod tests {
                 .get_mut(&transaction_id)
                 .map(|x| &mut x.transaction)
         }
+    }
+
+    #[traced_test]
+    #[test]
+    fn failed_upgrade_lets_the_next_upgrade_candidate_through() {
+        let network = Network::Main;
+        let genesis_block = Block::genesis(network);
+        let mutator_set_hash = genesis_block
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .hash();
+
+        let mut mempool = Mempool::new(
+            ByteSize::gb(1),
+            TxProvingCapability::SingleProof,
+            &genesis_block,
+        );
+        for mut tx in make_plenty_mock_transaction_supported_by_primitive_witness(2) {
+            tx.kernel = TransactionKernelModifier::default()
+                .mutator_set_hash(mutator_set_hash)
+                .modify(tx.kernel);
+            tx.proof = TransactionProof::ProofCollection(ProofCollection::invalid());
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
+        }
+        assert_eq!(2, mempool.len(), "sanity: two distinct candidates");
+
+        let preferred = |pool: &Mempool| {
+            pool.preferred_proof_collection(usize::MAX, TxUpgradeFilter::match_all())
+                .map(|(kernel, _, _)| kernel.txid())
+        };
+
+        let first = preferred(&mempool).expect("sanity: a candidate must be picked");
+        mempool.record_upgrade_failure([first]);
+
+        let second = preferred(&mempool)
+            .expect("a transaction whose upgrade failed must not block the next candidate");
+        assert_ne!(
+            first, second,
+            "the failed candidate must not be picked again"
+        );
+
+        mempool.record_upgrade_failure([second]);
+        assert!(
+            preferred(&mempool).is_none(),
+            "no candidate remains once every transaction's upgrade has failed"
+        );
+
+        // A new block gives every transaction another chance. In this fork a
+        // block also kicks witness-less proof-collection transactions from the
+        // mempool, so check the failure record directly rather than through
+        // candidate selection.
+        let block1 = invalid_empty_block_with_timestamp(
+            &genesis_block,
+            genesis_block.header().timestamp + Timestamp::hours(1),
+            network,
+        );
+        mempool.update_with_block(&block1).unwrap();
+        assert!(
+            mempool.upgrade_failures.is_empty(),
+            "a new block must clear the recorded upgrade failures"
+        );
     }
 
     #[apply(shared_tokio_runtime)]
