@@ -544,7 +544,7 @@ impl UpgradeJob {
 
                 let Some(ms_update) = global_state
                     .chain
-                    .archival_state_mut()
+                    .archival_state()
                     .get_mutator_set_update_to_tip(
                         &mutator_set_for_tx,
                         SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
@@ -855,7 +855,7 @@ impl UpgradeJob {
 /// of this job to the wallet of this node. The value reported will be zero for
 /// all 3rd party transactions.
 pub(super) async fn get_upgrade_task_from_mempool(
-    global_state: &mut GlobalState,
+    global_state: &GlobalState,
 ) -> Option<UpgradeJob> {
     let tip_mutator_set = global_state
         .chain
@@ -1061,9 +1061,9 @@ mod tests {
                 .await;
             assert!(
                 !upgrade_priority.is_irrelevant()
-                    && get_upgrade_task_from_mempool(&mut rando).await.is_some()
+                    && get_upgrade_task_from_mempool(&rando).await.is_some()
                     || upgrade_priority.is_irrelevant()
-                        && get_upgrade_task_from_mempool(&mut rando).await.is_none()
+                        && get_upgrade_task_from_mempool(&rando).await.is_none()
             );
 
             // A high-fee paying transaction must be returned for upgrading
@@ -1078,7 +1078,7 @@ mod tests {
             rando
                 .mempool_insert(pc_tx_high_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted)
                 .await;
-            let job = get_upgrade_task_from_mempool(&mut rando).await.unwrap();
+            let job = get_upgrade_task_from_mempool(&rando).await.unwrap();
             let UpgradeJob::ProofCollectionToSingleProof(ProofCollectionToSingleProof {
                 kernel,
                 ..
@@ -1336,8 +1336,8 @@ mod tests {
         }
 
         let merge_upgrade_job = {
-            let mut alice = alice.lock_guard_mut().await;
-            get_upgrade_task_from_mempool(&mut alice).await.unwrap()
+            let alice = alice.lock_guard().await;
+            get_upgrade_task_from_mempool(&alice).await.unwrap()
         };
         assert!(
             matches!(merge_upgrade_job, UpgradeJob::Merge { .. }),
