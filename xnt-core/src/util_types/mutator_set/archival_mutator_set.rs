@@ -18,6 +18,7 @@ use super::removal_record::chunk_dictionary::ChunkDictionary;
 use super::removal_record::RemovalRecord;
 use super::shared::BATCH_SIZE;
 use super::shared::CHUNK_SIZE;
+use super::shared::WINDOW_SIZE;
 use crate::application::database::storage::storage_vec::traits::*;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::util_types::archival_mmr::ArchivalMmr;
@@ -496,7 +497,15 @@ where
         let active_window_start = batch_index * u128::from(CHUNK_SIZE);
 
         if index >= active_window_start {
-            let relative_index = (index - active_window_start) as u32;
+            // Ensure index is actually inside the active window. If not, it
+            // is a future index. Index must be valid u32.
+            let Ok(relative_index) = u32::try_from(index - active_window_start) else {
+                return false;
+            };
+            if relative_index >= WINDOW_SIZE {
+                return false;
+            }
+
             self.swbf_active.contains(relative_index)
         } else {
             let chunk_index = (index / u128::from(CHUNK_SIZE)) as u64;
@@ -642,6 +651,18 @@ mod tests {
     use crate::util_types::mutator_set::shared::NUM_TRIALS;
     use crate::util_types::test_shared::mutator_set::empty_rusty_mutator_set;
     use crate::util_types::test_shared::mutator_set::mock_item_and_randomnesses;
+
+    #[apply(shared_tokio_runtime)]
+    async fn far_future_index_is_not_in_active_window() {
+        let mut rms = empty_rusty_mutator_set().await;
+        let ams = rms.ams_mut();
+        ams.swbf_active.insert(5);
+
+        assert!(ams.bloom_filter_contains(5).await);
+        assert!(!ams.bloom_filter_contains((1u128 << 32) + 5).await);
+        assert!(!ams.bloom_filter_contains((1u128 << 64) + 5).await);
+        assert!(!ams.bloom_filter_contains((1u128 << 96) + 5).await);
+    }
 
     #[apply(shared_tokio_runtime)]
     async fn archival_set_commitment_test() {
