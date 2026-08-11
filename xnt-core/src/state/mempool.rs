@@ -56,6 +56,7 @@ use crate::api::export::NeptuneProof;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
@@ -1029,12 +1030,30 @@ impl Mempool {
     ///
     /// Number of transactions returned can be capped by either size (measured
     /// in bytes), or by transaction count. The function guarantees that neither
-    /// of the specified limits will be exceeded.
+    /// of the specified limits will be exceeded. The total number of inputs,
+    /// outputs, and announcements across the returned transactions likewise
+    /// respects the caps imposed by the consensus rules, leaving room for the
+    /// coinbase transaction they are expected to be merged with.
     pub(crate) fn get_transactions_for_block_composition(
         &self,
+        consensus_rule_set: ConsensusRuleSet,
         mut remaining_storage: usize,
         max_num_txs: Option<usize>,
     ) -> Vec<Transaction> {
+        // Numbers of outputs and announcements reserved for the coinbase
+        // transaction that the returned transactions will be merged with. No
+        // reservation is needed for inputs, as a coinbase transaction has none.
+        const COINBASE_NUM_OUTPUTS_RESERVATION: usize = 128;
+        const COINBASE_NUM_ANNOUNCEMENTS_RESERVATION: usize = 128;
+
+        let mut remaining_num_inputs = consensus_rule_set.max_num_inputs();
+        let mut remaining_num_outputs = consensus_rule_set
+            .max_num_outputs()
+            .saturating_sub(COINBASE_NUM_OUTPUTS_RESERVATION);
+        let mut remaining_num_announcements = consensus_rule_set
+            .max_num_announcements()
+            .saturating_sub(COINBASE_NUM_ANNOUNCEMENTS_RESERVATION);
+
         let mut transactions = vec![];
 
         for (transaction_digest, _fee_density) in self.fee_density_iter() {
@@ -1053,6 +1072,16 @@ impl Mempool {
                     continue;
                 }
 
+                // Current transaction would push the block transaction over one
+                // of the consensus caps.
+                let kernel = &transaction_ptr.kernel;
+                if kernel.inputs.len() > remaining_num_inputs
+                    || kernel.outputs.len() > remaining_num_outputs
+                    || kernel.announcements.len() > remaining_num_announcements
+                {
+                    continue;
+                }
+
                 let transaction_copy = transaction_ptr.to_owned();
                 let transaction_size = transaction_copy.get_size();
 
@@ -1063,6 +1092,9 @@ impl Mempool {
 
                 // Include transaction
                 remaining_storage -= transaction_size;
+                remaining_num_inputs -= transaction_copy.kernel.inputs.len();
+                remaining_num_outputs -= transaction_copy.kernel.outputs.len();
+                remaining_num_announcements -= transaction_copy.kernel.announcements.len();
                 transactions.push(transaction_copy)
             }
         }
@@ -1949,7 +1981,7 @@ mod tests {
         let max_fee_density: FeeDensity = FeeDensity::new(BigInt::from(u128::MAX), BigInt::from(1));
         let mut prev_fee_density = max_fee_density;
         for curr_transaction in
-            mempool.get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, None)
+            mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, None)
         {
             let curr_fee_density = curr_transaction.fee_density();
             assert!(curr_fee_density <= prev_fee_density);
@@ -1971,7 +2003,7 @@ mod tests {
 
         for num_mergers in 0..=num_txs_in_mempool {
             let returned_transactions = mempool
-                .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, Some(num_mergers));
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, Some(num_mergers));
             assert_eq!(num_mergers, returned_transactions.len());
 
             let max_fee_density: FeeDensity =
@@ -2077,7 +2109,7 @@ mod tests {
             assert_eq!(
                 i,
                 mempool
-                    .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, Some(i))
+                    .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, Some(i))
                     .len()
             );
         }
@@ -2107,7 +2139,7 @@ mod tests {
 
             let max_total_tx_size = 1_000_000_000;
             let txs_returned =
-                mempool.get_transactions_for_block_composition(max_total_tx_size, None);
+                mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), max_total_tx_size, None);
             assert_eq!(
                 0,
                 txs_returned.len(),
@@ -2125,7 +2157,7 @@ mod tests {
             assert_eq!(
                 i,
                 mempool
-                    .get_transactions_for_block_composition(max_total_tx_size, None)
+                    .get_transactions_for_block_composition(ConsensusRuleSet::default(), max_total_tx_size, None)
                     .len(),
                 "Must return {i}/{i} transaction when mutator set hashes do match"
             );
@@ -2351,7 +2383,7 @@ mod tests {
         // updated and valid-again mutator set data
         let block2_msa = block_2.mutator_set_accumulator_after().unwrap();
         let mut tx_by_alice_updated: Transaction =
-            mempool.get_transactions_for_block_composition(usize::MAX, None)[0].clone();
+            mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)[0].clone();
         assert!(
             tx_by_alice_updated.is_confirmable_relative_to(&block2_msa),
             "Block with tx with updated mutator set data must be confirmable wrt. block_2"
@@ -2375,7 +2407,7 @@ mod tests {
         }
 
         tx_by_alice_updated =
-            mempool.get_transactions_for_block_composition(usize::MAX, None)[0].clone();
+            mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)[0].clone();
         let block_5_timestamp = previous_block.header().timestamp + Timestamp::hours(1);
         let (cbtx, _eutxo) = make_coinbase_transaction_from_state(
             &alice
@@ -2735,7 +2767,7 @@ mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(usize::MAX, None);
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None);
             assert_eq!(
                 1,
                 mempool_txs.len(),
@@ -2784,7 +2816,7 @@ mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(usize::MAX, None)
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)
                 .iter()
                 .all(|tx| tx.is_confirmable_relative_to(
                     &block_1b.mutator_set_accumulator_after().unwrap(),
@@ -2938,7 +2970,7 @@ mod tests {
 
         assert!(!mempool.is_empty());
         assert!(mempool
-            .get_transactions_for_block_composition(usize::MAX, None)
+            .get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)
             .is_empty());
     }
 

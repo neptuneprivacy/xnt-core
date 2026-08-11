@@ -7,6 +7,7 @@ use crate::api::export::NativeCurrencyAmount;
 use crate::api::export::RecordTransactionError;
 use crate::application::job_queue::errors::AddJobError;
 use crate::application::job_queue::errors::JobHandleError;
+use crate::protocol::consensus::consensus_rule_set::TransactionTooBig;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::proof_abstractions::tasm::prover_job::ProverJobError;
 use crate::state::transaction::tx_proving_capability::TxProvingCapability;
@@ -128,4 +129,7 @@ pub enum SendError {
         tip_digest: Digest,
         max: usize,
     },
+
+    #[error("transaction can never be mined: {0}")]
+    TooBig(#[from] TransactionTooBig),
 }
