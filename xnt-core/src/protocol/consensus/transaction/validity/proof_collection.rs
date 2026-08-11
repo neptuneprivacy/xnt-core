@@ -423,6 +423,21 @@ impl ProofCollection {
         }
     }
 
+    /// Whether there is exactly one halting proof per collected script hash.
+    ///
+    /// The verification loops in [`verify`](Self::verify) and
+    /// [`verify_v2`](Self::verify_v2) pair claims with proofs using `zip`, which
+    /// silently truncates to the shorter operand; without this guard a prover
+    /// could submit fewer (e.g. zero) `*_scripts_halt` proofs than
+    /// `*_script_hashes` and have the surplus lock-/type-script checks skipped
+    /// while verification still returns `true`. Reject the
+    /// (attacker-controlled) length mismatch as invalid here rather than via
+    /// `zip_eq`, which would panic on untrusted input.
+    fn halt_proof_counts_match(&self) -> bool {
+        self.lock_scripts_halt.len() == self.lock_script_hashes.len()
+            && self.type_scripts_halt.len() == self.type_script_hashes.len()
+    }
+
     pub(crate) async fn verify(&self, txk_mast_hash: Digest, network: Network) -> bool {
         debug!("verifying, txk hash: {}", txk_mast_hash);
         debug!("verifying, salted inputs hash: {}", self.salted_inputs_hash);
@@ -435,16 +450,7 @@ impl ProofCollection {
             return false;
         }
 
-        // There must be exactly one halting proof per collected script hash.
-        // The verification loops below use `zip`, which silently truncates to the
-        // shorter operand; without this guard a prover could submit fewer (e.g.
-        // zero) `*_scripts_halt` proofs than `*_script_hashes` and have the
-        // surplus lock-/type-script checks skipped while `verify` still returns
-        // `true`. Reject the (attacker-controlled) length mismatch as invalid
-        // here rather than via `zip_eq`, which would panic on untrusted input.
-        if self.lock_scripts_halt.len() != self.lock_script_hashes.len()
-            || self.type_scripts_halt.len() != self.type_script_hashes.len()
-        {
+        if !self.halt_proof_counts_match() {
             return false;
         }
 
@@ -562,6 +568,10 @@ impl ProofCollection {
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
         debug!("verifying (V2), txk hash: {}", txk_mast_hash);
         if self.kernel_mast_hash != txk_mast_hash {
+            return false;
+        }
+
+        if !self.halt_proof_counts_match() {
             return false;
         }
 
@@ -841,6 +851,54 @@ pub mod tests {
             !missing_type_proofs.verify(txk, network).await,
             "non-empty type_script_hashes with no type_scripts_halt must be rejected"
         );
+    }
+
+    /// The V2 verification path must reject the same mismatches as `verify`.
+    ///
+    /// `verify_v2` has no upstream counterpart — it is this chain's post-fork
+    /// validation path — so the guard has to be asserted separately here. Were
+    /// it applied only to `verify`, every transaction validated after the V2
+    /// fork would still skip its lock- and type-script checks.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn verify_v2_rejects_halt_proof_count_mismatch() {
+        let mut test_runner = TestRunner::deterministic();
+        let primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+        let txk = primitive_witness.kernel.mast_hash();
+
+        let network = Network::RegTest;
+        let valid = ProofCollection::produce_mock(&primitive_witness, true);
+        assert!(!valid.lock_script_hashes.is_empty());
+        assert!(!valid.type_script_hashes.is_empty());
+        assert!(
+            valid.verify_v2(txk, network).await,
+            "sanity: a well-formed valid-mock collection must verify under V2"
+        );
+
+        let mutations: [(&str, fn(ProofCollection) -> ProofCollection); 3] = [
+            ("no lock-script proofs", |mut pc| {
+                pc.lock_scripts_halt.clear();
+                pc
+            }),
+            ("no type-script proofs", |mut pc| {
+                pc.type_scripts_halt.clear();
+                pc
+            }),
+            ("one lock-script proof too few", |mut pc| {
+                pc.lock_scripts_halt.pop();
+                pc
+            }),
+        ];
+
+        for (description, mutate) in mutations {
+            assert!(
+                !mutate(valid.clone()).verify_v2(txk, network).await,
+                "verify_v2 must reject a collection with {description}"
+            );
+        }
     }
 
     #[proptest(cases = 5)]
