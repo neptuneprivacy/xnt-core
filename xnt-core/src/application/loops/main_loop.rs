@@ -884,7 +884,11 @@ impl MainLoopHandler {
                         }
                     }
 
-                    let mut update_jobs: Vec<MempoolUpdateJob> = vec![];
+                    // Track the "update" jobs that should be performed after a
+                    // new tip is set. Keyed by transaction ID, so that multiple
+                    // incoming blocks do not schedule the same mempool
+                    // transaction to be updated more than once.
+                    let mut update_jobs: HashMap<_, _> = HashMap::new();
                     for new_block in blocks {
                         debug!(
                             "Storing block {:x} in database. Height: {}, Mined: {}",
@@ -904,12 +908,16 @@ impl MainLoopHandler {
 
                         let update_jobs_ = global_state_mut.set_new_tip(new_block).await?;
 
-                        update_jobs.extend(update_jobs_);
+                        update_jobs.extend(
+                            update_jobs_
+                                .into_iter()
+                                .map(|update_job| (update_job.txid(), update_job)),
+                        );
                     }
 
                     global_state_mut.flush_databases().await?;
 
-                    update_jobs
+                    update_jobs.into_values().collect_vec()
                 };
 
                 // Inform all peers about new block
