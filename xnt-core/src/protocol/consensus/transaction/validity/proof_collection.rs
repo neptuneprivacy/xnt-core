@@ -7,6 +7,7 @@ use serde::Serialize;
 use tasm_lib::prelude::Digest;
 use tasm_lib::structure::tasm_object::TasmObject;
 use tasm_lib::triton_vm::prelude::*;
+use tasm_lib::twenty_first::prelude::MerkleTreeInclusionProof;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
@@ -18,6 +19,7 @@ use crate::api::tx_initiation::error::CreateProofError;
 use crate::application::config::network::Network;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
+use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
 use crate::protocol::consensus::transaction::validity::collect_lock_scripts::CollectLockScripts;
 use crate::protocol::consensus::transaction::validity::collect_lock_scripts::CollectLockScriptsWitness;
@@ -26,6 +28,7 @@ use crate::protocol::consensus::transaction::validity::kernel_to_outputs::Kernel
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::removal_records_integrity::RemovalRecordsIntegrityWitness;
 use crate::protocol::consensus::transaction::BFieldCodec;
+use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
@@ -438,6 +441,25 @@ impl ProofCollection {
             && self.type_scripts_halt.len() == self.type_script_hashes.len()
     }
 
+    /// Whether the collection proves that the kernel's merge bit is *unset*.
+    ///
+    /// A `ProofCollection` may only back an unmerged transaction: the merged
+    /// variant is proven by `SingleProof`. The collection carries a MAST
+    /// authentication path for the merge-bit field, and the leaf value checked
+    /// here is hardcoded to `false`, so a collection whose kernel has the merge
+    /// bit set cannot authenticate — regardless of the path it supplies.
+    fn proves_unset_merge_bit(&self, txk_mast_hash: Digest) -> bool {
+        MerkleTreeInclusionProof {
+            tree_height: TransactionKernel::MAST_HEIGHT.try_into().unwrap(),
+            indexed_leafs: vec![(
+                TransactionKernelField::MergeBit.discriminant(),
+                Tip5::hash(&false),
+            )],
+            authentication_structure: self.merge_bit_mast_path.clone(),
+        }
+        .verify(txk_mast_hash)
+    }
+
     pub(crate) async fn verify(&self, txk_mast_hash: Digest, network: Network) -> bool {
         debug!("verifying, txk hash: {}", txk_mast_hash);
         debug!("verifying, salted inputs hash: {}", self.salted_inputs_hash);
@@ -451,6 +473,10 @@ impl ProofCollection {
         }
 
         if !self.halt_proof_counts_match() {
+            return false;
+        }
+
+        if !self.proves_unset_merge_bit(txk_mast_hash) {
             return false;
         }
 
@@ -577,6 +603,10 @@ impl ProofCollection {
         }
 
         if !self.halt_proof_counts_match() {
+            return false;
+        }
+
+        if !self.proves_unset_merge_bit(txk_mast_hash) {
             return false;
         }
 
@@ -747,6 +777,7 @@ pub mod tests {
     use crate::api::export::NeptuneProof;
     use crate::application::triton_vm_job_queue::vm_job_queue;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
+    use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
     use crate::tests::shared_tokio_runtime;
 
     impl ProofCollection {
@@ -855,6 +886,51 @@ pub mod tests {
         assert!(
             !missing_type_proofs.verify(txk, network).await,
             "non-empty type_script_hashes with no type_scripts_halt must be rejected"
+        );
+    }
+
+    /// Neither verification path may accept a collection whose kernel has the
+    /// merge bit set: a `ProofCollection` only ever backs an unmerged
+    /// transaction, the merged variant being proven by `SingleProof`.
+    ///
+    /// The collection below is *derived from the modified kernel*, so its
+    /// merge-bit MAST path correctly authenticates `true` under the new kernel
+    /// MAST hash. It must still be rejected, because the leaf value the guard
+    /// checks is hardcoded to `false`.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn verify_rejects_a_set_merge_bit() {
+        let mut test_runner = TestRunner::deterministic();
+        let mut primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+
+        let network = Network::RegTest;
+        let merge_bit_false = ProofCollection::produce_mock(&primitive_witness, true);
+        let txk_unmerged = primitive_witness.kernel.mast_hash();
+        assert!(
+            merge_bit_false.verify(txk_unmerged, network).await,
+            "sanity: an unmerged collection must verify"
+        );
+        assert!(
+            merge_bit_false.verify_v2(txk_unmerged, network).await,
+            "sanity: an unmerged collection must verify under V2"
+        );
+
+        primitive_witness.kernel = TransactionKernelModifier::default()
+            .merge_bit(true)
+            .modify(primitive_witness.kernel.clone());
+        let merge_bit_true = ProofCollection::produce_mock(&primitive_witness, true);
+        let txk_merged = primitive_witness.kernel.mast_hash();
+
+        assert!(
+            !merge_bit_true.verify(txk_merged, network).await,
+            "a collection whose kernel has the merge bit set must be rejected"
+        );
+        assert!(
+            !merge_bit_true.verify_v2(txk_merged, network).await,
+            "a collection whose kernel has the merge bit set must be rejected under V2"
         );
     }
 
