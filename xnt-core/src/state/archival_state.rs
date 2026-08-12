@@ -528,6 +528,28 @@ impl ArchivalState {
         self.write_block_internal(new_block, true).await
     }
 
+    /// Ensure internal consistency of archival state.
+    ///
+    /// Ensure that the entire archival state agrees with the tip defined by the
+    /// block index database and the block it points to on disk.
+    ///
+    /// Only intended to be run on startup, to recover from a non-graceful
+    /// shutdown. It fixes the state produced when the node is killed after the
+    /// block index database has been updated and the block written to disk, but
+    /// before the block MMR and mutator set updates finished.
+    ///
+    /// The sub-parts already handle roll-back and reorganization, so replaying
+    /// the tip update is sufficient to bring them all back into agreement.
+    pub(crate) async fn recover(&mut self) -> Result<()> {
+        let tip = self.get_tip().await;
+
+        self.write_block_as_tip(&tip).await?;
+        self.append_to_archival_block_mmr(&tip).await;
+        self.update_mutator_set(&tip).await?;
+
+        Ok(())
+    }
+
     /// Sets a block as tip for the archival block MMR.
     ///
     /// This method handles reorganizations, but all predecessors of this block
@@ -1513,6 +1535,7 @@ pub(super) mod tests {
     use crate::tests::shared::archival::add_block_to_archival_state;
     use crate::tests::shared::archival::mock_genesis_archival_state;
     use crate::tests::shared::blocks::invalid_block_with_transaction;
+    use crate::tests::shared::blocks::invalid_empty_block;
     use crate::tests::shared::blocks::make_mock_block;
     use crate::tests::shared::files::unit_test_data_directory;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
@@ -1600,6 +1623,66 @@ pub(super) mod tests {
                     .await
             );
         }
+
+        Ok(())
+    }
+
+    /// `recover` must repair the state left by a non-graceful shutdown, and be
+    /// a no-op on a state that is already consistent.
+    ///
+    /// The crash simulated here is the one the method exists for: the block
+    /// index database has been advanced to a new tip and the block written to
+    /// disk, but the process died before the block MMR and the mutator set were
+    /// brought along.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn recover_repairs_partially_applied_tip() -> Result<()> {
+        let network = Network::Main;
+        let mut archival_state = make_test_archival_state(network).await;
+        let genesis = archival_state.genesis_block.clone();
+
+        // Consistent to begin with, and `recover` must not disturb that.
+        assert_eq!(
+            genesis.hash(),
+            archival_state.archival_mutator_set.get_sync_label()
+        );
+        archival_state.recover().await?;
+        assert_eq!(
+            genesis.hash(),
+            archival_state.archival_mutator_set.get_sync_label(),
+            "recover must be a no-op on an already-consistent state"
+        );
+        let leafs_before = archival_state.archival_block_mmr.ammr().num_leafs().await;
+
+        // Simulate the crash: advance the tip only, leaving the block MMR and
+        // the mutator set behind.
+        let block1 = invalid_empty_block(&genesis, network);
+        archival_state.write_block_as_tip(&block1).await?;
+
+        assert_eq!(block1.hash(), archival_state.get_tip().await.hash());
+        assert_eq!(
+            genesis.hash(),
+            archival_state.archival_mutator_set.get_sync_label(),
+            "test premise: the mutator set must still lag the new tip"
+        );
+        assert_eq!(
+            leafs_before,
+            archival_state.archival_block_mmr.ammr().num_leafs().await,
+            "test premise: the block MMR must still lag the new tip"
+        );
+
+        archival_state.recover().await?;
+
+        assert_eq!(
+            block1.hash(),
+            archival_state.archival_mutator_set.get_sync_label(),
+            "recover must bring the mutator set up to the tip"
+        );
+        assert_eq!(
+            leafs_before + 1,
+            archival_state.archival_block_mmr.ammr().num_leafs().await,
+            "recover must bring the block MMR up to the tip"
+        );
 
         Ok(())
     }
@@ -4086,7 +4169,6 @@ pub(super) mod tests {
 
     mod block_hash_witness {
         use super::*;
-        use crate::tests::shared::blocks::invalid_empty_block;
 
         #[traced_test]
         #[apply(shared_tokio_runtime)]
