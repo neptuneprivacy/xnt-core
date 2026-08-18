@@ -1045,7 +1045,9 @@ mod tests {
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn dont_upgrade_foreign_proof_collection_if_fee_too_low() {
-        let network = Network::Main;
+        // Use a network whose premine funds the devnet wallet; on mainnet
+        // this fork's premine leaves the test wallet without funds.
+        let network = Network::RegTest;
 
         // Alice is premine recipient, so she can make a transaction (after
         // expiry of timelock). Rando is not premine recipient.

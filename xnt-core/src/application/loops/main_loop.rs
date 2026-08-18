@@ -2202,7 +2202,7 @@ mod tests {
     ) -> TestSetup {
         const CHANNEL_CAPACITY_MINER_TO_MAIN: usize = 10;
 
-        let network = Network::Main;
+        let network = cli.network;
         let (
             main_to_peer_tx,
             main_to_peer_rx,
@@ -2622,6 +2622,11 @@ mod tests {
             let num_outgoing_connections = 0;
             let num_incoming_connections = 0;
 
+            // Use a network whose premine funds the devnet wallet; on mainnet
+            // this fork's premine leaves the test wallet without funds. Not
+            // RegTest: that network mocks proofs, and the merge performed by
+            // the upgrade under test requires real single proofs as input.
+            let network = Network::Testnet(0);
             let TestSetup {
                 mut main_loop_handler,
                 mut main_to_peer_rx,
@@ -2629,7 +2634,7 @@ mod tests {
             } = setup(
                 num_outgoing_connections,
                 num_incoming_connections,
-                cli_args::Args::default(),
+                cli_args::Args::default_with_network(network),
             )
             .await;
 
@@ -2638,7 +2643,7 @@ mod tests {
             let mocked_cli = cli_args::Args {
                 tx_proving_capability: Some(TxProvingCapability::SingleProof),
                 tx_proof_upgrading: true,
-                ..Default::default()
+                ..cli_args::Args::default_with_network(network)
             };
 
             main_loop_handler
