@@ -1910,9 +1910,8 @@ impl WalletState {
                     ));
                 }
             } else {
-                let any_mp = &mutxo.blockhash_to_membership_proof.iter().next().unwrap().1;
                 unsynced.push(WalletStatusElement::new(
-                    any_mp.aocl_leaf_index,
+                    mutxo.aocl_leaf_index,
                     utxo,
                     payment_id,
                 ));
