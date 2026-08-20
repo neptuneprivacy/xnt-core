@@ -870,6 +870,17 @@ impl MainLoopHandler {
                     // Ask miner to stop work until state update is completed
                     self.main_to_miner_tx.send(MainToMiner::WaitForContinue);
 
+                    // Register sync progress on the healthy (canonical) path
+                    // too. The global synchronization timeout measures time
+                    // since the anchor was last updated; without this refresh
+                    // it fires a fixed 480 s after sync-mode entry no matter
+                    // how well the sync is going, and the forced re-entry gap
+                    // pushes catch-up onto the unbounded fork-reconciliation
+                    // path.
+                    if let Some(sync_anchor) = global_state_mut.net.sync_anchor.as_mut() {
+                        sync_anchor.catch_up(last_block.header().height, last_block.hash());
+                    }
+
                     // Get out of sync mode if needed
                     if global_state_mut.net.sync_anchor.is_some() {
                         let stay_in_sync_mode = stay_in_sync_mode(
