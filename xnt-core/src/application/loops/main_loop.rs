@@ -469,7 +469,7 @@ impl MainLoopHandler {
     ///
     /// Sends the result back through the provided channel.
     async fn update_mempool_jobs(
-        mut global_state_lock: GlobalStateLock,
+        global_state_lock: GlobalStateLock,
         update_jobs: Vec<MempoolUpdateJob>,
         job_queue: Arc<TritonVmJobQueue>,
         transaction_update_sender: mpsc::Sender<Vec<MempoolUpdateJobResult>>,
@@ -489,10 +489,10 @@ impl MainLoopHandler {
 
                     // Acquire lock, and drop it immediately.
                     let msa_update = global_state_lock
-                        .lock_guard_mut()
+                        .lock_guard()
                         .await
                         .chain
-                        .archival_state_mut()
+                        .archival_state()
                         .get_mutator_set_update_to_tip(
                             old_msa,
                             SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
@@ -541,7 +541,7 @@ impl MainLoopHandler {
                 } => {
                     let upgrade_incentive = UpgradeIncentive::Critical;
                     let Ok(update_job) = global_state_lock
-                        .lock_guard_mut()
+                        .lock_guard()
                         .await
                         .update_single_proof_job(
                             old_kernel.to_owned(),
@@ -870,6 +870,17 @@ impl MainLoopHandler {
                     // Ask miner to stop work until state update is completed
                     self.main_to_miner_tx.send(MainToMiner::WaitForContinue);
 
+                    // Register sync progress on the healthy (canonical) path
+                    // too. The global synchronization timeout measures time
+                    // since the anchor was last updated; without this refresh
+                    // it fires a fixed 480 s after sync-mode entry no matter
+                    // how well the sync is going, and the forced re-entry gap
+                    // pushes catch-up onto the unbounded fork-reconciliation
+                    // path.
+                    if let Some(sync_anchor) = global_state_mut.net.sync_anchor.as_mut() {
+                        sync_anchor.catch_up(last_block.header().height, last_block.hash());
+                    }
+
                     // Get out of sync mode if needed
                     if global_state_mut.net.sync_anchor.is_some() {
                         let stay_in_sync_mode = stay_in_sync_mode(
@@ -884,7 +895,11 @@ impl MainLoopHandler {
                         }
                     }
 
-                    let mut update_jobs: Vec<MempoolUpdateJob> = vec![];
+                    // Track the "update" jobs that should be performed after a
+                    // new tip is set. Keyed by transaction ID, so that multiple
+                    // incoming blocks do not schedule the same mempool
+                    // transaction to be updated more than once.
+                    let mut update_jobs: HashMap<_, _> = HashMap::new();
                     for new_block in blocks {
                         debug!(
                             "Storing block {:x} in database. Height: {}, Mined: {}",
@@ -904,12 +919,16 @@ impl MainLoopHandler {
 
                         let update_jobs_ = global_state_mut.set_new_tip(new_block).await?;
 
-                        update_jobs.extend(update_jobs_);
+                        update_jobs.extend(
+                            update_jobs_
+                                .into_iter()
+                                .map(|update_job| (update_job.txid(), update_job)),
+                        );
                     }
 
                     global_state_mut.flush_databases().await?;
 
-                    update_jobs
+                    update_jobs.into_values().collect_vec()
                 };
 
                 // Inform all peers about new block
@@ -1500,7 +1519,11 @@ impl MainLoopHandler {
                 .proof_upgrader_task
                 .as_ref()
                 .is_some_and(|x| !x.is_finished());
+            let vm_job_queue = vm_job_queue();
+            let busy = vm_job_queue.num_queued_jobs() > 0;
+
             global_state.cli().tx_proof_upgrading
+                && !busy
                 && global_state.net.sync_anchor.is_none()
                 && global_state.proving_capability() == TxProvingCapability::SingleProof
                 && !previous_upgrade_task_is_still_running
@@ -1511,7 +1534,7 @@ impl MainLoopHandler {
         // Check if it's time to run the proof-upgrader, and if we're capable
         // of upgrading a transaction proof.
         let upgrade_candidate = {
-            let mut global_state = self.global_state_lock.lock_guard_mut().await;
+            let global_state = self.global_state_lock.lock_guard().await;
             if !attempt_upgrade(&global_state, main_loop_state) {
                 trace!("Not attempting upgrade.");
                 return Ok(());
@@ -1520,8 +1543,7 @@ impl MainLoopHandler {
             debug!("Attempting to run transaction-proof-upgrade");
 
             // Find a candidate for proof upgrade
-            let Some(upgrade_candidate) = get_upgrade_task_from_mempool(&mut global_state).await
-            else {
+            let Some(upgrade_candidate) = get_upgrade_task_from_mempool(&global_state).await else {
                 debug!("Found no transaction-proof to upgrade");
                 return Ok(());
             };
@@ -1565,12 +1587,24 @@ impl MainLoopHandler {
         main_loop_state: &mut MutableMainLoopState,
         update_jobs: Vec<MempoolUpdateJob>,
     ) {
-        // job completion of the spawned task is communicated through the
-        // `update_mempool_txs_handle` channel.
         let vm_job_queue = vm_job_queue();
-        if let Some(handle) = main_loop_state.update_mempool_txs_handle.as_ref() {
+        let num_queued_job = vm_job_queue.num_queued_jobs();
+
+        // Don't do anything if there are already too many jobs in the queue.
+        // A later block will hopefully update the transaction in question, or
+        // the current-running job will self correct.
+        if num_queued_job > 2 {
+            warn!(
+                "Not updating mempool txs since job queue \
+                   already contains {num_queued_job} jobs"
+            );
+            return;
+        }
+
+        if let Some(handle) = main_loop_state.update_mempool_txs_handle.take() {
             handle.abort();
         }
+
         let (update_sender, update_receiver) =
             mpsc::channel::<Vec<MempoolUpdateJobResult>>(TX_UPDATER_CHANNEL_CAPACITY);
 
@@ -2179,7 +2213,7 @@ mod tests {
     ) -> TestSetup {
         const CHANNEL_CAPACITY_MINER_TO_MAIN: usize = 10;
 
-        let network = Network::Main;
+        let network = cli.network;
         let (
             main_to_peer_tx,
             main_to_peer_rx,
@@ -2599,6 +2633,11 @@ mod tests {
             let num_outgoing_connections = 0;
             let num_incoming_connections = 0;
 
+            // Use a network whose premine funds the devnet wallet; on mainnet
+            // this fork's premine leaves the test wallet without funds. Not
+            // RegTest: that network mocks proofs, and the merge performed by
+            // the upgrade under test requires real single proofs as input.
+            let network = Network::Testnet(0);
             let TestSetup {
                 mut main_loop_handler,
                 mut main_to_peer_rx,
@@ -2606,7 +2645,7 @@ mod tests {
             } = setup(
                 num_outgoing_connections,
                 num_incoming_connections,
-                cli_args::Args::default(),
+                cli_args::Args::default_with_network(network),
             )
             .await;
 
@@ -2615,7 +2654,7 @@ mod tests {
             let mocked_cli = cli_args::Args {
                 tx_proving_capability: Some(TxProvingCapability::SingleProof),
                 tx_proof_upgrading: true,
-                ..Default::default()
+                ..cli_args::Args::default_with_network(network)
             };
 
             main_loop_handler

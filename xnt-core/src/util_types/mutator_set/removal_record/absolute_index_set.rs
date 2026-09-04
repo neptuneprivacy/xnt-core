@@ -130,6 +130,14 @@ impl AbsoluteIndexSet {
             .map(|x| u128::from(x).saturating_add(self.minimum))
     }
 
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = u128> + '_ {
+        let min = self.minimum;
+        self.distances
+            .iter()
+            .map(move |&d| min.saturating_add(u128::from(d)))
+    }
+
     /// Split the [`AbsoluteIndexSet`] into two parts, one for chunks in the
     /// inactive part of the Bloom filter and another one for chunks in the
     /// active part of the Bloom filter.

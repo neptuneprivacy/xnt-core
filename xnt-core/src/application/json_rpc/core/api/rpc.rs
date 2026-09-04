@@ -23,6 +23,9 @@ pub enum RestoreMembershipProofError {
 
     #[error("Exceeds the allowed limit")]
     ExceedsAllowed,
+
+    #[error("A new tip arrived while the membership proofs were being derived")]
+    TipMoved,
 }
 
 #[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +70,9 @@ pub enum RpcError {
     #[error("Failed to submit block: {0}")]
     SubmitBlock(SubmitBlockError),
 
+    #[error("Too many absolute index sets requested: maximum is {max}, got {got}")]
+    TooManyAbsoluteIndexSets { max: usize, got: usize },
+
     // Common case errors
     #[error("Invalid address provided in arguments")]
     InvalidAddress,
@@ -79,6 +85,15 @@ pub enum RpcError {
 }
 
 pub type RpcResult<T> = Result<T, RpcError>;
+
+/// The hard limit on how many membership proofs one request may ask for.
+/// Applies to every caller, including those allowed to exceed
+/// [`MAX_RESTRICTED_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS`].
+pub const MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS: usize = 1000;
+
+/// The limit on how many membership proofs one request may ask for, for
+/// callers that are not granted unrestricted access.
+pub const MAX_RESTRICTED_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS: usize = 256;
 
 #[async_trait]
 pub trait RpcApi: Sync + Send {

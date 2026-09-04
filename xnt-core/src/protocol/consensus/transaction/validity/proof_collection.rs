@@ -7,6 +7,7 @@ use serde::Serialize;
 use tasm_lib::prelude::Digest;
 use tasm_lib::structure::tasm_object::TasmObject;
 use tasm_lib::triton_vm::prelude::*;
+use tasm_lib::twenty_first::prelude::MerkleTreeInclusionProof;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
@@ -18,6 +19,7 @@ use crate::api::tx_initiation::error::CreateProofError;
 use crate::application::config::network::Network;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
+use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
 use crate::protocol::consensus::transaction::validity::collect_lock_scripts::CollectLockScripts;
 use crate::protocol::consensus::transaction::validity::collect_lock_scripts::CollectLockScriptsWitness;
@@ -26,6 +28,7 @@ use crate::protocol::consensus::transaction::validity::kernel_to_outputs::Kernel
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::removal_records_integrity::RemovalRecordsIntegrityWitness;
 use crate::protocol::consensus::transaction::BFieldCodec;
+use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
@@ -423,6 +426,40 @@ impl ProofCollection {
         }
     }
 
+    /// Whether there is exactly one halting proof per collected script hash.
+    ///
+    /// The verification loops in [`verify`](Self::verify) and
+    /// [`verify_v2`](Self::verify_v2) pair claims with proofs using `zip`, which
+    /// silently truncates to the shorter operand; without this guard a prover
+    /// could submit fewer (e.g. zero) `*_scripts_halt` proofs than
+    /// `*_script_hashes` and have the surplus lock-/type-script checks skipped
+    /// while verification still returns `true`. Reject the
+    /// (attacker-controlled) length mismatch as invalid here rather than via
+    /// `zip_eq`, which would panic on untrusted input.
+    fn halt_proof_counts_match(&self) -> bool {
+        self.lock_scripts_halt.len() == self.lock_script_hashes.len()
+            && self.type_scripts_halt.len() == self.type_script_hashes.len()
+    }
+
+    /// Whether the collection proves that the kernel's merge bit is *unset*.
+    ///
+    /// A `ProofCollection` may only back an unmerged transaction: the merged
+    /// variant is proven by `SingleProof`. The collection carries a MAST
+    /// authentication path for the merge-bit field, and the leaf value checked
+    /// here is hardcoded to `false`, so a collection whose kernel has the merge
+    /// bit set cannot authenticate — regardless of the path it supplies.
+    fn proves_unset_merge_bit(&self, txk_mast_hash: Digest) -> bool {
+        MerkleTreeInclusionProof {
+            tree_height: TransactionKernel::MAST_HEIGHT.try_into().unwrap(),
+            indexed_leafs: vec![(
+                TransactionKernelField::MergeBit.discriminant(),
+                Tip5::hash(&false),
+            )],
+            authentication_structure: self.merge_bit_mast_path.clone(),
+        }
+        .verify(txk_mast_hash)
+    }
+
     pub(crate) async fn verify(&self, txk_mast_hash: Digest, network: Network) -> bool {
         debug!("verifying, txk hash: {}", txk_mast_hash);
         debug!("verifying, salted inputs hash: {}", self.salted_inputs_hash);
@@ -432,6 +469,14 @@ impl ProofCollection {
         );
         // make sure we are talking about the same tx
         if self.kernel_mast_hash != txk_mast_hash {
+            return false;
+        }
+
+        if !self.halt_proof_counts_match() {
+            return false;
+        }
+
+        if !self.proves_unset_merge_bit(txk_mast_hash) {
             return false;
         }
 
@@ -491,54 +536,59 @@ impl ProofCollection {
             })
             .collect_vec();
 
-        // verify
-        debug!("verifying removal records integrity ...");
-        let rri = verify_transaction_proof(
-            removal_records_integrity_claim.clone(),
-            self.removal_records_integrity.clone(),
-            network,
-        )
-        .await;
-        debug!("{rri}");
-        debug!("verifying kernel to outputs ...");
-        let k2o = verify_transaction_proof(
-            kernel_to_outputs_claim.clone(),
-            self.kernel_to_outputs.clone(),
-            network,
-        )
-        .await;
-        debug!("{k2o}");
-        debug!("verifying collect lock scripts ...");
-        let cls = verify_transaction_proof(
-            collect_lock_scripts_claim.clone(),
-            self.collect_lock_scripts.clone(),
-            network,
-        )
-        .await;
-        debug!("{cls}");
-        debug!("verifying collect type scripts ...");
-        let cts = verify_transaction_proof(
-            collect_type_scripts_claim.clone(),
-            self.collect_type_scripts.clone(),
-            network,
-        )
-        .await;
-        debug!("{cts}");
-        debug!("verifying that all lock scripts halt ...");
-        let mut lsh = true;
-        for (cl, pr) in lock_script_claims.iter().zip(self.lock_scripts_halt.iter()) {
-            lsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
+        // Verify, returning on the first proof that fails.
+        //
+        // The two `collect_*_scripts` claims commit to the script-hash lists,
+        // and those lists' lengths decide how many proofs the loop below
+        // verifies. All four claims here are checked before that loop is
+        // entered, which bounds the work an attacker can make the victim do
+        // without constructing a valid transaction.
+        for (name, claim, proof) in [
+            (
+                "removal records integrity",
+                removal_records_integrity_claim,
+                &self.removal_records_integrity,
+            ),
+            (
+                "kernel to outputs",
+                kernel_to_outputs_claim,
+                &self.kernel_to_outputs,
+            ),
+            (
+                "collect lock scripts",
+                collect_lock_scripts_claim,
+                &self.collect_lock_scripts,
+            ),
+            (
+                "collect type scripts",
+                collect_type_scripts_claim,
+                &self.collect_type_scripts,
+            ),
+        ] {
+            debug!("verifying {name} ...");
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                debug!("{name} is invalid");
+                return false;
+            }
         }
-        debug!("{lsh}");
-        debug!("verifying that all type scripts halt ...");
-        let mut tsh = true;
-        for (cl, pr) in type_script_claims.iter().zip(self.type_scripts_halt.iter()) {
-            tsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
-        }
-        debug!("{tsh}");
 
-        // and all bits together and return
-        rri && k2o && cls && cts && lsh && tsh
+        debug!("verifying that all lock scripts halt ...");
+        for (claim, proof) in lock_script_claims.into_iter().zip(&self.lock_scripts_halt) {
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                debug!("a lock script does not halt gracefully");
+                return false;
+            }
+        }
+
+        debug!("verifying that all type scripts halt ...");
+        for (claim, proof) in type_script_claims.into_iter().zip(&self.type_scripts_halt) {
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                debug!("a type script does not halt gracefully");
+                return false;
+            }
+        }
+
+        true
     }
 
     /// V2 counterpart of [`verify`]. Identical except that the inline
@@ -549,6 +599,14 @@ impl ProofCollection {
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
         debug!("verifying (V2), txk hash: {}", txk_mast_hash);
         if self.kernel_mast_hash != txk_mast_hash {
+            return false;
+        }
+
+        if !self.halt_proof_counts_match() {
+            return false;
+        }
+
+        if !self.proves_unset_merge_bit(txk_mast_hash) {
             return false;
         }
 
@@ -719,6 +777,7 @@ pub mod tests {
     use crate::api::export::NeptuneProof;
     use crate::application::triton_vm_job_queue::vm_job_queue;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
+    use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
     use crate::tests::shared_tokio_runtime;
 
     impl ProofCollection {
@@ -782,6 +841,144 @@ pub mod tests {
                     prop(primitive_witness).await.unwrap();
                 }
             }
+        }
+    }
+
+    /// Regression test for the `.zip()` truncation bug (opus48_neptune_cash7.md):
+    /// `verify` must reject a collection whose `*_scripts_halt` proof count
+    /// differs from its `*_script_hashes` count. Before the length guard, `zip`
+    /// silently truncated to the shorter side, so a collection with zero halting
+    /// proofs but non-empty hashes was accepted — skipping every lock-script
+    /// (spend authorization) and type-script (value conservation) check.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn verify_rejects_halt_proof_count_mismatch() {
+        let mut test_runner = TestRunner::deterministic();
+        let primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+        let txk = primitive_witness.kernel.mast_hash();
+
+        // RegTest accepts valid mock proofs, so a well-formed mock collection
+        // verifies. This isolates the length guard as the sole reason a mutated
+        // collection is rejected.
+        let network = Network::RegTest;
+        let valid = ProofCollection::produce_mock(&primitive_witness, true);
+        assert!(!valid.lock_script_hashes.is_empty());
+        assert!(!valid.type_script_hashes.is_empty());
+        assert!(
+            valid.verify(txk, network).await,
+            "sanity: a well-formed valid-mock collection must verify"
+        );
+
+        // Drop the lock-script halting proofs (the part needing the spender's key).
+        let mut missing_lock_proofs = valid.clone();
+        missing_lock_proofs.lock_scripts_halt.clear();
+        assert!(
+            !missing_lock_proofs.verify(txk, network).await,
+            "non-empty lock_script_hashes with no lock_scripts_halt must be rejected"
+        );
+
+        // Drop the type-script halting proofs (value conservation).
+        let mut missing_type_proofs = valid.clone();
+        missing_type_proofs.type_scripts_halt.clear();
+        assert!(
+            !missing_type_proofs.verify(txk, network).await,
+            "non-empty type_script_hashes with no type_scripts_halt must be rejected"
+        );
+    }
+
+    /// Neither verification path may accept a collection whose kernel has the
+    /// merge bit set: a `ProofCollection` only ever backs an unmerged
+    /// transaction, the merged variant being proven by `SingleProof`.
+    ///
+    /// The collection below is *derived from the modified kernel*, so its
+    /// merge-bit MAST path correctly authenticates `true` under the new kernel
+    /// MAST hash. It must still be rejected, because the leaf value the guard
+    /// checks is hardcoded to `false`.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn verify_rejects_a_set_merge_bit() {
+        let mut test_runner = TestRunner::deterministic();
+        let mut primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+
+        let network = Network::RegTest;
+        let merge_bit_false = ProofCollection::produce_mock(&primitive_witness, true);
+        let txk_unmerged = primitive_witness.kernel.mast_hash();
+        assert!(
+            merge_bit_false.verify(txk_unmerged, network).await,
+            "sanity: an unmerged collection must verify"
+        );
+        assert!(
+            merge_bit_false.verify_v2(txk_unmerged, network).await,
+            "sanity: an unmerged collection must verify under V2"
+        );
+
+        primitive_witness.kernel = TransactionKernelModifier::default()
+            .merge_bit(true)
+            .modify(primitive_witness.kernel.clone());
+        let merge_bit_true = ProofCollection::produce_mock(&primitive_witness, true);
+        let txk_merged = primitive_witness.kernel.mast_hash();
+
+        assert!(
+            !merge_bit_true.verify(txk_merged, network).await,
+            "a collection whose kernel has the merge bit set must be rejected"
+        );
+        assert!(
+            !merge_bit_true.verify_v2(txk_merged, network).await,
+            "a collection whose kernel has the merge bit set must be rejected under V2"
+        );
+    }
+
+    /// The V2 verification path must reject the same mismatches as `verify`.
+    ///
+    /// `verify_v2` has no upstream counterpart — it is this chain's post-fork
+    /// validation path — so the guard has to be asserted separately here. Were
+    /// it applied only to `verify`, every transaction validated after the V2
+    /// fork would still skip its lock- and type-script checks.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn verify_v2_rejects_halt_proof_count_mismatch() {
+        let mut test_runner = TestRunner::deterministic();
+        let primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+        let txk = primitive_witness.kernel.mast_hash();
+
+        let network = Network::RegTest;
+        let valid = ProofCollection::produce_mock(&primitive_witness, true);
+        assert!(!valid.lock_script_hashes.is_empty());
+        assert!(!valid.type_script_hashes.is_empty());
+        assert!(
+            valid.verify_v2(txk, network).await,
+            "sanity: a well-formed valid-mock collection must verify under V2"
+        );
+
+        let mutations: [(&str, fn(ProofCollection) -> ProofCollection); 3] = [
+            ("no lock-script proofs", |mut pc| {
+                pc.lock_scripts_halt.clear();
+                pc
+            }),
+            ("no type-script proofs", |mut pc| {
+                pc.type_scripts_halt.clear();
+                pc
+            }),
+            ("one lock-script proof too few", |mut pc| {
+                pc.lock_scripts_halt.pop();
+                pc
+            }),
+        ];
+
+        for (description, mutate) in mutations {
+            assert!(
+                !mutate(valid.clone()).verify_v2(txk, network).await,
+                "verify_v2 must reject a collection with {description}"
+            );
         }
     }
 

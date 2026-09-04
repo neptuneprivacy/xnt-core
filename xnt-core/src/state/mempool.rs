@@ -56,6 +56,7 @@ use crate::api::export::NeptuneProof;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
@@ -197,6 +198,19 @@ pub struct Mempool {
     /// called and can shrink when [`Self::update_with_block`] is called.
     merge_input_cache: MergeInputCache,
 
+    /// Transactions whose proof upgrade was attempted and failed since the
+    /// last block.
+    ///
+    /// Proof upgrade candidate selection is deterministic, so a transaction
+    /// whose upgrade fails is picked again on every following attempt, and no
+    /// other transaction behind it is ever upgraded. Recording the failure
+    /// keeps the upgrader moving and gives other txs a chance. Cleared whenever
+    /// a new block is processed such that a transient failure doesn't prevent
+    /// the transaction from ever being upgraded. A transaction is never dropped
+    /// on account of upgrade failures.
+    #[get_size(ignore)]
+    upgrade_failures: HashSet<TransactionKernelId>,
+
     /// Recent mempool events. Keeps last N batches in memory only.
     #[get_size(ignore)]
     event_log: VecDeque<MempoolEventBatch>,
@@ -244,9 +258,23 @@ impl Mempool {
             tip_mutator_set_hash,
             tx_proving_capability,
             merge_input_cache,
+            upgrade_failures: HashSet::default(),
             event_log: VecDeque::new(),
             pending_abandoned: Vec::new(),
         }
+    }
+
+    /// Record that upgrading the proofs of these transactions failed, so that
+    /// they are passed over when picking the next upgrade candidate.
+    ///
+    /// The transactions are not removed, and the record is discarded by
+    /// [`Self::update_with_block`], so a failure that was transient only delays
+    /// an upgrade by one block.
+    pub(super) fn record_upgrade_failure(
+        &mut self,
+        txids: impl IntoIterator<Item = TransactionKernelId>,
+    ) {
+        self.upgrade_failures.extend(txids);
     }
 
     /// Update mempool with chain information.
@@ -335,6 +363,10 @@ impl Mempool {
             .chain(self.fee_density_iter().map(|(txid, _)| txid))
         {
             let candidate = self.tx_dictionary.get(&candidate_txid).unwrap();
+            if self.upgrade_failures.contains(&candidate_txid) {
+                continue;
+            }
+
             if self.tx_is_synced(&candidate.transaction.kernel) {
                 continue;
             }
@@ -388,6 +420,10 @@ impl Mempool {
             .chain(self.fee_density_iter().map(|(txid, _)| txid))
         {
             let candidate = self.tx_dictionary.get(&candidate_txid).unwrap();
+            if self.upgrade_failures.contains(&candidate_txid) {
+                continue;
+            }
+
             if !self.tx_is_synced(&candidate.transaction.kernel) {
                 continue;
             }
@@ -440,6 +476,10 @@ impl Mempool {
             .chain(self.fee_density_iter().map(|(txid, _)| txid))
         {
             let candidate = self.tx_dictionary.get(&candidate_txid).unwrap();
+
+            if self.upgrade_failures.contains(&candidate_txid) {
+                continue;
+            }
 
             if !self.tx_is_synced(&candidate.transaction.kernel) {
                 continue;
@@ -655,6 +695,25 @@ impl Mempool {
                 .get(&txid)
                 .and_then(|tx| tx.primitive_witness.clone())
         };
+
+        // A transaction's upgrade priority reflects our financial interest in
+        // seeing it confirmed, and that interest does not vanish when the
+        // transaction is superseded. A copy that reaches us over the wire is
+        // inserted with `Irrelevant` priority — whether it's our own
+        // transaction gossiped back, or, more importantly, a third party's
+        // merge that folded our inputs and outputs into a larger transaction.
+        // A merge carries a *new* txid, but it still conflicts with (and, when
+        // inserted below, kicks out) our original transaction. So the inserted
+        // transaction must inherit at least the highest priority among the
+        // conflicts it replaces; otherwise the mempool would stop
+        // mutator-set-updating the transaction carrying our funds. Compute this
+        // before the conflicting transactions are removed below.
+        let priority = conflicts
+            .keys()
+            .filter_map(|conflicting_txid| self.tx_dictionary.get(conflicting_txid))
+            .map(|conflicting| conflicting.upgrade_priority)
+            .fold(priority, |acc, conflicting| acc.max(conflicting));
+
         let new_tx = MempoolTransaction {
             transaction: new_tx,
             upgrade_priority: priority,
@@ -1029,12 +1088,30 @@ impl Mempool {
     ///
     /// Number of transactions returned can be capped by either size (measured
     /// in bytes), or by transaction count. The function guarantees that neither
-    /// of the specified limits will be exceeded.
+    /// of the specified limits will be exceeded. The total number of inputs,
+    /// outputs, and announcements across the returned transactions likewise
+    /// respects the caps imposed by the consensus rules, leaving room for the
+    /// coinbase transaction they are expected to be merged with.
     pub(crate) fn get_transactions_for_block_composition(
         &self,
+        consensus_rule_set: ConsensusRuleSet,
         mut remaining_storage: usize,
         max_num_txs: Option<usize>,
     ) -> Vec<Transaction> {
+        // Numbers of outputs and announcements reserved for the coinbase
+        // transaction that the returned transactions will be merged with. No
+        // reservation is needed for inputs, as a coinbase transaction has none.
+        const COINBASE_NUM_OUTPUTS_RESERVATION: usize = 128;
+        const COINBASE_NUM_ANNOUNCEMENTS_RESERVATION: usize = 128;
+
+        let mut remaining_num_inputs = consensus_rule_set.max_num_inputs();
+        let mut remaining_num_outputs = consensus_rule_set
+            .max_num_outputs()
+            .saturating_sub(COINBASE_NUM_OUTPUTS_RESERVATION);
+        let mut remaining_num_announcements = consensus_rule_set
+            .max_num_announcements()
+            .saturating_sub(COINBASE_NUM_ANNOUNCEMENTS_RESERVATION);
+
         let mut transactions = vec![];
 
         for (transaction_digest, _fee_density) in self.fee_density_iter() {
@@ -1053,6 +1130,16 @@ impl Mempool {
                     continue;
                 }
 
+                // Current transaction would push the block transaction over one
+                // of the consensus caps.
+                let kernel = &transaction_ptr.kernel;
+                if kernel.inputs.len() > remaining_num_inputs
+                    || kernel.outputs.len() > remaining_num_outputs
+                    || kernel.announcements.len() > remaining_num_announcements
+                {
+                    continue;
+                }
+
                 let transaction_copy = transaction_ptr.to_owned();
                 let transaction_size = transaction_copy.get_size();
 
@@ -1063,6 +1150,9 @@ impl Mempool {
 
                 // Include transaction
                 remaining_storage -= transaction_size;
+                remaining_num_inputs -= transaction_copy.kernel.inputs.len();
+                remaining_num_outputs -= transaction_copy.kernel.outputs.len();
+                remaining_num_announcements -= transaction_copy.kernel.announcements.len();
                 transactions.push(transaction_copy)
             }
         }
@@ -1150,6 +1240,10 @@ impl Mempool {
         &mut self,
         new_block: &Block,
     ) -> anyhow::Result<(Vec<MempoolEvent>, Vec<MempoolUpdateJob>)> {
+        // Ensure transactions are not permanently blocked on transient upgrade
+        // failures.
+        self.upgrade_failures.clear();
+
         // If the mempool is empty, there is nothing to do.
         if self.is_empty() && self.merge_input_cache.is_empty() {
             self.set_sync_labels(new_block)?;
@@ -1483,6 +1577,67 @@ mod tests {
                 .get_mut(&transaction_id)
                 .map(|x| &mut x.transaction)
         }
+    }
+
+    #[traced_test]
+    #[test]
+    fn failed_upgrade_lets_the_next_upgrade_candidate_through() {
+        let network = Network::Main;
+        let genesis_block = Block::genesis(network);
+        let mutator_set_hash = genesis_block
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .hash();
+
+        let mut mempool = Mempool::new(
+            ByteSize::gb(1),
+            TxProvingCapability::SingleProof,
+            &genesis_block,
+        );
+        for mut tx in make_plenty_mock_transaction_supported_by_primitive_witness(2) {
+            tx.kernel = TransactionKernelModifier::default()
+                .mutator_set_hash(mutator_set_hash)
+                .modify(tx.kernel);
+            tx.proof = TransactionProof::ProofCollection(ProofCollection::invalid());
+            mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
+        }
+        assert_eq!(2, mempool.len(), "sanity: two distinct candidates");
+
+        let preferred = |pool: &Mempool| {
+            pool.preferred_proof_collection(usize::MAX, TxUpgradeFilter::match_all())
+                .map(|(kernel, _, _)| kernel.txid())
+        };
+
+        let first = preferred(&mempool).expect("sanity: a candidate must be picked");
+        mempool.record_upgrade_failure([first]);
+
+        let second = preferred(&mempool)
+            .expect("a transaction whose upgrade failed must not block the next candidate");
+        assert_ne!(
+            first, second,
+            "the failed candidate must not be picked again"
+        );
+
+        mempool.record_upgrade_failure([second]);
+        assert!(
+            preferred(&mempool).is_none(),
+            "no candidate remains once every transaction's upgrade has failed"
+        );
+
+        // A new block gives every transaction another chance. In this fork a
+        // block also kicks witness-less proof-collection transactions from the
+        // mempool, so check the failure record directly rather than through
+        // candidate selection.
+        let block1 = invalid_empty_block_with_timestamp(
+            &genesis_block,
+            genesis_block.header().timestamp + Timestamp::hours(1),
+            network,
+        );
+        mempool.update_with_block(&block1).unwrap();
+        assert!(
+            mempool.upgrade_failures.is_empty(),
+            "a new block must clear the recorded upgrade failures"
+        );
     }
 
     #[apply(shared_tokio_runtime)]
@@ -1949,7 +2104,7 @@ mod tests {
         let max_fee_density: FeeDensity = FeeDensity::new(BigInt::from(u128::MAX), BigInt::from(1));
         let mut prev_fee_density = max_fee_density;
         for curr_transaction in
-            mempool.get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, None)
+            mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, None)
         {
             let curr_fee_density = curr_transaction.fee_density();
             assert!(curr_fee_density <= prev_fee_density);
@@ -1971,7 +2126,7 @@ mod tests {
 
         for num_mergers in 0..=num_txs_in_mempool {
             let returned_transactions = mempool
-                .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, Some(num_mergers));
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, Some(num_mergers));
             assert_eq!(num_mergers, returned_transactions.len());
 
             let max_fee_density: FeeDensity =
@@ -2077,7 +2232,7 @@ mod tests {
             assert_eq!(
                 i,
                 mempool
-                    .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, Some(i))
+                    .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, Some(i))
                     .len()
             );
         }
@@ -2107,7 +2262,7 @@ mod tests {
 
             let max_total_tx_size = 1_000_000_000;
             let txs_returned =
-                mempool.get_transactions_for_block_composition(max_total_tx_size, None);
+                mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), max_total_tx_size, None);
             assert_eq!(
                 0,
                 txs_returned.len(),
@@ -2125,7 +2280,7 @@ mod tests {
             assert_eq!(
                 i,
                 mempool
-                    .get_transactions_for_block_composition(max_total_tx_size, None)
+                    .get_transactions_for_block_composition(ConsensusRuleSet::default(), max_total_tx_size, None)
                     .len(),
                 "Must return {i}/{i} transaction when mutator set hashes do match"
             );
@@ -2351,7 +2506,7 @@ mod tests {
         // updated and valid-again mutator set data
         let block2_msa = block_2.mutator_set_accumulator_after().unwrap();
         let mut tx_by_alice_updated: Transaction =
-            mempool.get_transactions_for_block_composition(usize::MAX, None)[0].clone();
+            mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)[0].clone();
         assert!(
             tx_by_alice_updated.is_confirmable_relative_to(&block2_msa),
             "Block with tx with updated mutator set data must be confirmable wrt. block_2"
@@ -2375,7 +2530,7 @@ mod tests {
         }
 
         tx_by_alice_updated =
-            mempool.get_transactions_for_block_composition(usize::MAX, None)[0].clone();
+            mempool.get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)[0].clone();
         let block_5_timestamp = previous_block.header().timestamp + Timestamp::hours(1);
         let (cbtx, _eutxo) = make_coinbase_transaction_from_state(
             &alice
@@ -2735,7 +2890,7 @@ mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(usize::MAX, None);
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None);
             assert_eq!(
                 1,
                 mempool_txs.len(),
@@ -2784,7 +2939,7 @@ mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(usize::MAX, None)
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)
                 .iter()
                 .all(|tx| tx.is_confirmable_relative_to(
                     &block_1b.mutator_set_accumulator_after().unwrap(),
@@ -2938,7 +3093,7 @@ mod tests {
 
         assert!(!mempool.is_empty());
         assert!(mempool
-            .get_transactions_for_block_composition(usize::MAX, None)
+            .get_transactions_for_block_composition(ConsensusRuleSet::default(), usize::MAX, None)
             .is_empty());
     }
 
@@ -3721,6 +3876,105 @@ mod tests {
                     updated_tx.kernel.mutator_set_hash
                 ),
                 "Must return false on original after insertion of updated tx"
+            );
+        }
+
+        /// Regression test: a transaction inserted with a *lower* priority that
+        /// kicks out higher-priority conflicts must inherit their priority.
+        ///
+        /// The motivating case: we initiate transaction `a` (`Critical`). A
+        /// third party merges `a` with their own transaction `b` into `c`. `c`
+        /// carries our inputs and outputs (so it conflicts with, and replaces,
+        /// `a`) but has a *new* txid and reaches us over the wire as
+        /// `Irrelevant`. If `c` kept `Irrelevant`, the mempool would stop
+        /// mutator-set-updating the transaction that now carries our funds
+        /// (both `update_with_block` and `preferred_update` gate updating single
+        /// proofs on the stored `Critical` priority).
+        #[proptest(cases = 15, async = "tokio")]
+        async fn merge_received_over_wire_inherits_replaced_priority(
+            #[strategy(1usize..10)] _num_inputs_own: usize,
+            #[strategy(1usize..10)] _num_outputs_own: usize,
+            #[strategy(1usize..10)] _num_inputs_foreign: usize,
+            #[strategy(1usize..10)] _num_outputs_foreign: usize,
+            #[strategy(PrimitiveWitness::arbitrary_tuple_with_matching_mutator_sets(
+            [(#_num_inputs_own, #_num_outputs_own, 0),
+            (#_num_inputs_foreign, #_num_outputs_foreign, 0),],
+    ))]
+            pws: [PrimitiveWitness; 2],
+        ) {
+            // Transactions in the mempool do not need to be valid, so we just
+            // pretend that the primitive-witness backed transactions have a
+            // SingleProof. Skip cases where the (arbitrary) mutator set happens
+            // to match the genesis tip, so the transactions count as unsynced.
+            let genesis_block = Block::genesis(Network::Main);
+            let genesis_ms_hash = genesis_block
+                .mutator_set_accumulator_after()
+                .unwrap()
+                .hash();
+            let [own_pw, foreign_pw] = pws;
+            prop_assume!(own_pw.kernel.mutator_set_hash != genesis_ms_hash);
+
+            // Our transaction, with a small fee.
+            let own_kernel = TransactionKernelModifier::default()
+                .fee(NativeCurrencyAmount::from_nau(1))
+                .modify(own_pw.kernel);
+            let own_tx = Transaction {
+                kernel: own_kernel.clone(),
+                proof: TransactionProof::invalid(),
+            };
+
+            // A third party's merge of our transaction with theirs: it carries
+            // both parties' inputs and outputs (so it conflicts with `own_tx`),
+            // a large combined fee (so it wins the fee-density replacement), and
+            // therefore a new txid.
+            let merged_kernel = TransactionKernelModifier::default()
+                .inputs([own_kernel.inputs.clone(), foreign_pw.kernel.inputs.clone()].concat())
+                .outputs(
+                    [
+                        own_kernel.outputs.clone(),
+                        foreign_pw.kernel.outputs.clone(),
+                    ]
+                    .concat(),
+                )
+                .fee(NativeCurrencyAmount::coins(1))
+                .modify(own_kernel);
+            let merged_tx = Transaction {
+                kernel: merged_kernel,
+                proof: TransactionProof::invalid(),
+            };
+            prop_assert_ne!(own_tx.kernel.txid(), merged_tx.kernel.txid());
+
+            let mut mempool = Mempool::new(
+                ByteSize::gb(1),
+                TxProvingCapability::SingleProof,
+                &genesis_block,
+            );
+
+            // We initiated `own_tx`, so it enters the mempool as `Critical`.
+            mempool.insert(own_tx.clone(), UpgradePriority::Critical, AddReason::Submitted);
+
+            // The merge arrives over the wire as `Irrelevant`. It kicks out
+            // `own_tx` (shared inputs, higher combined fee density) ...
+            mempool.insert(merged_tx.clone(), UpgradePriority::Irrelevant, AddReason::Submitted);
+            prop_assert!(
+                !mempool.contains(own_tx.kernel.txid()),
+                "merge must replace our transaction"
+            );
+            prop_assert!(mempool.contains(merged_tx.kernel.txid()));
+
+            // ... but must inherit our `Critical` interest so the mempool keeps
+            // mutator-set-updating the transaction carrying our funds. The
+            // transactions are unsynced relative to the genesis tip, so
+            // `preferred_update` returns the merge along with its stored
+            // priority.
+            let (returned_kernel, _, priority) = mempool
+                .preferred_update(TxUpgradeFilter::match_all())
+                .expect("unsynced single-proof tx must be returned for update");
+            prop_assert_eq!(returned_kernel.txid(), merged_tx.kernel.txid());
+            prop_assert_eq!(
+                UpgradePriority::Critical,
+                priority,
+                "merge that replaces a Critical tx must inherit its priority"
             );
         }
     }

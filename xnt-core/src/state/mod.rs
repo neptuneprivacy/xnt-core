@@ -2323,14 +2323,11 @@ impl GlobalState {
     /// Favors transactions based on upgrade priority first, fee density
     /// second.
     ///
-    /// Needs mutable state access because of how the mutator set update value
-    /// is calculated. Does not actually mutate any state.
-    ///
     /// Returns none if no transaction in the mempool is in need of upgrading
     /// or if transaction in need of upgrading does not provide enough
     /// incentive.
     pub(crate) async fn preferred_update_job_from_mempool(
-        &mut self,
+        &self,
         min_gobbling_fee: NativeCurrencyAmount,
         tx_upgrade_filter: TxUpgradeFilter,
     ) -> Option<UpdateMutatorSetDataJob> {
@@ -2361,6 +2358,18 @@ impl GlobalState {
             self.mempool.log_events(&[e.clone()], tip_height);
         }
         self.wallet_state.handle_mempool_events(event).await;
+    }
+
+    /// Record that upgrading the proofs of these transactions failed, so the
+    /// proof upgrader picks a different candidate next time.
+    ///
+    /// Produces no mempool events: nothing is removed, the transactions are
+    /// only passed over until the next block arrives.
+    pub(crate) fn mempool_record_upgrade_failure(
+        &mut self,
+        txids: impl IntoIterator<Item = TransactionKernelId>,
+    ) {
+        self.mempool.record_upgrade_failure(txids);
     }
 
     /// clears all Tx from mempool and notifies wallet of changes.
@@ -2408,14 +2417,14 @@ impl GlobalState {
     }
 
     pub(crate) async fn upgrade_proof_collection_job(
-        &mut self,
+        &self,
         kernel: TransactionKernel,
         proof: ProofCollection,
         upgrade_incentive: UpgradeIncentive,
     ) -> Result<ProofCollectionToSingleProof> {
         let msa_lookup_result = self
             .chain
-            .archival_state_mut()
+            .archival_state()
             .old_mutator_set_and_mutator_set_update_to_tip(
                 kernel.mutator_set_hash,
                 SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
@@ -2440,14 +2449,14 @@ impl GlobalState {
     /// Does not perform any proof upgrading, only returns the witness data
     /// required to construct a synced single proof.
     pub(crate) async fn update_single_proof_job(
-        &mut self,
+        &self,
         old_kernel: TransactionKernel,
         old_proof: NeptuneProof,
         upgrade_incentive: UpgradeIncentive,
     ) -> Result<UpdateMutatorSetDataJob> {
         let msa_lookup_result = self
             .chain
-            .archival_state_mut()
+            .archival_state()
             .old_mutator_set_and_mutator_set_update_to_tip(
                 old_kernel.mutator_set_hash,
                 SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
