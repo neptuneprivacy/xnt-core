@@ -290,7 +290,8 @@ pub(crate) async fn produce_single_proof(
         | ConsensusRuleSet::UpgradeVM
         | ConsensusRuleSet::UpgradeVMv4
         | ConsensusRuleSet::UpgradeVMv5
-        | ConsensusRuleSet::UpgradeVMv7 => {
+        | ConsensusRuleSet::UpgradeVMv7
+        | ConsensusRuleSet::UpgradeVMv8 => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
                 ::produce(primitive_witness, triton_vm_job_queue, proof_job_options)
                 .await
@@ -325,6 +326,8 @@ pub(crate) fn single_proof_claim(
         "15312e1a996ae949b1c5aa9b3af6c3ca5f9566cae3e40aa7d0552b2ed780a279a7c3a3bb783aeee7";
     const SINGLE_PROOF_V2_UPGRADE_VM_V5_DIGEST: &str = // SingleProofV2, v5 tree (UpgradeVMv5)
         "e66985a98e4d5e455c5d11e57a16c3dca3cce2bd2a16d6f5e791f592801cc32eb99c57c32bf90e88";
+    const SINGLE_PROOF_V2_UPGRADE_VM_V7_DIGEST: &str = // SingleProofV2, v7 tree (UpgradeVMv7)
+        "5c75cc2d808464503cccf3bf2467ff13bd3fc736d06aa4f661415852549900e04eb667ddd9792d76";
 
     let input = tx_kernel_mast_hash.reversed().values().to_vec();
     let version = consensus_rule_set.triton_proof_version().claim_version();
@@ -363,8 +366,14 @@ pub(crate) fn single_proof_claim(
                 .about_version(version)
                 .with_input(input)
         }
-        // SingleProofV2, current (v7) bytecode — recompute from the linked program.
+        // SingleProofV2, UpgradeVMv7 (v7) bytecode — now a pre-v8 era, hardcoded.
         ConsensusRuleSet::UpgradeVMv7 => {
+            Claim::new(Digest::try_from_hex(SINGLE_PROOF_V2_UPGRADE_VM_V7_DIGEST).unwrap())
+                .about_version(version)
+                .with_input(input)
+        }
+        // SingleProofV2, current (v8) bytecode — recompute from the linked program.
+        ConsensusRuleSet::UpgradeVMv8 => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2::claim(
                 tx_kernel_mast_hash,
             )
@@ -1465,10 +1474,10 @@ pub(crate) mod tests {
 
     test_program_snapshot!(
         SingleProof,
-        // Re-hashed under triton-vm v7 (tasm-lib u128 range-check). SingleProof is
+        // Re-hashed under triton-vm v8 (sound Hash/Program Table AIR). SingleProof is
         // the v1 program used only by checkpointed pre-TimelockExtension eras, which
         // select hardcoded historical digests in single_proof_claim, so this live
         // hash is a tripwire only and does not feed consensus.
-        "57885d5ca34bb292d5c1057c1b93f01f3eb3dbf932705bef90fcdeae59a121a4028eaeb268ef150c"
+        "59771f2fadbe130c0e257e315279edef5c2ab7d269cc9e1b3ec41c7e73598be043478f264d6e49f2"
     );
 }

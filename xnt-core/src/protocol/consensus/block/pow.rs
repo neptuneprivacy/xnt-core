@@ -381,6 +381,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
             || consensus_rule_set == ConsensusRuleSet::UpgradeVMv4
             || consensus_rule_set == ConsensusRuleSet::UpgradeVMv5
             || consensus_rule_set == ConsensusRuleSet::UpgradeVMv7
+            || consensus_rule_set == ConsensusRuleSet::UpgradeVMv8
         {
             // Commitment to all the fields in the block that are not pow
             mast_auth_paths.commit()
@@ -541,7 +542,8 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv7 => auth_paths.commit(),
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => auth_paths.commit(),
         };
         let index_picker_preimage = Tip5::hash_pair(self.root, auth_paths.commit());
         let (index_a, index_b) = Self::indices(index_picker_preimage, self.nonce);
@@ -553,6 +555,7 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
             || consensus_rule_set == ConsensusRuleSet::UpgradeVMv4
             || consensus_rule_set == ConsensusRuleSet::UpgradeVMv5
             || consensus_rule_set == ConsensusRuleSet::UpgradeVMv7
+            || consensus_rule_set == ConsensusRuleSet::UpgradeVMv8
         {
             (
                 Self::leaf(leaf_prefix, index_a),

@@ -99,6 +99,10 @@ tarpc = { version = "^0.34", features = [
     "serde-transport-json",
     "tcp",
 ] }
+# TODO(triton-vm-v8): this rev is tasm-lib 7.0.0 (triton-vm 7). The v8 upgrade
+# needs the fork's `upgrade-v8` branch: tasm-lib v8.0.0 with d6fef3d4 (the u128
+# limb range-check) cherry-picked on top. Until that branch is pushed, the
+# workspace `[patch]` at the bottom of the root Cargo.toml supplies it locally.
 tasm-lib = { git = "https://github.com/neptuneprivacy/tasm-lib", rev = "803223357cc7d50ceba68ea1310911639b86f02f" }
 tiny-bip39 = "1.0"
 tokio = { version = "1.41", features = ["full", "tracing"] }
