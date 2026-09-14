@@ -407,7 +407,7 @@ impl WalletState {
             // Check if we are premine recipients, and add expected UTXOs if so.
             for premine_key in &premine_keys {
                 let own_receiving_address = premine_key.clone().to_address();
-                for utxo in Block::premine_utxos() {
+                for utxo in Block::premine_utxos(configuration.network()) {
                     if utxo.lock_script_hash() == own_receiving_address.lock_script_hash() {
                         wallet_state
                             .add_expected_utxo(ExpectedUtxo::new(
@@ -1910,9 +1910,8 @@ impl WalletState {
                     ));
                 }
             } else {
-                let any_mp = &mutxo.blockhash_to_membership_proof.iter().next().unwrap().1;
                 unsynced.push(WalletStatusElement::new(
-                    any_mp.aocl_leaf_index,
+                    mutxo.aocl_leaf_index,
                     utxo,
                     payment_id,
                 ));
@@ -2228,7 +2227,7 @@ pub(crate) mod tests {
 
         let premine_utxo = {
             let wallet = &alice_global_lock.lock_guard().await.wallet_state;
-            Block::premine_utxos()
+            Block::premine_utxos(network)
                 .into_iter()
                 .find(|premine_utxo| wallet.can_unlock(premine_utxo))
                 .or_else(|| panic!())
@@ -5311,7 +5310,7 @@ pub(crate) mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(1_000_000_000, None)[0]
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), 1_000_000_000, None)[0]
                 .clone();
 
             // create block ignoring that transaction. Rando has upgraded tx
@@ -5369,7 +5368,7 @@ pub(crate) mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(10_000_000, None);
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), 10_000_000, None);
             assert_eq!(1, transactions_for_block.len());
             let upgraded_transaction = transactions_for_block[0].clone();
             let new_num_announcements = upgraded_transaction.kernel.announcements.len();

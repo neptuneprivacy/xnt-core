@@ -61,6 +61,7 @@ mod tests {
     use crate::protocol::proof_abstractions::timestamp::Timestamp;
     use crate::state::transaction::tx_creation_config::TxCreationConfig;
     use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+    use crate::state::wallet::address::ReceivingAddress;
     use crate::state::wallet::expected_utxo::UtxoNotifier;
     use crate::state::wallet::secret_key_material::SecretKeyMaterial;
     use crate::state::wallet::transaction_output::TxOutput;
@@ -97,17 +98,33 @@ mod tests {
             let mut alice =
                 mock_genesis_wallet_state(WalletEntropy::devnet_wallet(), &cli_args).await;
             let alice_wallet = get_monitored_utxos(&alice).await;
-            assert_eq!(
-                1,
-                alice_wallet.len(),
-                "Monitored UTXO list must contain premined UTXO at init, for premine-wallet"
-            );
 
-            let expected_utxo = Block::premine_utxos()[0].clone();
+            // Only non-mainnet networks allocate premine to the devnet wallet;
+            // mainnet's allocation is fixed and goes elsewhere.
+            let devnet_lock_script_hash = ReceivingAddress::from(
+                WalletEntropy::devnet_wallet()
+                    .nth_generation_spending_key(0)
+                    .to_address(),
+            )
+            .lock_script_hash();
+            let expected_utxos = Block::premine_utxos(network)
+                .into_iter()
+                .filter(|utxo| utxo.lock_script_hash() == devnet_lock_script_hash)
+                .collect_vec();
+
             assert_eq!(
-                expected_utxo, alice_wallet[0].utxo,
-                "Devnet wallet's monitored UTXO must match that from genesis block at initialization"
+                expected_utxos.len(),
+                alice_wallet.len(),
+                "{network}: monitored UTXO list must contain every premine UTXO the devnet \
+                 wallet owns, at init"
             );
+            for (expected_utxo, monitored) in expected_utxos.iter().zip(&alice_wallet) {
+                assert_eq!(
+                    *expected_utxo, monitored.utxo,
+                    "{network}: devnet wallet's monitored UTXO must match that from the genesis \
+                     block at initialization"
+                );
+            }
 
             let bob_wallet = WalletEntropy::new_pseudorandom(rng.random());
             let bob_wallet = mock_genesis_wallet_state(bob_wallet, &cli_args).await;
@@ -141,22 +158,26 @@ mod tests {
 
             let alice_mutxos = get_monitored_utxos(&alice).await;
             assert_eq!(
-                1,
+                expected_utxos.len(),
                 alice_mutxos.len(),
-                "monitored UTXOs must be 1 after applying N blocks not mined by wallet"
+                "{network}: monitored UTXO count must be unchanged after applying N blocks not \
+                 mined by wallet"
             );
 
-            let genesis_block_utxo = alice_mutxos[0].utxo.clone();
-            let ms_membership_proof = alice_mutxos[0]
-                .get_membership_proof_for_block(next_block.hash())
-                .unwrap();
-            assert!(
-                next_block
-                    .mutator_set_accumulator_after()
-                    .unwrap()
-                    .verify(Tip5::hash(&genesis_block_utxo), &ms_membership_proof),
-                "Membership proof must be valid after updating wallet state with generated blocks"
-            );
+            for mutxo in &alice_mutxos {
+                let genesis_block_utxo = mutxo.utxo.clone();
+                let ms_membership_proof = mutxo
+                    .get_membership_proof_for_block(next_block.hash())
+                    .unwrap();
+                assert!(
+                    next_block
+                        .mutator_set_accumulator_after()
+                        .unwrap()
+                        .verify(Tip5::hash(&genesis_block_utxo), &ms_membership_proof),
+                    "{network}: membership proof must be valid after updating wallet state with \
+                     generated blocks"
+                );
+            }
         }
     }
 

@@ -534,6 +534,7 @@ pub(crate) async fn create_block_transaction_from(
             .await
             .mempool
             .get_transactions_for_block_composition(
+                consensus_rule_set,
                 block_capacity_for_transactions,
                 Some(max_num_mergers),
             ),
@@ -552,7 +553,7 @@ pub(crate) async fn create_block_transaction_from(
         info!("No synced single-proof tx found for merge looking for one to update");
         let min_gobbling_fee = NativeCurrencyAmount::zero();
         let update_job = global_state_lock
-            .lock_guard_mut()
+            .lock_guard()
             .await
             .preferred_update_job_from_mempool(min_gobbling_fee, TxUpgradeFilter::match_all())
             .await;
@@ -613,6 +614,7 @@ pub(crate) async fn create_block_transaction_from(
                 .await
                 .mempool
                 .get_transactions_for_block_composition(
+                    consensus_rule_set,
                     block_capacity_for_transactions,
                     Some(max_num_mergers),
                 ),
@@ -1281,7 +1283,7 @@ pub(crate) mod tests {
                 .lock_guard_mut()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, None)
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, None)
                 .is_empty(),
             "May not have synced tx in mempool"
         );

@@ -62,6 +62,8 @@ pub(crate) enum RemovalRecordListUnpackError {
     IllegalTreeHeight { tree_height: u64 },
     #[error("List of tree heights contains duplicates.")]
     DuplicateTreeHeights,
+    #[error("Incorrectly sorted tree heights.")]
+    IncorrectlySortedTreeHeights,
     #[error("removal records are mutually inconsistent: {0}")]
     Inconsistency(RemovalRecordListInconsistency),
 }
@@ -280,10 +282,12 @@ impl RemovalRecordList {
     ///  - If the observed authentication path lengths is not sorted in
     ///    descending order (*i.e.*, largest first).
     ///  - If the observed authentication path lengths contains duplicates.
+    ///
+    /// Returns `None` if the estimate is not representable.
     fn estimate_num_leafs_aocl(
         observed_chunk_indices: &[u64],
         observed_authentication_path_lengths: &[usize],
-    ) -> u64 {
+    ) -> Option<u64> {
         let largest_observed_chunk_index =
             observed_chunk_indices.iter().copied().max().unwrap_or(0);
         let mut swbfi_leaf_count_estimate = largest_observed_chunk_index;
@@ -312,7 +316,9 @@ impl RemovalRecordList {
             }
         }
 
-        swbfi_leaf_count_estimate * u64::from(BATCH_SIZE) + 1
+        swbfi_leaf_count_estimate
+            .checked_mul(u64::from(BATCH_SIZE))?
+            .checked_add(1)
     }
 
     /// Compute a [`ChunkDictionary`], densely encoding all the data about
@@ -511,6 +517,7 @@ impl RemovalRecordList {
         let expected_authentication_structure_lengths = all_peak_heights
             .into_iter()
             .zip(merkle_leaf_indices_by_tree)
+            .sorted_by_key(|&(peak_height, _)| peak_height)
             .map(|(ph, mlis)| {
                 MerkleTree::authentication_structure_node_indices(1_u64 << ph, &mlis)
                     .unwrap_or_else(|_| {
@@ -522,13 +529,11 @@ impl RemovalRecordList {
                     })
                     .len()
             })
-            .sorted()
             .collect_vec();
         let observed_authentication_structure_lengths = self
             .authentication_structures
             .iter()
             .map(|auth_str| auth_str.len())
-            .sorted()
             .collect_vec();
         if expected_authentication_structure_lengths != observed_authentication_structure_lengths {
             return Err(
@@ -548,6 +553,8 @@ impl RemovalRecordList {
     fn decode_from_vec(
         removal_records: Vec<RemovalRecord>,
     ) -> Result<RemovalRecordList, RemovalRecordListUnpackError> {
+        // This function is not allowed to panic as it's run on untrusted
+        // input.
         let mut index_sets = vec![];
         let mut authentication_structures = vec![];
         let mut chunks = vec![];
@@ -559,6 +566,13 @@ impl RemovalRecordList {
                 removal_record.target_chunks.iter()
             {
                 if *tree_height < Self::ENCODING_TREE_HEIGHT_OFFSET {
+                    // Verify that tree heights are sorted correctly
+                    if let Some(previous) = tree_heights.last() {
+                        if *previous > *tree_height {
+                            return Err(RemovalRecordListUnpackError::IncorrectlySortedTreeHeights);
+                        }
+                    }
+
                     // use both authentication structure and chunk
                     tree_heights.push(*tree_height);
                     authentication_structures
@@ -601,7 +615,8 @@ impl RemovalRecordList {
         let num_leafs_aocl = Self::estimate_num_leafs_aocl(
             &observed_chunk_indices,
             &tree_heights.iter().map(|u| *u as usize).rev().collect_vec(),
-        );
+        )
+        .ok_or(RemovalRecordListUnpackError::AbsoluteIndexTooBig)?;
 
         let removal_record_list = Self {
             index_sets,
@@ -650,6 +665,8 @@ impl RemovalRecordList {
 
     /// Decompress a [`Vec`] of [`RemovalRecord`]s as packed by [`Self::pack`].
     /// Returns an error if the packing is invalid.
+    ///
+    /// Never panics, so this function is safe to run on untrusted input.
     pub(crate) fn try_unpack(
         removal_records: Vec<RemovalRecord>,
     ) -> Result<Vec<RemovalRecord>, RemovalRecordListUnpackError> {
@@ -690,7 +707,8 @@ impl RemovalRecordList {
         let num_leafs_aocl = RemovalRecordList::estimate_num_leafs_aocl(
             &observed_chunk_indices,
             &authentication_path_lengths,
-        );
+        )
+        .expect("locally derived removal records must have a representable AOCL leaf count");
 
         RemovalRecordList::from_removal_records(removal_records, num_leafs_aocl)
     }
@@ -1463,7 +1481,8 @@ mod tests {
         let estimate_num_leafs_aocl = RemovalRecordList::estimate_num_leafs_aocl(
             &chunk_indices,
             &authentication_path_lengths,
-        );
+        )
+        .unwrap();
 
         prop_assert!(estimate_num_leafs_aocl <= num_leafs_aocl);
     }
@@ -1491,7 +1510,8 @@ mod tests {
         let estimate_num_leafs_aocl = RemovalRecordList::estimate_num_leafs_aocl(
             &chunk_indices,
             &authentication_path_lengths,
-        );
+        )
+        .unwrap();
 
         // the estimate explains all authentication path lengths
         let num_leafs_swbfi = aocl_to_swbfi_leaf_counts(estimate_num_leafs_aocl);
@@ -1557,7 +1577,8 @@ mod tests {
         let estimate_num_leafs_aocl = RemovalRecordList::estimate_num_leafs_aocl(
             &chunk_indices,
             &authentication_path_lengths,
-        );
+        )
+        .unwrap();
 
         // the estimate explains all authentication path lengths
         let num_leafs_swbfi = aocl_to_swbfi_leaf_counts(estimate_num_leafs_aocl);
@@ -2232,6 +2253,105 @@ mod tests {
         }
 
         #[test]
+        fn try_unpack_rejects_indices_that_overflow_the_aocl_leaf_count_estimate() {
+            let removal_record = RemovalRecord {
+                absolute_indices: AbsoluteIndexSet::new_raw(1u128 << 74, [0; NUM_TRIALS as usize]),
+                target_chunks: ChunkDictionary::new(vec![(
+                    0,
+                    (MmrMembershipProof::new(vec![]), Chunk::empty_chunk()),
+                )]),
+            };
+
+            assert!(matches!(
+                RemovalRecordList::try_unpack(vec![removal_record]),
+                Err(RemovalRecordListUnpackError::AbsoluteIndexTooBig)
+            ));
+        }
+
+
+        #[test]
+        fn no_panic_on_mispaired_authentication_structures() {
+            let num_aocl_leafs = 120;
+            let mut test_runner = TestRunner::deterministic();
+            let mut rng = rng();
+
+            // Find a set of removal records that spans two trees whose
+            // authentication structures have different lengths; only then can
+            // the structures be mispaired without changing the multiset.
+            let mut swapped = None;
+            for _ in 0..100 {
+                let item: Digest = rng.random();
+                let msa_and_records = MsaAndRecords::arbitrary_with((
+                    vec![(item, Digest::default(), Digest::default()); 2],
+                    num_aocl_leafs,
+                ))
+                .new_tree(&mut test_runner)
+                .unwrap()
+                .current();
+
+                let packed = RemovalRecordList::pack(msa_and_records.unpacked_removal_records());
+                let dictionary = &packed[0].target_chunks.dictionary;
+                let Some((i, j)) = (0..dictionary.len())
+                    .cartesian_product(0..dictionary.len())
+                    .find(|&(i, j)| {
+                        dictionary[i].1 .0.authentication_path.len()
+                            != dictionary[j].1 .0.authentication_path.len()
+                    })
+                else {
+                    continue;
+                };
+
+                let mut mispaired = packed.clone();
+                let dictionary = &mut mispaired[0].target_chunks.dictionary;
+                let structure_i = dictionary[i].1 .0.authentication_path.clone();
+                let structure_j = dictionary[j].1 .0.authentication_path.clone();
+                dictionary[i].1 .0.authentication_path = structure_j;
+                dictionary[j].1 .0.authentication_path = structure_i;
+                swapped = Some(mispaired);
+                break;
+            }
+
+            let mispaired = swapped.expect("must find two structures of differing lengths");
+
+            // Per the no-crash contract this must return Err, not panic.
+            let result = RemovalRecordList::try_unpack(mispaired);
+            assert!(
+                matches!(
+                    result,
+                    Err(RemovalRecordListUnpackError::Inconsistency(
+                        RemovalRecordListInconsistency::AuthenticationStructureLength { .. }
+                    ))
+                ),
+                "Must return expected error on mispaired authentication structures. Got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn no_panic_on_decending_tree_heights() {
+            let empty = Chunk::empty_chunk();
+            let removal_record = RemovalRecord {
+                absolute_indices: AbsoluteIndexSet::new_raw(0, [0; NUM_TRIALS as usize]),
+                target_chunks: ChunkDictionary {
+                    dictionary: vec![
+                        // Tree heights: [5,3] unique, descending
+                        (5, (MmrMembershipProof::new(vec![]), empty.clone())), // tree height 5
+                        (3, (MmrMembershipProof::new(vec![]), empty.clone())), // tree height 3
+                    ],
+                },
+            };
+
+            // Per the no-crash contract this must return Err, not panic.
+            let res = RemovalRecordList::try_unpack(vec![removal_record]);
+            assert!(
+                matches!(
+                    res,
+                    Err(RemovalRecordListUnpackError::IncorrectlySortedTreeHeights)
+                ),
+                "Must return expected error on incorrectly sorted tree heights"
+            );
+        }
+
+        #[test]
         fn too_many_chunks() {
             let absolute_indices_with_one_chunk_idx =
                 AbsoluteIndexSet::new_raw(0, [0; NUM_TRIALS as usize]);
@@ -2463,9 +2583,6 @@ mod tests {
             // Ensure no crash.
             let _ = RemovalRecordList::try_unpack(removal_records); // no crash
         }
-
-        #[proptest]
-        fn try_unpack_repeated_tree_height() {}
 
         #[proptest]
         fn removal_record_list_is_inconsistent_or_convert_to_vec_succeeds(

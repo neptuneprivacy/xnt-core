@@ -657,6 +657,7 @@ impl PeerLoopHandler {
                 if peers.len() > MAX_PEER_LIST_LENGTH {
                     self.punish(NegativePeerSanction::FloodPeerListResponse)
                         .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
                 let peers = peers
@@ -1352,10 +1353,29 @@ impl PeerLoopHandler {
                     )
                 };
 
-                // 1. If transaction is invalid, punish.
                 let network = self.global_state_lock.cli().network;
                 let consensus_rule_set =
                     ConsensusRuleSet::infer_from(network, current_block_height);
+
+                // 0. If transaction can never be mined, punish. Checked before
+                // validity because it reads only kernel lengths, whereas
+                // validity verifies proofs.
+                if let Err(too_big) = consensus_rule_set.mempool_size_check(
+                    transaction.kernel.inputs.len(),
+                    transaction.kernel.outputs.len(),
+                    transaction.kernel.announcements.len(),
+                ) {
+                    warn!(
+                        "Received transaction with TXID {} that exceeds the allowed limits, and \
+                         can therefore never be mined: {too_big}",
+                        transaction.kernel.txid()
+                    );
+                    self.punish(NegativePeerSanction::UnrelayableTransaction)
+                        .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                // 1. If transaction is invalid, punish.
                 if !transaction.is_valid(network, consensus_rule_set).await {
                     warn!("Received invalid tx");
                     self.punish(NegativePeerSanction::InvalidTransaction)
@@ -1423,13 +1443,21 @@ impl PeerLoopHandler {
                             );
                             match removal_record_error_code {
                                 Ok(_) => unreachable!(),
-                                Err(RemovalRecordValidityError::AbsentAuthenticatedChunk) => {
-                                    debug!("invalid because membership proof is missing");
+                                Err(RemovalRecordValidityError::MismatchedChunkIndices) => {
+                                    debug!(
+                                        "invalid because the authenticated chunks are not the ones the \
+                                         indices require: some are missing or superfluous"
+                                    );
                                 }
                                 Err(RemovalRecordValidityError::InvalidSwbfiMmrMp {
                                     chunk_index,
                                 }) => {
                                     debug!("invalid because membership proof for chunk index {chunk_index} is invalid");
+                                }
+                                Err(RemovalRecordValidityError::DuplicateChunkIndex {
+                                    chunk_index,
+                                }) => {
+                                    debug!("invalid because chunk index {chunk_index} occurs more than once");
                                 }
                             };
                             self.punish(NegativePeerSanction::UnconfirmableTransaction)

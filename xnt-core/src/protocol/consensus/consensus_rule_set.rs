@@ -297,6 +297,73 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv7 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
+
+    /// How many inputs, outputs, and announcements a block reserves for the
+    /// transactions that a mempool transaction is merged with before it can be
+    /// mined: the composer's coinbase transaction, which typically has two
+    /// outputs, and possibly a negative-fee transaction whose author claims
+    /// part of the fee.
+    const MERGE_HEADROOM: usize = 5;
+
+    /// The largest number of inputs a transaction may have and still be worth
+    /// admitting to the mempool.
+    ///
+    /// A transaction above this limit can never be mined, because the merged
+    /// block transaction would exceed [`max_num_inputs`](Self::max_num_inputs).
+    /// Relaying or storing it only spends bandwidth and memory.
+    pub(crate) fn max_num_inputs_in_mempool(&self) -> usize {
+        self.max_num_inputs().saturating_sub(Self::MERGE_HEADROOM)
+    }
+
+    /// Mempool counterpart of [`max_num_outputs`](Self::max_num_outputs); see
+    /// [`max_num_inputs_in_mempool`](Self::max_num_inputs_in_mempool).
+    pub(crate) fn max_num_outputs_in_mempool(&self) -> usize {
+        self.max_num_outputs().saturating_sub(Self::MERGE_HEADROOM)
+    }
+
+    /// Mempool counterpart of
+    /// [`max_num_announcements`](Self::max_num_announcements); see
+    /// [`max_num_inputs_in_mempool`](Self::max_num_inputs_in_mempool).
+    pub(crate) fn max_num_announcements_in_mempool(&self) -> usize {
+        self.max_num_announcements()
+            .saturating_sub(Self::MERGE_HEADROOM)
+    }
+
+    /// Whether a transaction is small enough to be admitted to the mempool.
+    ///
+    /// Returns the offending item kind if any count is above its mempool limit.
+    pub(crate) fn mempool_size_check(
+        &self,
+        num_inputs: usize,
+        num_outputs: usize,
+        num_announcements: usize,
+    ) -> Result<(), TransactionTooBig> {
+        if num_inputs > self.max_num_inputs_in_mempool() {
+            return Err(TransactionTooBig::TooManyInputs);
+        }
+        if num_outputs > self.max_num_outputs_in_mempool() {
+            return Err(TransactionTooBig::TooManyOutputs);
+        }
+        if num_announcements > self.max_num_announcements_in_mempool() {
+            return Err(TransactionTooBig::TooManyAnnouncements);
+        }
+
+        Ok(())
+    }
+}
+
+/// Why a transaction is too big to be admitted to the mempool. See
+/// [`ConsensusRuleSet::mempool_size_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransactionTooBig {
+    #[error("transaction has more inputs than can be mined")]
+    TooManyInputs,
+
+    #[error("transaction has more outputs than can be mined")]
+    TooManyOutputs,
+
+    #[error("transaction has more announcements than can be mined")]
+    TooManyAnnouncements,
 }
 
 #[cfg(test)]
@@ -309,6 +376,7 @@ pub(crate) mod tests {
     use rand::rngs::StdRng;
     use rand::Rng;
     use rand::SeedableRng;
+    use strum::IntoEnumIterator;
     use tracing_test::traced_test;
 
     use super::*;
@@ -346,6 +414,48 @@ pub(crate) mod tests {
     use crate::tests::shared::blocks::next_block;
     use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
     use crate::tests::tokio_runtime;
+
+    /// A transaction is admissible right up to the mempool limit, and rejected
+    /// one item beyond it, for each of the three item kinds.
+    ///
+    /// The mempool limit sits [`ConsensusRuleSet::MERGE_HEADROOM`] below the
+    /// block limit, so that a transaction admitted here still fits in a block
+    /// after being merged with the composer's coinbase transaction.
+    #[test]
+    fn mempool_size_check_is_exact_at_the_limit() {
+        for rule_set in ConsensusRuleSet::iter() {
+            let max_inputs = rule_set.max_num_inputs_in_mempool();
+            let max_outputs = rule_set.max_num_outputs_in_mempool();
+            let max_announcements = rule_set.max_num_announcements_in_mempool();
+
+            assert!(
+                max_inputs < rule_set.max_num_inputs(),
+                "{rule_set}: mempool limit must leave headroom below the block limit"
+            );
+
+            assert_eq!(
+                Ok(()),
+                rule_set.mempool_size_check(max_inputs, max_outputs, max_announcements),
+                "{rule_set}: a transaction exactly at the limit must be admissible"
+            );
+
+            assert_eq!(
+                Err(TransactionTooBig::TooManyInputs),
+                rule_set.mempool_size_check(max_inputs + 1, 0, 0),
+                "{rule_set}: one input too many must be rejected"
+            );
+            assert_eq!(
+                Err(TransactionTooBig::TooManyOutputs),
+                rule_set.mempool_size_check(0, max_outputs + 1, 0),
+                "{rule_set}: one output too many must be rejected"
+            );
+            assert_eq!(
+                Err(TransactionTooBig::TooManyAnnouncements),
+                rule_set.mempool_size_check(0, 0, max_announcements + 1),
+                "{rule_set}: one announcement too many must be rejected"
+            );
+        }
+    }
 
     async fn tx_with_n_outputs(
         mut state: GlobalStateLock,

@@ -74,6 +74,7 @@ use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::proof_abstractions::verifier::verify;
 use crate::protocol::proof_abstractions::SecretWitness;
 use crate::state::wallet::address::ReceivingAddress;
+use crate::state::wallet::wallet_entropy::WalletEntropy;
 use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::commit;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
@@ -434,7 +435,7 @@ impl Block {
     }
 
     pub fn genesis(network: Network) -> Self {
-        let premine_distribution = Self::premine_distribution();
+        let premine_distribution = Self::premine_distribution(network);
         let total_premine_amount = premine_distribution
             .iter()
             .map(|(_receiving_address, amount)| *amount)
@@ -444,7 +445,7 @@ impl Block {
         let mut genesis_mutator_set = MutatorSetAccumulator::default();
         let mut genesis_tx_outputs = vec![];
         for ((receiving_address, _amount), utxo) in
-            premine_distribution.iter().zip(Self::premine_utxos())
+            premine_distribution.iter().zip(Self::premine_utxos(network))
         {
             let utxo_digest = Tip5::hash(&utxo);
             // generate randomness for mutator set commitment
@@ -496,7 +497,35 @@ impl Block {
         Digest::new(bfe_array![u64::from(network.id()), 0, 0, 0, 0])
     }
 
-    fn original_premine_distribution() -> Vec<(ReceivingAddress, NativeCurrencyAmount)> {
+    /// The premine allocation for `network`.
+    ///
+    /// Mainnet's allocation is hardcoded in
+    /// [`Self::mainnet_premine_distribution`] and must never change: the genesis
+    /// block it produces is pinned to the live chain (see
+    /// [`Self::premine_utxos`]).
+    ///
+    /// Every other network additionally funds the devnet wallet. Upstream
+    /// allocated to that wallet the same way; this fork dropped it when it set
+    /// its own mainnet premine, which left every test needing spendable funds
+    /// unable to build a transaction. Because the addition is gated on the
+    /// network, mainnet's distribution — and therefore its genesis hash — is
+    /// unaffected.
+    fn original_premine_distribution(
+        network: Network,
+    ) -> Vec<(ReceivingAddress, NativeCurrencyAmount)> {
+        let mut distribution = Self::mainnet_premine_distribution();
+
+        if network != Network::Main {
+            let devnet_address = WalletEntropy::devnet_wallet()
+                .nth_generation_spending_key(0)
+                .to_address();
+            distribution.push((devnet_address.into(), NativeCurrencyAmount::coins(20)));
+        }
+
+        distribution
+    }
+
+    fn mainnet_premine_distribution() -> Vec<(ReceivingAddress, NativeCurrencyAmount)> {
         // The premine UTXOs can be hardcoded here.
         vec![
             (ReceivingAddress::from_bech32m("xntnwm19tgyejh6wxmjqn09shm044d2kfrr3vygk2hzpey739qw4uw6npsgwlagxanu4ndp94x9y6vcnfz8tcwrhcgk0sfxr7z8g78w47lv758edaxa80pjj8sgshdtjgp8jtp5rpxy0ds3c23h2xvecst4e8yevr7cx6t9llczdudwqejwjklpjqy8369v0eydxzh6awmxw2t6clrvtck0guzgjfz8ata54l3zhfrkqrncmynz856tugjkau6f6jh5wxu783vn8wzl0jv5v5s5vecuengvq0hsprj2cp4j323wxxdl95l5x88g0ww5mzjf3tlxdr2md5jvqncxyu3gj5ezvyd6dqex6g45fz7znfgz0kjdtxdsyzkernax5de5v0uhe97dydktttvwymy7kehznzzutv3gdtxmk805kqlthy42hgcnsfxxpktujqlkeftsvht24uuhjqgv45khpuwt0p26rkg30sd2dvgd4k2mu05rzjnathyqw748qm792gtd39vupxe4h3wdzap4rhkdescvjhsh3k6rpcp49vkhpk5722vwadg39844609ku79s4j25uqyr99fk4zf3u4uffm6hk5pgqax903gm0pn5utgngr90ef9kzzpdp6acwv574t8hyf9sdt6de8vlx8t3hu3e0yzvy6hrsxwrpjr296z4wtpulgazxsphw4hn6k7zhu9ehmdknhudl0xf6dzj0uz8yaxw4sju9sthmsc2uju07ua0amu0jvpfqqtsqkeyrjj8vgxssaqk35w40ze7dhpvgcqxehm8xccfxn6m9j707kcwfr5quyze2ntxmqfdw4n5yg93rzdrmskh9hsdut9s9u3d4zm2dk8pfl85394twy9g89c8ncarcealz4dhjc6vdw0gmm9rfce0t959e8fx2hczzhhpp6trufk8vm3r2ck3e6dyuuzgqh0jzfd9r9l2zyaf7mnz4cqyer34zgfpufg4683pgw9h4vr3f825m6gled0g5nz92u7eaelgdm5wkpg4dzmrqhl8hszelq4h2aglcgynn3y6xfrsyplfvfhmd9s68rdagqaa20gh2tnc4hpev9uuqvz99vcfahelyraz9xq9gucpkgv99w2wrca066p8j7qcdlljd5nq8yau76man3989c0kq0ulzs7e2079w8v3q6dnaynr8y286kfmm85z6sg2n0eqm7dlep3ml38pemyh9n40zydk98dlmz9f8c5ppsxeglvy4davsqfu5ll7q7ufzhy7xfvgcz7sm9akkl7gkcsad08w48el8keusussuk8upnc0gs7aq9kz2znl7uyc77wupyry9zwne86pnnsp8v496kfdx3nwkkpc89md5eh9ph55xvs6gnz05wqkvlkc4ztpqcc37d4nee5fhpuwxkvlvyq29u0lqe9j3dfhtdru9k0l7vm56wq4ed27w80puylx4w5agnf54v8hnv5vs36dxjw8xklsvsqsk4dlv3un9dn2sr6tj7aknuvhd8et6anhfvxjmfjqzth53gvt6hvys5gu8hhaqzavyta475yzflx882zqqadm3htl07qawfwylkf8apju9cc8xd9uzcfzs0mhhfw4qhn9qhrv09clgn6rl8l4rr5cemtmvsy9gsel9qvpa4ysd5upe3kas2vu5fk0fgw5wzjs0u27yexe2m6e8ysn426vl0v4ejclryse2u2dupzp73kzmz42pqa49xxgukzr4mw7e9rkqtulgzw47l44zspw453hd0q7dllach6ws0ym4j4qs7yexn05xpfe8nz0e29xe2ra93dyn2q8ca49mezgdmh9cd8k0shg4ztwxcu6pmkaxrf7kfmzn8wrfmxthnz9t6gn6e2ym58fdyu9ln4qfl7me2vtg465c94sgrgehc8qhrmqr7x7vjrfe2s648kuhulhhhsvf5plqmff8evj3y3g33ds4klzd42y02v53r2cfkqnjkrwrme8w27svzkwg4lpt7r0jvcn7klwmpstufgkf5c9pdhewyuvxuhjfsvp6n62vnxkup3t8m0z94twyprxp5sd3pla02j0kj76pu6928st26vp06kqv7assrugejn8jn9lt3eemapqmrunsfyy0yhh42tgmrlfht63vys0vzjg97jau7truzuycct2rtx7a8zqjuwyu82v3qmz99ddcucg0zxckpslaayknwpplyz9yma8pzk8dsx70qj0s3q5waj8whxxctsf7gh5z07sadhh042yeuz4qrpmmpcnafnvlcnv0sswq66a97gaqxtm4wuxsvl082dltvwtqsrzw285vfc97aewvg8pkh26u40cuxm7qxvg7c5anzhwhphl5m28jul3clvgzl5cth8awccmcyfl0ze9lzykcwpuasmcf080ynp437h57gtajwawayaclnmgjc7fp5477mzctm4m8d2ay2t3r4jzgmpf97dlckhfjlsrxfpr7ckv7kt3j4w4rmv3z9p2tdcs6slq6nrx543g6eqd3afyk4cu74xfjklnj0ny968v4zegprw7ncrmut0jzcvmknwtfxl9fmpwhnzdn4059r29zlaqwhrwfwzx3e4envdl8zer6zsh6qkejj3445pycsg95a7t5vh0t498q5zcdxvuzyk3xzs3y5upnxyc53k962pk4cfur5cn4f8varemgny86qpknhvkdjxwafxjwvue2mgu8zymv7x99e9wqqcq23tzm8n3skv9a4k9rpw0r27fevs4tqku7q3uh77g7yw206tugdavd327t9wk2zytw9prfdzeuf6dkvywcg9pmkchrf6azwhc3483f5z03pjy2rglhy7w2z0tuc4jr9njzk28hq8rkrggd8uc6whry8am30j2yt4ez4e8z8amcm2pyvcxd7g5acq63dlk4s465ug28ryvfvagjxaxvjc77fgkl5mseg0y68mmf7vpmlysjp5d3qgpjfcpy7dgws2gjvct9qflqw5ms36czcv7ls3c32jmpnn9mrev4h2k89k2qctr4ye599a5s76z0utup69zsxcqklr5jn6pp5uf39r3w75danrvdc2mrmxncykm9y8ka57yzkyfyrvft4mvtzr86eys0qnrwegs2st2u8gjextz4kvk66whp2ncytm5t2ftnq20a7vu222k93r6n82lt2lrp6akrxknc2a66tg5pycu9rck3v8h5jfm4xul0wa4htzjxehtder9c4usudechyqx4qv3r4tj7cl3sczja6l63uh7j4nvzselnspc9udjf3dh5ljld9m60lem3fyrvt7dnew0va7g9tgg4544g2yfpmnxrqztm8632vayv674c8yxn2yhvlsm043d5nyvk99fpht5yr6y8nw9qs5y7hxtnnrasy7chtuwqu5shd3qgjc2hpgvjm6kdzkxxpsfdlypw4tldu5", Network::Main).unwrap(), NativeCurrencyAmount::coins(1942384))
@@ -504,11 +533,11 @@ impl Block {
     }
 
     /// All premine allocations, including claims fund and claims
-    fn premine_distribution() -> Vec<(ReceivingAddress, NativeCurrencyAmount)> {
-        [Self::original_premine_distribution()].concat()
+    fn premine_distribution(network: Network) -> Vec<(ReceivingAddress, NativeCurrencyAmount)> {
+        [Self::original_premine_distribution(network)].concat()
     }
 
-    pub fn premine_utxos() -> Vec<Utxo> {
+    pub fn premine_utxos(network: Network) -> Vec<Utxo> {
         // Premine will be unlocked at genesis.
         //
         // The native-currency type-script hash is pinned to the launch-era value
@@ -520,7 +549,7 @@ impl Block {
         let nc_hash = NativeCurrency::legacy_type_script_hash();
 
         let mut utxos = vec![];
-        for (receiving_address, amount) in Self::premine_distribution() {
+        for (receiving_address, amount) in Self::premine_distribution(network) {
             let coins = vec![
                 Coin::new_native_currency_with_type_script_hash(nc_hash, amount),
                 //TimeLock::until(premine_release_date),
@@ -2309,7 +2338,58 @@ pub(crate) mod tests {
 
     #[test]
     fn premine_distribution_does_not_crash() {
-        Block::premine_distribution();
+        Block::premine_distribution(Network::Main);
+    }
+
+    /// Mainnet's genesis block is pinned to the live chain: if this hash moves,
+    /// every node on mainnet stops agreeing with this build. Nothing that
+    /// touches the premine, the genesis transaction, or the native-currency
+    /// type-script hash may change it.
+    ///
+    /// Recorded 2026-08-12, before adding the devnet-wallet premine for
+    /// non-mainnet networks.
+    #[test]
+    fn mainnet_genesis_hash_is_pinned() {
+        assert_eq!(
+            "03176465667522202772,04681390879739058532,17582005166685872536,\
+             11472275972434987608,03744294643659606529"
+                .replace([' ', '\\'], ""),
+            Block::genesis(Network::Main).hash().to_string(),
+            "mainnet genesis hash must never change"
+        );
+    }
+
+    /// Only mainnet gets the hardcoded allocation; every other network also
+    /// funds the devnet wallet that the test suite spends from.
+    #[test]
+    fn only_non_mainnet_networks_fund_the_devnet_wallet() {
+        assert_eq!(
+            1,
+            Block::premine_distribution(Network::Main).len(),
+            "mainnet premine must hold exactly the hardcoded allocation"
+        );
+
+        let devnet_lock_script_hash = ReceivingAddress::from(
+            WalletEntropy::devnet_wallet()
+                .nth_generation_spending_key(0)
+                .to_address(),
+        )
+        .lock_script_hash();
+
+        for network in [
+            Network::TestnetMock,
+            Network::RegTest,
+            Network::Testnet(0),
+        ] {
+            let utxos = Block::premine_utxos(network);
+            assert_eq!(2, utxos.len(), "{network} premine must fund the devnet wallet");
+            assert!(
+                utxos
+                    .iter()
+                    .any(|utxo| utxo.lock_script_hash() == devnet_lock_script_hash),
+                "{network} premine must contain the devnet wallet's UTXO"
+            );
+        }
     }
 
     /// Exhibits a strategy for creating one transaction by merging in many
