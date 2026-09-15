@@ -170,7 +170,7 @@ impl BlockTransaction {
         proof_job_options: TritonVmProofJobOptions,
         consensus_rule_set: ConsensusRuleSet,
     ) -> anyhow::Result<BlockTransaction> {
-        let merge_witness = MergeWitness::for_composition(coinbase, other, shuffle_seed);
+        let merge_witness = MergeWitness::for_composition(coinbase, other, shuffle_seed, consensus_rule_set);
         let tx = MergeWitness::merge_with_rule(
             merge_witness,
             triton_vm_job_queue,
@@ -195,7 +195,7 @@ pub(crate) mod tests {
         /// supplied, it will (probably) become invalid. Use only in tests where
         /// the proof does not matter.
         pub(crate) fn upgrade(tx: Transaction) -> Self {
-            let packed = RemovalRecordList::pack(tx.kernel.inputs.clone());
+            let packed = RemovalRecordList::pack(tx.kernel.inputs.clone(), true);
             let kernel = TransactionKernelModifier::default()
                 .merge_bit(true)
                 .inputs(packed)
@@ -211,7 +211,7 @@ pub(crate) mod tests {
         /// Is guaranteed to have an invalid transaction proof. Use only in
         /// tests.
         pub(crate) fn from_tx_kernel(kernel: TransactionKernel) -> Self {
-            let packed = RemovalRecordList::pack(kernel.inputs.clone());
+            let packed = RemovalRecordList::pack(kernel.inputs.clone(), true);
             let kernel = TransactionKernelModifier::default()
                 .merge_bit(true)
                 .inputs(packed)

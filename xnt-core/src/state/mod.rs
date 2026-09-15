@@ -1559,7 +1559,7 @@ impl GlobalState {
 
                 // revert removals
                 for removal_record in revert_block
-                    .mutator_set_update()
+                    .mutator_set_update(self.cli().network)
                     .expect("Stored block must have mutator set update")
                     .removals
                     .iter()
@@ -1615,7 +1615,7 @@ impl GlobalState {
                     additions,
                     mut removals,
                 } = apply_block
-                    .mutator_set_update()
+                    .mutator_set_update(self.cli().network)
                     .expect("block from archival state must have mutator set update");
 
                 // apply additions
@@ -2751,7 +2751,7 @@ mod tests {
                 block = next_block;
 
                 // update membership proofs
-                let mutator_set_update = block.mutator_set_update().unwrap();
+                let mutator_set_update = block.mutator_set_update(network).unwrap();
                 let MutatorSetUpdate {
                     additions,
                     mut removals,
@@ -2820,7 +2820,7 @@ mod tests {
                 }
 
                 block
-                    .mutator_set_update()
+                    .mutator_set_update(network)
                     .unwrap()
                     .apply_to_accumulator(&mut test_msa)
                     .unwrap();

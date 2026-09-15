@@ -323,6 +323,31 @@ impl ConsensusRuleSet {
         }
     }
 
+    /// Whether a packed chunk may use the extended length indicator.
+    ///
+    /// Before `UpgradeVMv8` the indicator is a single `u12`, which caps a chunk
+    /// at 4095 relative indices. An attacker who controls sender randomness can
+    /// grind more indices than that into a single chunk; the old scheme cannot
+    /// express the result, so packing it panics on the block-processing path.
+    /// v8 widens the indicator to 23 bits, lifting the cap to 92160.
+    ///
+    /// This is gated rather than applied unconditionally: accepting the extended
+    /// form before activation would let an attacker pick the moment of a chain
+    /// split, since an upgraded node would accept blocks its peers reject.
+    pub(crate) fn allow_big_chunks(&self) -> bool {
+        match self {
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv7 => false,
+            ConsensusRuleSet::UpgradeVMv8 => true,
+        }
+    }
+
     pub(crate) fn max_num_inputs(&self) -> usize {
         match self {
             ConsensusRuleSet::Reboot

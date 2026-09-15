@@ -35,7 +35,7 @@ impl MsaAndRecords {
     }
 
     pub(crate) fn packed_removal_records(&self) -> Vec<RemovalRecord> {
-        RemovalRecordList::pack(self.removal_records.clone())
+        RemovalRecordList::pack(self.removal_records.clone(), true)
     }
 
     pub fn verify(&self, items: &[Digest]) -> bool {

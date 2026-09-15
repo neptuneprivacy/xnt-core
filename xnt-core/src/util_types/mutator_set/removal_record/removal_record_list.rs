@@ -331,7 +331,7 @@ impl RemovalRecordList {
     /// # Panics
     ///
     ///  - If self is inconsistent.
-    fn compressed_chunk_dictionary(&self) -> ChunkDictionary {
+    fn compressed_chunk_dictionary(&self, allow_big_chunks: bool) -> ChunkDictionary {
         use itertools::EitherOrBoth::Both;
         use itertools::EitherOrBoth::Left;
         use itertools::EitherOrBoth::Right;
@@ -354,7 +354,7 @@ impl RemovalRecordList {
         );
 
         let chunk_dictionary = tree_heights_and_authentication_structures
-            .zip_longest(self.chunks.iter().map(Chunk::pack))
+            .zip_longest(self.chunks.iter().map(|chunk| chunk.pack(allow_big_chunks)))
             .map(|x| match x {
                 Both((tree_height, membership_proof), packed_chunk) => {
                     (tree_height, (membership_proof, packed_chunk))
@@ -409,8 +409,8 @@ impl RemovalRecordList {
     ///
     /// See also: [`Self::decode_from_vec`], which computes the inverse of this
     /// function.
-    fn encode_as_vec(&self) -> Vec<RemovalRecord> {
-        let chunk_dictionaries = vec![self.compressed_chunk_dictionary()]
+    fn encode_as_vec(&self, allow_big_chunks: bool) -> Vec<RemovalRecord> {
+        let chunk_dictionaries = vec![self.compressed_chunk_dictionary(allow_big_chunks)]
             .into_iter()
             .chain(std::iter::repeat(ChunkDictionary::empty()));
 
@@ -552,6 +552,7 @@ impl RemovalRecordList {
     /// [`Self::encode_as_vec`].
     fn decode_from_vec(
         removal_records: Vec<RemovalRecord>,
+        allow_big_chunks: bool,
     ) -> Result<RemovalRecordList, RemovalRecordListUnpackError> {
         // This function is not allowed to panic as it's run on untrusted
         // input.
@@ -577,7 +578,7 @@ impl RemovalRecordList {
                     tree_heights.push(*tree_height);
                     authentication_structures
                         .push(mmr_authentication_path.authentication_path.clone());
-                    let unpacked_chunk = chunk.try_unpack().map_err(Box::new).map_err(
+                    let unpacked_chunk = chunk.try_unpack(allow_big_chunks).map_err(Box::new).map_err(
                         |e: Box<ChunkUnpackError>| {
                             RemovalRecordListUnpackError::InnerDecodingFailure(e)
                         },
@@ -591,7 +592,7 @@ impl RemovalRecordList {
                         .push(mmr_authentication_path.authentication_path.clone());
                 } else if *tree_height == Self::ENCODING_DELIMITER_IGNORE_TREE_HEIGHT {
                     // ignore tree
-                    let unpacked_chunk = chunk.try_unpack().map_err(Box::new).map_err(
+                    let unpacked_chunk = chunk.try_unpack(allow_big_chunks).map_err(Box::new).map_err(
                         |e: Box<ChunkUnpackError>| {
                             RemovalRecordListUnpackError::InnerDecodingFailure(e)
                         },
@@ -658,9 +659,14 @@ impl RemovalRecordList {
 
     /// Compress a [`Vec`] of [`RemovalRecord`]s densely by packing the same
     /// information into another, *smaller*, [`Vec`] of [`RemovalRecord`]s.
-    pub(crate) fn pack(removal_records: Vec<RemovalRecord>) -> Vec<RemovalRecord> {
+    /// `allow_big_chunks` decides whether a chunk may use the extended length
+    /// indicator; it comes from the consensus rule set in force.
+    pub(crate) fn pack(
+        removal_records: Vec<RemovalRecord>,
+        allow_big_chunks: bool,
+    ) -> Vec<RemovalRecord> {
         let as_rr_list = Self::convert_from_vec(removal_records);
-        as_rr_list.encode_as_vec()
+        as_rr_list.encode_as_vec(allow_big_chunks)
     }
 
     /// Decompress a [`Vec`] of [`RemovalRecord`]s as packed by [`Self::pack`].
@@ -669,8 +675,10 @@ impl RemovalRecordList {
     /// Never panics, so this function is safe to run on untrusted input.
     pub(crate) fn try_unpack(
         removal_records: Vec<RemovalRecord>,
+        allow_big_chunks: bool,
     ) -> Result<Vec<RemovalRecord>, RemovalRecordListUnpackError> {
-        let as_removal_record_list = RemovalRecordList::decode_from_vec(removal_records)?;
+        let as_removal_record_list =
+            RemovalRecordList::decode_from_vec(removal_records, allow_big_chunks)?;
         Ok(as_removal_record_list.convert_to_vec())
     }
 
@@ -906,7 +914,7 @@ impl BFieldCodec for RemovalRecordList {
 
     fn decode(sequence: &[BFieldElement]) -> Result<Box<Self>, Self::Error> {
         Ok(Box::new(
-            Self::decode_from_vec(*Vec::<RemovalRecord>::decode(sequence)?)
+            Self::decode_from_vec(*Vec::<RemovalRecord>::decode(sequence)?, true)
                 .map_err(Box::new)
                 .map_err(|e: Box<RemovalRecordListUnpackError>| {
                     BFieldCodecError::InnerDecodingFailure(e)
@@ -915,7 +923,7 @@ impl BFieldCodec for RemovalRecordList {
     }
 
     fn encode(&self) -> Vec<BFieldElement> {
-        self.encode_as_vec().encode()
+        self.encode_as_vec(true).encode()
     }
 
     fn static_length() -> Option<usize> {
@@ -1290,8 +1298,8 @@ mod tests {
     #[test]
     fn empty_with_implied_aocl_leaf_count() {
         let removal_records = Vec::<RemovalRecord>::default();
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
         assert_eq!(removal_records, unpacked);
     }
 
@@ -1627,7 +1635,7 @@ mod tests {
         let rrl = RemovalRecordList::convert_from_vec(removal_records);
         prop_assert_eq!(
             &rrl,
-            &RemovalRecordList::decode_from_vec(rrl.encode_as_vec()).unwrap()
+            &RemovalRecordList::decode_from_vec(rrl.encode_as_vec(true), true).unwrap()
         );
     }
 
@@ -1641,17 +1649,17 @@ mod tests {
         #[strategy(arb::<usize>())] index_of_change: usize,
     ) {
         let rrl = RemovalRecordList::convert_from_vec(removal_records);
-        let mut received_over_wire = rrl.encode_as_vec();
+        let mut received_over_wire = rrl.encode_as_vec(true);
         let length = received_over_wire.len();
         received_over_wire[index_of_change % length]
             .absolute_indices
             .set_minimum(u128::MAX);
-        let _ = RemovalRecordList::decode_from_vec(received_over_wire.clone()); // no crash
+        let _ = RemovalRecordList::decode_from_vec(received_over_wire.clone(), true); // no crash
 
         received_over_wire[index_of_change % length]
             .absolute_indices
             .set_distance(distance_index_mutated, u32::MAX);
-        let _ = RemovalRecordList::decode_from_vec(received_over_wire); // no crash
+        let _ = RemovalRecordList::decode_from_vec(received_over_wire, true); // no crash
     }
 
     #[proptest]
@@ -1669,7 +1677,7 @@ mod tests {
             let removal_records = vec![removal_record];
             prop_assert_eq!(
                 removal_records.clone(),
-                RemovalRecordList::try_unpack(removal_records).unwrap()
+                RemovalRecordList::try_unpack(removal_records, true).unwrap()
             );
         }
     }
@@ -1768,8 +1776,8 @@ mod tests {
         };
 
         let removal_records = vec![removal_record];
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
         assert_eq!(removal_records, unpacked);
     }
 
@@ -1820,10 +1828,10 @@ mod tests {
     fn more_chunks_than_absolute_index_sets_multiple_steps() {
         let not_packed = vec![more_chunks_than_abs_index_sets()];
         let temp0 = RemovalRecordList::from_removal_records(not_packed.clone(), 17);
-        let packed = temp0.encode_as_vec();
-        let temp1 = RemovalRecordList::decode_from_vec(packed.clone()).unwrap();
+        let packed = temp0.encode_as_vec(true);
+        let temp1 = RemovalRecordList::decode_from_vec(packed.clone(), true).unwrap();
         assert_eq!(temp0, temp1);
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
         assert_eq!(not_packed, unpacked);
     }
 
@@ -1831,8 +1839,8 @@ mod tests {
     #[test]
     fn more_chunks_than_absolute_index_sets_pack() {
         let not_packed = vec![more_chunks_than_abs_index_sets()];
-        let packed = RemovalRecordList::pack(not_packed.clone());
-        assert_eq!(not_packed, RemovalRecordList::try_unpack(packed).unwrap());
+        let packed = RemovalRecordList::pack(not_packed.clone(), true);
+        assert_eq!(not_packed, RemovalRecordList::try_unpack(packed, true).unwrap());
     }
 
     #[proptest]
@@ -1850,7 +1858,7 @@ mod tests {
             let removal_records = vec![removal_record];
             prop_assert_eq!(
                 removal_records.clone(),
-                RemovalRecordList::try_unpack(removal_records).unwrap()
+                RemovalRecordList::try_unpack(removal_records, true).unwrap()
             );
         }
     }
@@ -1870,7 +1878,7 @@ mod tests {
             let removal_records = vec![removal_record.clone(), removal_record];
             prop_assert_eq!(
                 removal_records.clone(),
-                RemovalRecordList::try_unpack(removal_records).unwrap()
+                RemovalRecordList::try_unpack(removal_records, true).unwrap()
             );
         }
     }
@@ -1894,10 +1902,10 @@ mod tests {
         };
 
         let rrs = vec![rr];
-        let packed = RemovalRecordList::pack(rrs.clone());
+        let packed = RemovalRecordList::pack(rrs.clone(), true);
         assert_eq!(
             rrs.clone(),
-            RemovalRecordList::try_unpack(packed)
+            RemovalRecordList::try_unpack(packed, true)
                 .unwrap_or_else(|err| panic!("rrs: {rrs:#?}\n. Error:\n{err}")),
             "rrs: {rrs:#?}\n"
         );
@@ -1910,8 +1918,8 @@ mod tests {
         #[strategy(RemovalRecord::arbitrary_synchronized_set(#_num_leafs_aocl, #_num_records))]
         removal_records: Vec<RemovalRecord>,
     ) {
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
         prop_assert_eq!(removal_records, unpacked);
     }
 
@@ -1923,9 +1931,9 @@ mod tests {
         removal_records: Vec<RemovalRecord>,
     ) {
         let as_list = RemovalRecordList::convert_from_vec(removal_records);
-        let encoded = as_list.encode_as_vec().encode();
+        let encoded = as_list.encode_as_vec(true).encode();
         let decoded =
-            RemovalRecordList::decode_from_vec(*Vec::<RemovalRecord>::decode(&encoded).unwrap())
+            RemovalRecordList::decode_from_vec(*Vec::<RemovalRecord>::decode(&encoded).unwrap(), true)
                 .unwrap();
 
         prop_assert_eq!(as_list, decoded);
@@ -1943,9 +1951,9 @@ mod tests {
                 .current();
 
         let as_list = RemovalRecordList::convert_from_vec(removal_records.clone());
-        let encoded = as_list.encode_as_vec().encode();
+        let encoded = as_list.encode_as_vec(true).encode();
         let decoded =
-            RemovalRecordList::decode_from_vec(*Vec::<RemovalRecord>::decode(&encoded).unwrap())
+            RemovalRecordList::decode_from_vec(*Vec::<RemovalRecord>::decode(&encoded).unwrap(), true)
                 .unwrap();
 
         assert_eq!(as_list, decoded);
@@ -1977,7 +1985,7 @@ mod tests {
             total_size_naive += (encoded_directly.len() as f64) / (num_records as f64);
 
             let as_list = RemovalRecordList::convert_from_vec(removal_records.clone());
-            let list_encoded = as_list.encode_as_vec().encode();
+            let list_encoded = as_list.encode_as_vec(true).encode();
             total_size_smart += (list_encoded.len() as f64) / (num_records as f64);
         }
 
@@ -2026,8 +2034,8 @@ mod tests {
             })
             .collect_vec();
 
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
         assert_eq!(removal_records, unpacked);
     }
 
@@ -2041,8 +2049,8 @@ mod tests {
         msa_and_records: MsaAndRecords,
     ) {
         let removal_records = msa_and_records.unpacked_removal_records();
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2057,8 +2065,8 @@ mod tests {
         msa_and_records: MsaAndRecords,
     ) {
         let removal_records = msa_and_records.unpacked_removal_records();
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2094,8 +2102,8 @@ mod tests {
                     .count()
             );
 
-            let packed = RemovalRecordList::pack(removal_records.clone());
-            let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+            let packed = RemovalRecordList::pack(removal_records.clone(), true);
+            let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
             assert_eq!(removal_records, unpacked);
         }
@@ -2122,8 +2130,8 @@ mod tests {
                 .count()
         );
 
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2151,8 +2159,8 @@ mod tests {
                 .count()
         );
 
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2180,8 +2188,8 @@ mod tests {
                 .count()
         );
 
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2209,8 +2217,8 @@ mod tests {
                 .count()
         );
 
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2225,8 +2233,8 @@ mod tests {
         msa_and_records: MsaAndRecords,
     ) {
         let removal_records = msa_and_records.unpacked_removal_records();
-        let packed = RemovalRecordList::pack(removal_records.clone());
-        let unpacked = RemovalRecordList::try_unpack(packed).unwrap();
+        let packed = RemovalRecordList::pack(removal_records.clone(), true);
+        let unpacked = RemovalRecordList::try_unpack(packed, true).unwrap();
 
         prop_assert_eq!(removal_records, unpacked);
     }
@@ -2249,7 +2257,7 @@ mod tests {
             let removal_records = vec![removal_record];
 
             // Ensure no crash, and that an error is returned.
-            assert!(RemovalRecordList::try_unpack(removal_records).is_err());
+            assert!(RemovalRecordList::try_unpack(removal_records, true).is_err());
         }
 
         #[test]
@@ -2263,7 +2271,7 @@ mod tests {
             };
 
             assert!(matches!(
-                RemovalRecordList::try_unpack(vec![removal_record]),
+                RemovalRecordList::try_unpack(vec![removal_record], true),
                 Err(RemovalRecordListUnpackError::AbsoluteIndexTooBig)
             ));
         }
@@ -2289,7 +2297,7 @@ mod tests {
                 .unwrap()
                 .current();
 
-                let packed = RemovalRecordList::pack(msa_and_records.unpacked_removal_records());
+                let packed = RemovalRecordList::pack(msa_and_records.unpacked_removal_records(), true);
                 let dictionary = &packed[0].target_chunks.dictionary;
                 let Some((i, j)) = (0..dictionary.len())
                     .cartesian_product(0..dictionary.len())
@@ -2314,7 +2322,7 @@ mod tests {
             let mispaired = swapped.expect("must find two structures of differing lengths");
 
             // Per the no-crash contract this must return Err, not panic.
-            let result = RemovalRecordList::try_unpack(mispaired);
+            let result = RemovalRecordList::try_unpack(mispaired, true);
             assert!(
                 matches!(
                     result,
@@ -2341,7 +2349,7 @@ mod tests {
             };
 
             // Per the no-crash contract this must return Err, not panic.
-            let res = RemovalRecordList::try_unpack(vec![removal_record]);
+            let res = RemovalRecordList::try_unpack(vec![removal_record], true);
             assert!(
                 matches!(
                     res,
@@ -2372,7 +2380,7 @@ mod tests {
                     let removal_records = vec![removal_record.clone(); num_rrs];
 
                     // Ensure no crash, and that an error is returned.
-                    assert!(RemovalRecordList::try_unpack(removal_records).is_err());
+                    assert!(RemovalRecordList::try_unpack(removal_records, true).is_err());
                 }
             }
         }
@@ -2420,7 +2428,7 @@ mod tests {
             let removal_records = vec![removal_record.clone(); num_removal_records];
 
             // Ensure no crash
-            let _ = RemovalRecordList::try_unpack(removal_records);
+            let _ = RemovalRecordList::try_unpack(removal_records, true);
         }
 
         #[proptest]
@@ -2435,14 +2443,14 @@ mod tests {
         ) {
             let mut packed = msa_and_records.packed_removal_records();
             prop_assume!(packed[0].target_chunks.len() > insert_index);
-            prop_assert!(RemovalRecordList::try_unpack(packed.clone()).is_ok());
+            prop_assert!(RemovalRecordList::try_unpack(packed.clone(), true).is_ok());
 
             let cloned_entry = packed[0].target_chunks.dictionary[insert_index].clone();
             packed[0]
                 .target_chunks
                 .dictionary
                 .insert(insert_index, cloned_entry);
-            prop_assert!(RemovalRecordList::try_unpack(packed).is_err());
+            prop_assert!(RemovalRecordList::try_unpack(packed, true).is_err());
         }
 
         #[proptest(cases = 40)]
@@ -2456,7 +2464,7 @@ mod tests {
             msa_and_records: MsaAndRecords,
         ) {
             let mut packed = msa_and_records.packed_removal_records();
-            prop_assert!(RemovalRecordList::try_unpack(packed.clone()).is_ok());
+            prop_assert!(RemovalRecordList::try_unpack(packed.clone(), true).is_ok());
             prop_assume!(packed[0].target_chunks.len() > remove_index);
 
             packed[0].target_chunks.dictionary.remove(remove_index);
@@ -2465,7 +2473,7 @@ mod tests {
             // fail since the removing of a chunk might correspond to a valid
             // packed removal record list for a smaller number of AOCL leafs. In
             // that case, though, the later `can_remove` must fail.
-            let res = RemovalRecordList::try_unpack(packed);
+            let res = RemovalRecordList::try_unpack(packed, true);
             if let Ok(unpacked) = res {
                 let mut all_can_be_removed = true;
                 for rr in unpacked {
@@ -2501,7 +2509,7 @@ mod tests {
                 let removal_records = vec![removal_record.clone(); num_removal_records];
 
                 // Ensure no crash
-                let _ = RemovalRecordList::try_unpack(removal_records);
+                let _ = RemovalRecordList::try_unpack(removal_records, true);
             }
         }
 
@@ -2520,7 +2528,7 @@ mod tests {
                 ),
                 target_chunks: ChunkDictionary { dictionary: vec![] },
             };
-            let _ = RemovalRecordList::try_unpack(vec![removal_record]); // no crash
+            let _ = RemovalRecordList::try_unpack(vec![removal_record], true); // no crash
         }
 
         #[test]
@@ -2551,7 +2559,7 @@ mod tests {
                     )],
                 },
             };
-            let _ = RemovalRecordList::try_unpack(vec![removal_record]); // no crash
+            let _ = RemovalRecordList::try_unpack(vec![removal_record], true); // no crash
         }
 
         #[test]
@@ -2569,7 +2577,7 @@ mod tests {
                 ),
                 target_chunks: ChunkDictionary { dictionary: vec![] },
             };
-            let _ = RemovalRecordList::try_unpack(vec![removal_record]); // no crash
+            let _ = RemovalRecordList::try_unpack(vec![removal_record], true); // no crash
         }
 
         #[proptest(cases = 30)]
@@ -2581,7 +2589,7 @@ mod tests {
         ) {
             // Attempt to unpack a list of removal records that are not packed.
             // Ensure no crash.
-            let _ = RemovalRecordList::try_unpack(removal_records); // no crash
+            let _ = RemovalRecordList::try_unpack(removal_records, true); // no crash
         }
 
         #[proptest]

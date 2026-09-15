@@ -2163,7 +2163,7 @@ impl NeptuneRPCServer {
                         .num_leafs()
                         - 1;
                     let num_outputs_in_block: u64 = block
-                        .mutator_set_update()
+                        .mutator_set_update(network)
                         .expect("Block from state must have mutator set update")
                         .additions
                         .len()
