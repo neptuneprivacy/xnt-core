@@ -957,9 +957,7 @@ impl Block {
     /// evaluates the following logic:
     ///  - if the height is different, prefer the block with more accumulated
     ///    proof-of-work;
-    ///  - otherwise, if exactly one of the blocks' transactions has no inputs,
-    ///    reject that one;
-    ///  - otherwise, prefer the current tip.
+    ///  - if the height is the same, prefer the current tip.
     ///
     /// This function assumes the blocks are valid and have the self-declared
     /// accumulated proof-of-work.
@@ -978,15 +976,16 @@ impl Block {
         current_tip: &'a Self,
         incoming_block: &'a Self,
     ) -> &'a Self {
-        if current_tip.header().height != incoming_block.header().height {
-            if current_tip.header().cumulative_proof_of_work
-                >= incoming_block.header().cumulative_proof_of_work
-            {
-                current_tip
-            } else {
-                incoming_block
-            }
-        } else if current_tip.body().transaction_kernel.inputs.is_empty() {
+        let (current, incoming) = (current_tip.header(), incoming_block.header());
+
+        // At equal height, the first-seen block is preferred. Otherwise, prefer
+        // the one with most cumulative proof of work. Preferring the first seen
+        // at equal heights disincentivizes selfish mining, and makes the rule
+        // stable: previously two input-free blocks at equal height each beat the
+        // other, so the tip flickered on every re-delivery. Closes NPT-3.
+        let incoming_wins = current.height != incoming.height
+            && incoming.cumulative_proof_of_work > current.cumulative_proof_of_work;
+        if incoming_wins {
             incoming_block
         } else {
             current_tip

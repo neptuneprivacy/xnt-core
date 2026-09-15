@@ -467,12 +467,26 @@ impl PeerLoopHandler {
         let received_block_matches_fork_reconciliation_list = if let Some(successor) =
             peer_state.fork_reconciliation_blocks.last()
         {
+            let network = self.global_state_lock.cli().network;
+
+            // Check proof-of-work first: it is cheap to check and expensive to
+            // fabricate, whereas `is_valid` runs a recursive STARK verification.
+            // Without this a peer can make us verify proofs for blocks carrying
+            // no work at all.
+            if !successor.has_proof_of_work(network, received_block.header()) {
+                let (height, hash) = (successor.header().height, successor.hash());
+                warn!(
+                    "Fork reconciliation failed after receiving {} blocks: successor of received block has insufficient proof of work",
+                    peer_state.fork_reconciliation_blocks.len() + 1
+                );
+                self.punish(NegativePeerSanction::InvalidBlock((height, hash)))
+                    .await?;
+                peer_state.fork_reconciliation_blocks.clear();
+                return Ok(());
+            }
+
             let valid = successor
-                .is_valid(
-                    received_block.as_ref(),
-                    self.now(),
-                    self.global_state_lock.cli().network,
-                )
+                .is_valid(received_block.as_ref(), self.now(), network)
                 .await;
             if !valid {
                 warn!(

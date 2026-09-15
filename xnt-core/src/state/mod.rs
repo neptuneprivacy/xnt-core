@@ -1909,11 +1909,18 @@ impl GlobalState {
             );
         }
 
+        // Prune by timestamp BEFORE the block update, so that transactions which
+        // are already too old to be mined are dropped rather than being handed to
+        // the updater. Doing it the other way round spends update work, and then
+        // proving work, on transactions that are about to be discarded anyway.
+        let mut mempool_events = self.mempool.prune_stale_transactions();
+
         // Update mempool with UTXOs from this block. This is done by
         // removing all transaction that became invalid/was mined by this
         // block. Also returns the list of update-jobs that should be
         // performed by this client.
-        let (mempool_events, update_jobs) = self.mempool.update_with_block(&new_tip)?;
+        let (update_events, update_jobs) = self.mempool.update_with_block(&new_tip)?;
+        mempool_events.extend(update_events);
 
         let parent_ms_accumulator =
             self.chain

@@ -355,6 +355,14 @@ impl Widget for PeersScreen {
 
         let mut pi = self.data.lock().unwrap();
 
+        // All the column sorts below are stable, so ties in the sorted column
+        // keep whatever order they already had. Establish a deterministic base
+        // order first, and the list then renders identically on every refresh
+        // provided the underlying set is unchanged. Upstream keys this on the
+        // instance id; that accessor is crate-private here, and the connected
+        // address is equally unique per connection.
+        pi.sort_by_key(|p| (p.connection_established(), p.connected_address()));
+
         match self.sort_column {
             PeerSortColumn::Ip => pi.sort_by(|a, b| {
                 self.sort_order
