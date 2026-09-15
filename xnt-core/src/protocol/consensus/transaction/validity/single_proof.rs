@@ -240,6 +240,7 @@ impl SingleProof {
         primitive_witness: &PrimitiveWitness,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Proof, CreateProofError> {
         let proof_collection = ProofCollection::produce(
             primitive_witness,
@@ -248,7 +249,18 @@ impl SingleProof {
         )
         .await?;
         let single_proof_witness = SingleProofWitness::from_collection(proof_collection);
-        let claim = single_proof_witness.claim();
+        // Build the claim through the versioned builder rather than the
+        // witness's default `claim()`, which stamps the LINKED triton-vm's
+        // `CURRENT_VERSION`. Those two agree only while the era being produced
+        // for is the current one; for any other era they disagree, and because
+        // the claim's version is part of the Fiat-Shamir transcript the proof
+        // then answers a different question than the verifier asks. Going
+        // through the same builder the verifier uses makes them agree by
+        // construction. Upstream: d4742c65.
+        let claim = single_proof_claim(
+            primitive_witness.kernel.mast_hash(),
+            consensus_rule_set,
+        );
 
         let nondeterminism = single_proof_witness.nondeterminism();
         info!("Start: generate single proof from proof collection");
@@ -284,7 +296,13 @@ pub(crate) async fn produce_single_proof(
         ConsensusRuleSet::Reboot
         | ConsensusRuleSet::HardforkAlpha
         | ConsensusRuleSet::Xnt => {
-            SingleProof::produce(primitive_witness, triton_vm_job_queue, proof_job_options).await
+            SingleProof::produce(
+                primitive_witness,
+                triton_vm_job_queue,
+                proof_job_options,
+                consensus_rule_set,
+            )
+            .await
         }
         ConsensusRuleSet::TimelockExtension
         | ConsensusRuleSet::UpgradeVM
@@ -293,7 +311,12 @@ pub(crate) async fn produce_single_proof(
         | ConsensusRuleSet::UpgradeVMv7
         | ConsensusRuleSet::UpgradeVMv8 => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
-                ::produce(primitive_witness, triton_vm_job_queue, proof_job_options)
+                ::produce(
+                    primitive_witness,
+                    triton_vm_job_queue,
+                    proof_job_options,
+                    consensus_rule_set,
+                )
                 .await
         }
     }

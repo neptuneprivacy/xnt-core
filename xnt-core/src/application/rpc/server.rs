@@ -5001,11 +5001,11 @@ mod tests {
 
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+                .write_peer_standing(peer_address0.ip(), standing0)
                 .await;
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+                .write_peer_standing(peer_address1.ip(), standing1)
                 .await;
         }
 
@@ -5120,11 +5120,11 @@ mod tests {
 
         state
             .net
-            .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+            .write_peer_standing(peer_address0.ip(), standing0)
             .await;
         state
             .net
-            .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+            .write_peer_standing(peer_address1.ip(), standing1)
             .await;
 
         drop(state);

@@ -7,6 +7,7 @@ pub mod transfer_transaction;
 
 use std::fmt::Display;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use handshake_data::HandshakeData;
@@ -303,9 +304,14 @@ impl Sanction for PeerSanction {
 //
 // The most central methods are [PeerStanding::sanction] and
 // [PeerStanding::is_bad].
+/// How long negative peer standing takes to halve.
+pub const STANDING_HALF_LIFE: Duration = Duration::from_secs(48 * 60 * 60);
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PeerStanding {
-    /// The actual standing. The higher, the better.
+    /// The standing as last recorded. The higher, the better. Negative values
+    /// decay with time; read [`Self::standing_now`] for the value that applies
+    /// now.
     pub standing: i32,
     pub latest_punishment: Option<(NegativePeerSanction, SystemTime)>,
     pub latest_reward: Option<(PositivePeerSanction, SystemTime)>,
@@ -339,6 +345,10 @@ impl PeerStanding {
         &mut self,
         sanction: PeerSanction,
     ) -> Result<(), StandingExceedsBanThreshold> {
+        // Reduce negative standing with time-decay, before applying this
+        // sanction.
+        self.realise_decay();
+
         self.standing = self
             .standing
             .saturating_add(sanction.severity())
@@ -366,12 +376,62 @@ impl PeerStanding {
         self.latest_reward = None;
     }
 
+    /// The number of whole half-lives that have passed since the peer was last
+    /// punished.
+    fn half_lives_since_punishment(&self) -> u32 {
+        let Some((_sanction, punished_at)) = self.latest_punishment else {
+            return 0;
+        };
+
+        // A clock that has moved backwards returns 0 half lives.
+        let Ok(elapsed) = punished_at.elapsed() else {
+            return 0;
+        };
+
+        u32::try_from(elapsed.as_secs() / STANDING_HALF_LIFE.as_secs()).unwrap_or(u32::MAX)
+    }
+
+    /// The standing as it applies now.
+    ///
+    /// Negative standing decays toward zero, halving every
+    /// [`STANDING_HALF_LIFE`], so that a peer sanctioned once is not shut out
+    /// for the lifetime of the database. Positive standing does not decay.
+    pub fn standing_now(&self) -> i32 {
+        if !self.standing.is_negative() {
+            return self.standing;
+        }
+
+        // Arithmetic shift halves toward negative infinity, which errs on the
+        // side of keeping the sanction.
+        match self.half_lives_since_punishment() {
+            0 => self.standing,
+            half_lives if half_lives >= i32::BITS => 0,
+            half_lives => self.standing >> half_lives,
+        }
+    }
+
+    /// Reduce any negative standing with the right number of half lives.
+    fn realise_decay(&mut self) {
+        let half_lives = self.half_lives_since_punishment();
+        if half_lives == 0 {
+            return;
+        }
+
+        self.standing = self.standing_now();
+        if let Some((sanction, punished_at)) = self.latest_punishment {
+            let consumed = STANDING_HALF_LIFE.saturating_mul(half_lives);
+            self.latest_punishment = punished_at
+                .checked_add(consumed)
+                .map(|advanced| (sanction, advanced));
+        }
+    }
+
     pub fn is_negative(&self) -> bool {
-        self.standing.is_negative()
+        self.standing_now().is_negative()
     }
 
     pub(crate) fn is_bad(&self) -> bool {
-        self.standing <= -self.peer_tolerance
+        self.standing_now() <= -self.peer_tolerance
     }
 
     pub(crate) fn is_good(&self) -> bool {
@@ -381,7 +441,7 @@ impl PeerStanding {
 
 impl Display for PeerStanding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.standing)
+        write!(f, "{}", self.standing_now())
     }
 }
 
