@@ -93,7 +93,7 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
 ///
 /// Mainnet v8 activation height.
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(85_000u64));
+    BlockHeight::new(BFieldElement::new(95_000u64));
 
 /// Enumerates all possible sets of consensus rules.
 ///
