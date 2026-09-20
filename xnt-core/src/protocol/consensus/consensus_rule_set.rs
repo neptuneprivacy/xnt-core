@@ -348,6 +348,35 @@ impl ConsensusRuleSet {
         }
     }
 
+    /// Whether this era uses the `HardforkAlpha` proof-of-work layout: the
+    /// guesser's commitment prefix is the parent block digest rather than the
+    /// full PoW MAST authentication paths, and leaf indices are bit-reversed
+    /// (the guesser swaps leaves once in preprocessing, the verifier reverses
+    /// the picked indices). Every other era commits to the MAST paths and
+    /// indexes leaves directly.
+    ///
+    /// The guesser and the verifier MUST agree on this for every era, so both
+    /// consult this one predicate. It used to be four hand-maintained lists of
+    /// variants in `pow.rs`; when `UpgradeVMv8` was added, three were updated
+    /// and the fourth, a negated `!=` chain the compiler cannot check, was not.
+    /// The guesser then preprocessed v8 under the Alpha layout while the
+    /// verifier checked it under the direct layout, and every block the node
+    /// mined was rejected by its own `has_proof_of_work`. This match is
+    /// exhaustive on purpose.
+    pub(crate) fn pow_index_bit_reversal(&self) -> bool {
+        match self {
+            ConsensusRuleSet::HardforkAlpha => true,
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => false,
+        }
+    }
+
     pub(crate) fn max_num_inputs(&self) -> usize {
         match self {
             ConsensusRuleSet::Reboot
