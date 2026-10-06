@@ -130,6 +130,11 @@ axum-extra = { version = "0.10.0", features = ["erased-json", "typed-header"], o
 tower-http = { version = "0.6.2", features = ["cors", "trace"], optional = true }
 dctidh512 = { git = "https://github.com/neptuneprivacy/dCTIDH-512sp.git", rev = "d7bd1de39ff9f0e192d601dcf3ffe1b8e25cbffa", package = "ctidh512" }
 
+# Global allocator of the node and prover binaries; see `src/global_allocator.rs`
+# for why it is not triton-vm's own `jemalloc` feature.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+tikv-jemallocator = "0.7"
+
 [dev-dependencies]
 
 # note: arbitrary, proptest, proptest-arbitrary-interop are duplicated in [dev-dependencies]
