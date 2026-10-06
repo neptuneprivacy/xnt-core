@@ -156,7 +156,8 @@ impl TransactionProof {
                 | ConsensusRuleSet::UpgradeVM
                 | ConsensusRuleSet::UpgradeVMv4
                 | ConsensusRuleSet::UpgradeVMv5
-                | ConsensusRuleSet::UpgradeVMv7 => {
+                | ConsensusRuleSet::UpgradeVMv7
+                | ConsensusRuleSet::UpgradeVMv8 => {
                     proof_collection.verify_v2(kernel_mast_hash, network).await
                 }
             },

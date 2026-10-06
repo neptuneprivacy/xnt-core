@@ -15,6 +15,7 @@ use crate::api::export::GlobalStateLock;
 use crate::api::export::NativeCurrencyAmount;
 use crate::api::export::NeptuneProof;
 use crate::api::export::Network;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::api::export::ReceivingAddress;
 use crate::api::export::Timestamp;
 use crate::api::export::Transaction;
@@ -147,7 +148,10 @@ pub async fn next_block_incoming_utxos(
     );
 
     let kernel = PrimitiveWitness::from_transaction_details(&tx_details).kernel;
-    let packed = RemovalRecordList::pack(kernel.inputs.clone());
+    let consensus_rule_set =
+        ConsensusRuleSet::infer_from(network, parent.header().height.next());
+    let packed =
+        RemovalRecordList::pack(kernel.inputs.clone(), consensus_rule_set.allow_big_chunks());
     let kernel = TransactionKernelModifier::default()
         .merge_bit(true)
         .inputs(packed)

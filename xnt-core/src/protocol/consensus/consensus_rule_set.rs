@@ -65,6 +65,36 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V5_MAIN_NET: BlockHeight =
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
     BlockHeight::new(BFieldElement::new(59200u64));
 
+/// Height of the 1st block that follows the `UpgradeVMv8` consensus ruleset on
+/// mainnet. UpgradeVMv8 is the triton-vm v8 upgrade.
+///
+/// v8 is a security release, not a feature release. It makes the Hash Table and
+/// Program Table AIR sound, closing findings NPT-1 and NPT-20: before it, the
+/// initial sponge capacity was prover-chosen and Program Table padding could
+/// begin mid-chunk, which together made program attestation forgeable. It also
+/// randomizes the quotient table, giving Triton VM an explicit zero-knowledge
+/// proof for the first time, and adds four guards against panics on malformed
+/// proofs.
+///
+/// The constraint system changes, so the proof format version jumps 5 -> 8 and
+/// every proof program re-hashes. The v8 verifier cannot re-check v7 proofs, so
+/// pre-v8 history is checkpointed via the hardcoded v7 program digests.
+///
+/// The leaf type scripts are byte-identical across v7 and v8 — verified by the
+/// `program_hash_has_not_changed` snapshots for `NativeCurrency`, `TimeLock`,
+/// `TimeLockV2` and `CollectTypeScripts(V2)`, all unchanged — so existing coins
+/// need no remap and remain spendable directly. Only `SingleProof`,
+/// `SingleProofV2` and `BlockProgram`, which embed the STARK verifier, re-hash.
+///
+/// ROLLOUT: a binary linking triton-vm v8 cannot extend the v7 chain, because a
+/// v7-era claim names the hardcoded v7 program digest and no v8 bytecode
+/// reproduces it. This height is therefore the cut-over point, not a date after
+/// which the binary may be shipped: nodes must move together at it.
+///
+/// Mainnet v8 activation height.
+pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET: BlockHeight =
+    BlockHeight::new(BFieldElement::new(95_000u64));
+
 /// Enumerates all possible sets of consensus rules.
 ///
 /// Specifically, this enum captures *differences* between consensus rules,
@@ -133,6 +163,21 @@ pub enum ConsensusRuleSet {
     /// recomputed v7 proof-program digests. Because the type scripts did not
     /// change, coins from every prior era remain spendable with no remap.
     UpgradeVMv7,
+    /// The triton-vm v8 upgrade hard fork.
+    ///
+    /// Activated at [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET`] on Main.
+    /// Unlike the preceding VM bumps, this one is a security release. v8 makes
+    /// the Hash Table and Program Table AIR sound, closing the forgeable
+    /// program-attestation findings NPT-1 and NPT-20, and randomizes the
+    /// quotient table so the proof system has an explicit zero-knowledge proof.
+    ///
+    /// The constraint system changes, so the proof FORMAT version jumps 5 -> 8
+    /// and the proof programs that embed the STARK verifier (`SingleProof`,
+    /// `SingleProofV2`, `BlockProgram`) re-hash. The current binary links
+    /// triton-vm v8, so pre-v8 history is checkpointed via the hardcoded v7
+    /// program digests rather than re-verified. UpgradeVMv8 blocks use the
+    /// recomputed v8 proof-program digests.
+    UpgradeVMv8,
 }
 
 /// The triton-vm crate major a rule set's proofs were produced under. The
@@ -154,6 +199,14 @@ pub enum TritonProofVersion {
     /// triton-vm v7.0.0 (proof format version 5; same format as v5, different
     /// tasm-lib bytecode) — UpgradeVMv7.
     V7,
+    /// triton-vm v8.0.0 (proof format version 8) — UpgradeVMv8.
+    ///
+    /// v8 makes the Hash Table and Program Table AIR sound, closing the
+    /// forgeable-program-attestation findings NPT-1 and NPT-20, and randomizes
+    /// the quotient table so the proof system has an explicit zero-knowledge
+    /// proof. Both change the constraint system, so the proof format version
+    /// jumps 5 -> 8 and every proof program re-hashes.
+    V8,
 }
 
 impl TritonProofVersion {
@@ -169,12 +222,17 @@ impl TritonProofVersion {
             // v5 is frozen at proof format version 5 (the value the linked
             // triton-vm v5 stamped while v5 was the current era).
             TritonProofVersion::V5 => 5,
-            // v7 is the CURRENT era: its claim version must match the version the
-            // linked triton-vm v7 actually stamps into proofs, so track the live
+            // v7 is FROZEN at proof format version 5. triton-vm v7 kept v5's
+            // proof format, and 5 is the value stamped into every v7-era proof
+            // already on chain. This must not track the live constant any more:
+            // the linked triton-vm is now v8, whose `CURRENT_VERSION` is 8, so
+            // tracking it would silently re-version every historical v7 claim.
+            TritonProofVersion::V7 => 5,
+            // v8 is the CURRENT era: its claim version must match the version the
+            // linked triton-vm actually stamps into proofs, so track the live
             // constant rather than a literal (keeps `BlockProgram::claim` in sync
-            // with the live `SingleProofV2`/`BlockProgram` provers). triton-vm v7
-            // keeps the v5 proof format, so this is currently also 5.
-            TritonProofVersion::V7 => tasm_lib::triton_vm::proof::CURRENT_VERSION,
+            // with the live `SingleProofV2`/`BlockProgram` provers).
+            TritonProofVersion::V8 => tasm_lib::triton_vm::proof::CURRENT_VERSION,
         }
     }
 }
@@ -189,6 +247,7 @@ impl ConsensusRuleSet {
             ConsensusRuleSet::UpgradeVMv4 => TritonProofVersion::V4,
             ConsensusRuleSet::UpgradeVMv5 => TritonProofVersion::V5,
             ConsensusRuleSet::UpgradeVMv7 => TritonProofVersion::V7,
+            ConsensusRuleSet::UpgradeVMv8 => TritonProofVersion::V8,
         }
     }
 
@@ -208,7 +267,7 @@ impl ConsensusRuleSet {
     /// Triton VM … with checkpoint"): the superseded history is trusted instead of
     /// relying on cross-crate-major proof re-verification.
     pub(crate) fn proofs_are_trusted(&self) -> bool {
-        !matches!(self, ConsensusRuleSet::UpgradeVMv7)
+        !matches!(self, ConsensusRuleSet::UpgradeVMv8)
     }
 
     /// Maximum block size in number of BFieldElements
@@ -221,7 +280,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv7 => {
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => {
                 // This size is 8MB which should keep it feasible to run archival nodes for
                 // many years without requiring excessive disk space.
                 1_000_000
@@ -251,13 +311,69 @@ impl ConsensusRuleSet {
                     ConsensusRuleSet::UpgradeVMv4
                 } else if block_height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET {
                     ConsensusRuleSet::UpgradeVMv5
-                } else {
+                } else if block_height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET {
                     ConsensusRuleSet::UpgradeVMv7
+                } else {
+                    ConsensusRuleSet::UpgradeVMv8
                 }
             }
             Network::TestnetMock | Network::RegTest | Network::Testnet(_) => {
-                ConsensusRuleSet::UpgradeVMv7
+                ConsensusRuleSet::UpgradeVMv8
             }
+        }
+    }
+
+    /// Whether a packed chunk may use the extended length indicator.
+    ///
+    /// Before `UpgradeVMv8` the indicator is a single `u12`, which caps a chunk
+    /// at 4095 relative indices. An attacker who controls sender randomness can
+    /// grind more indices than that into a single chunk; the old scheme cannot
+    /// express the result, so packing it panics on the block-processing path.
+    /// v8 widens the indicator to 23 bits, lifting the cap to 92160.
+    ///
+    /// This is gated rather than applied unconditionally: accepting the extended
+    /// form before activation would let an attacker pick the moment of a chain
+    /// split, since an upgraded node would accept blocks its peers reject.
+    pub(crate) fn allow_big_chunks(&self) -> bool {
+        match self {
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv7 => false,
+            ConsensusRuleSet::UpgradeVMv8 => true,
+        }
+    }
+
+    /// Whether this era uses the `HardforkAlpha` proof-of-work layout: the
+    /// guesser's commitment prefix is the parent block digest rather than the
+    /// full PoW MAST authentication paths, and leaf indices are bit-reversed
+    /// (the guesser swaps leaves once in preprocessing, the verifier reverses
+    /// the picked indices). Every other era commits to the MAST paths and
+    /// indexes leaves directly.
+    ///
+    /// The guesser and the verifier MUST agree on this for every era, so both
+    /// consult this one predicate. It used to be four hand-maintained lists of
+    /// variants in `pow.rs`; when `UpgradeVMv8` was added, three were updated
+    /// and the fourth, a negated `!=` chain the compiler cannot check, was not.
+    /// The guesser then preprocessed v8 under the Alpha layout while the
+    /// verifier checked it under the direct layout, and every block the node
+    /// mined was rejected by its own `has_proof_of_work`. This match is
+    /// exhaustive on purpose.
+    pub(crate) fn pow_index_bit_reversal(&self) -> bool {
+        match self {
+            ConsensusRuleSet::HardforkAlpha => true,
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => false,
         }
     }
 
@@ -270,7 +386,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv7 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
     pub(crate) fn max_num_outputs(&self) -> usize {
@@ -282,7 +399,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv7 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
     pub(crate) fn max_num_announcements(&self) -> usize {
@@ -294,7 +412,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv7 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
 
@@ -579,10 +698,17 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    // v7 block-production readiness: build a chain at the v7 fork height (59200)
-    // and mine the first post-fork blocks (59201, 59202) under UpgradeVMv7, to
-    // confirm v7 nodes can actually compose+prove+validate blocks across the fork.
+    // v8 block-production readiness: build a chain at the v8 fork height and mine
+    // the first two post-fork blocks under UpgradeVMv8, to confirm v8 nodes can
+    // actually compose+prove+validate blocks across the fork.
     // (No `#[traced_test]`: keeps the output to the readable step logs below.)
+    //
+    // NOTE: this must always target the CURRENT era's fork height. A binary that
+    // links triton-vm v8 can only produce v8-era blocks: a v7-era claim names the
+    // hardcoded v7 program digest, which no v8 bytecode reproduces. That is also
+    // the operational constraint on the rollout -- a v8 binary cannot extend the
+    // v7 chain, so the activation height is the cut-over point, not a date after
+    // which the binary may be shipped.
     #[test]
     fn new_blocks_at_upgrade_vm_height() {
         // We want to use the following block primitive witness generator (which
@@ -592,13 +718,13 @@ pub(crate) mod tests {
         // witness once, in this synchronous wrapper, and continue
         // asynchronously with the helper function.
 
-        // Build on top of a chain at the UpgradeVMv7 fork height. Producing new
-        // blocks only works under the current (v7) rule set: pre-v7 history is
+        // Build on top of a chain at the UpgradeVMv8 fork height. Producing new
+        // blocks only works under the current (v8) rule set: pre-v8 history is
         // verifiable via hardcoded per-era program digests but cannot be
-        // *extended*, since those claims reference digests that no v7 bytecode
+        // *extended*, since those claims reference digests that no v8 bytecode
         // reproduces.
         use crate::protocol::consensus::block::difficulty_control::Difficulty;
-        let init_block_heigth = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET;
+        let init_block_heigth = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
         // MINIMUM difficulty so PoW guessing for the mined blocks is instant; the
         // STARK proving cost is unchanged (independent of difficulty).
         let bpw = BlockPrimitiveWitness::deterministic_with_block_height_and_difficulty(
@@ -632,16 +758,16 @@ pub(crate) mod tests {
 
         let observed_block_height = bob.lock_guard().await.chain.light_state().header().height;
         assert_eq!(
-            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET,
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET,
             observed_block_height,
         );
 
-        // 2. mine the first 2 post-fork blocks (59201, 59202) under UpgradeVMv7,
-        //    confirming each is BOTH consensus-valid AND proof-of-work mineable.
+        // 2. mine the first 2 post-fork blocks under UpgradeVMv8, confirming each
+        //    is BOTH consensus-valid AND proof-of-work mineable.
         use crate::protocol::consensus::block::pow::Pow;
         use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
         eprintln!(
-            "\n=== UpgradeVMv7 mining readiness: chain synced to fork height {observed_block_height} ==="
+            "\n=== UpgradeVMv8 mining readiness: chain synced to fork height {observed_block_height} ==="
         );
         let blocks_to_mine = 2;
         let mut predecessor = block_10_000;
@@ -653,10 +779,10 @@ pub(crate) mod tests {
             );
             let (next_block, expected_composer_utxos) = mine_to_own_wallet(bob.clone(), now).await;
 
-            // a) consensus validity: every block/tx proof verifies under UpgradeVMv7.
+            // a) consensus validity: every block/tx proof verifies under UpgradeVMv8.
             assert!(
                 next_block.is_valid(&predecessor, now, network).await,
-                "height {next_height}: block must be consensus-valid under UpgradeVMv7",
+                "height {next_height}: block must be consensus-valid under UpgradeVMv8",
             );
             eprintln!("[mine {i}/{blocks_to_mine}] height {next_height}: consensus-valid [OK] (all proofs verify)");
 
@@ -796,7 +922,7 @@ pub(crate) mod tests {
     #[test]
     fn timelock_extension_never_activates_off_mainnet() {
         // The fork is mainnet-only. Off-mainnet networks (Testnet, RegTest,
-        // TestnetMock) run the newest ruleset (UpgradeVMv7) from genesis, so they
+        // TestnetMock) run the newest ruleset (UpgradeVMv8) from genesis, so they
         // never pass through the TimelockExtension ruleset regardless of height.
         let high = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET;
         for nw in [
@@ -807,7 +933,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 ConsensusRuleSet::infer_from(nw, high),
-                ConsensusRuleSet::UpgradeVMv7,
+                ConsensusRuleSet::UpgradeVMv8,
                 "{nw:?} must never activate TimelockExtension"
             );
         }
@@ -859,6 +985,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn upgrade_vm_v8_active_on_main_at_activation_height() {
+        // At exactly the v8 activation height, mainnet switches to UpgradeVMv8;
+        // one block below it, mainnet is still on UpgradeVMv7 (checkpointed).
+        let activation = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
+        assert_eq!(
+            ConsensusRuleSet::infer_from(Network::Main, activation),
+            ConsensusRuleSet::UpgradeVMv8,
+            "UpgradeVMv8 must activate at exactly its mainnet activation height"
+        );
+        assert_eq!(
+            ConsensusRuleSet::infer_from(Network::Main, activation.previous().unwrap()),
+            ConsensusRuleSet::UpgradeVMv7,
+            "the block below the v8 height must still be UpgradeVMv7"
+        );
+    }
+
+    #[test]
     fn upgrade_vm_v7_active_on_main_at_activation_height() {
         // At exactly the v7 activation height, mainnet switches to UpgradeVMv7;
         // one block below it, mainnet is still on UpgradeVMv5 (v5 verifier).
@@ -877,22 +1020,24 @@ pub(crate) mod tests {
 
 
     #[test]
-    fn current_v7_program_hashes_are_stable() {
+    fn current_v8_program_hashes_are_stable() {
         // Drift-detection for the CURRENT (UpgradeVMv7 / triton-vm v7) program
         // hashes. If any of these change accidentally, the activation height
         // would refer to a different program-set and the fork would become
         // incompatible.
         //
-        // NOTE: the v5 -> v7 change (tasm-lib u128 operand range-check) re-hashed
-        // only the proof programs that embed those snippets. `TimeLockV2` and
-        // `CollectTypeScriptsV2` are byte-identical to v5 (their digests did NOT
-        // change); only `SingleProofV2` (and `BlockProgram`) moved v5 -> v7.
+        // NOTE: the v7 -> v8 change (triton-vm v8: sound Hash/Program Table AIR,
+        // randomized quotient table) re-hashed only the proof programs that embed
+        // the STARK verifier. `TimeLockV2` and `CollectTypeScriptsV2` are
+        // byte-identical to v5 and v7 (their digests did NOT change), so coins
+        // from every prior era stay spendable with no remap; only `SingleProofV2`
+        // (and `SingleProof` and `BlockProgram`) moved v7 -> v8.
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
         use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
         use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
         use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 
-        // Unchanged across v5 -> v7.
+        // Unchanged across v5 -> v7 -> v8.
         let timelock_v2 = TimeLockV2.hash().to_hex();
         assert_eq!(
             timelock_v2,
@@ -907,11 +1052,11 @@ pub(crate) mod tests {
             "CollectTypeScriptsV2 program hash drifted"
         );
 
-        // Re-hashed v5 (e66985a8…) -> v7.
+        // Re-hashed v5 (e66985a8…) -> v7 (5c75cc2d…) -> v8.
         let sp_v2 = SingleProofV2.hash().to_hex();
         assert_eq!(
             sp_v2,
-            "5c75cc2d808464503cccf3bf2467ff13bd3fc736d06aa4f661415852549900e04eb667ddd9792d76",
+            "307f41ff80f6f7af27a6382ae91cf0d54f9464c0cda525652c1e5285c0ab0044374a488c3d7dc75e",
             "SingleProofV2 program hash drifted"
         );
     }

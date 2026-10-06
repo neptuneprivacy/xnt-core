@@ -184,19 +184,17 @@ impl NetworkingState {
     // Storing IP addresses is, according to this answer, not a violation of GDPR:
     // https://law.stackexchange.com/a/28609/45846
     // Wayback machine: https://web.archive.org/web/20220708143841/https://law.stackexchange.com/questions/28603/how-to-satisfy-gdprs-consent-requirement-for-ip-logging/28609
-    pub async fn write_peer_standing_on_decrease(
-        &mut self,
-        ip: IpAddr,
-        current_standing: PeerStanding,
-    ) {
-        let old_standing = self.peer_databases.peer_standings.get(ip).await;
-
-        if old_standing.is_none() || old_standing.unwrap().standing > current_standing.standing {
-            self.peer_databases
-                .peer_standings
-                .put(ip, current_standing)
-                .await
-        }
+    /// Persist a peer's standing.
+    ///
+    /// Writes unconditionally. Previously only decreases were stored, which
+    /// meant a peer could never work its way back out of a bad standing, and
+    /// the time-decay applied by [`PeerStanding::standing_now`] was never
+    /// written back either.
+    pub async fn write_peer_standing(&mut self, ip: IpAddr, current_standing: PeerStanding) {
+        self.peer_databases
+            .peer_standings
+            .put(ip, current_standing)
+            .await
     }
 
     /// Register the disconnection time of a peer.

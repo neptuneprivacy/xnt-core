@@ -947,9 +947,10 @@ mod tests {
                 .collect_vec();
             assert_eq!(
                 just_removal_records.clone(),
-                RemovalRecordList::try_unpack(RemovalRecordList::pack(
-                    just_removal_records.clone(),
-                ),)
+                RemovalRecordList::try_unpack(
+                    RemovalRecordList::pack(just_removal_records.clone(), true),
+                    true,
+                )
                 .unwrap_or_else(|err| panic!(
                     "i: {i};\n\n just_removal_records: {just_removal_records:#?}\n. Error:\n{err}"
                 )),
@@ -993,7 +994,10 @@ mod tests {
                 .collect_vec();
             assert_eq!(
                 just_removal_records.clone(),
-                RemovalRecordList::try_unpack(RemovalRecordList::pack(just_removal_records),)
+                RemovalRecordList::try_unpack(
+                    RemovalRecordList::pack(just_removal_records, true),
+                    true,
+                )
                     .unwrap()
             );
         }

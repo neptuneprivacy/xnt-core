@@ -51,9 +51,14 @@ enum SuperfluousProofItems {
 /// parameters exist for that padded height.
 fn expected_num_proof_items(stark: Stark, proof: &VmProof) -> Option<usize> {
     /// Items read outside of FRI: the padded height, three Merkle roots, four
-    /// out-of-domain rows, the out-of-domain quotient segments, and, for each of
+    /// out-of-domain rows, two out-of-domain quotient segments, and, for each of
     /// the three tables, the revealed rows plus their authentication structure.
-    const NUM_ITEMS_OUTSIDE_FRI: usize = 15;
+    ///
+    /// NOTE: this was 15 through triton-vm v7. Triton VM v8 randomizes the
+    /// quotient table, so the quotient segments are communicated as two items
+    /// rather than one. Bumping the linked triton-vm without bumping this
+    /// constant makes `has_expected_num_proof_items` reject every honest proof.
+    const NUM_ITEMS_OUTSIDE_FRI: usize = 16;
 
     /// Items read by FRI independently of the number of rounds: the Merkle root
     /// of the first round, the last round's codeword and polynomial, and the
@@ -77,10 +82,12 @@ fn expected_num_proof_items(stark: Stark, proof: &VmProof) -> Option<usize> {
 /// Determine whether the proof holds exactly those proof items that Triton VM's
 /// verifier reads, and no others.
 ///
-/// Triton VM's native verifier ignores any items beyond the ones it reads,
-/// whereas the verifier running *inside* the VM rejects them. A transaction
-/// carrying such a proof would therefore be relayed by every node but could
-/// never be merged into a block transaction.
+/// Through triton-vm v7 the native verifier ignored any items beyond the ones it
+/// reads, whereas the verifier running *inside* the VM rejected them, so a
+/// transaction carrying such a proof would be relayed by every node yet could
+/// never be merged into a block transaction. triton-vm v8 rejects them natively
+/// as well, so this is now defence in depth; it still earns its place by keeping
+/// such proofs out of the mempool before the prover is ever invoked.
 fn has_expected_num_proof_items(proof: &VmProof) -> bool {
     let Some(expected_num_items) = expected_num_proof_items(Stark::default(), proof) else {
         return false;
@@ -106,10 +113,9 @@ pub(crate) async fn verify(claim: Claim, proof: Proof, network: Network) -> bool
 /// Verify a Triton VM (claim, proof) pair belonging to a transaction.
 ///
 /// Behaves like [`verify`], except that proofs holding more proof items than
-/// the verifier reads are rejected. Such proofs are accepted by Triton VM's
-/// native verifier but rejected by the verifier running inside the VM, so a
-/// transaction backed by one could be relayed but never confirmed. Rejecting
-/// them here keeps them out of the mempool; see `has_expected_num_proof_items`.
+/// the verifier reads are rejected up front. Since triton-vm v8 the native
+/// verifier rejects them too, so this is defence in depth; it still keeps such
+/// proofs out of the mempool cheaply. See `has_expected_num_proof_items`.
 pub(crate) async fn verify_transaction_proof(claim: Claim, proof: Proof, network: Network) -> bool {
     verify_inner(claim, proof, network, SuperfluousProofItems::Reject).await
 }
@@ -247,13 +253,16 @@ pub(crate) mod tests {
             "proof with a trailing proof item must be detected"
         );
 
-        // The divergence this check compensates for: Triton VM's native
-        // verifier accepts the padded proof, while the verifier running inside
-        // the VM rejects it. Should this assertion ever fail, Triton VM itself
-        // rejects superfluous proof items and the check above is redundant.
+        // Through triton-vm v7 the native verifier ACCEPTED the padded proof
+        // while the verifier running inside the VM rejected it, and
+        // `has_expected_num_proof_items` existed to close that divergence.
+        // triton-vm v8 fixed it at the source ("Reject proofs with superfluous
+        // items"), so the native verifier now rejects it too and the check above
+        // is defence in depth rather than the only line of defence. Keep both:
+        // the in-tree check also keeps such proofs out of the mempool.
         assert!(
-            triton_vm::verify(Stark::default(), &claim, &appended_proof),
-            "native verifier is expected to accept a proof with trailing items"
+            !triton_vm::verify(Stark::default(), &claim, &appended_proof),
+            "since triton-vm v8 the native verifier must reject trailing items"
         );
     }
 
@@ -274,9 +283,12 @@ pub(crate) mod tests {
             !verify_transaction_proof(claim.clone(), appended_proof.clone(), network).await,
             "transaction proof with trailing proof item must be rejected"
         );
+        // Block proofs are still exempt from the in-tree item-count check, but
+        // since triton-vm v8 the native verifier rejects superfluous items, so a
+        // padded block proof no longer verifies either.
         assert!(
-            verify(claim, appended_proof, network).await,
-            "block proofs are exempt from the proof item count check, for now"
+            !verify(claim, appended_proof, network).await,
+            "since triton-vm v8 a block proof with a trailing item must be rejected"
         );
     }
 

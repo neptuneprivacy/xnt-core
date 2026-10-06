@@ -1440,7 +1440,7 @@ impl WalletState {
             additions: addition_records,
             removals: removal_records,
         } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
         let mut removal_records = removal_records;
         removal_records.reverse();
@@ -1651,7 +1651,7 @@ impl WalletState {
         let mut recovery_data = vec![];
 
         let MutatorSetUpdate { additions, .. } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
 
         for addition_record in additions {
@@ -1745,7 +1745,7 @@ impl WalletState {
         let outputs_recovered_through_scan_mode = self.recover_by_scanning(block).await;
 
         let MutatorSetUpdate { additions, .. } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
 
         let offchain_received_outputs = self.scan_for_expected_utxos(&additions).await;
@@ -5352,7 +5352,7 @@ pub(crate) mod tests {
                 single_proof_transaction.kernel,
                 single_proof_transaction.proof.into_single_proof(),
                 genesis_mutator_set,
-                block_one.mutator_set_update().unwrap(),
+                block_one.mutator_set_update(network).unwrap(),
                 upgrade_incentive,
                 consensus_rule_set,
             ));

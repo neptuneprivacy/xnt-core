@@ -248,7 +248,7 @@ mod tests {
                                 block_mmr_accumulator,
                             )| {
                                 let inputs =
-                                    RemovalRecordList::pack(transaction_kernel.inputs.clone());
+                                    RemovalRecordList::pack(transaction_kernel.inputs.clone(), true);
                                 let transaction_kernel = TransactionKernelModifier::default()
                                     .inputs(inputs)
                                     .modify(transaction_kernel);
