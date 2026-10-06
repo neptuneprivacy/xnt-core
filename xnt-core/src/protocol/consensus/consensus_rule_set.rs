@@ -854,13 +854,13 @@ pub(crate) mod tests {
 
         let hopefully_plus_5 = bob.lock_guard().await.chain.light_state().header().height;
         assert_eq!(
-            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET + 2,
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET + 2,
             hopefully_plus_5
         );
         // The COMPOSER reward landed in the wallet and must be UNLOCKED: it shows
         // up as confirmed, spendable balance. `spendable_inputs` only counts
         // immediately-spendable (non-time-locked) UTXOs, so a positive count here
-        // proves the composer earned liquid coins under v7.
+        // proves the composer earned liquid coins under v8.
         let composer_available = bob.api().wallet().balances(now).await.confirmed_available;
         let spendable_inputs = bob.api().wallet().spendable_inputs(now, 0).await;
         assert!(
@@ -892,7 +892,7 @@ pub(crate) mod tests {
             predecessor = next_block;
             eprintln!("[outputs {j}/{num_blocks_with_many_outputs}] height {next_height}: valid + applied [OK]");
         }
-        eprintln!("\n=== TEST PASSED: v7 blocks are composable, provable, valid, and mineable ===\n");
+        eprintln!("\n=== TEST PASSED: v8 blocks are composable, provable, valid, and mineable ===\n");
     }
 
     #[test]
