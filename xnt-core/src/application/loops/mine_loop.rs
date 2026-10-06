@@ -13,7 +13,7 @@ use num_traits::CheckedSub;
 use num_traits::Zero;
 use primitive_witness::PrimitiveWitness;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPoolBuilder;
@@ -66,7 +66,8 @@ use crate::COMPOSITION_FAILED_EXIT_CODE;
 pub(crate) struct GuessingConfiguration {
     pub(crate) num_guesser_threads: Option<usize>,
     pub(crate) address: ReceivingAddress,
-    pub(crate) override_rng: Option<StdRng>,
+    /// Seeds every guesser thread's RNG identically, for deterministic tests.
+    pub(crate) override_rng_seed: Option<u64>,
     pub(crate) override_timestamp: Option<Timestamp>,
 }
 
@@ -179,7 +180,7 @@ fn guess_worker(
     let GuessingConfiguration {
         num_guesser_threads,
         address: guesser_address,
-        override_rng: rng,
+        override_rng_seed: rng_seed,
         override_timestamp: now,
     } = guessing_configuration;
 
@@ -259,7 +260,7 @@ fn guess_worker(
     let guess_result = pool.install(|| {
         rayon::iter::repeat(0)
             .map_init(
-                || rng.clone().unwrap_or(std_rng_from_thread_rng()),
+                || rng_seed.map_or_else(std_rng_from_thread_rng, StdRng::seed_from_u64),
                 |rng, _i| {
                     guess_nonce_iteration(
                         &guesser_buffer,
@@ -771,7 +772,7 @@ pub(crate) async fn mine(
                 GuessingConfiguration {
                     num_guesser_threads: cli_args.guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
             );
@@ -1015,7 +1016,7 @@ pub(crate) mod tests {
     use num_traits::One;
     use num_traits::Pow;
     use num_traits::Zero;
-    use rand::RngCore;
+    use rand::Rng;
     use tracing_test::traced_test;
 
     use super::*;
@@ -1637,7 +1638,7 @@ pub(crate) mod tests {
             GuessingConfiguration {
                 num_guesser_threads,
                 address: guesser_key.to_address().into(),
-                override_rng: None,
+                override_rng_seed: None,
                 override_timestamp: None,
             },
             None,
@@ -1721,7 +1722,7 @@ pub(crate) mod tests {
             GuessingConfiguration {
                 num_guesser_threads,
                 address: guesser_key.to_address().into(),
-                override_rng: None,
+                override_rng_seed: None,
                 override_timestamp: None,
             },
             None,
@@ -1873,7 +1874,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
                 Some(target_block_interval),
@@ -2542,7 +2543,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: Some(block_time),
                 },
                 None,

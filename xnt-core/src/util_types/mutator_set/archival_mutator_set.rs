@@ -640,7 +640,7 @@ mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
 
     use super::*;

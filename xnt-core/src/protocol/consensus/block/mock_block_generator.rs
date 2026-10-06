@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 
 use super::block_transaction::BlockOrRegularTransaction;

@@ -7,7 +7,7 @@ use anyhow::Result;
 use num_traits::CheckedSub;
 use rand::distr::Alphanumeric;
 use rand::distr::SampleString;
-use rand::Rng;
+use rand::RngExt;
 use tasm_lib::prelude::Digest;
 use tokio::sync::mpsc;
 

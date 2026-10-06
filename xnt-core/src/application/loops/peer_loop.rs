@@ -11,7 +11,7 @@ use futures::sink::SinkExt;
 use futures::stream::TryStream;
 use futures::stream::TryStreamExt;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::triton_vm::prelude::Digest;
 use tasm_lib::twenty_first::prelude::Mmr;
@@ -94,7 +94,7 @@ pub type PeerStandingNumber = i32;
 ///
 /// also handles messages from main task over the main-to-peer-tasks broadcast
 /// channel.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PeerLoopHandler {
     to_main_tx: mpsc::Sender<PeerTaskToMain>,
     global_state_lock: GlobalStateLock,
@@ -2120,7 +2120,7 @@ impl PeerLoopHandler {
 mod tests {
     use macro_rules_attr::apply;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tokio::sync::mpsc::error::TryRecvError;
     use tracing_test::traced_test;

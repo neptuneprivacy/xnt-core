@@ -30,7 +30,7 @@ use itertools::Itertools;
 use mutator_set_update::MutatorSetUpdate;
 use num_traits::Zero;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rayon::ThreadPoolBuilder;
 use serde::Deserialize;
@@ -1080,7 +1080,7 @@ pub(crate) mod tests {
     use rand::random;
     use rand::rng;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use strum::IntoEnumIterator;
     use tasm_lib::twenty_first::util_types::mmr::mmr_trait::LeafMutation;

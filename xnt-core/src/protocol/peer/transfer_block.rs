@@ -76,7 +76,7 @@ impl TryFrom<&Block> for TransferBlock {
 mod tests {
     use macro_rules_attr::apply;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tracing_test::traced_test;
 

@@ -4399,7 +4399,7 @@ mod tests {
     use num_traits::Zero;
     use proptest::prop_assume;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use strum::IntoEnumIterator;
     use tracing_test::traced_test;

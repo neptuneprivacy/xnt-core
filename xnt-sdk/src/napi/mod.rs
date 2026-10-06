@@ -1216,7 +1216,7 @@ pub fn xnt_timestamp_now() -> i64 {
 /// Uses cryptographically secure OsRng for transaction privacy
 #[napi]
 pub fn xnt_random_sender_randomness() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 40];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)

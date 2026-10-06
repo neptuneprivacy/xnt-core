@@ -19,7 +19,7 @@ use num_traits::Zero;
 use peer_block_notifications::PeerBlockNotification;
 use rand::rngs::StdRng;
 use rand::Rng;
-use rand::RngCore;
+use rand::RngExt;
 use rand::SeedableRng;
 use serde::Deserialize;
 use serde::Serialize;

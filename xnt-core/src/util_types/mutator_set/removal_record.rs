@@ -468,7 +468,7 @@ mod tests {
     use proptest::prelude::*;
     use proptest_arbitrary_interop::arb;
     use rand::prelude::IndexedRandom;
-    use rand::Rng;
+    use rand::RngExt;
     use tasm_lib::prelude::Tip5;
     use tasm_lib::triton_vm::prelude::BFieldCodec;
 

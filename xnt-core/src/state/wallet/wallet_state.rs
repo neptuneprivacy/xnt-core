@@ -3249,7 +3249,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads: Some(2),
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
             )

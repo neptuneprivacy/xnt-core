@@ -3,7 +3,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use num_traits::Zero;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::prelude::Digest;
 use tracing::error;

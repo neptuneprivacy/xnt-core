@@ -31,7 +31,7 @@ mod tests {
     use num_traits::Zero;
     use rand::random;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tasm_lib::prelude::Digest;
     use tasm_lib::prelude::Tip5;

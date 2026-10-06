@@ -2,7 +2,7 @@ use futures::channel::oneshot;
 use num_traits::ConstZero;
 use num_traits::Zero;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::prelude::Digest;
 use tasm_lib::twenty_first;
@@ -77,7 +77,7 @@ pub(crate) async fn next_block(global_state_lock: GlobalStateLock, parent: Block
     .await
     .unwrap();
 
-    let deterministic_guesser_rng = StdRng::seed_from_u64(55512345);
+    let deterministic_guesser_rng_seed = 55512345;
 
     let guesser_address = global_state_lock
         .lock_guard()
@@ -97,7 +97,7 @@ pub(crate) async fn next_block(global_state_lock: GlobalStateLock, parent: Block
         GuessingConfiguration {
             num_guesser_threads: global_state_lock.cli().guesser_threads,
             address: guesser_address,
-            override_rng: Some(deterministic_guesser_rng),
+            override_rng_seed: Some(deterministic_guesser_rng_seed),
             override_timestamp: Some(new_timestamp),
         },
     )

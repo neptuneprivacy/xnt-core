@@ -637,7 +637,7 @@ mod tests {
     use proptest::prop_assert;
     use proptest::prop_assert_eq;
     use proptest_arbitrary_interop::arb;
-    use rand::Rng;
+    use rand::RngExt;
     use test_strategy::proptest;
 
     use super::*;

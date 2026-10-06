@@ -569,7 +569,7 @@ mod tests {
     use macro_rules_attr::apply;
     use proptest::prelude::*;
     use proptest::prop_assert_eq;
-    use rand::Rng;
+    use rand::RngExt;
     use test_strategy::proptest;
 
     use super::*;

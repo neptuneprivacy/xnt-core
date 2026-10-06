@@ -590,7 +590,7 @@ mod tests {
         use crate::util_types::mutator_set::removal_record::RemovalRecord;
         use crate::util_types::mutator_set::shared::BATCH_SIZE;
         use crate::util_types::test_shared::mutator_set::mock_item_and_randomnesses;
-        use rand::Rng;
+        use rand::RngExt;
 
         use super::MutatorSetUpdate;
 

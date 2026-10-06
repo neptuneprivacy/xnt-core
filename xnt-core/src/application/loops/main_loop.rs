@@ -1189,7 +1189,7 @@ impl MainLoopHandler {
         let peers_to_disconnect = connected_peers
             .into_iter()
             .filter(|peer| !cli_args.peers.contains(&peer.connected_address()))
-            .choose_multiple(&mut rand::rng(), num_peers_to_disconnect);
+            .sample(&mut rand::rng(), num_peers_to_disconnect);
         match peers_to_disconnect.len() {
             0 => warn!("Not disconnecting from any peer because of manual override."),
             i => info!("Disconnecting from {i} peers."),
@@ -3021,7 +3021,7 @@ mod tests {
 
     mod bootstrapper_mode {
 
-        use rand::Rng;
+        use rand::RngExt;
 
         use super::*;
         use crate::protocol::peer::PeerMessage;

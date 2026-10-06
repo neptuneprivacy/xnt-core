@@ -493,7 +493,7 @@ pub(crate) mod tests {
     use futures::channel::oneshot;
     use itertools::Itertools;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use strum::IntoEnumIterator;
     use tracing_test::traced_test;
