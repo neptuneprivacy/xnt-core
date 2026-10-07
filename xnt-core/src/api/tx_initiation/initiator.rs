@@ -11,7 +11,10 @@
 //!
 //! see [tx_initiation](super) for other APIs.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use tasm_lib::prelude::Digest;
 
 use super::error;
 use crate::api::export::Timestamp;
@@ -35,6 +38,7 @@ use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurr
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
+use crate::state::wallet::address::KeyType;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::transaction_input::TxInput;
 use crate::state::wallet::transaction_input::TxInputList;
@@ -294,7 +298,7 @@ impl TransactionInitiator {
     /// While transactions are private by default, an initiator can opt to make
     /// it transparent. In this case, the transaction contains an announcement
     /// containing the consumed and produced UTXOs along with the commitment
-    /// randomness.
+    /// randomness. Only UTXOs held by Generation keys are spent as inputs.
     pub async fn send_transparent(
         &mut self,
         outputs: impl IntoIterator<Item = impl Into<OutputFormat>>,
@@ -349,11 +353,29 @@ impl TransactionInitiator {
         // select inputs
         let spend_amount = tx_outputs.total_native_coins() + fee;
         let policy = InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending);
-        let tx_inputs = self
-            .select_spendable_inputs(policy, spend_amount, timestamp, exclude_recent_blocks, max_inputs)
+        let mut spendable_inputs: Vec<TxInput> = self
+            .spendable_inputs(timestamp, exclude_recent_blocks)
             .await
-            .into_iter()
-            .collect::<Vec<_>>();
+            .into();
+        if transparent {
+            // Transparent transactions only spend UTXOs held by Generation keys.
+            let generation_locks: HashSet<Digest> = self
+                .global_state_lock
+                .lock_guard()
+                .await
+                .wallet_state
+                .get_known_spending_keys(KeyType::Generation)
+                .map(|key| key.lock_script_hash())
+                .collect();
+            spendable_inputs
+                .retain(|input| generation_locks.contains(&input.utxo.lock_script_hash()));
+        }
+        let tx_inputs = TxInputListBuilder::new()
+            .spendable_inputs(spendable_inputs)
+            .policy(policy)
+            .spend_amount(spend_amount)
+            .max_inputs(max_inputs)
+            .build();
 
         // generate tx details (may add change output)
         let tx_details = TransactionDetailsBuilder::new()

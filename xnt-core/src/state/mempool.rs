@@ -48,6 +48,7 @@ use priority_queue::priority_queue::iterators::IntoSortedIter as SingleEndedIter
 use priority_queue::DoublePriorityQueue;
 use priority_queue::PriorityQueue;
 use tasm_lib::prelude::Digest;
+use tasm_lib::triton_vm::prelude::BFieldCodec;
 use tracing::debug;
 use tracing::error;
 use tracing::warn;
@@ -1086,16 +1087,22 @@ impl Mempool {
     /// - backed by single proofs, and
     /// - synced to the tip.
     ///
-    /// Number of transactions returned can be capped by either size (measured
-    /// in bytes), or by transaction count. The function guarantees that neither
-    /// of the specified limits will be exceeded. The total number of inputs,
-    /// outputs, and announcements across the returned transactions likewise
-    /// respects the caps imposed by the consensus rules, leaving room for the
-    /// coinbase transaction they are expected to be merged with.
+    /// Number of transactions returned can be capped by either total kernel
+    /// length (measured in BFieldElements), or by transaction count. The
+    /// function guarantees that neither of the specified limits will be
+    /// exceeded. The total number of inputs, outputs, and announcements across
+    /// the returned transactions likewise respects the caps imposed by the
+    /// consensus rules, leaving room for the coinbase transaction they are
+    /// expected to be merged with.
+    ///
+    /// Budgeting on kernel length, rather than whole-transaction byte size,
+    /// keeps the composed block within [`ConsensusRuleSet::max_block_size`]:
+    /// the per-transaction proofs are discarded by the merge, whereas the
+    /// kernels accumulate into the block body.
     pub(crate) fn get_transactions_for_block_composition(
         &self,
         consensus_rule_set: ConsensusRuleSet,
-        mut remaining_storage: usize,
+        mut remaining_kernel_len: usize,
         max_num_txs: Option<usize>,
     ) -> Vec<Transaction> {
         // Numbers of outputs and announcements reserved for the coinbase
@@ -1116,7 +1123,8 @@ impl Mempool {
 
         for (transaction_digest, _fee_density) in self.fee_density_iter() {
             // No more transactions can possibly be packed
-            if remaining_storage == 0 || max_num_txs.is_some_and(|max| transactions.len() == max) {
+            if remaining_kernel_len == 0 || max_num_txs.is_some_and(|max| transactions.len() == max)
+            {
                 break;
             }
 
@@ -1141,15 +1149,15 @@ impl Mempool {
                 }
 
                 let transaction_copy = transaction_ptr.to_owned();
-                let transaction_size = transaction_copy.get_size();
+                let kernel_len = transaction_copy.kernel.encode().len();
 
                 // Current transaction is too big
-                if transaction_size > remaining_storage {
+                if kernel_len > remaining_kernel_len {
                     continue;
                 }
 
                 // Include transaction
-                remaining_storage -= transaction_size;
+                remaining_kernel_len -= kernel_len;
                 remaining_num_inputs -= transaction_copy.kernel.inputs.len();
                 remaining_num_outputs -= transaction_copy.kernel.outputs.len();
                 remaining_num_announcements -= transaction_copy.kernel.announcements.len();

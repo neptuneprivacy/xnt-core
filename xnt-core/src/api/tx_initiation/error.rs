@@ -46,6 +46,9 @@ pub enum CreateTxError {
 
     #[error("tip does not have mutator-set-after")]
     NoMutatorSetAccumulatorAfter,
+
+    #[error("transparent transactions can only spend UTXOs held by Generation keys")]
+    TransparentInputNotAllowed,
 }
 
 #[derive(Debug, Clone, thiserror::Error, strum::Display)]

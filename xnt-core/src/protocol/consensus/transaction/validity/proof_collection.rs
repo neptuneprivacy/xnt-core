@@ -619,36 +619,36 @@ impl ProofCollection {
         let lock_script_claims = self.lock_script_claims();
         let type_script_claims = self.type_script_claims();
 
-        let rri = verify_transaction_proof(
-            removal_records_integrity_claim,
-            self.removal_records_integrity.clone(),
-            network,
-        )
-        .await;
-        let k2o = verify_transaction_proof(kernel_to_outputs_claim, self.kernel_to_outputs.clone(), network).await;
-        let cls = verify_transaction_proof(
-            collect_lock_scripts_claim,
-            self.collect_lock_scripts.clone(),
-            network,
-        )
-        .await;
-        let cts = verify_transaction_proof(
-            collect_type_scripts_claim,
-            self.collect_type_scripts.clone(),
-            network,
-        )
-        .await;
-
-        let mut lsh = true;
-        for (cl, pr) in lock_script_claims.iter().zip(self.lock_scripts_halt.iter()) {
-            lsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
-        }
-        let mut tsh = true;
-        for (cl, pr) in type_script_claims.iter().zip(self.type_scripts_halt.iter()) {
-            tsh &= verify_transaction_proof(cl.clone(), pr.clone(), network).await;
+        // Verify in the same order as `verify`, returning on the first proof
+        // that fails: the script-hash lists, whose lengths decide how many
+        // proofs the halting loops verify, are checked before those loops.
+        for (claim, proof) in [
+            (
+                removal_records_integrity_claim,
+                &self.removal_records_integrity,
+            ),
+            (kernel_to_outputs_claim, &self.kernel_to_outputs),
+            (collect_lock_scripts_claim, &self.collect_lock_scripts),
+            (collect_type_scripts_claim, &self.collect_type_scripts),
+        ] {
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                return false;
+            }
         }
 
-        rri && k2o && cls && cts && lsh && tsh
+        for (claim, proof) in lock_script_claims.into_iter().zip(&self.lock_scripts_halt) {
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                return false;
+            }
+        }
+
+        for (claim, proof) in type_script_claims.into_iter().zip(&self.type_scripts_halt) {
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn removal_records_integrity_claim(&self) -> Claim {

@@ -148,7 +148,8 @@ typedef struct XntXntTxOutputInfoArray {
     uintptr_t len;
 } XntXntTxOutputInfoArray;
 
-// Get receiving address from spending key
+// Get receiving address from spending key. Returns NULL and sets the last
+// error for legacy-derivation dCTIDH keys, which have no receiving address.
 xnt_
 struct XntAddressHandle *xnt_spending_key_to_address(const struct XntSpendingKeyHandle *handle);
 
@@ -296,6 +297,12 @@ struct XntSpendingKeyHandle *xnt_wallet_derive_key(const struct XntWalletEntropy
 xnt_
 struct XntSpendingKeyHandle *xnt_wallet_derive_dctidh_key(const struct XntWalletEntropyHandle *handle,
                                                           uint64_t index);
+
+// Derive Nth CTIDH spending key using the legacy (pre-v0.3) derivation, for
+// recognising and sweeping funds at legacy-format dCTIDH addresses.
+xnt_
+struct XntSpendingKeyHandle *xnt_wallet_derive_legacy_dctidh_key(const struct XntWalletEntropyHandle *handle,
+                                                                 uint64_t index);
 
 // Get receiver_id from spending key
 xnt_ uint64_t xnt_spending_key_receiver_id(const struct XntSpendingKeyHandle *handle);

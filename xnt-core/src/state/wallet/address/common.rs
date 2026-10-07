@@ -116,7 +116,12 @@ pub fn derive_receiver_id(seed: Digest) -> BFieldElement {
 pub fn deterministically_derive_seed_and_nonce(
     payload: &UtxoNotificationPayload,
 ) -> ([u8; 32], BFieldElement) {
-    let combined = Tip5::hash_pair(payload.sender_randomness, payload.utxo.lock_script_hash());
+    // Derive from the entire payload, so that payloads differing in amount,
+    // time-lock, or payment id yield distinct seeds and nonces even when the
+    // recipient and sender randomness are the same.
+    let payload_digest =
+        Tip5::hash_varlen(&[payload.utxo.encode(), vec![payload.payment_id]].concat());
+    let combined = Tip5::hash_pair(payload.sender_randomness, payload_digest);
     let [e0, e1, e2, e3, e4] = combined.values();
     let e0: [u8; 8] = e0.into();
     let e1: [u8; 8] = e1.into();
@@ -219,6 +224,11 @@ pub fn bfes_to_bytes(bfes: &[BFieldElement]) -> Result<Vec<u8>> {
             }
         }
     }
+
+    ensure!(
+        claimed_length <= bytes.len(),
+        "Claimed length cannot exceed actual length when decoding bytes"
+    );
 
     Ok(bytes[0..claimed_length].to_vec())
 }

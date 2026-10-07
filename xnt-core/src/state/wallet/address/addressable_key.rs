@@ -200,7 +200,7 @@ impl SpendingKey {
         }
     }
 
-    pub(crate) fn lock_script_hash(&self) -> Digest {
+    pub fn lock_script_hash(&self) -> Digest {
         self.lock_script().hash()
     }
 

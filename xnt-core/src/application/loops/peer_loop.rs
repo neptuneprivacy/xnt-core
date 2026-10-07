@@ -338,10 +338,6 @@ impl PeerLoopHandler {
                 previous_block.header(),
             );
             debug!("new block has proof of work? {new_block_has_proof_of_work}");
-            let new_block_is_valid = new_block
-                .is_valid(previous_block, now, self.global_state_lock.cli().network)
-                .await;
-            debug!("new block is valid? {new_block_is_valid}");
             if !new_block_has_proof_of_work {
                 warn!(
                     "Received invalid proof-of-work for block of height {} from peer with IP {}",
@@ -367,7 +363,15 @@ impl PeerLoopHandler {
                 .await?;
                 warn!("Failed to validate block due to insufficient PoW");
                 return Ok(None);
-            } else if !new_block_is_valid {
+            }
+
+            // Checked after proof-of-work, which is cheap to check, because
+            // `is_valid` runs a recursive STARK verification.
+            let new_block_is_valid = new_block
+                .is_valid(previous_block, now, self.global_state_lock.cli().network)
+                .await;
+            debug!("new block is valid? {new_block_is_valid}");
+            if !new_block_is_valid {
                 warn!(
                     "Received invalid block of height {} from peer with IP {}",
                     new_block.kernel.header.height, self.peer_address
@@ -711,15 +715,17 @@ impl PeerLoopHandler {
             PeerMessage::BlockNotificationRequest => {
                 debug!("Got BlockNotificationRequest");
 
-                peer.send(PeerMessage::BlockNotification(
+                // Build the response in its own statement so the state lock is
+                // released before sending, which waits on the peer.
+                let block_notification = PeerMessage::BlockNotification(
                     self.global_state_lock
                         .lock_guard()
                         .await
                         .chain
                         .light_state()
                         .into(),
-                ))
-                .await?;
+                );
+                peer.send(block_notification).await?;
 
                 Ok(KEEP_CONNECTION_ALIVE)
             }
@@ -976,7 +982,11 @@ impl PeerLoopHandler {
                         Ok(KEEP_CONNECTION_ALIVE)
                     }
                     Some(b) => {
-                        peer.send(PeerMessage::Block(Box::new(b.try_into().unwrap())))
+                        let Ok(transfer_block) = TransferBlock::try_from(b) else {
+                            warn!("Peer requested block with hash {block_digest:x}, which cannot be transferred");
+                            return Ok(KEEP_CONNECTION_ALIVE);
+                        };
+                        peer.send(PeerMessage::Block(Box::new(transfer_block)))
                             .await?;
                         Ok(KEEP_CONNECTION_ALIVE)
                     }
@@ -1025,7 +1035,12 @@ impl PeerLoopHandler {
                         .await?
                         .unwrap();
 
-                    PeerMessage::Block(Box::new(canonical_chain_block.try_into().unwrap()))
+                    let Ok(transfer_block) = TransferBlock::try_from(canonical_chain_block) else {
+                        warn!("Peer requested block of height {block_height}, which cannot be transferred");
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    };
+
+                    PeerMessage::Block(Box::new(transfer_block))
                 };
 
                 debug!("Sending block");
@@ -1415,15 +1430,7 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                // 1. If transaction is invalid, punish.
-                if !transaction.is_valid(network, consensus_rule_set).await {
-                    warn!("Received invalid tx");
-                    self.punish(NegativePeerSanction::InvalidTransaction)
-                        .await?;
-                    return Ok(KEEP_CONNECTION_ALIVE);
-                }
-
-                // 2. If transaction has coinbase, punish.
+                // 1. If transaction has coinbase, punish.
                 // Transactions received from peers have not been mined yet.
                 // Only the miner is allowed to produce transactions with non-empty coinbase fields.
                 if transaction.kernel.coinbase.is_some() {
@@ -1433,7 +1440,7 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                // 3. If negative fee, punish.
+                // 2. If negative fee, punish.
                 if transaction.kernel.fee.is_negative() {
                     warn!("Received negative-fee transaction.");
                     self.punish(NegativePeerSanction::TransactionWithNegativeFee)
@@ -1441,7 +1448,7 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                // 4. Check if transaction is already known.
+                // 3. Check if transaction is already known.
                 if !self
                     .global_state_lock
                     .lock_guard()
@@ -1460,7 +1467,7 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                // 5. if transaction is not confirmable, punish.
+                // 4. if transaction is not confirmable, punish.
                 if !transaction.is_confirmable_relative_to(&mutator_set_accumulator_after) {
                     warn!(
                         "Received unconfirmable transaction with TXID {}. Unconfirmable because:",
@@ -1545,7 +1552,7 @@ impl PeerLoopHandler {
 
                 let tx_timestamp = transaction.kernel.timestamp;
 
-                // 6. Ignore if transaction is too old
+                // 5. Ignore if transaction is too old
                 let now = self.now();
                 if tx_timestamp < now - Timestamp::seconds(MEMPOOL_TX_THRESHOLD_AGE_IN_SECS) {
                     // TODO: Consider punishing here
@@ -1553,10 +1560,20 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                // 7. Ignore if transaction is too far into the future
+                // 6. Ignore if transaction is too far into the future
                 if tx_timestamp >= now + FUTUREDATING_LIMIT {
                     // TODO: Consider punishing here
                     warn!("Received tx too far into the future. Got timestamp: {tx_timestamp:?}");
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                // 7. If transaction is invalid, punish. Checked last because
+                // it verifies proofs, whereas the checks above read only the
+                // kernel and the mempool.
+                if !transaction.is_valid(network, consensus_rule_set).await {
+                    warn!("Received invalid tx");
+                    self.punish(NegativePeerSanction::InvalidTransaction)
+                        .await?;
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 

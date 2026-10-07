@@ -90,14 +90,39 @@ impl WalletEntropy {
     /// callers should use [wallet_state::WalletState::next_unused_spending_key()]
     /// which takes &mut self.
     pub fn nth_dctidh_spending_key(&self, index: u64) -> dctidh_address::dCTIDHSpendingKey {
-        let key_seed = Tip5::hash_varlen(
+        dctidh_address::dCTIDHSpendingKey::derive_from_seed(self.nth_dctidh_key_seed(index))
+    }
+
+    /// Derives the CTIDH spending key at `index` using the legacy (pre-v0.3)
+    /// lock derivation, for recognising and sweeping funds received at
+    /// legacy-format dCTIDH addresses. The key seed matches
+    /// [`Self::nth_dctidh_spending_key`]; only the lock derivation differs.
+    pub fn nth_legacy_dctidh_spending_key(&self, index: u64) -> dctidh_address::dCTIDHSpendingKey {
+        dctidh_address::dCTIDHSpendingKey::legacy_from_seed(self.nth_dctidh_key_seed(index))
+    }
+
+    /// Derives the CTIDH spending key at `index` together with its legacy
+    /// (pre-v0.3) derivation counterpart, at the cost of a single derivation.
+    pub fn nth_dctidh_spending_key_with_legacy(
+        &self,
+        index: u64,
+    ) -> (
+        dctidh_address::dCTIDHSpendingKey,
+        dctidh_address::dCTIDHSpendingKey,
+    ) {
+        dctidh_address::dCTIDHSpendingKey::derive_with_legacy_from_seed(
+            self.nth_dctidh_key_seed(index),
+        )
+    }
+
+    fn nth_dctidh_key_seed(&self, index: u64) -> Digest {
+        Tip5::hash_varlen(
             &[
                 self.secret_seed.0.encode(),
                 bfe_vec![dctidh_address::CTIDH_FLAG, index],
             ]
             .concat(),
-        );
-        dctidh_address::dCTIDHSpendingKey::derive_from_seed(key_seed)
+        )
     }
 
     /// derives a symmetric key at `index`

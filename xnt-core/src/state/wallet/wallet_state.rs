@@ -94,6 +94,10 @@ pub struct WalletState {
     known_symmetric_keys: Vec<SpendingKey>,
     /// CTIDH key
     known_dctidh_keys: Vec<SpendingKey>,
+    /// Legacy-derivation CTIDH keys, one per known index, cached so scanning
+    /// and input selection do not repeat the key derivation. Used for scanning
+    /// and spending only, never surfaced as receiving addresses.
+    known_legacy_dctidh_keys: Vec<SpendingKey>,
 
     /// Tunable options for configuring how the wallet state operates.
     pub(crate) configuration: WalletConfiguration,
@@ -330,9 +334,13 @@ impl WalletState {
             .collect_vec();
 
         let dctidh_counter = rusty_wallet_database.get_dctidh_key_counter();
-        let known_dctidh_keys: Vec<SpendingKey> = (0..dctidh_counter)
-            .map(|idx| wallet_entropy.nth_dctidh_spending_key(idx).into())
-            .collect_vec();
+        let (known_dctidh_keys, known_legacy_dctidh_keys): (Vec<SpendingKey>, Vec<SpendingKey>) =
+            (0..dctidh_counter)
+                .map(|idx| {
+                    let (key, legacy) = wallet_entropy.nth_dctidh_spending_key_with_legacy(idx);
+                    (key.into(), legacy.into())
+                })
+                .unzip();
 
         let mut wallet_state = Self {
             wallet_db: rusty_wallet_database,
@@ -342,6 +350,7 @@ impl WalletState {
             known_generation_keys,
             known_symmetric_keys,
             known_dctidh_keys,
+            known_legacy_dctidh_keys,
             configuration: configuration.clone(),
         };
 
@@ -1020,9 +1029,16 @@ impl WalletState {
         let future_symmetric_keys = self
             .get_future_symmetric_keys(num_future_keys)
             .map(|(i, sk)| (KeyType::Symmetric, i, SpendingKey::from(sk)));
+        // Each future CTIDH index also yields its legacy-derivation key, so that
+        // a wallet restored from seed recovers funds at legacy-format addresses.
         let future_dctidh_keys = self
             .get_future_dctidh_spending_keys(num_future_keys)
-            .map(|(i, csk)| (KeyType::dCTIDH, i, SpendingKey::from(csk)));
+            .flat_map(|(i, csk, legacy)| {
+                [
+                    (KeyType::dCTIDH, i, SpendingKey::from(csk)),
+                    (KeyType::dCTIDH, i, SpendingKey::from(legacy)),
+                ]
+            });
         future_generation_keys
             .chain(future_symmetric_keys)
             .chain(future_dctidh_keys)
@@ -1038,7 +1054,11 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
-            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => Box::new(self.get_known_dctidh_keys()),
+            // Include legacy-format keys so scanning and input selection can
+            // recognise and sweep funds received at legacy dCTIDH addresses.
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
+                Box::new(self.get_known_dctidh_keys_with_legacy())
+            }
         }
     }
 
@@ -1084,6 +1104,16 @@ impl WalletState {
         self.known_dctidh_keys.iter().cloned()
     }
 
+    /// The known dCTIDH keys, plus a legacy-derivation key per used index for
+    /// recognising and sweeping funds received at legacy-format addresses. Used
+    /// for scanning and input selection only, never for deriving new addresses.
+    fn get_known_dctidh_keys_with_legacy(&self) -> impl Iterator<Item = SpendingKey> + '_ {
+        self.known_dctidh_keys
+            .iter()
+            .chain(self.known_legacy_dctidh_keys.iter())
+            .cloned()
+    }
+
     /// Get the next unused spending key of a given type.
     ///
     /// returns key at present counter (for key_type), and increments the
@@ -1126,8 +1156,10 @@ impl WalletState {
                 KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
                     self.wallet_db.set_dctidh_key_counter(new_counter).await;
                     for idx in current_counter..new_counter {
-                        let key = self.wallet_entropy.nth_dctidh_spending_key(idx).into();
-                        self.known_dctidh_keys.push(key);
+                        let (key, legacy) =
+                            self.wallet_entropy.nth_dctidh_spending_key_with_legacy(idx);
+                        self.known_dctidh_keys.push(key.into());
+                        self.known_legacy_dctidh_keys.push(legacy.into());
                     }
                 }
             }
@@ -1196,9 +1228,12 @@ impl WalletState {
         &mut self,
     ) -> crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey {
         let index = self.wallet_db.get_dctidh_key_counter();
-        let key = self.wallet_entropy.nth_dctidh_spending_key(index);
+        let (key, legacy) = self
+            .wallet_entropy
+            .nth_dctidh_spending_key_with_legacy(index);
         self.wallet_db.set_dctidh_key_counter(index + 1).await;
         self.known_dctidh_keys.push(key.clone().into());
+        self.known_legacy_dctidh_keys.push(legacy.into());
         key
     }
 
@@ -1224,15 +1259,23 @@ impl WalletState {
             .map(|i| (i, self.wallet_entropy.nth_symmetric_key(i)))
     }
 
-    /// Get the next n CTIDH spending keys (with derivation indices)
-    /// without modifying the counter.
+    /// Get the next n CTIDH spending keys, each with its legacy-derivation
+    /// counterpart (with derivation indices), without modifying the counter.
     pub(crate) fn get_future_dctidh_spending_keys(
         &self,
         num_future_keys: usize,
-    ) -> impl Iterator<Item = (u64, dctidh_address::dCTIDHSpendingKey)> + use<'_> {
+    ) -> impl Iterator<
+        Item = (
+            u64,
+            dctidh_address::dCTIDHSpendingKey,
+            dctidh_address::dCTIDHSpendingKey,
+        ),
+    > + use<'_> {
         let index = self.wallet_db.get_dctidh_key_counter();
-        (index..index + (num_future_keys as u64))
-            .map(|i| (i, self.wallet_entropy.nth_dctidh_spending_key(i)))
+        (index..index + (num_future_keys as u64)).map(|i| {
+            let (key, legacy) = self.wallet_entropy.nth_dctidh_spending_key_with_legacy(i);
+            (i, key, legacy)
+        })
     }
 
     pub(crate) async fn claim_utxo(&mut self, utxo_claim_data: ClaimUtxoData) -> Result<()> {

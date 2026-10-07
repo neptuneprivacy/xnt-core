@@ -172,6 +172,19 @@ impl TransactionDetailsBuilder {
             ..
         } = self;
 
+        // A transparent transaction publishes each input's receiver preimage,
+        // so only inputs whose lock does not open with that preimage can be
+        // spent transparently.
+        if self.transparent
+            && tx_inputs.iter().any(|input| {
+                let receiver_postimage = input.mutator_set_mp().receiver_preimage.hash();
+                LockScript::standard_hash_lock_from_after_image(receiver_postimage).hash()
+                    == input.utxo.lock_script_hash()
+            })
+        {
+            return Err(CreateTxError::TransparentInputNotAllowed);
+        }
+
         // default to present time if unspecified
         let timestamp = timestamp.unwrap_or_else(Timestamp::now);
 

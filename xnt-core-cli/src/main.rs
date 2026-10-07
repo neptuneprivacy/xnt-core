@@ -310,6 +310,9 @@ enum Command {
     /// track amounts as well as origins and destinations. Because of the added
     /// announcements, these transactions require a higher fee than
     /// non-transparent transactions.
+    ///
+    /// Only UTXOs held by Generation keys are spent, and change is returned to
+    /// a Generation key.
     SendTransparent {
         #[clap(long, value_parser, required = false)]
         file: Option<PathBuf>,
@@ -1399,7 +1402,7 @@ async fn main() -> Result<()> {
                     token,
                     parsed_outputs,
                     ChangePolicy::recover_to_next_unused_key(
-                        KeyType::Symmetric,
+                        KeyType::Generation,
                         UtxoNotificationMedium::OnChain,
                     ),
                     fee,

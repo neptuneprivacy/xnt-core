@@ -124,15 +124,17 @@ impl dCTIDHSubAddress {
         format!("xntcta{}", common::network_hrp_char(network))
     }
 
-    /// Encode subaddress as bech32m string (only encryption_key + payment_id)
+    /// Encode subaddress as bech32m string.
+    ///
+    /// Payload: encryption_key (64) + lock postimage (40) + payment_id (8) =
+    /// 112 bytes, giving ~193 chars (under 255).
     pub fn to_bech32m(&self, network: Network) -> Result<String> {
         let hrp = Self::get_hrp(network);
-        // Only encode encryption_key (64 bytes) + payment_id (8 bytes) = 72 bytes total
-        // This matches the compact format of base address (64 bytes)
-        let mut payload = Vec::with_capacity(72);
+        let mut payload = Vec::with_capacity(64 + Digest::LEN * 8 + 8);
         payload.extend_from_slice(&self.base.encryption_key()[..]);
+        payload.extend_from_slice(&digest_to_bytes(&self.base.lock_postimage));
         payload.extend_from_slice(&self.payment_id.value().to_le_bytes());
-        
+
         let variant = Variant::Bech32m;
         let enc = bech32::encode(&hrp, payload.to_base32(), variant)
             .map_err(|e| anyhow!("bech32m encode: {e}"))?;
@@ -159,26 +161,27 @@ impl dCTIDHSubAddress {
         );
 
         let payload = Vec::<u8>::from_base32(&data)?;
+        const PK_LEN: usize = 64;
+        const POST_LEN: usize = Digest::LEN * 8;
+        const EXPECTED_LEN: usize = PK_LEN + POST_LEN + 8;
         ensure!(
-            payload.len() == 72,
-            "CTIDH subaddress payload must be 72 bytes (64 encryption_key + 8 payment_id), got {}",
+            payload.len() == EXPECTED_LEN,
+            "CTIDH subaddress payload must be {EXPECTED_LEN} bytes (64 pubkey + 40 postimage + 8 payment_id), got {}",
             payload.len()
         );
-        
-        // Extract encryption_key (first 64 bytes)
+
         let mut encryption_key = [0u8; 64];
-        encryption_key.copy_from_slice(&payload[0..64]);
-        
-        // Extract payment_id (last 8 bytes)
-        let payment_id_bytes = &payload[64..72];
+        encryption_key.copy_from_slice(&payload[0..PK_LEN]);
+        let postimage = digest_from_bytes(&payload[PK_LEN..PK_LEN + POST_LEN]);
+        let payment_id_bytes = &payload[PK_LEN + POST_LEN..EXPECTED_LEN];
         let payment_id_value = u64::from_le_bytes([
             payment_id_bytes[0], payment_id_bytes[1], payment_id_bytes[2], payment_id_bytes[3],
             payment_id_bytes[4], payment_id_bytes[5], payment_id_bytes[6], payment_id_bytes[7],
         ]);
-        
-        let base = dCTIDHReceivingAddress::from_public_key(encryption_key);
+
+        let base = dCTIDHReceivingAddress::from_parts(encryption_key, postimage);
         let payment_id = BFieldElement::new(payment_id_value);
-        
+
         Self::new(base, payment_id)
     }
 }
@@ -232,6 +235,13 @@ pub struct dCTIDHSpendingKey {
 
     #[serde(skip)]
     unlock_key_preimage: Digest,
+
+    /// True only for keys derived with the legacy (pre-v0.3) lock derivation,
+    /// used for recognising and sweeping legacy-format UTXOs. Not serialized:
+    /// a deserialized key is always a current-scheme key, so legacy keys must
+    /// be derived fresh and never round-tripped through serde.
+    #[serde(skip)]
+    legacy: bool,
 }
 
 impl<'de> serde::de::Deserialize<'de> for dCTIDHSpendingKey {
@@ -318,9 +328,42 @@ fn receiver_identifier_from_public_key(pk: &PublicKey) -> BFieldElement {
     hash.values()[0]
 }
 
+/// Derive the lock preimage from the key's secret material, with domain
+/// separation. The receiving address carries only `preimage.hash()`.
+fn secret_lock_preimage(secret_material: &[BFieldElement]) -> Digest {
+    const LOCK_PREIMAGE_DOMAIN: BFieldElement = BFieldElement::new(0xd0_c71d_10c_u64);
+    Tip5::hash_varlen(
+        &[secret_material.to_vec(), vec![LOCK_PREIMAGE_DOMAIN]].concat(),
+    )
+}
+
+/// Legacy lock preimage derivation, kept only so the wallet can recognise and
+/// sweep dCTIDH UTXOs received at pre-v0.3 (legacy-format) addresses. Never used
+/// to derive new receiving addresses.
 fn lock_preimage_from_public_key(pk: &PublicKey) -> Digest {
     let bfes = common::bytes_to_bfes(&pk[..]);
     Tip5::hash_varlen(&bfes)
+}
+
+/// Encode a [Digest] as exactly 40 bytes (5 little-endian u64 limbs), for the
+/// address payload.
+fn digest_to_bytes(d: &Digest) -> [u8; Digest::LEN * 8] {
+    let mut out = [0u8; Digest::LEN * 8];
+    for (i, bfe) in d.values().iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&bfe.value().to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [digest_to_bytes]. `bytes.len()` must be `Digest::LEN * 8`.
+fn digest_from_bytes(bytes: &[u8]) -> Digest {
+    let mut limbs = [BFieldElement::new(0); Digest::LEN];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+        *limb = BFieldElement::new(u64::from_le_bytes(b));
+    }
+    Digest::new(limbs)
 }
 
 const CTIDH_SK_DOMAIN: &[u8] = b"dctidh512_sk";
@@ -336,7 +379,7 @@ impl dCTIDHSpendingKey {
         let secret_key: SecretKey = secret_key_bytes;
         let public_key = sk_to_pk(&secret_key).expect("dctidh sk_to_pk from derived sk");
         let receiver_identifier = receiver_identifier_from_public_key(&public_key);
-        let receiver_preimage = lock_preimage_from_public_key(&public_key);
+        let receiver_preimage = secret_lock_preimage(&seed.values());
         let unlock_key_preimage = receiver_preimage;
         Self {
             seed,
@@ -344,18 +387,50 @@ impl dCTIDHSpendingKey {
             secret_key,
             receiver_preimage,
             unlock_key_preimage,
+            legacy: false,
         }
+    }
+
+    /// Derive a spending key using the legacy (pre-v0.3) lock derivation. Used
+    /// only to recognise and sweep funds received at legacy-format dCTIDH
+    /// addresses; it is never surfaced as a receiving address.
+    pub fn legacy_from_seed(seed: Digest) -> Self {
+        Self::derive_with_legacy_from_seed(seed).1
+    }
+
+    /// Derive both the current-scheme key and its legacy-derivation
+    /// counterpart for `seed`, computing the public key only once.
+    pub fn derive_with_legacy_from_seed(seed: Digest) -> (Self, Self) {
+        let seed_bytes = bincode::serialize(&seed).unwrap();
+        let secret_key: SecretKey =
+            common::shake256::<74>(&[seed_bytes.as_slice(), CTIDH_SK_DOMAIN].concat());
+        let public_key = sk_to_pk(&secret_key).expect("dctidh sk_to_pk from derived sk");
+        let receiver_identifier = receiver_identifier_from_public_key(&public_key);
+        let key = |receiver_preimage: Digest, legacy: bool| Self {
+            seed,
+            receiver_identifier,
+            secret_key,
+            receiver_preimage,
+            unlock_key_preimage: receiver_preimage,
+            legacy,
+        };
+        (
+            key(secret_lock_preimage(&seed.values()), false),
+            key(lock_preimage_from_public_key(&public_key), true),
+        )
     }
 
     pub fn from_key_pair(public_key: PublicKey, secret_key: SecretKey) -> Self {
         let receiver_identifier = receiver_identifier_from_public_key(&public_key);
-        let receiver_preimage = lock_preimage_from_public_key(&public_key);
+        // Lock preimage from the imported secret key material.
+        let receiver_preimage = secret_lock_preimage(&common::bytes_to_bfes(&secret_key));
         Self {
             seed: Digest::new([BFieldElement::new(0); Digest::LEN]),
             receiver_identifier,
             secret_key,
             receiver_preimage,
             unlock_key_preimage: receiver_preimage,
+            legacy: false,
         }
     }
 
@@ -374,11 +449,27 @@ impl dCTIDHSpendingKey {
         self.seed
     }
 
+    /// True for keys derived with the legacy lock derivation. Such keys are
+    /// used only for scanning and spending and have no receiving address.
+    pub fn is_legacy(&self) -> bool {
+        self.legacy
+    }
+
     /// Receiving address for this key.
     pub fn to_address(&self) -> dCTIDHReceivingAddress {
+        assert!(
+            !self.legacy,
+            "legacy dCTIDH keys must never be surfaced as receiving addresses"
+        );
         let public_key =
             sk_to_pk(&self.secret_key).expect("dctidh sk_to_pk from spending secret key");
-        dCTIDHReceivingAddress::from_public_key(public_key)
+        // The address carries the hash of the lock preimage.
+        dCTIDHReceivingAddress {
+            encryption_key: public_key,
+            receiver_identifier: self.receiver_identifier,
+            receiver_postimage: self.receiver_preimage.hash(),
+            lock_postimage: self.unlock_key_preimage.hash(),
+        }
     }
 
     pub fn receiver_preimage(&self) -> Digest {
@@ -466,16 +557,15 @@ impl dCTIDHSpendingKey {
 }
 
 impl dCTIDHReceivingAddress {
-    pub fn from_public_key(public_key: PublicKey) -> Self {
+    /// Reconstruct a receiving address from its wire parts: the encryption
+    /// public key and the lock postimage carried in the address.
+    fn from_parts(public_key: PublicKey, postimage: Digest) -> Self {
         let receiver_identifier = receiver_identifier_from_public_key(&public_key);
-        let preimage = lock_preimage_from_public_key(&public_key);
-        let receiver_postimage = preimage.hash();
-        let lock_postimage = preimage.hash();
         Self {
             encryption_key: public_key,
             receiver_identifier,
-            receiver_postimage,
-            lock_postimage,
+            receiver_postimage: postimage,
+            lock_postimage: postimage,
         }
     }
 
@@ -562,11 +652,16 @@ impl dCTIDHReceivingAddress {
     }
 
     /// Encode this receiving address as canonical bech32m string.
+    ///
+    /// Payload: encryption_key (64 bytes) + lock postimage (40 bytes) = 104
+    /// bytes, giving a bech32m string of ~180 chars (well under 255).
     pub fn to_bech32m(&self, network: Network) -> Result<String> {
         let hrp = Self::get_hrp(network);
-        let payload_bytes = &self.encryption_key[..];
+        let mut payload = Vec::with_capacity(64 + Digest::LEN * 8);
+        payload.extend_from_slice(&self.encryption_key[..]);
+        payload.extend_from_slice(&digest_to_bytes(&self.lock_postimage));
         let variant = Variant::Bech32m;
-        let enc = bech32::encode(&hrp, payload_bytes.to_base32(), variant)
+        let enc = bech32::encode(&hrp, payload.to_base32(), variant)
             .map_err(|e| anyhow!("bech32m encode: {e}"))?;
         ensure!(
             enc.len() <= CTIDH_ADDRESS_MAX_BECH32M_LEN,
@@ -588,10 +683,16 @@ impl dCTIDHReceivingAddress {
         ensure!(variant == Variant::Bech32m, "Only bech32m supported");
         ensure!(hrp == expected_hrp, "Invalid HRP for CTIDH address");
         let bytes = Vec::<u8>::from_base32(&data)?;
-        ensure!(bytes.len() == 64, "CTIDH public key must be 64 bytes");
+        const EXPECTED_LEN: usize = 64 + Digest::LEN * 8;
+        ensure!(
+            bytes.len() == EXPECTED_LEN,
+            "CTIDH address payload must be {EXPECTED_LEN} bytes (64 pubkey + 40 postimage), got {}",
+            bytes.len()
+        );
         let mut public_key = [0u8; 64];
-        public_key.copy_from_slice(&bytes);
-        Ok(Self::from_public_key(public_key))
+        public_key.copy_from_slice(&bytes[0..64]);
+        let postimage = digest_from_bytes(&bytes[64..EXPECTED_LEN]);
+        Ok(Self::from_parts(public_key, postimage))
     }
 }
 

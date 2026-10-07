@@ -216,7 +216,7 @@ fn test_dctidh_address() {
 
     // Derive CTIDH spending key (uses CTIDH-512 under the hood)
     let key = wallet.derive_dctidh_spending_key(0);
-    let addr = key.to_address();
+    let addr = key.to_address().expect("receiving address");
 
     // Standard bech32m encoding (long form, always decodable)
     let b32 = addr
@@ -874,7 +874,7 @@ fn test_tx_dctidh() {
     let wallet =
         xnt_sdk::core::WalletEntropy::from_mnemonic(&mnemonic).expect("wallet from mnemonic");
     let dctidh_key = wallet.derive_dctidh_spending_key(0);
-    let dctidh_addr = dctidh_key.to_address();
+    let dctidh_addr = dctidh_key.to_address().expect("receiving address");
     let dctidh_b32 = dctidh_addr
         .to_bech32(xnt_sdk::core::Network::Main)
         .expect("dctidh bech32m");
@@ -1006,8 +1006,8 @@ fn test_tx_dctidh_multi() {
     // Derive Generation and CTIDH keys from the same seed
     let gen_key = wallet.derive_spending_key(0);
     let dctidh_key = wallet.derive_dctidh_spending_key(0);
-    let gen_addr = gen_key.to_address();
-    let dctidh_addr = dctidh_key.to_address();
+    let gen_addr = gen_key.to_address().expect("receiving address");
+    let dctidh_addr = dctidh_key.to_address().expect("receiving address");
     println!(
         "length of CTIDH bech32m address: {}",
         dctidh_addr

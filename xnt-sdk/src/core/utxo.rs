@@ -168,7 +168,7 @@ mod tests {
         ];
 
         for key in keys {
-            let receiving_address = key.to_address().inner;
+            let receiving_address = key.to_address().unwrap().inner;
             let sender_randomness: CoreDigest = rand::random();
             let tx_output = TxOutput::onchain_native_currency(
                 NativeCurrencyAmount::coins(5),

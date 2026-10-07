@@ -587,6 +587,14 @@ impl RemovalRecordList {
                 } else if *tree_height < 2 * Self::ENCODING_TREE_HEIGHT_OFFSET {
                     // ignore chunk
                     let tree_height = *tree_height - Self::ENCODING_TREE_HEIGHT_OFFSET;
+
+                    // Verify that tree heights are sorted correctly
+                    if let Some(previous) = tree_heights.last() {
+                        if *previous > tree_height {
+                            return Err(RemovalRecordListUnpackError::IncorrectlySortedTreeHeights);
+                        }
+                    }
+
                     tree_heights.push(tree_height);
                     authentication_structures
                         .push(mmr_authentication_path.authentication_path.clone());
@@ -807,10 +815,6 @@ impl RemovalRecordList {
                 sparse_mmr.insert((*tree_height, node_index), *node_hash);
             }
         }
-
-        assert!(sparse_mmr
-            .values()
-            .all(|v| v.to_hex().chars().take(8).collect::<String>() != "be450642"));
 
         // populate sparse MMR by completing families with parents whenever both
         // children are already present

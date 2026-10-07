@@ -110,6 +110,15 @@ impl XntWalletEntropy {
             inner: self.inner.derive_dctidh_spending_key(index as u64),
         }
     }
+
+    /// Derive dCTIDH spending key at index using the legacy (pre-v0.3)
+    /// derivation, for recognising and sweeping funds at legacy-format addresses.
+    #[napi(js_name = "deriveLegacydCTIDHKey")]
+    pub fn derive_legacy_dctidh_key(&self, index: u32) -> XntSpendingKey {
+        XntSpendingKey {
+            inner: self.inner.derive_legacy_dctidh_spending_key(index as u64),
+        }
+    }
 }
 
 /// Spending key for signing transactions
@@ -120,12 +129,15 @@ pub struct XntSpendingKey {
 
 #[napi]
 impl XntSpendingKey {
-    /// Get receiving address from spending key
+    /// Get receiving address from spending key. Throws for legacy-derivation
+    /// dCTIDH keys, which have no receiving address.
     #[napi]
-    pub fn to_address(&self) -> XntAddress {
-        XntAddress {
-            inner: self.inner.to_address(),
-        }
+    pub fn to_address(&self) -> Result<XntAddress> {
+        let inner = self
+            .inner
+            .to_address()
+            .map_err(|e| Error::from_reason(format!("{e}")))?;
+        Ok(XntAddress { inner })
     }
 
     /// Get receiver identifier as u64

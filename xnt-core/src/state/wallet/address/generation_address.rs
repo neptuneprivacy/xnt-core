@@ -460,7 +460,7 @@ impl GenerationReceivingAddress {
             "Can only decode bech32m addresses.",
         );
         ensure!(
-            hrp[0..=5] == Self::get_hrp(network),
+            hrp == Self::get_hrp(network),
             "Could not decode bech32m address because of invalid prefix",
         );
 

@@ -92,6 +92,22 @@ pub extern "C" fn xnt_wallet_derive_dctidh_key(
     )))
 }
 
+/// Derive Nth CTIDH spending key using the legacy (pre-v0.3) derivation, for
+/// recognising and sweeping funds at legacy-format dCTIDH addresses.
+#[no_mangle]
+pub extern "C" fn xnt_wallet_derive_legacy_dctidh_key(
+    handle: *const WalletEntropyHandle,
+    index: u64,
+) -> *mut SpendingKeyHandle {
+    ffi_begin!();
+    check_null!(handle, "wallet handle is null");
+
+    let wallet = ffi_ref!(handle);
+    Box::into_raw(Box::new(SpendingKeyHandle(
+        wallet.0.derive_legacy_dctidh_spending_key(index),
+    )))
+}
+
 ffi_free!(xnt_spending_key_free, SpendingKeyHandle);
 
 /// Get receiver_id from spending key

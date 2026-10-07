@@ -67,6 +67,16 @@ impl WalletEntropy {
             inner: CoreSpendingKey::dCTIDH(dctidh_key),
         }
     }
+
+    /// Derive the Nth CTIDH spending key using the legacy (pre-v0.3) lock
+    /// derivation, for recognising and sweeping funds received at
+    /// legacy-format dCTIDH addresses. Not used to derive new addresses.
+    pub fn derive_legacy_dctidh_spending_key(&self, index: u64) -> SpendingKey {
+        let dctidh_key = self.inner.nth_legacy_dctidh_spending_key(index);
+        SpendingKey {
+            inner: CoreSpendingKey::dCTIDH(dctidh_key),
+        }
+    }
 }
 
 /// Spending key for signing transactions
@@ -76,9 +86,19 @@ pub struct SpendingKey {
 }
 
 impl SpendingKey {
-    /// Get receiving address from spending key
-    pub fn to_address(&self) -> Address {
-        Address::from_core(self.inner.clone().to_address())
+    /// Get receiving address from spending key.
+    ///
+    /// Fails for legacy-derivation dCTIDH keys, which are used only for
+    /// scanning and spending and have no receiving address.
+    pub fn to_address(&self) -> Result<Address> {
+        if let CoreSpendingKey::dCTIDH(key) = &self.inner {
+            if key.is_legacy() {
+                return Err(XntError::InvalidInput(
+                    "legacy dCTIDH keys have no receiving address".to_string(),
+                ));
+            }
+        }
+        Ok(Address::from_core(self.inner.clone().to_address()))
     }
 
     /// Get receiver identifier (8 bytes, little-endian u64)
@@ -107,7 +127,7 @@ impl SpendingKey {
     /// Announced UTXOs whose lock script hash differs from this cannot be
     /// spent by this key and must not be counted towards the balance.
     pub fn lock_script_hash(&self) -> Digest {
-        Digest::from_core(self.inner.clone().to_address().lock_script_hash())
+        Digest::from_core(self.inner.lock_script_hash())
     }
 
     /// Returns true if this is a CTIDH spending key.

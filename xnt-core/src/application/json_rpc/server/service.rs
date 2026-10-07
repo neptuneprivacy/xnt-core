@@ -509,9 +509,12 @@ impl RpcApi for RpcServer {
                 let utxo_digest = ar.canonical_commitment;
 
                 if let Some(incoming) = known_outputs.get(&utxo_digest) {
+                    // Only addressable keys may be rendered as a receiving
+                    // address; legacy-derivation keys are for scanning and
+                    // spending only.
                     let spending_key = state
                         .wallet_state
-                        .find_spending_key_for_utxo(&incoming.utxo);
+                        .find_addressable_spending_key_for_utxo(&incoming.utxo);
                     let receiving_address = spending_key
                         .as_ref()
                         .and_then(|key| key.clone().to_address().to_bech32m(network).ok());
@@ -525,7 +528,7 @@ impl RpcApi for RpcServer {
                         utxo_digest,
                         sender_randomness: Some(incoming.sender_randomness),
                         receiving_address,
-                        receiver_digest: Some(incoming.receiver_preimage),
+                        receiver_digest: Some(incoming.receiver_preimage.hash()),
                         receiver_identifier,
                         utxo: Some(ApiUtxo::new(&incoming.utxo)),
                     }

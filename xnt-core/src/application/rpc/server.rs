@@ -2924,7 +2924,9 @@ impl RPC for NeptuneRPCServer {
             .lock_guard()
             .await
             .wallet_state
-            .get_all_known_spending_keys()
+            // Addressable keys only: legacy-derivation keys are for scanning
+            // and spending, and must not be handed out as receiving keys.
+            .get_all_known_addressable_spending_keys()
             .collect())
     }
 
@@ -2943,7 +2945,7 @@ impl RPC for NeptuneRPCServer {
             .lock_guard()
             .await
             .wallet_state
-            .get_known_spending_keys(key_type)
+            .get_known_addressable_spending_keys(key_type)
             .collect())
     }
 

@@ -100,6 +100,33 @@ fn has_expected_num_proof_items(proof: &VmProof) -> bool {
     proof_stream.items.len() == expected_num_items
 }
 
+/// Determine whether Triton VM's verifier supports the proof's padded height.
+///
+/// The verifier draws FRI indices as `u32`, so the FRI domain belonging to the
+/// padded height must be shorter than 2^32. Honest proofs stay far below this
+/// bound. The padded height is read the way the verifier reads it, from the
+/// first proof item, so no proof the verifier accepts is rejected here.
+fn has_supported_padded_height(proof: &VmProof) -> bool {
+    let Ok(proof_stream) = ProofStream::try_from(proof) else {
+        return false;
+    };
+    let Some(Ok(log2_padded_height)) = proof_stream
+        .items
+        .into_iter()
+        .next()
+        .map(|item| item.try_into_log2_padded_height())
+    else {
+        return false;
+    };
+    let Some(padded_height) = 1_usize.checked_shl(log2_padded_height) else {
+        return false;
+    };
+
+    Stark::default()
+        .fri(padded_height)
+        .is_ok_and(|fri| u32::try_from(fri.domain.len()).is_ok())
+}
+
 /// Verify a Triton VM (claim, proof) pair for default STARK parameters.
 ///
 /// When the test flag is set, this function checks whether the claim is present
@@ -146,6 +173,10 @@ async fn verify_inner(
     let reject_superfluous = superfluous_proof_items == SuperfluousProofItems::Reject;
     let verify_job: Box<dyn FnOnce() -> bool + Send> =
         if claim.version == TritonProofVersion::V8.claim_version() {
+            if !has_supported_padded_height(&proof) {
+                warn!("rejecting proof of unsupported padded height");
+                return false;
+            }
             if reject_superfluous && !has_expected_num_proof_items(&proof) {
                 warn!("rejecting proof that holds an unexpected number of proof items");
                 return false;
@@ -155,6 +186,10 @@ async fn verify_inner(
         } else if claim.version == TritonProofVersion::V7.claim_version() {
             let legacy_claim = legacy_v7::claim(&claim);
             let legacy_proof = legacy_v7::proof(&proof.into());
+            if !legacy_v7::has_supported_padded_height(&legacy_proof) {
+                warn!("rejecting legacy v7 proof of unsupported padded height");
+                return false;
+            }
             if reject_superfluous && !legacy_v7::has_expected_num_proof_items(&legacy_proof) {
                 warn!("rejecting legacy v7 proof that holds an unexpected number of proof items");
                 return false;
@@ -171,9 +206,11 @@ async fn verify_inner(
     #[cfg(test)]
     let claim_clone = claim.clone();
 
-    let verdict = task::spawn_blocking(verify_job)
-        .await
-        .expect("should be able to verify proof in new tokio task");
+    // A verification that does not run to completion rejects the proof.
+    let Ok(verdict) = task::spawn_blocking(verify_job).await else {
+        warn!("rejecting proof whose verification did not complete");
+        return false;
+    };
 
     // tbd: we might want to enable a cache for mainnet usage.
     // but we should probably use a cache that has a configurable max
@@ -238,6 +275,28 @@ mod legacy_v7 {
             + NUM_ROUND_INDEPENDENT_FRI_ITEMS
             + NUM_FRI_ITEMS_PER_ROUND * fri.num_rounds();
         proof_stream.items.len() == expected
+    }
+
+    /// Like [`super::has_supported_padded_height`], for triton-vm v7.
+    pub(super) fn has_supported_padded_height(proof: &tvm7::proof::Proof) -> bool {
+        let Ok(proof_stream) = tvm7::proof_stream::ProofStream::try_from(proof) else {
+            return false;
+        };
+        let Some(Ok(log2_padded_height)) = proof_stream
+            .items
+            .into_iter()
+            .next()
+            .map(|item| item.try_into_log2_padded_height())
+        else {
+            return false;
+        };
+        let Some(padded_height) = 1_usize.checked_shl(log2_padded_height) else {
+            return false;
+        };
+
+        tvm7::prelude::Stark::default()
+            .fri(padded_height)
+            .is_ok_and(|fri| u32::try_from(fri.domain.len()).is_ok())
     }
 
     pub(super) fn verify(claim: &tvm7::proof::Claim, proof: &tvm7::proof::Proof) -> bool {

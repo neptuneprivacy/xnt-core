@@ -37,14 +37,15 @@ impl From<XntNetwork> for Network {
     }
 }
 
-/// Get receiving address from spending key
+/// Get receiving address from spending key. Returns NULL and sets the last
+/// error for legacy-derivation dCTIDH keys, which have no receiving address.
 #[no_mangle]
 pub extern "C" fn xnt_spending_key_to_address(handle: *const SpendingKeyHandle) -> *mut AddressHandle {
     ffi_begin!();
     check_null!(handle, "spending key handle is null");
 
     let key = ffi_ref!(handle);
-    Box::into_raw(Box::new(AddressHandle(key.0.to_address())))
+    ffi_result!(key.0.to_address(), AddressHandle)
 }
 
 ffi_free!(xnt_address_free, AddressHandle);

@@ -323,6 +323,20 @@ impl ConsensusRuleSet {
         }
     }
 
+    /// The largest block-transaction kernel a composer should select from the
+    /// mempool, in number of BFieldElements.
+    ///
+    /// Leaves room under [`Self::max_block_size`] for the block proof and the
+    /// rest of the block body, so that a composed block stays within the size
+    /// limit.
+    pub(crate) fn max_recommended_block_tx_kernel_size(&self) -> usize {
+        const BIG_BLOCK_PROOF_LEN: usize = 160_000;
+
+        self.max_block_size()
+            .checked_sub(BIG_BLOCK_PROOF_LEN)
+            .expect("Max block size cannot be less than that of a big proof")
+    }
+
     /// Infer the [`ConsensusRuleSet`] from the [`Network`] and the
     /// [`BlockHeight`]. The second argument is necessary to take into account
     /// planned hard or soft forks that activate at a given height. The first
