@@ -88,6 +88,12 @@ pub enum CreateProofError {
 
     #[error("Could not forward job cancellation msg to proving job. {0}")]
     JobCancelSendError(#[from] tokio::sync::watch::error::SendError<()>),
+
+    #[error(
+        "this version verifies but cannot produce proofs for consensus rule set {0}; \
+         it produces proofs from the next hard fork on"
+    )]
+    LegacyEra(crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet),
 }
 
 /// enumerates possible upgrade-proof errors

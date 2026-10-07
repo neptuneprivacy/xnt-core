@@ -237,14 +237,15 @@ impl Block {
         let network = proof_job_options.job_settings.network;
         let body = primitive_witness.body().to_owned();
         let header = primitive_witness.header(timestamp, network.target_block_interval());
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, header.height);
+        anyhow::ensure!(
+            !consensus_rule_set.is_legacy_era(),
+            "this version cannot produce block proofs for consensus rule set {consensus_rule_set}"
+        );
         let (appendix, proof) = {
             let block_proof_witness = BlockProofWitness::produce(primitive_witness);
             let appendix = block_proof_witness.appendix();
-            let claim = BlockProgram::claim(
-                &body,
-                &appendix,
-                ConsensusRuleSet::infer_from(network, header.height),
-            );
+            let claim = BlockProgram::claim(&body, &appendix, consensus_rule_set);
 
             let proof = ProofBuilder::new()
                 .program(BlockProgram.program())
@@ -667,7 +668,7 @@ impl Block {
 
         // 1.a)
         // Skip claim validation for checkpointed (pre-v7) blocks, whose superseded
-        // proof format the current (v7) verifier cannot check.
+        // proof formats no linked verifier checks.
         if !consensus_rule_set.proofs_are_trusted() {
             for required_claim in BlockAppendix::consensus_claims(self.body(), consensus_rule_set) {
                 if !self.appendix().contains(&required_claim) {

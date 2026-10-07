@@ -2395,6 +2395,19 @@ impl GlobalState {
         add_reason: AddReason,
     ) {
         let tip_height = self.chain.light_state().header().height;
+
+        // Transactions live in the tip's era. Before the fork this version holds
+        // none: it cannot merge or upgrade legacy-era transactions, and one held
+        // across the fork would make the first block after it impossible to
+        // compose. See `ConsensusRuleSet::is_legacy_era`.
+        if ConsensusRuleSet::infer_from(self.cli().network, tip_height).is_legacy_era() {
+            debug!(
+                "Not adding transaction {} to the mempool: the tip is in the legacy era",
+                transaction.kernel.txid()
+            );
+            return;
+        }
+
         let events = self.mempool.insert(transaction, priority, add_reason);
         self.mempool.log_events(&events, tip_height);
         self.wallet_state.handle_mempool_events(events).await

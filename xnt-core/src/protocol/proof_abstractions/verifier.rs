@@ -7,6 +7,7 @@ use tokio::task;
 use tracing::warn;
 
 use crate::application::config::network::Network;
+use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 
 // This claims-cache stores mock proof-claims that are simply asserted to be valid.
@@ -138,20 +139,41 @@ async fn verify_inner(
         return true;
     }
 
-    if superfluous_proof_items == SuperfluousProofItems::Reject
-        && !has_expected_num_proof_items(&proof)
-    {
-        warn!("rejecting proof that holds an unexpected number of proof items");
-        return false;
-    }
+    // The claim's version names the Triton VM proof format the proof was made
+    // in, and only a verifier of that format can check it: format 8 for the
+    // current era, format 5 for `UpgradeVMv7`, which the legacy triton-vm v7
+    // verifies. Claims of any other format belong to checkpointed eras.
+    let reject_superfluous = superfluous_proof_items == SuperfluousProofItems::Reject;
+    let verify_job: Box<dyn FnOnce() -> bool + Send> =
+        if claim.version == TritonProofVersion::V8.claim_version() {
+            if reject_superfluous && !has_expected_num_proof_items(&proof) {
+                warn!("rejecting proof that holds an unexpected number of proof items");
+                return false;
+            }
+            let claim = claim.clone();
+            Box::new(move || triton_vm::verify(Stark::default(), &claim, &proof.into()))
+        } else if claim.version == TritonProofVersion::V7.claim_version() {
+            let legacy_claim = legacy_v7::claim(&claim);
+            let legacy_proof = legacy_v7::proof(&proof.into());
+            if reject_superfluous && !legacy_v7::has_expected_num_proof_items(&legacy_proof) {
+                warn!("rejecting legacy v7 proof that holds an unexpected number of proof items");
+                return false;
+            }
+            Box::new(move || legacy_v7::verify(&legacy_claim, &legacy_proof))
+        } else {
+            warn!(
+                "rejecting proof of unsupported proof format version {}",
+                claim.version
+            );
+            return false;
+        };
 
     #[cfg(test)]
     let claim_clone = claim.clone();
 
-    let verdict =
-        task::spawn_blocking(move || triton_vm::verify(Stark::default(), &claim, &proof.into()))
-            .await
-            .expect("should be able to verify proof in new tokio task");
+    let verdict = task::spawn_blocking(verify_job)
+        .await
+        .expect("should be able to verify proof in new tokio task");
 
     // tbd: we might want to enable a cache for mainnet usage.
     // but we should probably use a cache that has a configurable max
@@ -162,6 +184,65 @@ async fn verify_inner(
     }
 
     verdict
+}
+
+/// Verification of `UpgradeVMv7` proofs (proof format 5) with the linked
+/// legacy triton-vm v7, so that a node running this release before the
+/// `UpgradeVMv8` fork checks v7 blocks instead of trusting them. Field elements
+/// are carried across by value; both versions use the same field.
+mod legacy_v7 {
+    use tasm_lib::triton_vm::prelude::BFieldElement;
+    use tasm_lib::triton_vm::proof::Claim;
+    use tasm_lib::triton_vm::proof::Proof as VmProof;
+    use triton_vm_v7 as tvm7;
+
+    fn to_v7(elements: &[BFieldElement]) -> Vec<tvm7::prelude::BFieldElement> {
+        elements
+            .iter()
+            .map(|element| tvm7::prelude::BFieldElement::new(element.value()))
+            .collect()
+    }
+
+    pub(super) fn claim(claim: &Claim) -> tvm7::proof::Claim {
+        let digest: [tvm7::prelude::BFieldElement; 5] = to_v7(&claim.program_digest.values())
+            .try_into()
+            .expect("a digest has five elements");
+        tvm7::proof::Claim::new(tvm7::prelude::Digest::new(digest))
+            .about_version(claim.version)
+            .with_input(to_v7(&claim.input))
+            .with_output(to_v7(&claim.output))
+    }
+
+    pub(super) fn proof(proof: &VmProof) -> tvm7::proof::Proof {
+        tvm7::proof::Proof(to_v7(&proof.0))
+    }
+
+    /// Like [`super::has_expected_num_proof_items`], for triton-vm v7, which
+    /// sends one item fewer outside of FRI: its quotient segments are a single
+    /// item.
+    pub(super) fn has_expected_num_proof_items(proof: &tvm7::proof::Proof) -> bool {
+        const NUM_ITEMS_OUTSIDE_FRI: usize = 15;
+        const NUM_ROUND_INDEPENDENT_FRI_ITEMS: usize = 4;
+        const NUM_FRI_ITEMS_PER_ROUND: usize = 2;
+
+        let Ok(padded_height) = proof.padded_height() else {
+            return false;
+        };
+        let Ok(fri) = tvm7::prelude::Stark::default().fri(padded_height) else {
+            return false;
+        };
+        let Ok(proof_stream) = tvm7::proof_stream::ProofStream::try_from(proof) else {
+            return false;
+        };
+        let expected = NUM_ITEMS_OUTSIDE_FRI
+            + NUM_ROUND_INDEPENDENT_FRI_ITEMS
+            + NUM_FRI_ITEMS_PER_ROUND * fri.num_rounds();
+        proof_stream.items.len() == expected
+    }
+
+    pub(super) fn verify(claim: &tvm7::proof::Claim, proof: &tvm7::proof::Proof) -> bool {
+        tvm7::verify(tvm7::prelude::Stark::default(), claim, proof)
+    }
 }
 
 /// Add a claim to the [`CLAIMS_CACHE`].
@@ -290,6 +371,87 @@ pub(crate) mod tests {
             !verify(claim, appended_proof, network).await,
             "since triton-vm v8 a block proof with a trailing item must be rejected"
         );
+    }
+
+    /// Proofs made by triton-vm v7 (format 5), as `UpgradeVMv7` proofs are, are
+    /// routed to the linked legacy verifier: an honest one verifies, one with a
+    /// trailing item fails v7's item count, and the same proof does not satisfy
+    /// a format-8 claim.
+    mod legacy_v7_route {
+        use macro_rules_attr::apply;
+        use tasm_lib::prelude::Digest;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+        use tasm_lib::triton_vm::proof::Claim;
+        use tasm_lib::triton_vm::proof::Proof as VmProof;
+        use triton_vm_v7::prelude::triton_asm;
+        use triton_vm_v7::prelude::triton_program;
+        use triton_vm_v7::prelude::BFieldElement as V7Bfe;
+        use triton_vm_v7::prelude::NonDeterminism as V7NonDeterminism;
+        use triton_vm_v7::prelude::Stark as V7Stark;
+        use triton_vm_v7::proof::Claim as V7Claim;
+        use triton_vm_v7::proof::Proof as V7Proof;
+        use triton_vm_v7::proof_item::ProofItem as V7ProofItem;
+        use triton_vm_v7::proof_stream::ProofStream as V7ProofStream;
+
+        use crate::application::config::network::Network;
+        use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+        use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
+        use crate::tests::shared_tokio_runtime;
+
+        fn to_current(elements: &[V7Bfe]) -> Vec<BFieldElement> {
+            elements
+                .iter()
+                .map(|e| BFieldElement::new(e.value()))
+                .collect()
+        }
+
+        fn current_claim(claim: &V7Claim, version: u32) -> Claim {
+            let digest: [BFieldElement; 5] = to_current(&claim.program_digest.values())
+                .try_into()
+                .unwrap();
+            Claim::new(Digest::new(digest))
+                .about_version(version)
+                .with_input(to_current(&claim.input))
+                .with_output(to_current(&claim.output))
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn legacy_v7_proofs_are_routed_to_the_v7_verifier() {
+            let network = Network::Main;
+            let program = triton_program!({&triton_asm![nop; 200]} halt);
+            let claim7 = V7Claim::about_program(&program);
+            assert_eq!(claim7.version, TritonProofVersion::V7.claim_version());
+            let proof7 = triton_vm_v7::prove(
+                V7Stark::default(),
+                &claim7,
+                program,
+                V7NonDeterminism::default(),
+            )
+            .unwrap();
+            let proof = Proof::from(VmProof(to_current(&proof7.0)));
+
+            let mut padded_stream = V7ProofStream::try_from(&proof7).unwrap();
+            padded_stream.items.push(V7ProofItem::Log2PaddedHeight(8));
+            let padded7 = V7Proof::from(padded_stream);
+            let padded = Proof::from(VmProof(to_current(&padded7.0)));
+
+            // Negative cases first: test builds cache claims that verified.
+            let claim = current_claim(&claim7, claim7.version);
+            assert!(
+                !verify_transaction_proof(claim.clone(), padded, network).await,
+                "a v7 proof with a trailing item must fail v7's item count"
+            );
+            let as_v8 = current_claim(&claim7, TritonProofVersion::V8.claim_version());
+            assert!(
+                !verify_transaction_proof(as_v8, proof.clone(), network).await,
+                "a v7 proof must not satisfy a format-8 claim"
+            );
+            assert!(
+                verify_transaction_proof(claim, proof, network).await,
+                "an honest v7 proof must verify with the legacy verifier"
+            );
+        }
     }
 
     #[apply(shared_tokio_runtime)]

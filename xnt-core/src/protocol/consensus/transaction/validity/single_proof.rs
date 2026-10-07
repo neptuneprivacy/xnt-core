@@ -292,6 +292,12 @@ pub(crate) async fn produce_single_proof(
     proof_job_options: TritonVmProofJobOptions,
     consensus_rule_set: ConsensusRuleSet,
 ) -> Result<Proof, CreateProofError> {
+    // The legacy era's proofs need the v7 consensus programs, which this binary
+    // does not contain; fail cleanly instead of in the prover.
+    if consensus_rule_set.is_legacy_era() {
+        return Err(CreateProofError::LegacyEra(consensus_rule_set));
+    }
+
     match consensus_rule_set {
         ConsensusRuleSet::Reboot
         | ConsensusRuleSet::HardforkAlpha

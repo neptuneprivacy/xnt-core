@@ -177,6 +177,25 @@ impl PeerLoopHandler {
     ///
     /// # Locking:
     ///   * acquires `global_state_lock` for write
+    /// Whether the chain tip is in the legacy era, see
+    /// [`ConsensusRuleSet::is_legacy_era`]. Transactions are validated in the
+    /// tip's era. Before the fork this version neither verifies nor holds them:
+    /// it cannot merge or upgrade them, and one held across the fork would make
+    /// the first block after it impossible to compose. They are ignored rather
+    /// than punished, since the peers relaying them are honest.
+    async fn tip_is_in_legacy_era(&self) -> bool {
+        let tip_height = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        ConsensusRuleSet::infer_from(self.global_state_lock.cli().network, tip_height)
+            .is_legacy_era()
+    }
+
     async fn punish(&mut self, reason: NegativePeerSanction) -> Result<()> {
         let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
         warn!("Punishing peer {} for {:?}", self.peer_address.ip(), reason);
@@ -1318,6 +1337,13 @@ impl PeerLoopHandler {
             PeerMessage::Transaction(transaction) => {
                 log_slow_scope!(fn_name!() + "::PeerMessage::Transaction");
 
+                if self.tip_is_in_legacy_era().await {
+                    debug!(
+                        "Ignoring transaction: this version does not hold legacy-era transactions"
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
                 // Early check for oversized announcements to prevent DoS
                 for announcement in &transaction.kernel.announcements {
                     if announcement.message.len() > MAX_ANNOUNCEMENT_MESSAGE_SIZE {
@@ -1546,6 +1572,14 @@ impl PeerLoopHandler {
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             PeerMessage::TransactionNotification(tx_notification) => {
+                if self.tip_is_in_legacy_era().await {
+                    debug!(
+                        "Ignoring transaction notification: \
+                         this version does not hold legacy-era transactions"
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
                 // addresses #457
                 // new scope for state read-lock to avoid holding across peer.send()
                 {

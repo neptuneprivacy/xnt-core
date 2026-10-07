@@ -101,6 +101,10 @@ tarpc = { version = "^0.34", features = [
 ] }
 # tasm-lib 8.0.0 (triton-vm 8) plus the u128 limb range-check: fork branch upgrade-v8.
 tasm-lib = { git = "https://github.com/neptuneprivacy/tasm-lib", rev = "4b630213f6669f2e85be69808fb8c890b8735be8" }
+# Legacy verifier for the UpgradeVMv7 era (proof format 5). A node running this
+# release before the UpgradeVMv8 fork verifies v7 blocks with it instead of
+# trusting them. Remove once the fork is well past, as neptune-core did.
+triton-vm-v7 = { package = "triton-vm", version = "=7.0.0" }
 tiny-bip39 = "1.0"
 tokio = { version = "1.41", features = ["full", "tracing"] }
 tokio-serde = { version = "0.8", features = ["bincode", "json"] }

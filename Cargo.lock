@@ -1357,6 +1357,17 @@ dependencies = [
 
 [[package]]
 name = "get-size-derive2"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b6d1e2f75c16bfbcd0f95d84f99858a6e2f885c2287d1f5c3a96e8444a34b4"
+dependencies = [
+ "attribute-derive",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "get-size-derive2"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9f8ab1b98a1284961d722ce994d9a0f3018ab1917618d4113824a72b9f71bc9"
@@ -1368,11 +1379,20 @@ dependencies = [
 
 [[package]]
 name = "get-size2"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49cf31a6d70300cf81461098f7797571362387ef4bf85d32ac47eaa59b3a5a1a"
+dependencies = [
+ "get-size-derive2 0.7.4",
+]
+
+[[package]]
+name = "get-size2"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0cd0777a1057362cab35a779e0d79dacecb8d73e2c733eaafeb7ea917b08f03"
 dependencies = [
- "get-size-derive2",
+ "get-size-derive2 0.9.0",
 ]
 
 [[package]]
@@ -1393,9 +1413,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2442,7 +2464,7 @@ dependencies = [
  "divan",
  "field_count",
  "futures",
- "get-size2",
+ "get-size2 0.9.0",
  "hex",
  "humantime",
  "itertools 0.11.0",
@@ -2489,6 +2511,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "triton-vm 7.0.0",
  "xnt-rpc-macros",
  "zeroize",
 ]
@@ -4066,7 +4089,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "tasm-object-derive",
- "triton-vm",
+ "triton-vm 9.0.0",
  "web-time",
 ]
 
@@ -4623,6 +4646,20 @@ dependencies = [
 
 [[package]]
 name = "triton-air"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05100018626561a14bdfee44f9e47c767bbec7c645f4707ac5a3541ec648d49f"
+dependencies = [
+ "arbitrary",
+ "itertools 0.14.0",
+ "strum 0.27.2",
+ "triton-constraint-circuit 7.0.0",
+ "triton-isa 7.0.0",
+ "twenty-first 1.1.0",
+]
+
+[[package]]
+name = "triton-air"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c5d94b0749a48dff6a8288e736fb2ed8cab0bceaea370b467c4b6dcbf87670"
@@ -4630,9 +4667,27 @@ dependencies = [
  "arbitrary",
  "itertools 0.14.0",
  "strum 0.27.2",
- "triton-constraint-circuit",
- "triton-isa",
- "twenty-first",
+ "triton-constraint-circuit 9.0.0",
+ "triton-isa 9.0.0",
+ "twenty-first 3.0.0",
+]
+
+[[package]]
+name = "triton-constraint-builder"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceb01697a5d694084a6cb889cd543b86c6f7d8bf972f0f7ccac249a4aae63390"
+dependencies = [
+ "itertools 0.14.0",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "strum 0.27.2",
+ "syn 2.0.119",
+ "triton-air 7.0.0",
+ "triton-constraint-circuit 7.0.0",
+ "triton-isa 7.0.0",
+ "twenty-first 1.1.0",
 ]
 
 [[package]]
@@ -4647,10 +4702,25 @@ dependencies = [
  "quote",
  "strum 0.27.2",
  "syn 2.0.119",
- "triton-air",
- "triton-constraint-circuit",
- "triton-isa",
- "twenty-first",
+ "triton-air 9.0.0",
+ "triton-constraint-circuit 9.0.0",
+ "triton-isa 9.0.0",
+ "twenty-first 3.0.0",
+]
+
+[[package]]
+name = "triton-constraint-circuit"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "961bfa562c091b39f65b8fa0c27890db36ed8968ff9cf1c842db548c76941536"
+dependencies = [
+ "arbitrary",
+ "itertools 0.14.0",
+ "ndarray",
+ "num-traits",
+ "proc-macro2",
+ "quote",
+ "twenty-first 1.1.0",
 ]
 
 [[package]]
@@ -4665,7 +4735,26 @@ dependencies = [
  "num-traits",
  "proc-macro2",
  "quote",
- "twenty-first",
+ "twenty-first 3.0.0",
+]
+
+[[package]]
+name = "triton-isa"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee155aabdd118aa503e9bfe46e67c67a46d3c06b57b3ff94fa5a6ebf149e2371"
+dependencies = [
+ "arbitrary",
+ "get-size2 0.7.4",
+ "itertools 0.14.0",
+ "lazy_static",
+ "nom 8.0.0",
+ "nom-language",
+ "num-traits",
+ "serde",
+ "strum 0.27.2",
+ "thiserror 2.0.20",
+ "twenty-first 1.1.0",
 ]
 
 [[package]]
@@ -4675,7 +4764,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6f49f05be9bf8ab5b10cdef4cef676db57e930f72866db0757a4445f6e29d5"
 dependencies = [
  "arbitrary",
- "get-size2",
+ "get-size2 0.9.0",
  "itertools 0.14.0",
  "lazy_static",
  "nom 8.0.0",
@@ -4684,7 +4773,39 @@ dependencies = [
  "serde",
  "strum 0.27.2",
  "thiserror 2.0.20",
- "twenty-first",
+ "twenty-first 3.0.0",
+]
+
+[[package]]
+name = "triton-vm"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b7f98e447c631135092a38c29a5ba286e77540759560287f6798e2e840a3c79"
+dependencies = [
+ "arbitrary",
+ "colored",
+ "get-size2 0.7.4",
+ "indexmap 2.14.2",
+ "itertools 0.14.0",
+ "lazy_static",
+ "memory-stats",
+ "ndarray",
+ "num-traits",
+ "prettyplease",
+ "proc-macro2",
+ "rand 0.9.5",
+ "rayon",
+ "serde",
+ "strum 0.27.2",
+ "syn 2.0.119",
+ "thiserror 2.0.20",
+ "triton-air 7.0.0",
+ "triton-constraint-builder 7.0.0",
+ "triton-constraint-circuit 7.0.0",
+ "triton-isa 7.0.0",
+ "twenty-first 1.1.0",
+ "unicode-width 0.2.0",
+ "web-time",
 ]
 
 [[package]]
@@ -4695,7 +4816,7 @@ checksum = "dc5c2b343f60bdaaff8f5174a237a32609a07cc865713b9b0f1f8f39c8839b58"
 dependencies = [
  "arbitrary",
  "colored",
- "get-size2",
+ "get-size2 0.9.0",
  "indexmap 2.14.2",
  "itertools 0.14.0",
  "lazy_static",
@@ -4710,11 +4831,11 @@ dependencies = [
  "strum 0.27.2",
  "syn 2.0.119",
  "thiserror 2.0.20",
- "triton-air",
- "triton-constraint-builder",
- "triton-constraint-circuit",
- "triton-isa",
- "twenty-first",
+ "triton-air 9.0.0",
+ "triton-constraint-builder 9.0.0",
+ "triton-constraint-circuit 9.0.0",
+ "triton-isa 9.0.0",
+ "twenty-first 3.0.0",
  "unicode-width 0.2.0",
  "web-time",
 ]
@@ -4727,13 +4848,40 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "twenty-first"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f2127e955aea73cc584e429c544f4a5997128fd5e4021c852cb63f309bf51ea"
+dependencies = [
+ "arbitrary",
+ "bfieldcodec_derive",
+ "get-size2 0.7.4",
+ "getrandom 0.3.4",
+ "hex",
+ "itertools 0.14.0",
+ "num-bigint",
+ "num-traits",
+ "phf",
+ "rand 0.9.5",
+ "rayon",
+ "serde",
+ "serde-big-array",
+ "serde_derive",
+ "serde_json",
+ "sha3 0.10.9",
+ "thiserror 2.0.20",
+ "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
+name = "twenty-first"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94fc33f2bb02d443dfb444a5181d8e2361295e59e8c8f84772d1572697221c1b"
 dependencies = [
  "arbitrary",
  "bfieldcodec_derive",
- "get-size2",
+ "get-size2 0.9.0",
  "getrandom 0.4.3",
  "hex",
  "itertools 0.14.0",

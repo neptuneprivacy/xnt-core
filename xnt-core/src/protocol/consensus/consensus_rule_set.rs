@@ -77,8 +77,9 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
 /// proofs.
 ///
 /// The constraint system changes, so the proof format version jumps 5 -> 8 and
-/// every proof program re-hashes. The v8 verifier cannot re-check v7 proofs, so
-/// pre-v8 history is checkpointed via the hardcoded v7 program digests.
+/// every proof program re-hashes. The v8 verifier cannot check v7 proofs, so
+/// this binary also links triton-vm v7 as a legacy verifier for the v7 era,
+/// against the hardcoded v7 program digests; earlier eras are checkpointed.
 ///
 /// The leaf type scripts are byte-identical across v7 and v8 — verified by the
 /// `program_hash_has_not_changed` snapshots for `NativeCurrency`, `TimeLock`,
@@ -86,10 +87,11 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
 /// need no remap and remain spendable directly. Only `SingleProof`,
 /// `SingleProofV2` and `BlockProgram`, which embed the STARK verifier, re-hash.
 ///
-/// ROLLOUT: a binary linking triton-vm v8 cannot extend the v7 chain, because a
+/// ROLLOUT: this binary verifies the v7 chain but cannot extend it, because a
 /// v7-era claim names the hardcoded v7 program digest and no v8 bytecode
-/// reproduces it. This height is therefore the cut-over point, not a date after
-/// which the binary may be shipped: nodes must move together at it.
+/// reproduces it. Before this height it therefore does not compose, nor hold
+/// or relay transactions (see `ConsensusRuleSet::is_legacy_era`), and the chain
+/// relies on composers still running the previous release to reach it.
 ///
 /// Mainnet v8 activation height.
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET: BlockHeight =
@@ -173,10 +175,10 @@ pub enum ConsensusRuleSet {
     ///
     /// The constraint system changes, so the proof FORMAT version jumps 5 -> 8
     /// and the proof programs that embed the STARK verifier (`SingleProof`,
-    /// `SingleProofV2`, `BlockProgram`) re-hash. The current binary links
-    /// triton-vm v8, so pre-v8 history is checkpointed via the hardcoded v7
-    /// program digests rather than re-verified. UpgradeVMv8 blocks use the
-    /// recomputed v8 proof-program digests.
+    /// `SingleProofV2`, `BlockProgram`) re-hash. The v7 era is verified with
+    /// the linked legacy triton-vm v7 against the hardcoded v7 program digests;
+    /// earlier eras are checkpointed. UpgradeVMv8 blocks use the recomputed v8
+    /// proof-program digests.
     UpgradeVMv8,
 }
 
@@ -251,23 +253,55 @@ impl ConsensusRuleSet {
         }
     }
 
-    /// Rule sets whose proofs the current verifier cannot check, so their blocks
-    /// are trusted (checkpointed) rather than re-verified.
+    /// Rule sets whose proofs this binary cannot check, so their blocks are
+    /// trusted (checkpointed) rather than re-verified.
     ///
-    /// triton-vm's proof format (`proof::CURRENT_VERSION`) changes only when the
-    /// STARK/ISA changes; a verifier can re-check only proofs of its OWN format
-    /// version. The current binary links triton-vm v7 (so its verifier re-checks
-    /// ONLY `UpgradeVMv7` proofs). Every earlier era — including `UpgradeVMv5` —
-    /// was produced under a superseded triton-vm whose proofs this verifier does
-    /// not re-check, and is therefore checkpointed.
+    /// A Triton VM verifier only checks proofs of its own proof format version.
+    /// This binary links triton-vm v9 (format 8) for `UpgradeVMv8` and, as a
+    /// legacy verifier, triton-vm v7 (format 5) for `UpgradeVMv7`; see
+    /// [`Self::is_legacy_era`]. Every earlier era was produced under a
+    /// superseded triton-vm or tasm-lib and is checkpointed.
     ///
-    /// NOTE: triton-vm v7 keeps v5's proof FORMAT version (`CURRENT_VERSION == 5`),
-    /// so a v5 proof is format-compatible. We nonetheless checkpoint the v5 era
-    /// rather than re-verify it, mirroring neptune-core's house pattern ("Upgrade
-    /// Triton VM … with checkpoint"): the superseded history is trusted instead of
-    /// relying on cross-crate-major proof re-verification.
+    /// `UpgradeVMv5` proofs share format 5 with v7 and might verify under the
+    /// legacy verifier, but that era is long past and stays checkpointed,
+    /// mirroring neptune-core's "upgrade Triton VM with checkpoint" pattern.
     pub(crate) fn proofs_are_trusted(&self) -> bool {
-        !matches!(self, ConsensusRuleSet::UpgradeVMv8)
+        match self {
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5 => true,
+            ConsensusRuleSet::UpgradeVMv7 | ConsensusRuleSet::UpgradeVMv8 => false,
+        }
+    }
+
+    /// Whether this is the era immediately before the current one, which this
+    /// binary verifies with the legacy triton-vm v7 but cannot produce proofs
+    /// for.
+    ///
+    /// On main net the chain stays in this era until
+    /// [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET`]. A node running this
+    /// binary before then verifies every block fully, but it must not compose
+    /// blocks or create, merge, upgrade or relay transactions: their proofs need
+    /// the v7 consensus programs, which this binary does not contain. Composing
+    /// a block of this era would fail at the first proof, and a v7 transaction
+    /// held in the mempool across the fork would make the first `UpgradeVMv8`
+    /// block impossible to compose.
+    pub(crate) fn is_legacy_era(&self) -> bool {
+        match self {
+            ConsensusRuleSet::UpgradeVMv7 => true,
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv8 => false,
+        }
     }
 
     /// Maximum block size in number of BFieldElements
@@ -533,6 +567,50 @@ pub(crate) mod tests {
     use crate::tests::shared::blocks::next_block;
     use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
     use crate::tests::tokio_runtime;
+
+    /// The legacy era is exactly `UpgradeVMv7`, the era before the v8 fork. On
+    /// main net it ends at the fork height: a composer whose tip is the last v7
+    /// block composes the first v8 block, while one block earlier it waits.
+    /// Test networks start in the current era and never are in it.
+    #[test]
+    fn legacy_era_is_exactly_the_era_before_the_v8_fork() {
+        for rule_set in ConsensusRuleSet::iter() {
+            assert_eq!(
+                rule_set == ConsensusRuleSet::UpgradeVMv7,
+                rule_set.is_legacy_era(),
+                "{rule_set}"
+            );
+            assert!(
+                !(rule_set.is_legacy_era() && rule_set.proofs_are_trusted()),
+                "{rule_set}: the legacy era is verified, not trusted"
+            );
+        }
+
+        let height = |h: u64| BlockHeight::new(BFieldElement::new(h));
+        let fork = u64::from(BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET);
+        let first_v7 = u64::from(BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET);
+        for h in [first_v7, first_v7 + 1, fork - 2, fork - 1] {
+            assert!(
+                ConsensusRuleSet::infer_from(Network::Main, height(h)).is_legacy_era(),
+                "main net height {h} is in the legacy era"
+            );
+        }
+        for h in [first_v7 - 1, fork, fork + 1] {
+            assert!(
+                !ConsensusRuleSet::infer_from(Network::Main, height(h)).is_legacy_era(),
+                "main net height {h} is not in the legacy era"
+            );
+        }
+
+        for network in [Network::Testnet(0), Network::RegTest, Network::TestnetMock] {
+            for h in [0, first_v7, fork - 1, fork] {
+                assert!(
+                    !ConsensusRuleSet::infer_from(network, height(h)).is_legacy_era(),
+                    "{network} height {h} is not in the legacy era"
+                );
+            }
+        }
+    }
 
     /// A transaction is admissible right up to the mempool limit, and rejected
     /// one item beyond it, for each of the three item kinds.
@@ -987,7 +1065,7 @@ pub(crate) mod tests {
     #[test]
     fn upgrade_vm_v8_active_on_main_at_activation_height() {
         // At exactly the v8 activation height, mainnet switches to UpgradeVMv8;
-        // one block below it, mainnet is still on UpgradeVMv7 (checkpointed).
+        // one block below it, mainnet is still on UpgradeVMv7 (legacy era).
         let activation = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
         assert_eq!(
             ConsensusRuleSet::infer_from(Network::Main, activation),

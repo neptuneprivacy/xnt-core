@@ -49,6 +49,7 @@ use crate::protocol::consensus::block::pow::Pow;
 use crate::protocol::consensus::block::pow::PowMastPaths;
 use crate::protocol::consensus::block::*;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::*;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -704,6 +705,7 @@ pub(crate) async fn mine(
 
     let mut pause_mine = false;
     let mut wait_for_confirmation = false;
+    let mut legacy_era_notice_height = None;
     loop {
         // Ensure restart timer doesn't resolve again, without guesser
         // task actually being spawned.
@@ -791,8 +793,33 @@ pub(crate) async fn mine(
         let (cancel_compose_tx, cancel_compose_rx) = tokio::sync::watch::channel(());
 
         let compose = cli_args.compose;
+
+        // Blocks of the legacy era need proofs this version cannot produce.
+        // Composing one would fail at the first proof and shut the node down,
+        // so wait for the fork instead; composing resumes on its own once the
+        // next block belongs to the current era.
+        let next_block_height = global_state_lock
+            .lock(|s| s.chain.light_state().header().height.next())
+            .await;
+        let next_block_is_legacy_era =
+            ConsensusRuleSet::infer_from(network, next_block_height).is_legacy_era();
+        if compose && next_block_is_legacy_era {
+            if legacy_era_notice_height != Some(next_block_height) {
+                info!(
+                    "Not composing block {next_block_height}: this version cannot prove blocks \
+                     before the hard fork at block {BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET}. \
+                     Composing starts automatically at the fork."
+                );
+                legacy_era_notice_height = Some(next_block_height);
+            }
+            if guesser_task.is_none() {
+                global_state_lock.set_mining_status_to_inactive().await;
+            }
+        }
+
         let mut composer_task = if !wait_for_confirmation
             && compose
+            && !next_block_is_legacy_era
             && guesser_task.is_none()
             && !is_syncing
             && !pause_mine
