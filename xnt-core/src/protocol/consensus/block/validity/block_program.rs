@@ -660,7 +660,8 @@ pub(crate) mod tests {
     /// hf_upgrade_vm_blocks); the test skips gracefully if they're absent.
     #[traced_test]
     #[apply(shared_tokio_runtime)]
-    async fn pre_v7_block_proofs_are_checkpointed_under_v7() {
+    async fn pre_v8_block_proofs_are_checkpointed_under_v8() {
+        const V7_FIXTURE: &str = "block_upgrade_vm_v7_80001.json";
         use crate::application::json_rpc::core::model::block::appendix::RpcBlockAppendix;
         use crate::application::json_rpc::core::model::block::body::RpcBlockBody;
         use crate::application::json_rpc::core::model::block::RpcBlockProof;
@@ -695,9 +696,10 @@ pub(crate) mod tests {
             Some(BlockProgram::verify(&body, &appendix, &proof, Network::Main, crs).await)
         }
 
-        // Under the v7 verifier every PRE-v7 era is checkpointed (trusted) rather
-        // than re-verified: the binary links triton-vm v7, and the superseded
-        // eras (including v5) are trusted instead of re-verified. Lock in the boundary.
+        // Under the v8 verifier every PRE-v8 era is checkpointed (trusted) rather
+        // than re-verified: the binary links triton-vm v8 (proof version 8), and the
+        // superseded eras (including v7) are trusted instead of re-verified. Lock in
+        // the boundary.
         for crs in [
             ConsensusRuleSet::Reboot,
             ConsensusRuleSet::HardforkAlpha,
@@ -706,20 +708,21 @@ pub(crate) mod tests {
             ConsensusRuleSet::UpgradeVM,
             ConsensusRuleSet::UpgradeVMv4,
             ConsensusRuleSet::UpgradeVMv5,
+            ConsensusRuleSet::UpgradeVMv7,
         ] {
             assert!(
                 crs.proofs_are_trusted(),
-                "{crs} is a superseded era and must be checkpointed under v7"
+                "{crs} is a superseded era and must be checkpointed under v8"
             );
         }
         assert!(
-            !ConsensusRuleSet::UpgradeVMv7.proofs_are_trusted(),
-            "UpgradeVMv7 (current era) must be re-verified, not trusted"
+            !ConsensusRuleSet::UpgradeVMv8.proofs_are_trusted(),
+            "UpgradeVMv8 (current era) must be re-verified, not trusted"
         );
 
         // Demonstrate WHY the checkpoint is necessary, not gratuitous: a REAL
-        // pre-v5 mainnet block proof does NOT verify under the v7 verifier
-        // (proof version 0/1/2 vs the v7 verifier's version 5). If a fixture is
+        // pre-v5 mainnet block proof does NOT verify under the v8 verifier
+        // (proof version 0/1/2 vs the v8 verifier's version 8). If a fixture is
         // present, the direct `BlockProgram::verify` must return false.
         for (file, crs) in [
             ("block_upgrade_vm_56000.json", ConsensusRuleSet::UpgradeVM),
@@ -733,18 +736,17 @@ pub(crate) mod tests {
             if let Some(ok) = verify_fixture(file, crs).await {
                 assert!(
                     !ok,
-                    "{file}: a pre-v5 proof must NOT verify under the v7 verifier — \
+                    "{file}: a pre-v5 proof must NOT verify under the v8 verifier — \
                      which is exactly why {crs} is checkpointed"
                 );
             }
         }
 
-        // The immediate predecessor era: a REAL UpgradeVMv5 mainnet block (height
-        // 58000). v5 and v7 share the proof FORMAT (version 5), but the v5 block
-        // proof attests the v5 BlockProgram digest (e14d426b…) while tasm-lib's
-        // u128 range-check changed the v7 bytecode. Under the era-correct v5 claim
-        // the v7-linked verifier returns the verdict asserted below — observed, not
-        // assumed (it pins exactly what "checkpointed" protects against).
+        // A REAL UpgradeVMv5 mainnet block (height 58000): proof format version 5,
+        // attesting the v5 BlockProgram digest (e14d426b…). The v8-linked verifier
+        // only checks version-8 proofs, so under the era-correct v5 claim it must
+        // reject it, as it already did under v7, where the u128 range-check had
+        // changed the bytecode.
         if let Some(ok) =
             verify_fixture("block_upgrade_vm_v5_58000.json", ConsensusRuleSet::UpgradeVMv5).await
         {
@@ -752,7 +754,31 @@ pub(crate) mod tests {
             assert!(
                 !ok,
                 "block_upgrade_vm_v5_58000.json: a real v5 block proof must NOT verify under \
-                 the v7 verifier — which is exactly why UpgradeVMv5 is checkpointed"
+                 the v8 verifier — which is exactly why UpgradeVMv5 is checkpointed"
+            );
+        }
+
+        // The immediate predecessor era: a REAL UpgradeVMv7 mainnet block (height
+        // 80001, canonical digest 74a4d441…). v7 kept proof format version 5 and its
+        // proof attests the v7 BlockProgram digest (f87bda68…); the v8 verifier
+        // changed the AIR (sound Hash/Program Table, randomized quotients) and
+        // checks only version-8 proofs. Observed, not assumed: the same proof
+        // verifies under v0.2.7's v7 verifier but not here, which is exactly what
+        // checkpointing UpgradeVMv7 protects against.
+        //
+        // The fixture deliberately has no inputs. The JSON-RPC model stores a
+        // removal record's chunk dictionary as a map, so the packed form used in
+        // blocks (repeated `u64::MAX` sentinel chunk indices) collapses on the
+        // round trip and the decoded kernel no longer hashes to what was proven.
+        // A fixture with inputs would therefore fail to verify under ANY verifier.
+        if let Some(ok) =
+            verify_fixture(V7_FIXTURE, ConsensusRuleSet::UpgradeVMv7).await
+        {
+            eprintln!("[v7-fixture] BlockProgram::verify under UpgradeVMv7 verdict = {ok}");
+            assert!(
+                !ok,
+                "{V7_FIXTURE}: a real v7 block proof must NOT verify under the v8 \
+                 verifier — which is exactly why UpgradeVMv7 is checkpointed"
             );
         }
     }
@@ -796,6 +822,11 @@ pub(crate) mod tests {
                 UpgradeVMv5,
                 "e14d426bd76aad647703efb21c880f678b9a2eabe8dcfba7d6fc97b4b6b0f402c38d0c1be5f4942f",
             ),
+            // UpgradeVMv7 (v7) is now a pre-v8 era with a hardcoded digest.
+            (
+                UpgradeVMv7,
+                "f87bda68a0959a023fd1843ca47ab72fab871a853f392fc6e3f889ef10206f89b3f8a8ec2743d78d",
+            ),
         ];
         for (crs, hex) in cases {
             assert_eq!(
@@ -804,9 +835,9 @@ pub(crate) mod tests {
                 "{crs} BlockProgram digest drifted"
             );
         }
-        // UpgradeVMv7 (current) recomputes from the linked (v7) program.
+        // UpgradeVMv8 (current) recomputes from the linked (v8) program.
         assert_eq!(
-            BlockProgram::program_digest_for(UpgradeVMv7),
+            BlockProgram::program_digest_for(UpgradeVMv8),
             BlockProgram.hash()
         );
     }

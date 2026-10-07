@@ -1457,6 +1457,13 @@ pub(crate) mod tests {
                 "e66985a98e4d5e455c5d11e57a16c3dca3cce2bd2a16d6f5e791f592801cc32eb99c57c32bf90e88",
                 5,
             ),
+            // UpgradeVMv7 (v7) is now a pre-v8 era with a frozen SingleProofV2 digest
+            // and claim version 5 (triton-vm v7 kept v5's proof format).
+            (
+                UpgradeVMv7,
+                "5c75cc2d808464503cccf3bf2467ff13bd3fc736d06aa4f661415852549900e04eb667ddd9792d76",
+                5,
+            ),
         ];
         for (crs, hex, ver) in cases {
             let claim = single_proof_claim(txkmh, crs);
@@ -1473,25 +1480,25 @@ pub(crate) mod tests {
             );
         }
 
-        // UpgradeVMv7 (current) is NOT frozen — it recomputes from the live v7
+        // UpgradeVMv8 (current) is NOT frozen — it recomputes from the live v8
         // SingleProofV2 program. Pin that it produces the live digest with the live
-        // claim version, mirroring the pre-v7 cases above.
+        // claim version, mirroring the pre-v8 cases above.
         use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
-        let v7_claim = single_proof_claim(txkmh, UpgradeVMv7);
+        let v8_claim = single_proof_claim(txkmh, UpgradeVMv8);
         assert_eq!(
-            v7_claim.program_digest,
+            v8_claim.program_digest,
             SingleProofV2.hash(),
-            "UpgradeVMv7 must recompute the live SingleProofV2 digest"
+            "UpgradeVMv8 must recompute the live SingleProofV2 digest"
         );
         assert_eq!(
-            v7_claim.version,
+            v8_claim.version,
             tasm_lib::triton_vm::proof::CURRENT_VERSION,
-            "UpgradeVMv7 claim version must match the live triton-vm proof version"
+            "UpgradeVMv8 claim version must match the live triton-vm proof version"
         );
         assert_eq!(
-            v7_claim.input,
+            v8_claim.input,
             txkmh.reversed().values().to_vec(),
-            "UpgradeVMv7 claim input wrong"
+            "UpgradeVMv8 claim input wrong"
         );
     }
 
