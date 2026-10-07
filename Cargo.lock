@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "neptune-privacy"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5327,7 +5327,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xnt-core-cli"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -5350,7 +5350,7 @@ dependencies = [
 
 [[package]]
 name = "xnt-dashboard"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -5371,7 +5371,7 @@ dependencies = [
 
 [[package]]
 name = "xnt-rpc-client"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "neptune-privacy",
@@ -5382,7 +5382,7 @@ dependencies = [
 
 [[package]]
 name = "xnt-rpc-macros"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "convert_case 0.8.0",
  "quote",
@@ -5391,7 +5391,7 @@ dependencies = [
 
 [[package]]
 name = "xnt-sdk"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "aead",
  "aes-gcm",
