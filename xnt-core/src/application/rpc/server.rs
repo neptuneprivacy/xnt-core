@@ -2163,7 +2163,7 @@ impl NeptuneRPCServer {
                         .num_leafs()
                         - 1;
                     let num_outputs_in_block: u64 = block
-                        .mutator_set_update()
+                        .mutator_set_update(network)
                         .expect("Block from state must have mutator set update")
                         .additions
                         .len()
@@ -3234,7 +3234,7 @@ impl RPC for NeptuneRPCServer {
     }
 
     async fn upgrade(
-        mut self,
+        self,
         _ctx: context::Context,
         token: auth::Token,
         tx_kernel_id: TransactionKernelId,
@@ -3270,7 +3270,7 @@ impl RPC for NeptuneRPCServer {
                 let gobbling_potential = NativeCurrencyAmount::zero();
                 let update_job = self
                     .state
-                    .lock_guard_mut()
+                    .lock_guard()
                     .await
                     .update_single_proof_job(
                         tx.kernel,
@@ -3287,7 +3287,7 @@ impl RPC for NeptuneRPCServer {
                 let gobbling_potential = NativeCurrencyAmount::zero();
                 let raise_job = self
                     .state
-                    .lock_guard_mut()
+                    .lock_guard()
                     .await
                     .upgrade_proof_collection_job(
                         tx.kernel,
@@ -4399,7 +4399,7 @@ mod tests {
     use num_traits::Zero;
     use proptest::prop_assume;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use strum::IntoEnumIterator;
     use tracing_test::traced_test;
@@ -5001,11 +5001,11 @@ mod tests {
 
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+                .write_peer_standing(peer_address0.ip(), standing0)
                 .await;
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+                .write_peer_standing(peer_address1.ip(), standing1)
                 .await;
         }
 
@@ -5120,11 +5120,11 @@ mod tests {
 
         state
             .net
-            .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+            .write_peer_standing(peer_address0.ip(), standing0)
             .await;
         state
             .net
-            .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+            .write_peer_standing(peer_address1.ip(), standing1)
             .await;
 
         drop(state);

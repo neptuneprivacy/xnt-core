@@ -13,7 +13,7 @@ use num_traits::CheckedSub;
 use num_traits::Zero;
 use primitive_witness::PrimitiveWitness;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPoolBuilder;
@@ -49,6 +49,7 @@ use crate::protocol::consensus::block::pow::Pow;
 use crate::protocol::consensus::block::pow::PowMastPaths;
 use crate::protocol::consensus::block::*;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::*;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -66,7 +67,8 @@ use crate::COMPOSITION_FAILED_EXIT_CODE;
 pub(crate) struct GuessingConfiguration {
     pub(crate) num_guesser_threads: Option<usize>,
     pub(crate) address: ReceivingAddress,
-    pub(crate) override_rng: Option<StdRng>,
+    /// Seeds every guesser thread's RNG identically, for deterministic tests.
+    pub(crate) override_rng_seed: Option<u64>,
     pub(crate) override_timestamp: Option<Timestamp>,
 }
 
@@ -179,7 +181,7 @@ fn guess_worker(
     let GuessingConfiguration {
         num_guesser_threads,
         address: guesser_address,
-        override_rng: rng,
+        override_rng_seed: rng_seed,
         override_timestamp: now,
     } = guessing_configuration;
 
@@ -259,7 +261,7 @@ fn guess_worker(
     let guess_result = pool.install(|| {
         rayon::iter::repeat(0)
             .map_init(
-                || rng.clone().unwrap_or(std_rng_from_thread_rng()),
+                || rng_seed.map_or_else(std_rng_from_thread_rng, StdRng::seed_from_u64),
                 |rng, _i| {
                     guess_nonce_iteration(
                         &guesser_buffer,
@@ -534,6 +536,7 @@ pub(crate) async fn create_block_transaction_from(
             .await
             .mempool
             .get_transactions_for_block_composition(
+                consensus_rule_set,
                 block_capacity_for_transactions,
                 Some(max_num_mergers),
             ),
@@ -552,7 +555,7 @@ pub(crate) async fn create_block_transaction_from(
         info!("No synced single-proof tx found for merge looking for one to update");
         let min_gobbling_fee = NativeCurrencyAmount::zero();
         let update_job = global_state_lock
-            .lock_guard_mut()
+            .lock_guard()
             .await
             .preferred_update_job_from_mempool(min_gobbling_fee, TxUpgradeFilter::match_all())
             .await;
@@ -613,6 +616,7 @@ pub(crate) async fn create_block_transaction_from(
                 .await
                 .mempool
                 .get_transactions_for_block_composition(
+                    consensus_rule_set,
                     block_capacity_for_transactions,
                     Some(max_num_mergers),
                 ),
@@ -701,6 +705,7 @@ pub(crate) async fn mine(
 
     let mut pause_mine = false;
     let mut wait_for_confirmation = false;
+    let mut legacy_era_notice_height = None;
     loop {
         // Ensure restart timer doesn't resolve again, without guesser
         // task actually being spawned.
@@ -769,7 +774,7 @@ pub(crate) async fn mine(
                 GuessingConfiguration {
                     num_guesser_threads: cli_args.guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
             );
@@ -788,8 +793,33 @@ pub(crate) async fn mine(
         let (cancel_compose_tx, cancel_compose_rx) = tokio::sync::watch::channel(());
 
         let compose = cli_args.compose;
+
+        // Blocks of the legacy era need proofs this version cannot produce.
+        // Composing one would fail at the first proof and shut the node down,
+        // so wait for the fork instead; composing resumes on its own once the
+        // next block belongs to the current era.
+        let next_block_height = global_state_lock
+            .lock(|s| s.chain.light_state().header().height.next())
+            .await;
+        let next_block_is_legacy_era =
+            ConsensusRuleSet::infer_from(network, next_block_height).is_legacy_era();
+        if compose && next_block_is_legacy_era {
+            if legacy_era_notice_height != Some(next_block_height) {
+                info!(
+                    "Not composing block {next_block_height}: this version cannot prove blocks \
+                     before the hard fork at block {BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET}. \
+                     Composing starts automatically at the fork."
+                );
+                legacy_era_notice_height = Some(next_block_height);
+            }
+            if guesser_task.is_none() {
+                global_state_lock.set_mining_status_to_inactive().await;
+            }
+        }
+
         let mut composer_task = if !wait_for_confirmation
             && compose
+            && !next_block_is_legacy_era
             && guesser_task.is_none()
             && !is_syncing
             && !pause_mine
@@ -1013,7 +1043,7 @@ pub(crate) mod tests {
     use num_traits::One;
     use num_traits::Pow;
     use num_traits::Zero;
-    use rand::RngCore;
+    use rand::Rng;
     use tracing_test::traced_test;
 
     use super::*;
@@ -1043,8 +1073,10 @@ pub(crate) mod tests {
     use crate::state::wallet::transaction_output::TxOutput;
     use crate::state::wallet::wallet_entropy::WalletEntropy;
     use crate::tests::shared::blocks::fake_valid_deterministic_successor;
+    use crate::tests::shared::blocks::invalid_empty_block;
     use crate::tests::shared::dummy_expected_utxo;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
+    use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
     use crate::tests::shared::mock_tx::make_mock_block_transaction_with_mutator_set_hash;
     use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
     use crate::tests::shared::wait_until;
@@ -1281,7 +1313,7 @@ pub(crate) mod tests {
                 .lock_guard_mut()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, None)
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, None)
                 .is_empty(),
             "May not have synced tx in mempool"
         );
@@ -1635,7 +1667,7 @@ pub(crate) mod tests {
             GuessingConfiguration {
                 num_guesser_threads,
                 address: guesser_key.to_address().into(),
-                override_rng: None,
+                override_rng_seed: None,
                 override_timestamp: None,
             },
             None,
@@ -1719,7 +1751,7 @@ pub(crate) mod tests {
             GuessingConfiguration {
                 num_guesser_threads,
                 address: guesser_key.to_address().into(),
-                override_rng: None,
+                override_rng_seed: None,
                 override_timestamp: None,
             },
             None,
@@ -1871,7 +1903,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
                 Some(target_block_interval),
@@ -2439,6 +2471,111 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Runs the real mining loop across the UpgradeVMv8 fork on main net.
+    ///
+    /// While the next block is pre-fork the composer must wait: it must neither
+    /// start proving nor ask main to shut the node down. As soon as the tip is
+    /// the last pre-fork block, the same loop must compose the first v8 block,
+    /// and that block must be valid on top of the pre-fork tip.
+    #[apply(shared_tokio_runtime)]
+    async fn composer_waits_for_the_v8_fork_and_composes_its_first_block() {
+        let network = Network::Main;
+
+        // Tip two blocks before the fork, and the last pre-fork block on top
+        // of it. This version cannot prove pre-fork blocks, so both carry
+        // placeholder proofs where real ones would carry v7 proofs. Validating
+        // the fork block does not re-verify its parent's proof.
+        let genesis = Block::genesis(network);
+        let mut tip_header = *genesis.header();
+        tip_header.height = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET
+            .previous()
+            .and_then(|h| h.previous())
+            .unwrap();
+        let tip = Block::new(
+            tip_header,
+            genesis.body().clone(),
+            genesis.appendix().clone(),
+            BlockProof::Genesis,
+        );
+        let last_pre_fork_block = invalid_empty_block(&tip, network);
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET.previous(),
+            Some(last_pre_fork_block.header().height)
+        );
+        assert!(
+            ConsensusRuleSet::infer_from(network, last_pre_fork_block.header().height)
+                .is_legacy_era()
+        );
+
+        let cli = cli_args::Args {
+            network,
+            compose: true,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        // Two peers: main net never mines in isolation.
+        let mut state =
+            mock_genesis_global_state_with_block(2, WalletEntropy::devnet_wallet(), cli, tip).await;
+
+        let (miner_to_main_tx, mut miner_to_main_rx) =
+            mpsc::channel::<MinerToMain>(MINER_CHANNEL_CAPACITY);
+        let (main_to_miner_tx, main_to_miner_rx) =
+            mpsc::channel::<MainToMiner>(MINER_CHANNEL_CAPACITY);
+        let miner = tokio::task::spawn(mine(main_to_miner_rx, miner_to_main_tx, state.clone()));
+
+        // 1. Next block is pre-fork: the composer waits. Without the guard it
+        //    would be composing within milliseconds and then fail.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!miner.is_finished(), "mining loop must keep running");
+        assert!(
+            miner_to_main_rx.try_recv().is_err(),
+            "composer must neither propose nor request a shutdown before the fork"
+        );
+        assert!(matches!(
+            state.lock_guard().await.mining_state.mining_status,
+            MiningStatus::Inactive
+        ));
+
+        // 2. The last pre-fork block arrives: the composer starts on its own.
+        state
+            .set_new_tip(last_pre_fork_block.clone())
+            .await
+            .unwrap();
+        main_to_miner_tx.send(MainToMiner::NewBlock).await.unwrap();
+
+        let (fork_block, _) = loop {
+            match tokio::time::timeout(Duration::from_secs(3 * 3600), miner_to_main_rx.recv())
+                .await
+                .expect("composer must finish the fork block")
+            {
+                Some(MinerToMain::BlockProposal(proposal)) => break *proposal,
+                Some(MinerToMain::Shutdown(exit_code)) => {
+                    panic!("composer requested shutdown with exit code {exit_code}")
+                }
+                Some(MinerToMain::NewBlockFound(_)) => continue,
+                None => panic!("mining loop stopped"),
+            }
+        };
+
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET,
+            fork_block.header().height
+        );
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            ConsensusRuleSet::infer_from(network, fork_block.header().height)
+        );
+        assert!(
+            fork_block
+                .is_valid(&last_pre_fork_block, fork_block.header().timestamp, network)
+                .await,
+            "first v8 block must be valid on top of the last pre-fork block"
+        );
+
+        miner.abort();
+        let _ = miner.await;
+    }
+
     /// A test for difficulty reset logic, which occurs for the TestnetMock
     /// network.
     ///
@@ -2540,7 +2677,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: Some(block_time),
                 },
                 None,

@@ -207,6 +207,28 @@ impl TransactionInitiator {
         // may have been checked before, but just in case.
         self.worker().check_rate_limit().await?;
 
+        // Refuse to broadcast a transaction that can never be mined: peers
+        // reject it on admission and it would only occupy our own mempool.
+        {
+            let kernel = &tx.transaction.kernel;
+            let network = self.global_state_lock.cli().network;
+            let next_block_height = self
+                .global_state_lock
+                .lock_guard()
+                .await
+                .chain
+                .light_state()
+                .header()
+                .height
+                .next();
+
+            ConsensusRuleSet::infer_from(network, next_block_height).mempool_size_check(
+                kernel.inputs.len(),
+                kernel.outputs.len(),
+                kernel.announcements.len(),
+            )?;
+        }
+
         // note: acquires write-lock.
         // note: tx is validated internally.
         self.global_state_lock.record_own_transaction(tx).await?;

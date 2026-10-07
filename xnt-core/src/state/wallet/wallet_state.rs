@@ -407,7 +407,7 @@ impl WalletState {
             // Check if we are premine recipients, and add expected UTXOs if so.
             for premine_key in &premine_keys {
                 let own_receiving_address = premine_key.clone().to_address();
-                for utxo in Block::premine_utxos() {
+                for utxo in Block::premine_utxos(configuration.network()) {
                     if utxo.lock_script_hash() == own_receiving_address.lock_script_hash() {
                         wallet_state
                             .add_expected_utxo(ExpectedUtxo::new(
@@ -1440,7 +1440,7 @@ impl WalletState {
             additions: addition_records,
             removals: removal_records,
         } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
         let mut removal_records = removal_records;
         removal_records.reverse();
@@ -1651,7 +1651,7 @@ impl WalletState {
         let mut recovery_data = vec![];
 
         let MutatorSetUpdate { additions, .. } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
 
         for addition_record in additions {
@@ -1745,7 +1745,7 @@ impl WalletState {
         let outputs_recovered_through_scan_mode = self.recover_by_scanning(block).await;
 
         let MutatorSetUpdate { additions, .. } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
 
         let offchain_received_outputs = self.scan_for_expected_utxos(&additions).await;
@@ -1910,9 +1910,8 @@ impl WalletState {
                     ));
                 }
             } else {
-                let any_mp = &mutxo.blockhash_to_membership_proof.iter().next().unwrap().1;
                 unsynced.push(WalletStatusElement::new(
-                    any_mp.aocl_leaf_index,
+                    mutxo.aocl_leaf_index,
                     utxo,
                     payment_id,
                 ));
@@ -2228,7 +2227,7 @@ pub(crate) mod tests {
 
         let premine_utxo = {
             let wallet = &alice_global_lock.lock_guard().await.wallet_state;
-            Block::premine_utxos()
+            Block::premine_utxos(network)
                 .into_iter()
                 .find(|premine_utxo| wallet.can_unlock(premine_utxo))
                 .or_else(|| panic!())
@@ -3250,7 +3249,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads: Some(2),
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
             )
@@ -5311,7 +5310,7 @@ pub(crate) mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(1_000_000_000, None)[0]
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), 1_000_000_000, None)[0]
                 .clone();
 
             // create block ignoring that transaction. Rando has upgraded tx
@@ -5353,7 +5352,7 @@ pub(crate) mod tests {
                 single_proof_transaction.kernel,
                 single_proof_transaction.proof.into_single_proof(),
                 genesis_mutator_set,
-                block_one.mutator_set_update().unwrap(),
+                block_one.mutator_set_update(network).unwrap(),
                 upgrade_incentive,
                 consensus_rule_set,
             ));
@@ -5369,7 +5368,7 @@ pub(crate) mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(10_000_000, None);
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), 10_000_000, None);
             assert_eq!(1, transactions_for_block.len());
             let upgraded_transaction = transactions_for_block[0].clone();
             let new_num_announcements = upgraded_transaction.kernel.announcements.len();

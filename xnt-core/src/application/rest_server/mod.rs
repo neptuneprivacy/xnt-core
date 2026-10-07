@@ -177,7 +177,7 @@ impl ExportedBlock {
     /// caused by this block.
     pub fn mutator_set_update(&self) -> MutatorSetUpdate {
         let inputs =
-            RemovalRecordList::try_unpack(self.kernel.body.transaction_kernel.inputs.clone())
+            RemovalRecordList::try_unpack(self.kernel.body.transaction_kernel.inputs.clone(), true)
                 .expect(
                     "Exported blocks are assumed valid, so removal record list unpacking must work",
                 );

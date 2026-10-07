@@ -16,6 +16,10 @@ use tasm_lib::triton_vm::vm::VM;
 use thread_priority::set_current_thread_priority;
 use thread_priority::ThreadPriority;
 
+// jemalloc, shared with the node binary.
+#[path = "../global_allocator.rs"]
+mod global_allocator;
+
 // TODO: Replace by value exposed in Triton VM
 const LDE_TRACE_ENV_VAR: &str = "TVM_LDE_TRACE";
 

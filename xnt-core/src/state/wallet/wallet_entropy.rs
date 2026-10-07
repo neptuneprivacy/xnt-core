@@ -213,7 +213,7 @@ mod tests {
         /// Create a new `WalletEntropy` object and populate it with entropy
         /// obtained via `rand::rng()` from the operating system.
         pub(crate) fn new_random() -> Self {
-            Self::new_pseudorandom(rand::Rng::random(&mut rand::rng()))
+            Self::new_pseudorandom(rand::RngExt::random(&mut rand::rng()))
         }
 
         /// Create a new `WalletEntropy` object and populate it by expanding a given
@@ -221,7 +221,7 @@ mod tests {
         pub(crate) fn new_pseudorandom(seed: [u8; 32]) -> Self {
             let mut rng: rand::rngs::StdRng = rand::SeedableRng::from_seed(seed);
             Self {
-                secret_seed: SecretKeyMaterial(rand::Rng::random(&mut rng)),
+                secret_seed: SecretKeyMaterial(rand::RngExt::random(&mut rng)),
             }
         }
     }

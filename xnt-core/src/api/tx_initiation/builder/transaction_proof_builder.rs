@@ -268,6 +268,16 @@ impl<'a> TransactionProofBuilder<'a> {
 
         let proof_job_options = proof_job_options.ok_or(ProofRequirement::ProofJobOptions)?;
 
+        // Any transaction built for the legacy era is useless to this version: it
+        // can neither hold nor relay it (see `ConsensusRuleSet::is_legacy_era`),
+        // so a ProofCollection or PrimitiveWitness one would be dropped silently.
+        // Refuse it up front, for every proof type.
+        if let Some(rule_set) = consensus_rule_set {
+            if rule_set.is_legacy_era() {
+                return Err(CreateProofError::LegacyEra(rule_set));
+            }
+        }
+
         let valid_mock = valid_mock.unwrap_or(true);
         let job_queue = job_queue.unwrap_or_else(vm_job_queue);
 
@@ -455,4 +465,60 @@ async fn single_proof_from_witness(
     .await?;
 
     Ok(sp)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use macro_rules_attr::apply;
+
+    use super::*;
+    use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
+    use crate::application::config::network::Network;
+    use crate::tests::shared_tokio_runtime;
+
+    /// Before the fork no transaction can be built, whatever its proof type: a
+    /// legacy-era transaction could neither be held nor relayed by this version.
+    /// The guard fires before any witness data is needed.
+    #[apply(shared_tokio_runtime)]
+    async fn legacy_era_transactions_are_refused_for_every_proof_type() {
+        for proof_type in [
+            TransactionProofType::PrimitiveWitness,
+            TransactionProofType::ProofCollection,
+            TransactionProofType::SingleProof,
+        ] {
+            let options = TritonVmProofJobOptionsBuilder::new()
+                .network(Network::Main)
+                .proof_type(proof_type)
+                .build();
+            let result = TransactionProofBuilder::new()
+                .consensus_rule_set(ConsensusRuleSet::UpgradeVMv7)
+                .proof_job_options(options)
+                .build()
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(CreateProofError::LegacyEra(ConsensusRuleSet::UpgradeVMv7))
+                ),
+                "{proof_type}: expected the legacy-era refusal, got {result:?}"
+            );
+        }
+
+        // The current era is not refused: the builder proceeds and only stops
+        // for the missing witness data.
+        let options = TritonVmProofJobOptionsBuilder::new()
+            .network(Network::Main)
+            .proof_type(TransactionProofType::ProofCollection)
+            .build();
+        let result = TransactionProofBuilder::new()
+            .consensus_rule_set(ConsensusRuleSet::UpgradeVMv8)
+            .proof_job_options(options)
+            .build()
+            .await;
+        assert!(
+            !matches!(result, Err(CreateProofError::LegacyEra(_))),
+            "the current era must not be refused, got {result:?}"
+        );
+    }
 }

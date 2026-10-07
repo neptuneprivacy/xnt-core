@@ -11,7 +11,7 @@ use futures::sink::SinkExt;
 use futures::stream::TryStream;
 use futures::stream::TryStreamExt;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::triton_vm::prelude::Digest;
 use tasm_lib::twenty_first::prelude::Mmr;
@@ -94,7 +94,7 @@ pub type PeerStandingNumber = i32;
 ///
 /// also handles messages from main task over the main-to-peer-tasks broadcast
 /// channel.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PeerLoopHandler {
     to_main_tx: mpsc::Sender<PeerTaskToMain>,
     global_state_lock: GlobalStateLock,
@@ -177,6 +177,25 @@ impl PeerLoopHandler {
     ///
     /// # Locking:
     ///   * acquires `global_state_lock` for write
+    /// Whether the chain tip is in the legacy era, see
+    /// [`ConsensusRuleSet::is_legacy_era`]. Transactions are validated in the
+    /// tip's era. Before the fork this version neither verifies nor holds them:
+    /// it cannot merge or upgrade them, and one held across the fork would make
+    /// the first block after it impossible to compose. They are ignored rather
+    /// than punished, since the peers relaying them are honest.
+    async fn tip_is_in_legacy_era(&self) -> bool {
+        let tip_height = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        ConsensusRuleSet::infer_from(self.global_state_lock.cli().network, tip_height)
+            .is_legacy_era()
+    }
+
     async fn punish(&mut self, reason: NegativePeerSanction) -> Result<()> {
         let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
         warn!("Punishing peer {} for {:?}", self.peer_address.ip(), reason);
@@ -467,12 +486,26 @@ impl PeerLoopHandler {
         let received_block_matches_fork_reconciliation_list = if let Some(successor) =
             peer_state.fork_reconciliation_blocks.last()
         {
+            let network = self.global_state_lock.cli().network;
+
+            // Check proof-of-work first: it is cheap to check and expensive to
+            // fabricate, whereas `is_valid` runs a recursive STARK verification.
+            // Without this a peer can make us verify proofs for blocks carrying
+            // no work at all.
+            if !successor.has_proof_of_work(network, received_block.header()) {
+                let (height, hash) = (successor.header().height, successor.hash());
+                warn!(
+                    "Fork reconciliation failed after receiving {} blocks: successor of received block has insufficient proof of work",
+                    peer_state.fork_reconciliation_blocks.len() + 1
+                );
+                self.punish(NegativePeerSanction::InvalidBlock((height, hash)))
+                    .await?;
+                peer_state.fork_reconciliation_blocks.clear();
+                return Ok(());
+            }
+
             let valid = successor
-                .is_valid(
-                    received_block.as_ref(),
-                    self.now(),
-                    self.global_state_lock.cli().network,
-                )
+                .is_valid(received_block.as_ref(), self.now(), network)
                 .await;
             if !valid {
                 warn!(
@@ -657,6 +690,7 @@ impl PeerLoopHandler {
                 if peers.len() > MAX_PEER_LIST_LENGTH {
                     self.punish(NegativePeerSanction::FloodPeerListResponse)
                         .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
                 let peers = peers
@@ -1303,6 +1337,13 @@ impl PeerLoopHandler {
             PeerMessage::Transaction(transaction) => {
                 log_slow_scope!(fn_name!() + "::PeerMessage::Transaction");
 
+                if self.tip_is_in_legacy_era().await {
+                    debug!(
+                        "Ignoring transaction: this version does not hold legacy-era transactions"
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
                 // Early check for oversized announcements to prevent DoS
                 for announcement in &transaction.kernel.announcements {
                     if announcement.message.len() > MAX_ANNOUNCEMENT_MESSAGE_SIZE {
@@ -1352,10 +1393,29 @@ impl PeerLoopHandler {
                     )
                 };
 
-                // 1. If transaction is invalid, punish.
                 let network = self.global_state_lock.cli().network;
                 let consensus_rule_set =
                     ConsensusRuleSet::infer_from(network, current_block_height);
+
+                // 0. If transaction can never be mined, punish. Checked before
+                // validity because it reads only kernel lengths, whereas
+                // validity verifies proofs.
+                if let Err(too_big) = consensus_rule_set.mempool_size_check(
+                    transaction.kernel.inputs.len(),
+                    transaction.kernel.outputs.len(),
+                    transaction.kernel.announcements.len(),
+                ) {
+                    warn!(
+                        "Received transaction with TXID {} that exceeds the allowed limits, and \
+                         can therefore never be mined: {too_big}",
+                        transaction.kernel.txid()
+                    );
+                    self.punish(NegativePeerSanction::UnrelayableTransaction)
+                        .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                // 1. If transaction is invalid, punish.
                 if !transaction.is_valid(network, consensus_rule_set).await {
                     warn!("Received invalid tx");
                     self.punish(NegativePeerSanction::InvalidTransaction)
@@ -1423,13 +1483,21 @@ impl PeerLoopHandler {
                             );
                             match removal_record_error_code {
                                 Ok(_) => unreachable!(),
-                                Err(RemovalRecordValidityError::AbsentAuthenticatedChunk) => {
-                                    debug!("invalid because membership proof is missing");
+                                Err(RemovalRecordValidityError::MismatchedChunkIndices) => {
+                                    debug!(
+                                        "invalid because the authenticated chunks are not the ones the \
+                                         indices require: some are missing or superfluous"
+                                    );
                                 }
                                 Err(RemovalRecordValidityError::InvalidSwbfiMmrMp {
                                     chunk_index,
                                 }) => {
                                     debug!("invalid because membership proof for chunk index {chunk_index} is invalid");
+                                }
+                                Err(RemovalRecordValidityError::DuplicateChunkIndex {
+                                    chunk_index,
+                                }) => {
+                                    debug!("invalid because chunk index {chunk_index} occurs more than once");
                                 }
                             };
                             self.punish(NegativePeerSanction::UnconfirmableTransaction)
@@ -1504,6 +1572,14 @@ impl PeerLoopHandler {
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             PeerMessage::TransactionNotification(tx_notification) => {
+                if self.tip_is_in_legacy_era().await {
+                    debug!(
+                        "Ignoring transaction notification: \
+                         this version does not hold legacy-era transactions"
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
                 // addresses #457
                 // new scope for state read-lock to avoid holding across peer.send()
                 {
@@ -1842,6 +1918,21 @@ impl PeerLoopHandler {
         <S as Sink<PeerMessage>>::Error: std::error::Error + Sync + Send + 'static,
         <S as TryStream>::Error: std::error::Error,
     {
+        // If the peer indicates a more canonical block, request a block
+        // notification to catch up ASAP. This lives here rather than in
+        // `run_wrapper` so that nothing fallible sits between the peer-map
+        // insert and the connection-close callback. Read the lock and release
+        // it before the send, so the channel can never be awaited under it.
+        let own_cumulative_proof_of_work = self
+            .global_state_lock
+            .lock(|s| s.chain.light_state().kernel.header.cumulative_proof_of_work)
+            .await;
+        if self.peer_handshake_data.tip_header.cumulative_proof_of_work
+            > own_cumulative_proof_of_work
+        {
+            peer.send(PeerMessage::BlockNotificationRequest).await?;
+        }
+
         loop {
             select! {
                 // Handle peer messages
@@ -1948,7 +2039,7 @@ impl PeerLoopHandler {
     ///   * acquires `global_state_lock` for write
     pub(crate) async fn run_wrapper<S>(
         &mut self,
-        mut peer: S,
+        peer: S,
         from_main_rx: broadcast::Receiver<MainToPeerTask>,
     ) -> Result<()>
     where
@@ -2016,23 +2107,13 @@ impl PeerLoopHandler {
         // `MutablePeerState` contains the part of the peer-loop's state that is mutable
         let mut peer_state = MutablePeerState::new(self.peer_handshake_data.tip_header.height);
 
-        // If peer indicates more canonical block, request a block notification to catch up ASAP
-        if self.peer_handshake_data.tip_header.cumulative_proof_of_work
-            > self
-                .global_state_lock
-                .lock_guard()
-                .await
-                .chain
-                .light_state()
-                .kernel
-                .header
-                .cumulative_proof_of_work
-        {
-            // Send block notification request to catch up ASAP, in case we're
-            // behind the newly-connected peer.
-            peer.send(PeerMessage::BlockNotificationRequest).await?;
-        }
-
+        // Nothing fallible may sit between the peer-map insert above and the
+        // connection-close callback below. The insert is where the connection
+        // counts as established, and the callback is the only thing that
+        // removes the peer again; an early `?` return here would strand the
+        // peer in the map for good. The catch-up request that used to live here
+        // now runs at the top of `run`, where a failed send is an ordinary loop
+        // exit and the callback still fires. Upstream 5fec44b1.
         let res = self.run(peer, from_main_rx, &mut peer_state).await;
         debug!("Exited peer loop for {}", self.peer_address);
 
@@ -2073,7 +2154,7 @@ impl PeerLoopHandler {
 mod tests {
     use macro_rules_attr::apply;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tokio::sync::mpsc::error::TryRecvError;
     use tracing_test::traced_test;
@@ -2092,6 +2173,7 @@ mod tests {
     use crate::state::wallet::wallet_entropy::WalletEntropy;
     use crate::tests::shared::blocks::fake_valid_block_for_tests;
     use crate::tests::shared::blocks::fake_valid_sequence_of_blocks_for_tests;
+    use crate::tests::shared::blocks::invalid_empty_block;
     use crate::tests::shared::globalstate::get_dummy_handshake_data_for_genesis;
     use crate::tests::shared::globalstate::get_dummy_peer_connection_data_genesis;
     use crate::tests::shared::globalstate::get_dummy_socket_address;
@@ -2100,6 +2182,36 @@ mod tests {
     use crate::tests::shared::Action;
     use crate::tests::shared::Mock;
     use crate::tests::shared_tokio_runtime;
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn peer_lost_before_the_loop_starts_is_still_removed_from_the_peer_map() -> Result<()> {
+        // Claiming more work than our tip makes the node send a block
+        // notification request first thing. The mock refuses that write, as a
+        // peer that has already hung up would. Before the fix that send sat in
+        // `run_wrapper` between the peer-map insert and the close callback, so
+        // its `?` returned early and left the peer in the map for good.
+        //
+        // Our tip: genesis
+        // Peer tip: block 1
+        let network = Network::Main;
+        let (peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, state_lock, mut hsd) =
+            get_test_genesis_setup(network, 0, cli_args::Args::default()).await?;
+
+        hsd.tip_header = *invalid_empty_block(&Block::genesis(network), network).header();
+        let mock = Mock::new(vec![]);
+        let peer_address = get_dummy_socket_address(0);
+        let mut peer_loop_handler =
+            PeerLoopHandler::new(to_main_tx, state_lock.clone(), peer_address, hsd, true, 1);
+
+        assert!(peer_loop_handler
+            .run_wrapper(mock, peer_broadcast_tx.subscribe())
+            .await
+            .is_err());
+        assert!(state_lock.lock_guard().await.net.peer_map.is_empty());
+
+        Ok(())
+    }
 
     #[traced_test]
     #[apply(shared_tokio_runtime)]
@@ -4175,7 +4287,7 @@ mod tests {
 
                 // Mempool should now contain the unsynced transaction. Tip is block 1.
                 let pw_block1 =
-                    pw_genesis.update_with_new_ms_data(block1.mutator_set_update().unwrap());
+                    pw_genesis.update_with_new_ms_data(block1.mutator_set_update(network).unwrap());
                 let tx_synced_to_block1 = upgrade(pw_block1, consensus_rule_set).await;
 
                 let tx_notification: TransactionNotification =

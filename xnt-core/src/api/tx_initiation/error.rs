@@ -7,6 +7,7 @@ use crate::api::export::NativeCurrencyAmount;
 use crate::api::export::RecordTransactionError;
 use crate::application::job_queue::errors::AddJobError;
 use crate::application::job_queue::errors::JobHandleError;
+use crate::protocol::consensus::consensus_rule_set::TransactionTooBig;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::proof_abstractions::tasm::prover_job::ProverJobError;
 use crate::state::transaction::tx_proving_capability::TxProvingCapability;
@@ -87,6 +88,12 @@ pub enum CreateProofError {
 
     #[error("Could not forward job cancellation msg to proving job. {0}")]
     JobCancelSendError(#[from] tokio::sync::watch::error::SendError<()>),
+
+    #[error(
+        "this version verifies but cannot produce proofs for consensus rule set {0}; \
+         it produces proofs from the next hard fork on"
+    )]
+    LegacyEra(crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet),
 }
 
 /// enumerates possible upgrade-proof errors
@@ -128,4 +135,7 @@ pub enum SendError {
         tip_digest: Digest,
         max: usize,
     },
+
+    #[error("transaction can never be mined: {0}")]
+    TooBig(#[from] TransactionTooBig),
 }

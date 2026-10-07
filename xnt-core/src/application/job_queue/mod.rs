@@ -139,7 +139,7 @@
 //! use neptune_privacy::application::job_queue::JobQueue;
 //! use neptune_privacy::application::job_queue::channels::JobCancelReceiver;
 //! use neptune_privacy::application::job_queue::traits::*;
-//! use rand::Rng;
+//! use rand::RngExt;
 //!
 //! // ### First lets define some common types ###
 //! // -------------------------------------------
