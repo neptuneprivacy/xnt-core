@@ -396,7 +396,7 @@ pub extern "C" fn xnt_select_inputs(
 /// Generate random sender_randomness as XntDigest
 #[no_mangle]
 pub extern "C" fn xnt_random_sender_randomness() -> XntDigest {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 40];
     rand::rng().fill(&mut bytes);
     XntDigest::from_bytes(bytes)
@@ -406,7 +406,7 @@ pub extern "C" fn xnt_random_sender_randomness() -> XntDigest {
 #[no_mangle]
 pub extern "C" fn xnt_random_sender_randomness_hex() -> *mut c_char {
     ffi_begin!();
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 40];
     rand::rng().fill(&mut bytes);
     ffi_cstring!(hex::encode(bytes))

@@ -2,7 +2,7 @@ use futures::channel::oneshot;
 use num_traits::ConstZero;
 use num_traits::Zero;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::prelude::Digest;
 use tasm_lib::twenty_first;
@@ -77,7 +77,7 @@ pub(crate) async fn next_block(global_state_lock: GlobalStateLock, parent: Block
     .await
     .unwrap();
 
-    let deterministic_guesser_rng = StdRng::seed_from_u64(55512345);
+    let deterministic_guesser_rng_seed = 55512345;
 
     let guesser_address = global_state_lock
         .lock_guard()
@@ -97,7 +97,7 @@ pub(crate) async fn next_block(global_state_lock: GlobalStateLock, parent: Block
         GuessingConfiguration {
             num_guesser_threads: global_state_lock.cli().guesser_threads,
             address: guesser_address,
-            override_rng: Some(deterministic_guesser_rng),
+            override_rng_seed: Some(deterministic_guesser_rng_seed),
             override_timestamp: Some(new_timestamp),
         },
     )
@@ -331,6 +331,61 @@ pub(crate) async fn make_mock_block_with_inputs_and_outputs(
         network,
     )
     .await
+}
+
+/// Return a block with the specied number of inputs/outputs. Inputs and
+/// outputs are random. Also contains randomized composer rewards.
+///
+/// Does not have a valid proof, nor valid PoW. Not deterministic.
+pub(crate) async fn block_with_num_puts(
+    network: Network,
+    predecessor: &Block,
+    num_inputs: u128,
+    num_outputs: usize,
+) -> Block {
+    use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+    use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
+    use crate::util_types::mutator_set::shared::CHUNK_SIZE;
+    use crate::util_types::mutator_set::shared::NUM_TRIALS;
+    use crate::util_types::mutator_set::shared::WINDOW_SIZE;
+
+    let mut rng = rand::rng();
+    let active_window_start = u128::from(
+        predecessor
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .get_batch_index(),
+    ) * u128::from(CHUNK_SIZE);
+    let inputs = (0..num_inputs)
+        .map(|_| RemovalRecord {
+            absolute_indices: AbsoluteIndexSet::new(
+                (0..NUM_TRIALS)
+                    .map(|_| rng.random_range(u128::from(CHUNK_SIZE * 3)..u128::from(WINDOW_SIZE)))
+                    .map(|ri| ri + active_window_start)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            ),
+            target_chunks: ChunkDictionary::default(),
+        })
+        .collect::<Vec<_>>();
+
+    let outputs = (0..num_outputs)
+        .map(|_| AdditionRecord::new(rng.random()))
+        .collect::<Vec<_>>();
+
+    let (block, _) = make_mock_block_with_inputs_and_outputs(
+        predecessor,
+        inputs,
+        outputs,
+        None,
+        GenerationSpendingKey::derive_from_seed(rng.random()),
+        rng.random(),
+        network,
+    )
+    .await;
+
+    block
 }
 
 /// Create and store the next block including any transactions presently in the

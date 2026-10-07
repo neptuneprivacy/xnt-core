@@ -110,7 +110,7 @@ mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use rand::random;
-    use rand::RngCore;
+    use rand::Rng;
 
     use super::*;
     use crate::tests::shared_tokio_runtime;

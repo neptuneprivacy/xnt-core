@@ -26,7 +26,7 @@ use neptune_privacy::protocol::peer::peer_info::PeerInfo;
 use neptune_privacy::state::wallet::address::generation_address::GenerationReceivingAddress;
 use rand::rng;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::prelude::Digest;
 

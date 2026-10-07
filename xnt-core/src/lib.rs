@@ -134,6 +134,19 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
     let mut global_state_lock =
         GlobalStateLock::from_global_state(global_state, rpc_server_to_main_tx.clone());
 
+    // Ensure archival state is consistent. Repairs the block MMR and mutator
+    // set if a previous run was killed after writing a block but before
+    // finishing the rest of the tip update.
+    //
+    // `archival_state_mut` panics on a light node, so the call must be guarded.
+    {
+        let mut state = global_state_lock.lock_guard_mut().await;
+        if state.chain.is_archival_node() {
+            info!("Checking archival state consistency");
+            state.chain.archival_state_mut().recover().await?;
+        }
+    }
+
     // Construct the broadcast channel to communicate from the main task to peer tasks
     let (main_to_peer_broadcast_tx, _main_to_peer_broadcast_rx) =
         broadcast::channel::<MainToPeerTask>(PEER_CHANNEL_CAPACITY);

@@ -137,6 +137,8 @@ impl PeerInfo {
 #[cfg(any(feature = "mock-rpc", test))]
 impl rand::distr::Distribution<PeerConnectionInfo> for rand::distr::StandardUniform {
     fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> PeerConnectionInfo {
+        use rand::RngExt;
+
         PeerConnectionInfo {
             port_for_incoming_connections: if rng.random_bool(0.5) {
                 Some(rng.random())
@@ -160,6 +162,8 @@ impl rand::distr::Distribution<PeerConnectionInfo> for rand::distr::StandardUnif
 #[cfg(any(feature = "mock-rpc", test))]
 impl rand::distr::Distribution<PeerInfo> for rand::distr::StandardUniform {
     fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> PeerInfo {
+        use rand::RngExt;
+
         let own_timestamp_connection_established =
             SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(rng.next_u64() >> 20);
         let peer_timestamp_connection_established =
@@ -171,7 +175,7 @@ impl rand::distr::Distribution<PeerInfo> for rand::distr::StandardUniform {
             own_timestamp_connection_established,
             peer_timestamp_connection_established,
             standing: rng.random(),
-            version: <rand::rngs::StdRng as rand::Rng>::sample_iter(
+            version: <rand::rngs::StdRng as rand::RngExt>::sample_iter(
                 local_rng,
                 &rand::distr::Alphanumeric,
             )

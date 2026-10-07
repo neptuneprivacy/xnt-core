@@ -155,7 +155,7 @@ mod tests {
     use proptest::prelude::*;
     use rand::random;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use strum::EnumCount;
     use tasm_lib::hashing::merkle_verify::MerkleVerify;

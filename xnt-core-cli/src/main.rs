@@ -45,7 +45,7 @@ use neptune_privacy::state::wallet::wallet_file::WalletFile;
 use neptune_privacy::state::wallet::wallet_file::WalletFileContext;
 use neptune_privacy::state::wallet::wallet_status::WalletStatus;
 use neptune_privacy::state::wallet::wallet_status::WalletStatusExportFormat;
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
 use tarpc::client;
 use tarpc::context;

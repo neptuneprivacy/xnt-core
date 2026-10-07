@@ -1559,7 +1559,7 @@ impl GlobalState {
 
                 // revert removals
                 for removal_record in revert_block
-                    .mutator_set_update()
+                    .mutator_set_update(self.cli().network)
                     .expect("Stored block must have mutator set update")
                     .removals
                     .iter()
@@ -1615,7 +1615,7 @@ impl GlobalState {
                     additions,
                     mut removals,
                 } = apply_block
-                    .mutator_set_update()
+                    .mutator_set_update(self.cli().network)
                     .expect("block from archival state must have mutator set update");
 
                 // apply additions
@@ -1909,11 +1909,18 @@ impl GlobalState {
             );
         }
 
+        // Prune by timestamp BEFORE the block update, so that transactions which
+        // are already too old to be mined are dropped rather than being handed to
+        // the updater. Doing it the other way round spends update work, and then
+        // proving work, on transactions that are about to be discarded anyway.
+        let mut mempool_events = self.mempool.prune_stale_transactions();
+
         // Update mempool with UTXOs from this block. This is done by
         // removing all transaction that became invalid/was mined by this
         // block. Also returns the list of update-jobs that should be
         // performed by this client.
-        let (mempool_events, update_jobs) = self.mempool.update_with_block(&new_tip)?;
+        let (update_events, update_jobs) = self.mempool.update_with_block(&new_tip)?;
+        mempool_events.extend(update_events);
 
         let parent_ms_accumulator =
             self.chain
@@ -2323,14 +2330,11 @@ impl GlobalState {
     /// Favors transactions based on upgrade priority first, fee density
     /// second.
     ///
-    /// Needs mutable state access because of how the mutator set update value
-    /// is calculated. Does not actually mutate any state.
-    ///
     /// Returns none if no transaction in the mempool is in need of upgrading
     /// or if transaction in need of upgrading does not provide enough
     /// incentive.
     pub(crate) async fn preferred_update_job_from_mempool(
-        &mut self,
+        &self,
         min_gobbling_fee: NativeCurrencyAmount,
         tx_upgrade_filter: TxUpgradeFilter,
     ) -> Option<UpdateMutatorSetDataJob> {
@@ -2361,6 +2365,18 @@ impl GlobalState {
             self.mempool.log_events(&[e.clone()], tip_height);
         }
         self.wallet_state.handle_mempool_events(event).await;
+    }
+
+    /// Record that upgrading the proofs of these transactions failed, so the
+    /// proof upgrader picks a different candidate next time.
+    ///
+    /// Produces no mempool events: nothing is removed, the transactions are
+    /// only passed over until the next block arrives.
+    pub(crate) fn mempool_record_upgrade_failure(
+        &mut self,
+        txids: impl IntoIterator<Item = TransactionKernelId>,
+    ) {
+        self.mempool.record_upgrade_failure(txids);
     }
 
     /// clears all Tx from mempool and notifies wallet of changes.
@@ -2408,14 +2424,14 @@ impl GlobalState {
     }
 
     pub(crate) async fn upgrade_proof_collection_job(
-        &mut self,
+        &self,
         kernel: TransactionKernel,
         proof: ProofCollection,
         upgrade_incentive: UpgradeIncentive,
     ) -> Result<ProofCollectionToSingleProof> {
         let msa_lookup_result = self
             .chain
-            .archival_state_mut()
+            .archival_state()
             .old_mutator_set_and_mutator_set_update_to_tip(
                 kernel.mutator_set_hash,
                 SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
@@ -2440,14 +2456,14 @@ impl GlobalState {
     /// Does not perform any proof upgrading, only returns the witness data
     /// required to construct a synced single proof.
     pub(crate) async fn update_single_proof_job(
-        &mut self,
+        &self,
         old_kernel: TransactionKernel,
         old_proof: NeptuneProof,
         upgrade_incentive: UpgradeIncentive,
     ) -> Result<UpdateMutatorSetDataJob> {
         let msa_lookup_result = self
             .chain
-            .archival_state_mut()
+            .archival_state()
             .old_mutator_set_and_mutator_set_update_to_tip(
                 old_kernel.mutator_set_hash,
                 SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
@@ -2587,7 +2603,7 @@ mod tests {
     use rand::random;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tracing_test::traced_test;
     use wallet::address::generation_address::GenerationSpendingKey;
@@ -2735,7 +2751,7 @@ mod tests {
                 block = next_block;
 
                 // update membership proofs
-                let mutator_set_update = block.mutator_set_update().unwrap();
+                let mutator_set_update = block.mutator_set_update(network).unwrap();
                 let MutatorSetUpdate {
                     additions,
                     mut removals,
@@ -2804,7 +2820,7 @@ mod tests {
                 }
 
                 block
-                    .mutator_set_update()
+                    .mutator_set_update(network)
                     .unwrap()
                     .apply_to_accumulator(&mut test_msa)
                     .unwrap();

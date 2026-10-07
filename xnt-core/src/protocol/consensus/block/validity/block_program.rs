@@ -69,6 +69,8 @@ impl BlockProgram {
             "1a4df646ce2b7d671d8b370870d91e2f0e0421b6cccb29e047109b823657ef31e86258586a699ad9";
         const BLOCK_PROGRAM_UPGRADE_VM_V5_DIGEST: &str = // v5 tree (UpgradeVMv5), now pre-v7
             "e14d426bd76aad647703efb21c880f678b9a2eabe8dcfba7d6fc97b4b6b0f402c38d0c1be5f4942f";
+        const BLOCK_PROGRAM_UPGRADE_VM_V7_DIGEST: &str = // v7 tree (UpgradeVMv7), now pre-v8
+            "f87bda68a0959a023fd1843ca47ab72fab871a853f392fc6e3f889ef10206f89b3f8a8ec2743d78d";
 
         match consensus_rule_set {
             ConsensusRuleSet::Reboot | ConsensusRuleSet::HardforkAlpha => {
@@ -86,8 +88,11 @@ impl BlockProgram {
             ConsensusRuleSet::UpgradeVMv5 => {
                 Digest::try_from_hex(BLOCK_PROGRAM_UPGRADE_VM_V5_DIGEST).unwrap()
             }
-            // Current (v7) bytecode — recompute from the linked program.
-            ConsensusRuleSet::UpgradeVMv7 => Self.hash(),
+            ConsensusRuleSet::UpgradeVMv7 => {
+                Digest::try_from_hex(BLOCK_PROGRAM_UPGRADE_VM_V7_DIGEST).unwrap()
+            }
+            // Current (v8) bytecode — recompute from the linked program.
+            ConsensusRuleSet::UpgradeVMv8 => Self.hash(),
         }
     }
 
@@ -375,7 +380,7 @@ pub(crate) mod tests {
     use itertools::Itertools;
     use macro_rules_attr::apply;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tasm_lib::triton_vm;
     use tasm_lib::triton_vm::prelude::BFieldElement;
@@ -575,7 +580,7 @@ pub(crate) mod tests {
         let tx = Transaction::new_with_updated_mutator_set_records_given_proof(
             tx.kernel,
             &genesis_block.mutator_set_accumulator_after().unwrap(),
-            &block1.mutator_set_update().unwrap(),
+            &block1.mutator_set_update(network).unwrap(),
             tx.proof.into_single_proof(),
             TritonVmJobQueue::get_instance(),
             TritonVmJobPriority::default().into(),
@@ -809,9 +814,10 @@ pub(crate) mod tests {
     test_program_snapshot!(
         BlockProgram,
         // snapshot taken from master on 2025-04-11 e2a712efc34f78c6a28801544418e7051127d284
-        // Program hash updated for UpgradeVMv7 (triton-vm v7 / tasm-lib u128
-        // range-check); the UpgradeVMv5 (v5) digest (e14d426b…) lives on as a
-        // hardcoded prior-era digest in program_digest_for().
-        "f87bda68a0959a023fd1843ca47ab72fab871a853f392fc6e3f889ef10206f89b3f8a8ec2743d78d"
+        // Program hash updated for UpgradeVMv8 (triton-vm v8: sound Hash/Program
+        // Table AIR, randomized quotient table). The UpgradeVMv7 (v7) digest
+        // (f87bda68…) lives on as a hardcoded prior-era digest in
+        // program_digest_for(), as does the v5 one (e14d426b…).
+        "df05b05b64f356da179866a5858c0ca10756e62ccf603d8188952773bb6359f1f1a24f06b3eb7bfc"
     );
 }

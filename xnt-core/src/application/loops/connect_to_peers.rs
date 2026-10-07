@@ -679,7 +679,7 @@ pub(crate) async fn close_peer_connected_callback(
 
     global_state_mut
         .net
-        .write_peer_standing_on_decrease(peer_address.ip(), new_standing)
+        .write_peer_standing(peer_address.ip(), new_standing)
         .await;
     drop(global_state_mut); // avoid holding across mpsc::Sender::send()
     debug!("Stored peer info standing {new_standing} for peer {peer_address}");
@@ -960,7 +960,7 @@ mod tests {
             .lock_guard_mut()
             .await
             .net
-            .write_peer_standing_on_decrease(peer_sa.ip(), bad_standing)
+            .write_peer_standing(peer_sa.ip(), bad_standing)
             .await;
 
         status = check_if_connection_is_allowed(
@@ -1467,7 +1467,7 @@ mod tests {
             .lock_guard_mut()
             .await
             .net
-            .write_peer_standing_on_decrease(peer_address.ip(), bad_standing)
+            .write_peer_standing(peer_address.ip(), bad_standing)
             .await;
 
         let answer = answer_peer_inner(

@@ -7,7 +7,7 @@ use neptune_privacy::api::export::ReceivingAddress;
 use neptune_privacy::api::export::Timestamp;
 use neptune_privacy::application::loops::mine_loop::coinbase_distribution::CoinbaseDistribution;
 use neptune_privacy::application::loops::mine_loop::coinbase_distribution::CoinbaseOutput;
-use rand::Rng;
+use rand::RngExt;
 
 // #[traced_test]
 #[tokio::test(flavor = "multi_thread")]

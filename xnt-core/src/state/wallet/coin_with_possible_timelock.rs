@@ -111,7 +111,7 @@ mod tests {
     use arbitrary::Arbitrary;
     use arbitrary::Unstructured;
     use rand::Rng;
-    use rand::RngCore;
+    use rand::RngExt;
 
     use super::CoinWithPossibleTimeLock;
     use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
