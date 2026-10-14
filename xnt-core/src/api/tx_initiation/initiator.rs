@@ -38,12 +38,27 @@ use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurr
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
+use num_traits::CheckedSub;
+
 use crate::state::wallet::address::KeyType;
+use crate::state::wallet::address::ReceivingAddress;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::transaction_input::TxInput;
 use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutputList;
 use crate::GlobalStateLock;
+
+/// Where [`TransactionInitiator::migrate_dctidh_utxos`] should send the moved
+/// funds.
+#[derive(Debug, Clone)]
+pub enum MigrationDestination {
+    /// An explicit destination address.
+    Address(ReceivingAddress),
+    /// This wallet's Generation address at the given derivation index.
+    NewGeneration { index: u64 },
+    /// This wallet's current-format dCTIDH address at the given derivation index.
+    NewDctidh { index: u64 },
+}
 
 /// provides an API for building and sending neptune transactions.
 #[derive(Debug)]
@@ -437,6 +452,140 @@ impl TransactionInitiator {
         tracing::info!("send: all done!");
 
         Ok(tx_creation_artifacts)
+    }
+
+    /// Move funds held at legacy-format dCTIDH keys to a destination,
+    /// consolidating a batch of such UTXOs into a single output.
+    ///
+    /// Only UTXOs locked by legacy-format dCTIDH keys are spent; current-format
+    /// dCTIDH UTXOs and everything else in the wallet are left untouched. The
+    /// selected inputs, minus `fee`, are sent to `destination` as one on-chain
+    /// output. Because the destination is never a legacy-format lock, the moved
+    /// funds are not re-selected on a later call. The destination may be an
+    /// explicit address or this wallet's Generation / current-format dCTIDH
+    /// address at a fixed derivation index (no wallet counter is advanced, and
+    /// the address is always recoverable from the seed).
+    ///
+    /// Returns `Ok(None)` when there is nothing to move (no matching UTXOs, or
+    /// the available amount does not cover the fee). Otherwise returns the
+    /// created transaction artifacts. Bound the batch with `max_inputs` and call
+    /// repeatedly across blocks to drain a large set.
+    pub async fn migrate_dctidh_utxos(
+        &mut self,
+        destination: MigrationDestination,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> Result<Option<TxCreationArtifacts>, error::SendError> {
+        self.private().check_proceed_with_send(fee).await?;
+
+        // Lock-script hashes controlled by legacy-format dCTIDH keys.
+        let dctidh_locks: HashSet<Digest> = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .wallet_state
+            .get_known_legacy_dctidh_keys()
+            .map(|key| key.lock_script_hash())
+            .collect();
+
+        // Restrict spendable inputs to those locked by legacy-format dCTIDH keys.
+        let mut inputs: Vec<TxInput> = self
+            .spendable_inputs(timestamp, exclude_recent_blocks)
+            .await
+            .into();
+        inputs.retain(|input| dctidh_locks.contains(&input.utxo.lock_script_hash()));
+        if let Some(limit) = max_inputs {
+            inputs.truncate(limit);
+        }
+        if inputs.is_empty() {
+            return Ok(None);
+        }
+
+        let total: NativeCurrencyAmount = inputs
+            .iter()
+            .map(|input| input.utxo.get_native_currency_amount())
+            .sum();
+        let Some(output_amount) = total.checked_sub(&fee) else {
+            return Ok(None);
+        };
+        if output_amount == NativeCurrencyAmount::coins(0) {
+            return Ok(None);
+        }
+
+        // Resolve the destination. Self-derived destinations use a fixed
+        // derivation index, so no wallet counter is advanced and the address is
+        // always recoverable from the seed.
+        let destination = match destination {
+            MigrationDestination::Address(address) => address,
+            MigrationDestination::NewGeneration { index } => self
+                .global_state_lock
+                .lock_guard()
+                .await
+                .wallet_state
+                .nth_spending_key(KeyType::Generation, index)
+                .to_address(),
+            MigrationDestination::NewDctidh { index } => self
+                .global_state_lock
+                .lock_guard()
+                .await
+                .wallet_state
+                .nth_spending_key(KeyType::dCTIDH, index)
+                .to_address(),
+        };
+
+        let tx_outputs = self
+            .generate_tx_outputs(vec![OutputFormat::from((destination, output_amount))])
+            .await;
+
+        let target_proof_type = TransactionProofType::PrimitiveWitness;
+
+        let tx_details = TransactionDetailsBuilder::new()
+            .timestamp(timestamp)
+            .inputs(inputs.into())
+            .outputs(tx_outputs)
+            .fee(fee)
+            .change_policy(ChangePolicy::ExactChange)
+            .build(&mut self.global_state_lock.clone().into())
+            .await?;
+
+        let block_height = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        let cli_args = self.global_state_lock.cli();
+        let network = cli_args.network;
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+
+        let options = TritonVmProofJobOptionsBuilder::new()
+            .template(&cli_args.as_proof_job_options())
+            .proof_type(target_proof_type)
+            .build();
+
+        let proof = TransactionProofBuilder::new()
+            .consensus_rule_set(consensus_rule_set)
+            .transaction_details(&tx_details)
+            .job_queue(vm_job_queue())
+            .proof_job_options(options)
+            .build()
+            .await?;
+
+        let transaction = self.assemble_transaction(&tx_details, proof)?;
+
+        let tx_creation_artifacts = TxCreationArtifactsBuilder::new()
+            .transaction_details(tx_details)
+            .transaction(transaction)
+            .build()?;
+
+        self.record_and_broadcast_transaction(&tx_creation_artifacts)
+            .await?;
+
+        Ok(Some(tx_creation_artifacts))
     }
 
     fn private(&self) -> super::private::TransactionInitiatorPrivate {

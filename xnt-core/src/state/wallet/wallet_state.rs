@@ -1114,6 +1114,12 @@ impl WalletState {
             .cloned()
     }
 
+    /// The legacy-derivation dCTIDH keys only (one per used index), for
+    /// recognising and sweeping funds received at legacy-format addresses.
+    pub(crate) fn get_known_legacy_dctidh_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
+        self.known_legacy_dctidh_keys.iter().cloned()
+    }
+
     /// Get the next unused spending key of a given type.
     ///
     /// returns key at present counter (for key_type), and increments the

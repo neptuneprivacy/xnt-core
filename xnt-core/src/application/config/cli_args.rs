@@ -235,6 +235,29 @@ pub struct Args {
     #[clap(long, default_value = "0.0005", value_parser = NativeCurrencyAmount::coins_from_str)]
     pub(crate) min_relay_pctx_fee_per_input: NativeCurrencyAmount,
 
+    /// If set, periodically move funds received at legacy-format dCTIDH
+    /// addresses to a destination, one batch per new block. Current-format
+    /// dCTIDH funds are left untouched. Leave unset to disable.
+    ///
+    /// Accepts `generation` (move to a freshly derived Generation address of
+    /// this wallet), `dctidh` (a freshly derived current-format dCTIDH address
+    /// of this wallet), or an explicit bech32m address.
+    #[clap(long, value_name = "generation|dctidh|ADDRESS")]
+    pub(crate) migrate_dctidh: Option<String>,
+
+    /// Fee attached to each dCTIDH migration transaction.
+    #[clap(long, default_value = "0.01", value_parser = NativeCurrencyAmount::coins_from_str)]
+    pub(crate) migrate_dctidh_fee: NativeCurrencyAmount,
+
+    /// Maximum number of inputs consumed by each dCTIDH migration transaction.
+    #[clap(long, default_value = "10")]
+    pub(crate) migrate_dctidh_batch: usize,
+
+    /// Wallet derivation index used as the destination when --migrate-dctidh is
+    /// `generation` or `dctidh`. Ignored for an explicit destination address.
+    #[clap(long, default_value = "0")]
+    pub(crate) migrate_dctidh_index: u64,
+
     /// Whether to produce block proposals, which is the 2nd step of three-step
     /// mining. Note that composing block proposals involves the computationally
     /// expensive task of producing STARK proofs. You should have plenty of

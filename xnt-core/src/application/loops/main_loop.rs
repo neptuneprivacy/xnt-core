@@ -32,6 +32,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::api::tx_initiation::initiator::MigrationDestination;
 use crate::application::loops::channel::MainToMiner;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::MainToPeerTaskBatchBlockRequest;
@@ -67,6 +68,7 @@ use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposal;
 use crate::state::networking_state::SyncAnchor;
 use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+use crate::state::wallet::address::ReceivingAddress;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
 use crate::SUCCESS_EXIT_CODE;
@@ -946,6 +948,47 @@ impl MainLoopHandler {
                 // TODO: Do clever trick to collapse all jobs relating to the same transaction,
                 //       identified by transaction-ID, into *one* update job.
                 self.spawn_mempool_txs_update_job(main_loop_state, update_jobs);
+
+                // Move funds held at legacy-format dCTIDH keys to a destination,
+                // one batch per new block, if configured.
+                let migrate_spec = {
+                    let cli = self.global_state_lock.cli();
+                    cli.migrate_dctidh.as_ref().map(|spec| {
+                        (
+                            spec.clone(),
+                            cli.network,
+                            cli.migrate_dctidh_fee,
+                            cli.migrate_dctidh_batch,
+                            cli.migrate_dctidh_index,
+                        )
+                    })
+                };
+                if let Some((spec, network, fee, batch, index)) = migrate_spec {
+                    let destination = match spec.as_str() {
+                        "generation" => Some(MigrationDestination::NewGeneration { index }),
+                        "dctidh" => Some(MigrationDestination::NewDctidh { index }),
+                        address => match ReceivingAddress::from_bech32m(address, network) {
+                            Ok(address) => Some(MigrationDestination::Address(address)),
+                            Err(e) => {
+                                warn!("invalid --migrate-dctidh value: {e}");
+                                None
+                            }
+                        },
+                    };
+                    if let Some(destination) = destination {
+                        let mut tx_initiator = self.global_state_lock.api().tx_initiator();
+                        let timestamp =
+                            crate::protocol::proof_abstractions::timestamp::Timestamp::now();
+                        tokio::task::spawn(async move {
+                            if let Err(e) = tx_initiator
+                                .migrate_dctidh_utxos(destination, fee, timestamp, 0, Some(batch))
+                                .await
+                            {
+                                warn!("dCTIDH migration: {e}");
+                            }
+                        });
+                    }
+                }
 
                 // Inform miner about new block.
                 self.main_to_miner_tx.send(MainToMiner::NewBlock);
