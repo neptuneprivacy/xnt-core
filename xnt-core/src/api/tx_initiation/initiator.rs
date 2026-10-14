@@ -46,6 +46,7 @@ use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::transaction_input::TxInput;
 use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutputList;
+use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
 use crate::GlobalStateLock;
 
 /// Where [`TransactionInitiator::migrate_dctidh_utxos`] should send the moved
@@ -463,8 +464,9 @@ impl TransactionInitiator {
     /// output. Because the destination is never a legacy-format lock, the moved
     /// funds are not re-selected on a later call. The destination may be an
     /// explicit address or this wallet's Generation / current-format dCTIDH
-    /// address at a fixed derivation index (no wallet counter is advanced, and
-    /// the address is always recoverable from the seed).
+    /// address at a fixed derivation index (no wallet counter is advanced). The
+    /// output is always announced on-chain, also when it is owned by this
+    /// wallet, so the moved funds can be found again from the seed alone.
     ///
     /// Returns `Ok(None)` when there is nothing to move (no matching UTXOs, or
     /// the available amount does not cover the fee). Otherwise returns the
@@ -535,8 +537,15 @@ impl TransactionInitiator {
                 .to_address(),
         };
 
+        // Announce the output on-chain even when it is owned by this wallet.
+        // An off-chain notification would only live in the local wallet
+        // database, and the funds could not be found when restoring from seed.
         let tx_outputs = self
-            .generate_tx_outputs(vec![OutputFormat::from((destination, output_amount))])
+            .generate_tx_outputs(vec![OutputFormat::AddressAndAmountAndMedium(
+                destination,
+                output_amount,
+                UtxoNotificationMedium::OnChain,
+            )])
             .await;
 
         let target_proof_type = TransactionProofType::PrimitiveWitness;
