@@ -6,36 +6,6 @@ use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::Transaction;
 
-/// A borrowed transaction on either transaction pipeline.
-#[derive(Debug, Clone, Copy)]
-pub enum AnyTxRef<'a> {
-    Standard(&'a Transaction),
-    Link(&'a LinkTx),
-}
-
-impl<'a> From<&'a Transaction> for AnyTxRef<'a> {
-    fn from(transaction: &'a Transaction) -> Self {
-        Self::Standard(transaction)
-    }
-}
-
-impl<'a> From<&'a LinkTx> for AnyTxRef<'a> {
-    fn from(link_tx: &'a LinkTx) -> Self {
-        Self::Link(link_tx)
-    }
-}
-
-impl<'a> AnyTxRef<'a> {
-    /// The transaction kernel; for a link transaction, the wrapped
-    /// [`TransactionKernel`].
-    pub fn kernel(&self) -> &'a TransactionKernel {
-        match self {
-            AnyTxRef::Standard(transaction) => &transaction.kernel,
-            AnyTxRef::Link(link_tx) => &link_tx.kernel.kernel,
-        }
-    }
-}
-
 /// A transaction on either transaction pipeline: a single-proof [`Transaction`]
 /// or a chainable [`LinkTx`].
 ///
