@@ -1974,6 +1974,29 @@ impl WalletState {
         }
     }
 
+    /// Height of the block in which each monitored UTXO was confirmed, keyed
+    /// by AOCL leaf index.
+    ///
+    /// If the same AOCL leaf index is monitored more than once, e.g. after a
+    /// reorganization, the highest confirmation height is kept, so that the
+    /// number of confirmations is never overestimated.
+    pub(crate) async fn confirmation_heights(&self) -> HashMap<u64, BlockHeight> {
+        let monitored_utxos = self.wallet_db.monitored_utxos();
+        let stream = monitored_utxos.stream().await;
+        pin_mut!(stream); // needed for iteration
+
+        let mut heights: HashMap<u64, BlockHeight> = HashMap::new();
+        while let Some((_i, mutxo)) = stream.next().await {
+            let (_, _, height) = mutxo.confirmed_in_block;
+            heights
+                .entry(mutxo.aocl_leaf_index)
+                .and_modify(|known| *known = std::cmp::max(*known, height))
+                .or_insert(height);
+        }
+
+        heights
+    }
+
     /// Returns all spendable inputs.
     ///
     /// wallet_status must be current as of present tip.

@@ -27,6 +27,11 @@ pub fn main() -> Result<()> {
             anyhow::bail!(e);
         }
 
+        // Validate auto-consolidation settings
+        if let Err(e) = args.validate_auto_consolidation() {
+            anyhow::bail!(e);
+        }
+
         #[cfg(not(feature = "tokio-console"))]
         {
             use std::io::Write;

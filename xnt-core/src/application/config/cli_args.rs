@@ -17,6 +17,8 @@ use tracing::error;
 
 use super::fee_notification_policy::FeeNotificationPolicy;
 use super::network::Network;
+use crate::application::config::auto_consolidation::AutoConsolidationSettings;
+use crate::application::config::auto_consolidation::ConsolidationTarget;
 use crate::application::config::triton_vm_env_vars::TritonVmEnvVars;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::application::json_rpc::core::api::ops::Namespace;
@@ -257,6 +259,40 @@ pub struct Args {
     /// `generation` or `dctidh`. Ignored for an explicit destination address.
     #[clap(long, default_value = "0")]
     pub(crate) migrate_dctidh_index: u64,
+
+    /// Enable automatic consolidation of UTXOs.
+    ///
+    /// If this flag is set, then after every new block the node initiates and
+    /// broadcasts a transaction that spends `--num-consolidation-inputs` of the
+    /// oldest UTXOs managed by the wallet, each with at least 10 confirmations,
+    /// to a single output. The output goes to this wallet's Generation address
+    /// at derivation index 0, or else to the given address, and is always
+    /// announced on-chain. Nothing happens while fewer UTXOs qualify, or while
+    /// the node is syncing.
+    ///
+    /// The fee is fixed per transaction: 0.005 on nodes that can produce
+    /// single proofs, 0.1 on nodes that can only produce proof collections.
+    ///
+    /// Examples:
+    ///
+    /// ```text
+    /// --auto-consolidate
+    /// --auto-consolidate <ADDRESS>
+    /// ```
+    // OK to suppress this linter rule because we are parsing and the nested
+    // type tells clap how to parse.
+    #[expect(clippy::option_option)]
+    #[clap(long, default_value = None, value_name = "ADDRESS")]
+    pub(crate) auto_consolidate: Option<Option<String>>,
+
+    #[clap(skip)]
+    pub(crate) auto_consolidate_cache: OnceLock<AutoConsolidationSettings>,
+
+    /// Number of inputs per automated consolidation transaction. Will never
+    /// auto-consolidate with any other number of inputs than this. Must be
+    /// between 2 and 200.
+    #[clap(long, default_value = "8", value_name = "NUM_INPUTS")]
+    pub(crate) num_consolidation_inputs: u8,
 
     /// Whether to produce block proposals, which is the 2nd step of three-step
     /// mining. Note that composing block proposals involves the computationally
@@ -740,6 +776,61 @@ impl Args {
             }
         }
         Ok(())
+    }
+
+    /// Validates the auto-consolidation settings and caches the result.
+    /// Returns an error if the consolidation address cannot be parsed, if the
+    /// number of consolidation inputs is too small, or if auto-consolidation
+    /// is enabled on a node that does not initiate transactions.
+    pub fn validate_auto_consolidation(&self) -> Result<(), String> {
+        let settings = AutoConsolidationSettings::parse(
+            &self.auto_consolidate,
+            self.num_consolidation_inputs,
+            self.network,
+        )?;
+
+        if !matches!(settings.policy, ConsolidationTarget::Inactive) {
+            if self.no_transaction_initiation {
+                return Err(
+                    "--auto-consolidate cannot be combined with --no-transaction-initiation"
+                        .to_string(),
+                );
+            }
+            if matches!(
+                self.tx_proving_capability,
+                Some(TxProvingCapability::LockScript | TxProvingCapability::PrimitiveWitness)
+            ) {
+                return Err(
+                    "--auto-consolidate requires a proving capability of at least \
+                     proof collection"
+                        .to_string(),
+                );
+            }
+        }
+
+        let _ = self.auto_consolidate_cache.set(settings);
+        Ok(())
+    }
+
+    /// Get the auto-consolidation setting.
+    ///
+    /// Invalid settings are rejected at startup by
+    /// [`Self::validate_auto_consolidation`]. If that was skipped and the
+    /// settings are invalid, auto-consolidation is inactive.
+    pub(crate) fn auto_consolidate(&self) -> AutoConsolidationSettings {
+        self.auto_consolidate_cache
+            .get_or_init(|| {
+                AutoConsolidationSettings::parse(
+                    &self.auto_consolidate,
+                    self.num_consolidation_inputs,
+                    self.network,
+                )
+                .unwrap_or_else(|err| {
+                    tracing::warn!("auto-consolidation disabled: {err}");
+                    AutoConsolidationSettings::default()
+                })
+            })
+            .clone()
     }
 
     pub(crate) fn proof_job_options(

@@ -597,7 +597,7 @@ impl TransactionInitiator {
         Ok(Some(tx_creation_artifacts))
     }
 
-    fn private(&self) -> super::private::TransactionInitiatorPrivate {
+    pub(super) fn private(&self) -> super::private::TransactionInitiatorPrivate {
         super::private::TransactionInitiatorPrivate::new(self.global_state_lock.clone())
     }
 }

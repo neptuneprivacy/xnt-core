@@ -194,8 +194,13 @@ impl NativeCurrencyAmount {
 
     /// Convert the number of Neptune atomic units (nau) to a
     /// `NativeCurrencyAmount`.
-    pub fn from_nau(nau: i128) -> Self {
+    pub const fn from_nau(nau: i128) -> Self {
         Self(nau)
+    }
+
+    /// The number of Neptune atomic units (nau) in one whole coin.
+    pub const fn coin_as_nau() -> i128 {
+        Self::conversion_factor()
     }
 
     /// Multiply the amount by a non-negative 32-bit number.

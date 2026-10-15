@@ -325,6 +325,24 @@ enum Command {
         exclude_recent_blocks: usize,
     },
 
+    /// Initiate and broadcast a transaction that consolidates UTXOs.
+    ///
+    /// Spends the `batch` oldest UTXOs with at least 10 confirmations to a
+    /// single output owned by the node's wallet, or to the given address,
+    /// resulting in `batch - 1` fewer UTXOs to manage. Fails if fewer UTXOs
+    /// qualify, or if the node is configured to not initiate transactions.
+    Consolidate {
+        /// Number of UTXOs to consolidate. Defaults to the node's
+        /// `--num-consolidation-inputs` setting.
+        #[clap(long)]
+        batch: Option<usize>,
+
+        /// Send the consolidated output to this address instead of the node's
+        /// own wallet.
+        #[clap(long)]
+        address: Option<String>,
+    },
+
     /// Upgrade the specified transaction. Transaction must be either unsynced
     /// or not have a Single Proof for this to work.
     Upgrade {
@@ -1423,6 +1441,13 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => eprintln!("{e}"),
             }
+        }
+        Command::Consolidate { batch, address } => {
+            let address = address
+                .map(|address| ReceivingAddress::from_bech32m(&address, network))
+                .transpose()?;
+            let num_utxos_consolidated = client.consolidate(ctx, token, batch, address).await??;
+            println!("Initiating transaction to consolidate {num_utxos_consolidated} UTXOs.");
         }
         Command::Upgrade { tx_kernel_id } => {
             println!("Attempting to upgrade transaction {tx_kernel_id}");

@@ -33,6 +33,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::api::tx_initiation::initiator::MigrationDestination;
+use crate::application::config::auto_consolidation::ConsolidationTarget;
 use crate::application::loops::channel::MainToMiner;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::MainToPeerTaskBatchBlockRequest;
@@ -139,6 +140,10 @@ pub struct MainLoopHandler {
     miner_to_main_rx: mpsc::Receiver<MinerToMain>,
     rpc_server_to_main_rx: mpsc::Receiver<RPCServerToMain>,
     task_handles: Vec<JoinHandle<()>>,
+
+    /// Held by the task that migrates and consolidates wallet funds after a
+    /// new block, so that two such tasks never select the same inputs.
+    wallet_maintenance: Arc<tokio::sync::Mutex<()>>,
 
     #[cfg(test)]
     mock_now: Option<SystemTime>,
@@ -431,6 +436,7 @@ impl MainLoopHandler {
             miner_to_main_rx,
             rpc_server_to_main_rx,
             task_handles,
+            wallet_maintenance: Arc::new(tokio::sync::Mutex::new(())),
 
             #[cfg(test)]
             mock_now: None,
@@ -963,7 +969,7 @@ impl MainLoopHandler {
                         )
                     })
                 };
-                if let Some((spec, network, fee, batch, index)) = migrate_spec {
+                let migration = migrate_spec.and_then(|(spec, network, fee, batch, index)| {
                     let destination = match spec.as_str() {
                         "generation" => Some(MigrationDestination::NewGeneration { index }),
                         "dctidh" => Some(MigrationDestination::NewDctidh { index }),
@@ -975,19 +981,64 @@ impl MainLoopHandler {
                             }
                         },
                     };
-                    if let Some(destination) = destination {
-                        let mut tx_initiator = self.global_state_lock.api().tx_initiator();
-                        let timestamp =
-                            crate::protocol::proof_abstractions::timestamp::Timestamp::now();
-                        tokio::task::spawn(async move {
+                    destination.map(|destination| (destination, fee, batch))
+                });
+
+                // Consolidate a batch of old UTXOs, if configured.
+                let consolidation = {
+                    let settings = self.global_state_lock.cli().auto_consolidate();
+                    let num_inputs = usize::from(settings.num_inputs);
+                    match settings.policy {
+                        ConsolidationTarget::Inactive => None,
+                        ConsolidationTarget::ActiveDynamic => Some((num_inputs, None)),
+                        ConsolidationTarget::ActiveFixed { address } => {
+                            Some((num_inputs, Some(*address)))
+                        }
+                    }
+                };
+
+                // Both run in one task, one after the other, so that the
+                // consolidation does not select inputs the migration spends.
+                // Skipped while syncing, since the tip is not current, and
+                // while the task started by an earlier block still runs.
+                let syncing = self
+                    .global_state_lock
+                    .lock_guard()
+                    .await
+                    .net
+                    .sync_anchor
+                    .is_some();
+                if !syncing && (migration.is_some() || consolidation.is_some()) {
+                    let mut tx_initiator = self.global_state_lock.api().tx_initiator();
+                    let timestamp =
+                        crate::protocol::proof_abstractions::timestamp::Timestamp::now();
+                    let wallet_maintenance = self.wallet_maintenance.clone();
+                    tokio::task::spawn(async move {
+                        let Ok(_running) = wallet_maintenance.try_lock_owned() else {
+                            debug!("wallet maintenance for an earlier block still running");
+                            return;
+                        };
+
+                        if let Some((destination, fee, batch)) = migration {
                             if let Err(e) = tx_initiator
                                 .migrate_dctidh_utxos(destination, fee, timestamp, 0, Some(batch))
                                 .await
                             {
                                 warn!("dCTIDH migration: {e}");
                             }
-                        });
-                    }
+                        }
+
+                        if let Some((num_inputs, address)) = consolidation {
+                            match tx_initiator
+                                .consolidate(num_inputs, address, timestamp)
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(e) if e.is_nothing_to_do() => debug!("auto-consolidation: {e}"),
+                                Err(e) => warn!("auto-consolidation: {e}"),
+                            }
+                        }
+                    });
                 }
 
                 // Inform miner about new block.

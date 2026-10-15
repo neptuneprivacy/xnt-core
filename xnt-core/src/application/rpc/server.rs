@@ -2015,6 +2015,27 @@ pub trait RPC {
     /// # Ok(())
     /// # }
     async fn shutdown(token: auth::Token) -> RpcResult<bool>;
+
+    /// Initiate a transaction that spends a batch of UTXOs to the node's own
+    /// wallet, reducing the total number of UTXOs under management.
+    ///
+    /// Spends the oldest UTXOs with at least 10 confirmations to a single
+    /// on-chain output, for a fixed fee that depends on the node's proving
+    /// capability.
+    ///
+    /// # Parameters
+    ///
+    ///  - `num_inputs` -- the number of inputs to consolidate. Defaults to the
+    ///    node's `--num-consolidation-inputs` setting.
+    ///  - `to_address` -- set to consolidate the UTXOs to the given address as
+    ///    opposed to the node's own Generation address at derivation index 0.
+    ///
+    /// Returns the number of inputs consumed by the consolidation transaction.
+    async fn consolidate(
+        token: auth::Token,
+        num_inputs: Option<usize>,
+        to_address: Option<ReceivingAddress>,
+    ) -> RpcResult<usize>;
 }
 
 #[derive(Clone)]
@@ -3369,6 +3390,28 @@ impl RPC for NeptuneRPCServer {
     }
 
     // documented in trait. do not add doc-comment.
+    async fn consolidate(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        num_inputs: Option<usize>,
+        to_address: Option<ReceivingAddress>,
+    ) -> RpcResult<usize> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let num_inputs =
+            num_inputs.unwrap_or_else(|| usize::from(self.state.cli().num_consolidation_inputs));
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_initiator_mut()
+            .consolidate(num_inputs, to_address, Timestamp::now())
+            .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
     async fn clear_mempool(
         self,
         _context: tarpc::context::Context,
@@ -4319,6 +4362,15 @@ pub mod error {
 
         #[error("Wallet key counter is zero. Must be positive after init")]
         WalletKeyCounterIsZero,
+
+        #[error("consolidation error: {0}")]
+        ConsolidationError(String),
+    }
+
+    impl From<tx_initiation::consolidate::ConsolidationError> for RpcError {
+        fn from(err: tx_initiation::consolidate::ConsolidationError) -> Self {
+            RpcError::ConsolidationError(err.to_string())
+        }
     }
 
     impl From<tx_initiation::error::CreateTxError> for RpcError {
