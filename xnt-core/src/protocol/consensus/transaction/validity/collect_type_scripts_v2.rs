@@ -90,6 +90,117 @@ fn v3_remap(hash: Digest) -> Digest {
         .unwrap_or(hash)
 }
 
+/// The type-script hashes [`CollectTypeScriptsV2`] outputs for these UTXOs:
+/// native currency first, then every coin's type-script hash in order of first
+/// appearance, each folded through [`v3_remap`] and deduplicated after folding.
+///
+/// Every consumer that has to agree with `CollectTypeScriptsV2` on which type
+/// scripts a transaction needs -- and in which order their proofs come --
+/// derives the list here: the witness's `output`, and `Forge`, which collects
+/// the same list inline.
+pub(crate) fn collected_type_script_hashes<'a, I: Iterator<Item = &'a Utxo>>(
+    utxos: I,
+) -> Vec<Digest> {
+    let mut deduped: Vec<Digest> = vec![];
+    for hash in Utxo::type_script_hashes(utxos) {
+        let remapped = v3_remap(hash);
+        if !deduped.contains(&remapped) {
+            deduped.push(remapped);
+        }
+    }
+    deduped
+}
+
+/// The tasm counterpart of [`v3_remap`].
+pub(crate) struct V3RemapTasm {
+    /// Folds the `[digest]` on top of the stack onto its current counterpart, in
+    /// place: `_ [digest] -> _ [digest_or_remapped]`.
+    pub(crate) block: Vec<LabelledInstruction>,
+
+    /// The subroutines `block` calls. Emit them once per program.
+    pub(crate) subroutines: Vec<LabelledInstruction>,
+}
+
+/// Build the tasm for [`v3_remap`], with the given labels for its three
+/// subroutines.
+///
+/// The block compares the digest against each recognised pre-v3 hash and, on a
+/// match, swaps in the current counterpart. Targets are distinct from every old
+/// hash, so the comparisons can be chained order-independently. Built from the
+/// shared [`v3_remap_pairs`] table so the tasm and the host-side mirror can never
+/// drift.
+pub(crate) fn v3_remap_tasm(
+    remap_to_native_currency_hash: &str,
+    remap_to_timelock_v2_hash: &str,
+    remap_no_op: &str,
+) -> V3RemapTasm {
+    let eq_digest = DataType::Digest.compare();
+
+    // Each hash is pushed in reverse value order (see `push_digest_reversed`)
+    // so values()[0] ends on the stack top, matching what read_mem 5; pop 1
+    // produces for digests in memory.
+    let push_native_currency_hash = push_digest_reversed(NativeCurrency.hash());
+    let push_timelock_v2_hash = push_digest_reversed(TimeLockV2.hash());
+
+    let make_remap_compare = |push_old: &[LabelledInstruction], target_label: &str| {
+        let mut block = triton_asm! {
+            // _ [digest]
+            dup 4 dup 4 dup 4 dup 4 dup 4
+        };
+        block.extend_from_slice(push_old);
+        block.extend(triton_asm! {
+            {&eq_digest}
+            // _ [digest] (digest == old)
+            push 1
+            swap 1
+            skiz call {target_label}
+            skiz call {remap_no_op}
+            // _ [digest_or_remapped]
+        });
+        block
+    };
+
+    // The target subroutine is picked from the pair's target hash.
+    let mut block: Vec<LabelledInstruction> = vec![];
+    for (old_hash, target_hash) in v3_remap_pairs() {
+        let target_label = if target_hash == NativeCurrency.hash() {
+            remap_to_native_currency_hash
+        } else {
+            remap_to_timelock_v2_hash
+        };
+        block.extend(make_remap_compare(&push_digest_reversed(old_hash), target_label));
+    }
+
+    let subroutines = triton_asm! {
+        // Replace the matched old digest with the current NativeCurrency hash.
+        // BEFORE: _ ... [old_digest] 1
+        // AFTER:  _ ... [native_currency_hash] 0
+        {remap_to_native_currency_hash}:
+            pop 1
+            pop 5
+            {&push_native_currency_hash}
+            push 0
+            return
+
+        // Replace the matched old digest with the current TimeLockV2 hash.
+        // BEFORE: _ ... [old_digest] 1
+        // AFTER:  _ ... [timelock_v2_hash] 0
+        {remap_to_timelock_v2_hash}:
+            pop 1
+            pop 5
+            {&push_timelock_v2_hash}
+            push 0
+            return
+
+        // Invoked when the digest did not match this rule's old hash. The
+        // outer skiz dance already left the digest in place: no-op.
+        {remap_no_op}:
+            return
+    };
+
+    V3RemapTasm { block, subroutines }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, GetSize, BFieldCodec, TasmObject)]
 pub struct CollectTypeScriptsV2Witness {
     salted_input_utxos: SaltedUtxos,
@@ -109,20 +220,15 @@ impl SecretWitness for CollectTypeScriptsV2Witness {
         // recognised pre-UpgradeVM hash onto its current counterpart via the
         // shared `v3_remap` table. Host-side mirror of the TASM remap performed
         // in push_digest_from_coin_to_list.
-        let type_script_hashes = Utxo::type_script_hashes(
+        collected_type_script_hashes(
             self.salted_input_utxos
                 .utxos
                 .iter()
                 .chain(&self.salted_output_utxos.utxos),
-        );
-        let mut deduped: Vec<Digest> = vec![];
-        for hash in type_script_hashes {
-            let remapped = v3_remap(hash);
-            if !deduped.contains(&remapped) {
-                deduped.push(remapped);
-            }
-        }
-        deduped.into_iter().flat_map(|d| d.values()).collect_vec()
+        )
+        .into_iter()
+        .flat_map(|d| d.values())
+        .collect_vec()
     }
 
     fn program(&self) -> Program {
@@ -185,59 +291,19 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
         let push_digest_from_coin_to_list =
             "neptune_consensus_transaction_push_digest_to_list".to_string();
         let write_all_digests = "netpune_consensus_transaction_write_all_digests".to_string();
-        let remap_to_native_currency_hash =
-            "neptune_consensus_transaction_v3_remap_to_native_currency_hash".to_string();
-        let remap_to_timelock_v2_hash =
-            "neptune_consensus_transaction_v3_remap_to_timelock_v2_hash".to_string();
-        let v2_remap_no_op = "neptune_consensus_transaction_v2_remap_no_op".to_string();
-
         // V3 REMAP: coins committed before the UpgradeVM hard fork carry pre-v3
         // type-script hashes that no runnable program reproduces. Fold each onto
         // its current counterpart so the SingleProof layer demands a satisfiable
-        // proof:
-        //   legacy NativeCurrency       -> NativeCurrency.hash()
-        //   legacy + current TimeLock   -> TimeLockV2.hash()
-        //   legacy TimeLockV2           -> TimeLockV2.hash()
-        // Each hash is pushed in reverse value order (see `push_digest_reversed`)
-        // so values()[0] ends on the stack top, matching what read_mem 5; pop 1
-        // produces for digests in memory.
-        let push_native_currency_hash = push_digest_reversed(NativeCurrency.hash());
-        let push_timelock_v2_hash = push_digest_reversed(TimeLockV2.hash());
-
-        // In-place remap applied to a `[digest]` on the stack top: compare it
-        // against each recognised pre-v3 hash and, on a match, swap in the
-        // current counterpart. Targets are distinct from every old hash, so the
-        // comparisons can be chained order-independently. Reused verbatim at the
-        // de-duplication check and the list-push site below.
-        let make_remap_compare = |push_old: &[LabelledInstruction], target_label: &str| {
-            let mut block = triton_asm! {
-                // _ [digest]
-                dup 4 dup 4 dup 4 dup 4 dup 4
-            };
-            block.extend_from_slice(push_old);
-            block.extend(triton_asm! {
-                {&eq_digest}
-                // _ [digest] (digest == old)
-                push 1
-                swap 1
-                skiz call {target_label}
-                skiz call {v2_remap_no_op}
-                // _ [digest_or_remapped]
-            });
-            block
-        };
-        // Build the chained comparison from the shared `v3_remap_pairs` table so
-        // the TASM, the host `output()`, and the rust `source()` can never drift.
-        // The target subroutine is picked from the pair's target hash.
-        let mut v2_remap_block: Vec<LabelledInstruction> = vec![];
-        for (old_hash, target_hash) in v3_remap_pairs() {
-            let target_label = if target_hash == NativeCurrency.hash() {
-                &remap_to_native_currency_hash
-            } else {
-                &remap_to_timelock_v2_hash
-            };
-            v2_remap_block.extend(make_remap_compare(&push_digest_reversed(old_hash), target_label));
-        }
+        // proof. Shared with `Forge`, which collects type-script hashes the same
+        // way; see [`v3_remap_tasm`].
+        let V3RemapTasm {
+            block: v2_remap_block,
+            subroutines: v2_remap_subroutines,
+        } = v3_remap_tasm(
+            "neptune_consensus_transaction_v3_remap_to_native_currency_hash",
+            "neptune_consensus_transaction_v3_remap_to_timelock_v2_hash",
+            "neptune_consensus_transaction_v2_remap_no_op",
+        );
         let authenticate_salted_utxos_and_collect_hashes = triton_asm! {
             // BEFORE:
             // _ *ctsw *type_script_hashes *salted_utxos size
@@ -508,32 +574,7 @@ impl ConsensusProgram for CollectTypeScriptsV2 {
 
                 return
 
-            // V3: if invoked, replace the matched old digest with the current
-            // NativeCurrency hash.
-            // BEFORE: _ ... [old_digest] 1
-            // AFTER:  _ ... [native_currency_hash] 0
-            {remap_to_native_currency_hash}:
-                pop 1
-                pop 5
-                {&push_native_currency_hash}
-                push 0
-                return
-
-            // V3: if invoked, replace the matched old digest with the current
-            // TimeLockV2 hash.
-            // BEFORE: _ ... [old_digest] 1
-            // AFTER:  _ ... [timelock_v2_hash] 0
-            {remap_to_timelock_v2_hash}:
-                pop 1
-                pop 5
-                {&push_timelock_v2_hash}
-                push 0
-                return
-
-            // V3: invoked when the digest did not match this rule's old hash.
-            // The outer skiz dance already left the digest in place: no-op.
-            {v2_remap_no_op}:
-                return
+            {&v2_remap_subroutines}
 
             // INVARIANT: _ *type_script_hashes[i] *type_script_hashes[N+1]
             {write_all_digests}:

@@ -39,12 +39,24 @@ use crate::protocol::proof_abstractions::SecretWitness;
 use crate::BFieldElement;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 
+use super::tasm::single_proof::fix_branch::FixBranch;
+use super::tasm::single_proof::fix_branch::FixWitness;
 use super::tasm::single_proof::merge_branch::MergeWitness;
 use super::tasm::single_proof::update_branch::UpdateWitness;
+use super::tasm::single_proof::weld_branch::WeldBranch;
+use super::tasm::single_proof::weld_branch::WeldWitness;
 
 pub(crate) const DISCRIMINANT_FOR_PROOF_COLLECTION: u64 = 0;
 pub(crate) const DISCRIMINANT_FOR_UPDATE: u64 = 1;
 pub(crate) const DISCRIMINANT_FOR_MERGE: u64 = 2;
+
+/// Transaction chaining, from `UpgradeVMv8` onwards; see
+/// [`ConsensusRuleSet::has_chain_branches`].
+pub(crate) const DISCRIMINANT_FOR_FIX: u64 = 3;
+
+/// Transaction chaining, from `UpgradeVMv8` onwards; see
+/// [`ConsensusRuleSet::has_chain_branches`].
+pub(crate) const DISCRIMINANT_FOR_WELD: u64 = 4;
 
 const INVALID_WITNESS_DISCRIMINANT_ERROR: i128 = 1_000_050;
 const NO_BRANCH_TAKEN_ERROR: i128 = 1_000_051;
@@ -55,6 +67,14 @@ pub enum SingleProofV2Witness {
     Collection(Box<ProofCollection>),
     Update(UpdateWitness),
     Merger(MergeWitness),
+    /// `LinkTx -> Transaction`: send a chained transaction whose thruputs are
+    /// all resolved to a block-borne, `SingleProof`-backed one.
+    Fix(FixWitness),
+    /// `Transaction * LinkTx -> Transaction`: fold a link transaction into a
+    /// `SingleProof`-backed one, cutting every thruput through against that
+    /// transaction's outputs. What `Fix(Chain(Cast(A), B))` computes in three
+    /// proofs, in one.
+    Weld(Box<WeldWitness>),
     // Wait for Hard Fork One:
     // IntegralMempool(IntegralMempoolMembershipWitness)
 }
@@ -70,6 +90,45 @@ impl SingleProofV2Witness {
 
     pub(crate) fn from_merge(merge_witness: MergeWitness) -> Self {
         Self::Merger(merge_witness)
+    }
+
+    pub fn from_fix(witness: FixWitness) -> Self {
+        Self::Fix(witness)
+    }
+
+    pub fn from_weld(witness: WeldWitness) -> Self {
+        Self::Weld(Box::new(witness))
+    }
+
+    /// Prove this witness, yielding a [`SingleProofV2`]-backed [`Proof`].
+    pub async fn produce(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> Result<Proof, CreateProofError> {
+        // Through the versioned builder, like `SingleProofV2::produce`.
+        let claim = single_proof_claim(self.kernel_mast_hash(), ConsensusRuleSet::UpgradeVMv8);
+        let nondeterminism = self.nondeterminism();
+        ProofBuilder::new()
+            .program(SingleProofV2.program())
+            .claim(claim)
+            .nondeterminism(|| nondeterminism)
+            .job_queue(triton_vm_job_queue)
+            .proof_job_options(proof_job_options)
+            .build()
+            .await
+    }
+
+    /// MAST hash of the transaction kernel this witness attests to -- the public
+    /// input of the `SingleProof` claim.
+    pub fn kernel_mast_hash(&self) -> Digest {
+        match self {
+            Self::Collection(pc) => pc.kernel_mast_hash,
+            Self::Update(witness) => witness.new_kernel_mast_hash,
+            Self::Merger(witness) => witness.new_kernel.mast_hash(),
+            Self::Fix(witness) => witness.kernel_mast_hash(),
+            Self::Weld(witness) => witness.kernel_mast_hash(),
+        }
     }
 }
 
@@ -110,6 +169,10 @@ impl TasmObject for SingleProofV2Witness {
             DISCRIMINANT_FOR_MERGE => {
                 Ok(Box::new(Self::Merger(*BFieldCodec::decode(&field_data)?)))
             }
+            DISCRIMINANT_FOR_FIX => Ok(Box::new(Self::Fix(*BFieldCodec::decode(&field_data)?))),
+            DISCRIMINANT_FOR_WELD => Ok(Box::new(Self::Weld(Box::new(*BFieldCodec::decode(
+                &field_data,
+            )?)))),
             _ => Err(Box::new(BFieldCodecError::ElementOutOfRange)),
         }
     }
@@ -117,12 +180,7 @@ impl TasmObject for SingleProofV2Witness {
 
 impl SecretWitness for SingleProofV2Witness {
     fn standard_input(&self) -> PublicInput {
-        let kernel_mast_hash = match self {
-            Self::Collection(pc) => pc.kernel_mast_hash,
-            Self::Update(witness) => witness.new_kernel_mast_hash,
-            Self::Merger(witness) => witness.new_kernel.mast_hash(),
-        };
-        kernel_mast_hash.reversed().values().into()
+        self.kernel_mast_hash().reversed().values().into()
     }
 
     fn output(&self) -> Vec<BFieldElement> {
@@ -212,6 +270,12 @@ impl SecretWitness for SingleProofV2Witness {
             SingleProofV2Witness::Merger(witness_of_merge) => {
                 witness_of_merge
                     .populate_nd_streams(&mut nondeterminism, single_proof_program_hash);
+            }
+            SingleProofV2Witness::Fix(witness) => {
+                witness.populate_nd_streams(&mut nondeterminism, single_proof_program_hash);
+            }
+            SingleProofV2Witness::Weld(witness) => {
+                witness.populate_nd_streams(&mut nondeterminism, single_proof_program_hash);
             }
         }
 
@@ -396,8 +460,15 @@ pub(crate) fn produce_single_proof_mock(valid_mock: bool) -> Proof {
     }
 }
 
-impl ConsensusProgram for SingleProofV2 {
-    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
+impl SingleProofV2 {
+    /// Assemble the program, with or without the transaction-chaining
+    /// branches.
+    ///
+    /// Only the `UpgradeVMv8` program, which has them, is ever proven against;
+    /// see [`ConsensusRuleSet::has_chain_branches`]. Assembling it without them
+    /// reproduces the program as it was before they were added, which is what
+    /// shows that adding them changed nothing else.
+    fn assemble(&self, with_chain_branches: bool) -> (Library, Vec<LabelledInstruction>) {
         let mut library = Library::new();
 
         // imports
@@ -433,6 +504,39 @@ impl ConsensusProgram for SingleProofV2 {
         let claim_field_with_size_output = triton_asm!(read_mem 1 addi 1 place 1 addi -1);
         let merkle_verify =
             library.import(Box::new(tasm_lib::hashing::merkle_verify::MerkleVerify));
+
+        // The chaining branches are imported last: an import both emits code and
+        // hands out static-memory addresses, and importing them after every
+        // other snippet keeps the existing branches' allocations where they were.
+        //
+        // `Fix` and `Weld` share one slot for `D`, this program's own digest: both
+        // instantiate the `LinkProof` family at it, neither runs in the same
+        // execution as the other, and one slot is one `kmalloc` less.
+        let chain_branches = with_chain_branches.then(|| {
+            let single_proof_digest_alloc = library.kmalloc(u32::try_from(Digest::LEN).unwrap());
+            let fix = library.import(Box::new(FixBranch::new(single_proof_digest_alloc)));
+            let weld = library.import(Box::new(WeldBranch::new(single_proof_digest_alloc)));
+            (fix, weld)
+        });
+
+        // The `Fix` and `Weld` discriminants are only legal when their branches
+        // are present.
+        let (accept_chain_discriminants, dispatch_chain_branches) = match chain_branches {
+            None => (triton_asm!(), triton_asm!()),
+            Some((fix_branch, weld_branch)) => (
+                triton_asm!(
+                    dup 1 push {DISCRIMINANT_FOR_FIX} eq add
+                    dup 1 push {DISCRIMINANT_FOR_WELD} eq add
+                ),
+                triton_asm!(
+                    dup 0 push {DISCRIMINANT_FOR_FIX} eq
+                    skiz call {fix_branch}
+
+                    dup 0 push {DISCRIMINANT_FOR_WELD} eq
+                    skiz call {weld_branch}
+                ),
+            ),
+        };
 
         let verify_scripts_loop_label = "neptune_transaction_verify_lock_scripts_loop";
         let verify_scripts_loop_body = triton_asm! {
@@ -758,6 +862,9 @@ impl ConsensusProgram for SingleProofV2 {
             add
             // _ discr (discr == proof_coll || discr == update || discr == merge)
 
+            {&accept_chain_discriminants}
+            // _ discr (.. [|| discr == fix || discr == weld])
+
             assert error_id {INVALID_WITNESS_DISCRIMINANT_ERROR}
             // _ discr
         );
@@ -790,6 +897,8 @@ impl ConsensusProgram for SingleProofV2 {
             dup 0 push {DISCRIMINANT_FOR_MERGE} eq
             skiz call {merge_branch}
 
+            {&dispatch_chain_branches}
+
             // _ [own_digest] [txk_digest] *single_proof_witness discriminant
 
             // a discriminant of -1 indicates that some branch was executed
@@ -811,6 +920,12 @@ impl ConsensusProgram for SingleProofV2 {
         };
 
         (library, code)
+    }
+}
+
+impl ConsensusProgram for SingleProofV2 {
+    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
+        self.assemble(ConsensusRuleSet::UpgradeVMv8.has_chain_branches())
     }
 
     fn hash(&self) -> Digest {
@@ -937,6 +1052,12 @@ pub(crate) mod tests {
                 SingleProofV2Witness::Merger(witness) => {
                     witness.branch_source(own_program_digest, txk_digest)
                 }
+                SingleProofV2Witness::Fix(witness) => {
+                    witness.branch_source(own_program_digest, txk_digest)
+                }
+                SingleProofV2Witness::Weld(witness) => {
+                    witness.branch_source(own_program_digest, txk_digest)
+                }
             }
         }
     }
@@ -944,7 +1065,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn invalid_discriminant_crashes_execution() {
         let pub_input = PublicInput::new(bfe_vec![0, 0, 0, 0, 0]);
-        for illegal_discriminant_value in bfe_array![-1, 3, 4, 1u64 << 40] {
+        for illegal_discriminant_value in bfe_array![-1, 5, 6, 1u64 << 40] {
             let init_ram: HashMap<_, _> = [(
                 FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
                 illegal_discriminant_value,
@@ -1399,6 +1520,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// The pre-chaining `UpgradeVMv8` program: the branches the chaining
+    /// branches were added to are unchanged, down to their static-memory
+    /// addresses, which is why `FixBranch` and `WeldBranch` are imported last.
+    #[test]
+    fn program_without_chain_branches_is_the_pre_chaining_program() {
+        let (_, code) = SingleProofV2.assemble(false);
+        assert_eq!(
+            "307f41ff80f6f7af27a6382ae91cf0d54f9464c0cda525652c1e5285c0ab0044374a488c3d7dc75e",
+            Program::new(&code).hash().to_hex(),
+        );
+    }
+
+    /// Without the chaining branches, their discriminants are as illegal as
+    /// any other unknown value.
+    #[apply(shared_tokio_runtime)]
+    async fn chain_discriminants_are_illegal_without_chain_branches() {
+        let (_, code) = SingleProofV2.assemble(false);
+        let program = Program::new(&code);
+        let pub_input = PublicInput::new(bfe_vec![0, 0, 0, 0, 0]);
+        for discriminant in [DISCRIMINANT_FOR_FIX, DISCRIMINANT_FOR_WELD] {
+            let init_ram: HashMap<_, _> = [(
+                FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
+                bfe!(discriminant),
+            )]
+            .into_iter()
+            .collect();
+            let nondeterminism = NonDeterminism::default().with_ram(init_ram);
+
+            let_assert!(
+                Err(vm_error) = VM::run(program.clone(), pub_input.clone(), nondeterminism)
+            );
+            let_assert!(InstructionError::AssertionFailed(assertion_err) = vm_error.source);
+            assert_eq!(Some(INVALID_WITNESS_DISCRIMINANT_ERROR), assertion_err.id);
+        }
+    }
+
     test_program_snapshot!(
         SingleProofV2,
         // SP_V2_HASH frozen after phase 6 of the +1 year timelock hard fork.
@@ -1411,6 +1568,10 @@ pub(crate) mod tests {
         // Table AIR, randomized quotient table). The UpgradeVMv7 (v7) digest
         // (5c75cc2d…) lives on as a hardcoded constant in single_proof_claim,
         // as does the v5 one (e66985a8…).
-        "307f41ff80f6f7af27a6382ae91cf0d54f9464c0cda525652c1e5285c0ab0044374a488c3d7dc75e"
+        // Program hash updated again for the `Fix` and `Weld` branches
+        // (transaction chaining), which activate together with the v8 virtual
+        // machine. Without them the program still hashes to 307f41ff…; see
+        // `program_without_chain_branches_is_the_pre_chaining_program`.
+        "3ab71f45d12c1b1709197789ffe6194b25492fd0e7dd1aed054a68cf369ae14b17d9b80e99a5e8cf"
     );
 }

@@ -134,6 +134,15 @@ impl LockScriptAndWitness {
         )
     }
 
+    /// A hash lock with the same unlock key as a generation address derived
+    /// from `seed`, so that tests can unlock such UTXOs.
+    #[cfg(any(test, feature = "arbitrary-impls"))]
+    pub fn genaddr_like_hash_lock_from_seed(seed: Digest) -> LockScriptAndWitness {
+        let preimage =
+            Tip5::hash_varlen(&[seed.values().to_vec(), vec![BFieldElement::new(1)]].concat());
+        Self::standard_hash_lock_from_preimage(preimage)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_nd_tokens(&mut self, tokens: Vec<BFieldElement>) {
         self.nd_tokens = tokens;

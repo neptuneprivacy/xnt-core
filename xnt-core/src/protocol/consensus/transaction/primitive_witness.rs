@@ -565,6 +565,31 @@ pub enum WitnessValidationError {
     // catch-all error, eg for anyhow errors
     #[error("transaction could not be created.  reason: {0}")]
     Failed(String),
+
+    #[error(
+        "input UTXO count ({input_utxos}) does not equal confirmed inputs \
+         ({confirmed}) plus thruputs ({thruputs})"
+    )]
+    CardinalityMismatch {
+        input_utxos: usize,
+        confirmed: usize,
+        thruputs: usize,
+    },
+
+    #[error("thruput at index {index} does not match the commitment of its UTXO")]
+    ThruputCommitmentMismatch { index: usize },
+
+    #[error(
+        "output UTXO count ({output_utxos}) does not equal addition record \
+         count ({outputs})"
+    )]
+    OutputCardinalityMismatch { output_utxos: usize, outputs: usize },
+
+    #[error("output at index {index} does not match the commitment of its UTXO")]
+    OutputCommitmentMismatch { index: usize },
+
+    #[error("this witness's kernel cannot carry a coinbase")]
+    CoinbaseSet,
 }
 
 #[cfg(any(test, feature = "arbitrary-impls"))]

@@ -371,6 +371,32 @@ impl ConsensusRuleSet {
         }
     }
 
+    /// Whether the `SingleProof` program carries the
+    /// [`Fix`](crate::protocol::consensus::transaction::validity::tasm::single_proof::fix_branch::FixBranch)
+    /// and
+    /// [`Weld`](crate::protocol::consensus::transaction::validity::tasm::single_proof::weld_branch::WeldBranch)
+    /// branches, which recursively verify a `LinkProof` -- i.e. whether a
+    /// chained transaction can become block-borne.
+    ///
+    /// Activated together with the v8 virtual machine. Only the `UpgradeVMv8`
+    /// `SingleProofV2` program is assembled from this source tree; every
+    /// earlier era is verified against a hardcoded digest (see
+    /// `single_proof_claim`), so the two branches change the v8 program digest
+    /// and nothing else.
+    pub fn has_chain_branches(&self) -> bool {
+        match self {
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv7 => false,
+            ConsensusRuleSet::UpgradeVMv8 => true,
+        }
+    }
+
     /// Whether a packed chunk may use the extended length indicator.
     ///
     /// Before `UpgradeVMv8` the indicator is a single `u12`, which caps a chunk
@@ -1144,11 +1170,12 @@ pub(crate) mod tests {
             "CollectTypeScriptsV2 program hash drifted"
         );
 
-        // Re-hashed v5 (e66985a8…) -> v7 (5c75cc2d…) -> v8.
+        // Re-hashed v5 (e66985a8…) -> v7 (5c75cc2d…) -> v8, then with the
+        // transaction-chaining branches added (307f41ff… without them).
         let sp_v2 = SingleProofV2.hash().to_hex();
         assert_eq!(
             sp_v2,
-            "307f41ff80f6f7af27a6382ae91cf0d54f9464c0cda525652c1e5285c0ab0044374a488c3d7dc75e",
+            "3ab71f45d12c1b1709197789ffe6194b25492fd0e7dd1aed054a68cf369ae14b17d9b80e99a5e8cf",
             "SingleProofV2 program hash drifted"
         );
     }

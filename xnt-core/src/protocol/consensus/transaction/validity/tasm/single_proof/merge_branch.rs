@@ -1,4 +1,6 @@
 pub mod authenticate_coinbase_fields;
+pub(crate) mod bound_time_diff;
+pub(crate) mod coinbase_bound_time_diff;
 
 use std::cmp::max;
 use std::sync::Arc;

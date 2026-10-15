@@ -2,19 +2,27 @@ use tasm_lib::data_type::DataType;
 use tasm_lib::hashing::merkle_verify::MerkleVerify;
 use tasm_lib::mmr::bag_peaks::BagPeaks;
 use tasm_lib::prelude::*;
+use tasm_lib::triton_vm::prelude::*;
 use tasm_lib::twenty_first::prelude::Digest;
 
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
-use crate::protocol::consensus::transaction::TransactionKernel;
-use crate::protocol::proof_abstractions::mast_hash::MastHash;
-use crate::triton_vm::prelude::*;
 
-/// Authenticate a mutator set accumulator against a transaction-kernel mast hash
+/// Authenticate a mutator set accumulator against a kernel mast hash
 ///
 /// Crashes the VM if the mutator set does not belong in the Merkle tree from
-/// which the transaction-kernel mast hash was built.
+/// which the kernel mast hash was built.
+///
+/// `mast_height` is the height of that tree -- `TransactionKernel::MAST_HEIGHT`
+/// for the single-proof pipeline, `LinkKernel::MAST_HEIGHT` for the chaining pipeline.
+/// The `MutatorSetHash` leaf index (6) is the same in both kernels, so only the
+/// height varies. The entrypoint deliberately does *not* encode the height: no
+/// single program authenticates against two kernel heights, so a fixed name
+/// keeps each caller's bytes stable (in particular, it preserves the pinned
+/// `SingleProof` hash).
 #[derive(Debug, Clone, Copy)]
-pub struct AuthenticateMsaAgainstTxk;
+pub struct AuthenticateMsaAgainstTxk {
+    pub mast_height: u32,
+}
 
 impl BasicSnippet for AuthenticateMsaAgainstTxk {
     fn parameters(&self) -> Vec<(DataType, String)> {
@@ -70,7 +78,7 @@ impl BasicSnippet for AuthenticateMsaAgainstTxk {
             {entrypoint}:
                 // _ *aocl_mmr *swbfi_bagged *swbfa_digest [txk_mast_hash]
 
-                push {TransactionKernel::MAST_HEIGHT}
+                push {self.mast_height}
                 push {TransactionKernelField::MutatorSetHash as u32}
                 // _ *aocl_mmr *swbfi_bagged *swbfa_digest [txk_mast_hash] h i
 
@@ -80,7 +88,9 @@ impl BasicSnippet for AuthenticateMsaAgainstTxk {
                 // _ *aocl_mmr *swbfi_bagged *swbfa_digest [txk_mast_hash] h i [swbfi_bagged]
 
                 dup 14
+                // _ *aocl_mmr *swbfi_bagged *swbfa_digest [txk_mast_hash] h i [swbfi_bagged] *aocl_mmr
                 call {bag_mmr_peaks}
+
                 hint aocl_bagged: Digest = stack[0..5]
                 // _ *aocl_mmr *swbfi_bagged *swbfa_digest [txk_mast_hash] h i [swbfi_bagged] [aocl_mmr_bagged]
 
@@ -148,6 +158,7 @@ mod tests {
     use std::collections::HashMap;
     use std::collections::VecDeque;
 
+    use crate::protocol::proof_abstractions::mast_hash::MastHash;
     use itertools::Itertools;
     use prop::test_runner::RngAlgorithm;
     use prop::test_runner::TestRng;
@@ -157,7 +168,6 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::RngExt;
     use rand::SeedableRng;
-    use strum::EnumCount;
     use tasm_lib::hashing::merkle_verify::MerkleVerify;
     use tasm_lib::memory::encode_to_memory;
     use tasm_lib::snippet_bencher::BenchmarkCase;
@@ -174,6 +184,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
+    use crate::protocol::consensus::transaction::TransactionKernel;
 
     impl MemPreserver for AuthenticateMsaAgainstTxk {
         fn rust_shadow(
@@ -217,7 +228,7 @@ mod tests {
                 randomness[4],
             ]);
 
-            let tree_height = TransactionKernelField::COUNT.next_power_of_two().ilog2() as usize;
+            let tree_height = self.mast_height as usize;
             let auth_path = (0..tree_height).map(|i| nd_digests[i]).collect_vec();
 
             let mt_proof = MerkleTreeInclusionProof {
@@ -225,6 +236,7 @@ mod tests {
                 indexed_leafs: vec![(TransactionKernelField::MutatorSetHash as usize, msah_digest)],
                 authentication_structure: auth_path,
             };
+
             assert!(mt_proof.verify(txk_digest));
 
             Ok(vec![])
@@ -292,19 +304,24 @@ mod tests {
         }
     }
 
+    /// The snippet, instantiated for the `TransactionKernel` (height 3).
+    const SNIPPET: AuthenticateMsaAgainstTxk = AuthenticateMsaAgainstTxk {
+        mast_height: TransactionKernel::MAST_HEIGHT as u32,
+    };
+
     #[test]
     fn test() {
-        ShadowedMemPreserver::new(AuthenticateMsaAgainstTxk).test();
+        ShadowedMemPreserver::new(SNIPPET).test();
     }
 
     #[test]
     fn negative_test_bad_auth_path() {
         let seed: [u8; 32] = random();
-        let mut bad_auth_path = AuthenticateMsaAgainstTxk.pseudorandom_initial_state(seed, None);
+        let mut bad_auth_path = SNIPPET.pseudorandom_initial_state(seed, None);
         bad_auth_path.nondeterminism.digests[1] = random();
 
         test_assertion_failure(
-            &ShadowedMemPreserver::new(AuthenticateMsaAgainstTxk),
+            &ShadowedMemPreserver::new(SNIPPET),
             bad_auth_path.into(),
             &[MerkleVerify::ROOT_MISMATCH_ERROR_ID],
         );
