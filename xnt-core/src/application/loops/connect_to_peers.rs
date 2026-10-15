@@ -129,7 +129,10 @@ fn min_version_following(consensus_rule_set: ConsensusRuleSet) -> Option<semver:
 
 /// Whether a peer of the given version follows the given consensus rule set.
 /// See [`min_version_following`].
-fn version_follows_rule_set(other_version: &str, consensus_rule_set: ConsensusRuleSet) -> bool {
+pub(crate) fn version_follows_rule_set(
+    other_version: &str,
+    consensus_rule_set: ConsensusRuleSet,
+) -> bool {
     let Some(min_version) = min_version_following(consensus_rule_set) else {
         return true;
     };

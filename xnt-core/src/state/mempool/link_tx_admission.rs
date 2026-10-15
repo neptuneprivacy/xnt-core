@@ -33,6 +33,7 @@ use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 use crate::state::mempool::MEMPOOL_TX_THRESHOLD_AGE_IN_SECS;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
+use tasm_lib::prelude::Digest;
 
 /// Why a link transaction was refused admission to the mempool.
 ///
@@ -95,45 +96,18 @@ pub(crate) async fn link_tx_admissible(
     network: Network,
     consensus_rule_set: ConsensusRuleSet,
 ) -> Result<(), LinkTxAdmissionError> {
-    if !consensus_rule_set.has_chain_branches() {
-        return Err(LinkTxAdmissionError::NotYetActive);
-    }
-
-    let kernel = &link_tx.kernel.kernel;
-    if kernel.mutator_set_hash != tip_mutator_set_accumulator.hash() {
-        return Err(LinkTxAdmissionError::NotSynced);
-    }
-
-    if kernel.coinbase.is_some() {
-        return Err(LinkTxAdmissionError::HasCoinbase);
-    }
-
-    // No negative fees anywhere in the chain pipeline.
-    if kernel.fee.is_negative() {
-        return Err(LinkTxAdmissionError::NegativeFee);
-    }
-
-    // Every thruput is an input of the link transaction, so it counts against
-    // the input limit, as it does in the proofs that resolve it.
-    let num_inputs = kernel
-        .inputs
-        .len()
-        .saturating_add(link_tx.kernel.thruputs.len());
-    consensus_rule_set
-        .mempool_size_check(num_inputs, kernel.outputs.len(), kernel.announcements.len())
-        .map_err(LinkTxAdmissionError::TooBig)?;
-
-    let timestamp = kernel.timestamp;
-    if timestamp < now - Timestamp::seconds(MEMPOOL_TX_THRESHOLD_AGE_IN_SECS) {
-        return Err(LinkTxAdmissionError::TooOld);
-    }
-    if timestamp >= now + FUTUREDATING_LIMIT {
-        return Err(LinkTxAdmissionError::FutureDated);
-    }
+    link_tx_precheck(
+        link_tx,
+        tip_mutator_set_accumulator.hash(),
+        now,
+        consensus_rule_set,
+    )?;
 
     if already_known {
         return Err(LinkTxAdmissionError::AlreadyKnown);
     }
+
+    let kernel = &link_tx.kernel.kernel;
 
     // This covers the confirmed inputs; thruputs are not removal records.
     kernel
@@ -162,6 +136,55 @@ pub(crate) async fn link_tx_admissible(
     };
     if !valid {
         return Err(LinkTxAdmissionError::Invalid);
+    }
+
+    Ok(())
+}
+
+/// The checks of [`link_tx_admissible`] that read only the link transaction's
+/// kernel. They bound the size of the link transaction, and so the work of
+/// every check after them, which is why callers run them before anything that
+/// looks at the mempool.
+pub(crate) fn link_tx_precheck(
+    link_tx: &LinkTx,
+    tip_mutator_set_hash: Digest,
+    now: Timestamp,
+    consensus_rule_set: ConsensusRuleSet,
+) -> Result<(), LinkTxAdmissionError> {
+    if !consensus_rule_set.has_chain_branches() {
+        return Err(LinkTxAdmissionError::NotYetActive);
+    }
+
+    let kernel = &link_tx.kernel.kernel;
+    if kernel.mutator_set_hash != tip_mutator_set_hash {
+        return Err(LinkTxAdmissionError::NotSynced);
+    }
+
+    if kernel.coinbase.is_some() {
+        return Err(LinkTxAdmissionError::HasCoinbase);
+    }
+
+    // No negative fees anywhere in the chain pipeline.
+    if kernel.fee.is_negative() {
+        return Err(LinkTxAdmissionError::NegativeFee);
+    }
+
+    // Every thruput is an input of the link transaction, so it counts against
+    // the input limit, as it does in the proofs that resolve it.
+    let num_inputs = kernel
+        .inputs
+        .len()
+        .saturating_add(link_tx.kernel.thruputs.len());
+    consensus_rule_set
+        .mempool_size_check(num_inputs, kernel.outputs.len(), kernel.announcements.len())
+        .map_err(LinkTxAdmissionError::TooBig)?;
+
+    let timestamp = kernel.timestamp;
+    if timestamp < now - Timestamp::seconds(MEMPOOL_TX_THRESHOLD_AGE_IN_SECS) {
+        return Err(LinkTxAdmissionError::TooOld);
+    }
+    if timestamp >= now + FUTUREDATING_LIMIT {
+        return Err(LinkTxAdmissionError::FutureDated);
     }
 
     Ok(())

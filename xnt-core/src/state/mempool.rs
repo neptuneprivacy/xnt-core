@@ -884,8 +884,12 @@ impl Mempool {
         // conflicts it replaces; otherwise the mempool would stop
         // mutator-set-updating the transaction carrying our funds. Compute this
         // before the conflicting transactions are removed below.
+        // A member with the same id is replaced below even if it does not
+        // conflict on inputs, e.g. a link transaction without confirmed
+        // inputs that this transaction is the fixed form of.
         let priority = conflicts
             .keys()
+            .chain(std::iter::once(&txid))
             .filter_map(|conflicting_txid| self.tx_dictionary.get(conflicting_txid))
             .map(|conflicting| conflicting.upgrade_priority)
             .fold(priority, |acc, conflicting| acc.max(conflicting));
@@ -981,6 +985,7 @@ impl Mempool {
         }
 
         self.assert_queues_agree_and_shrink(&mut events);
+        events.extend(self.remove_stranded_links());
 
         MempoolEvent::normalize(events)
     }
@@ -1041,12 +1046,13 @@ impl Mempool {
 
         // Two link transactions consuming the same output exclude each other,
         // like two transactions spending the same input.
+        let new_thruputs: HashSet<&AdditionRecord> = new_link.kernel.thruputs.iter().collect();
         let shares_a_thruput = |tx: &AnyTx| match tx {
             AnyTx::Link(link) => link
                 .kernel
                 .thruputs
                 .iter()
-                .any(|thruput| new_link.kernel.thruputs.contains(thruput)),
+                .any(|thruput| new_thruputs.contains(thruput)),
             AnyTx::Standard(_) => false,
         };
         conflicts.extend(
@@ -1075,6 +1081,19 @@ impl Mempool {
                 &conflicts,
                 self.tip_mutator_set_hash,
             );
+        // A link transaction cannot replace a transaction that provides one of
+        // its own thruputs: it would be stranded the moment it is inserted.
+        if conflicts.values().any(|victim| {
+            victim
+                .kernel()
+                .outputs
+                .iter()
+                .any(|output| new_thruputs.contains(output))
+        }) {
+            debug!("Attempted to insert link transaction conflicting with its own predecessor.");
+            return vec![];
+        }
+
         let new_link_fee_density = new_link.fee_density();
         let min_fee_of_conflicts = conflicts.values().map(|tx| tx.fee_density()).min();
         let victims = conflicts.keys().copied().collect_vec();
@@ -1135,8 +1154,67 @@ impl Mempool {
         }
 
         self.assert_queues_agree_and_shrink(&mut events);
+        events.extend(self.remove_stranded_links());
 
         MempoolEvent::normalize(events)
+    }
+
+    /// Remove the link transactions with a thruput that is no longer an
+    /// output of any transaction in the mempool: their predecessor left the
+    /// mempool unmined, so the thruput can never be cut through.
+    ///
+    /// Repeats until none is left, since a removed link transaction may have
+    /// provided another one's thruput.
+    pub(super) fn remove_stranded_links(&mut self) -> Vec<MempoolEvent> {
+        let mut events = vec![];
+        loop {
+            let holds_link_with_thruputs = self.tx_dictionary.values().any(|member| {
+                matches!(&member.transaction, AnyTx::Link(link) if !link.kernel.thruputs.is_empty())
+            });
+            if !holds_link_with_thruputs {
+                break;
+            }
+
+            let outputs: HashSet<AdditionRecord> = self
+                .tx_dictionary
+                .values()
+                .flat_map(|member| member.transaction.kernel().outputs.iter().copied())
+                .collect();
+            let not_stranded = |(_transaction_id, tx): LookupItem| -> bool {
+                match tx {
+                    AnyTx::Standard(_) => true,
+                    AnyTx::Link(link) => link
+                        .kernel
+                        .thruputs
+                        .iter()
+                        .all(|thruput| outputs.contains(thruput)),
+                }
+            };
+            self.warn_about_own_links_removed_by(&not_stranded, "its predecessor left the mempool");
+            let removed = self.retain(not_stranded, RemovalReason::Abandoned);
+            if removed.is_empty() {
+                break;
+            }
+            events.extend(removed);
+        }
+
+        events
+    }
+
+    /// Warn about the link transactions of interest to this node that the
+    /// predicate is about to remove.
+    fn warn_about_own_links_removed_by<F>(&self, keep: &F, why: &str)
+    where
+        F: Fn(LookupItem) -> bool,
+    {
+        for (txid, member) in &self.tx_dictionary {
+            if matches!(member.transaction, AnyTx::Link(_))
+                && !member.upgrade_priority.is_irrelevant()
+                && !keep((*txid, &member.transaction))
+            {
+                warn!("Removing own link transaction {txid} from the mempool: {why}.");
+            }
+        }
     }
 
     /// Check the invariants between the table and the queues, shrink the
@@ -1583,7 +1661,9 @@ impl Mempool {
             cutoff < transaction.kernel().timestamp
         };
 
-        self.retain(keep, RemovalReason::Pruned)
+        let mut events = self.retain(keep, RemovalReason::Pruned);
+        events.extend(self.remove_stranded_links());
+        events
     }
 
     /// Remove from the mempool all transactions that become invalid because
@@ -1672,9 +1752,11 @@ impl Mempool {
             }
         };
         {
-            let removed = self.retain(no_mined_thruput, RemovalReason::Merged);
+            self.warn_about_own_links_removed_by(&no_mined_thruput, "a thruput was mined");
+            let removed = self.retain(no_mined_thruput, RemovalReason::Abandoned);
             events.extend(removed);
         }
+        events.extend(self.remove_stranded_links());
 
         // Restore transactions from blocks. Do this prior to the collection of
         // update jobs since we migth restore a transaction that we need to
@@ -1813,6 +1895,11 @@ impl Mempool {
             let removed = self.shrink_to_max_size();
             events.extend(removed);
         }
+        events.extend(self.remove_stranded_links());
+        update_jobs.retain(|job| match job {
+            MempoolUpdateJob::Link { old_link_tx } => self.contains(old_link_tx.txid()),
+            _ => true,
+        });
 
         // Update the sync-label to keep track of reorganizations
         self.set_sync_labels(new_block)?;
@@ -4888,6 +4975,123 @@ mod tests {
             assert!(!mempool.contains(first.txid()));
             assert!(mempool.contains(more_lavish.txid()));
             assert_eq!(2, mempool.len());
+        }
+
+        #[test]
+        fn link_whose_predecessor_leaves_the_mempool_is_removed() {
+            let (mut mempool, _) = genesis_mempool();
+            let [tx, predecessor_base, rival_base] =
+                make_plenty_mock_transaction_supported_by_invalid_single_proofs(3)
+                    .try_into()
+                    .unwrap();
+            let thruputs = arbitrary_addition_records(1);
+            let predecessor = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .outputs(thruputs.clone())
+                    .fee(NativeCurrencyAmount::coins(1))
+                    .modify(predecessor_base.kernel),
+                proof: predecessor_base.proof,
+            };
+            mempool.insert(
+                predecessor.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            );
+            let link = proof_backed_link(tx.kernel, thruputs);
+            let link_txid = link.txid();
+            mempool.insert_link(link, UpgradePriority::Critical, AddReason::Submitted);
+            assert_eq!(2, mempool.len());
+
+            // A rival spending the predecessor's inputs, at a higher fee
+            // density, replaces the predecessor -- and so strands the link.
+            let rival = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .inputs(predecessor.kernel.inputs.clone())
+                    .fee(NativeCurrencyAmount::coins(100))
+                    .modify(rival_base.kernel),
+                proof: rival_base.proof,
+            };
+            let rival_txid = rival.txid();
+            let events = mempool.insert(rival, UpgradePriority::Irrelevant, AddReason::FromPeer);
+            assert!(!mempool.contains(predecessor.txid()));
+            assert!(
+                !mempool.contains(link_txid),
+                "a link transaction whose predecessor left must leave too"
+            );
+            assert!(mempool.contains(rival_txid));
+            assert_eq!(1, mempool.len());
+            assert_eq!(0, mempool.num_own_txs());
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, MempoolEvent::RemoveTx(_, RemovalReason::Abandoned))));
+        }
+
+        #[test]
+        fn link_cannot_replace_its_own_predecessor() {
+            let (mut mempool, _) = genesis_mempool();
+            let [tx, predecessor_base] =
+                make_plenty_mock_transaction_supported_by_invalid_single_proofs(2)
+                    .try_into()
+                    .unwrap();
+            let thruputs = arbitrary_addition_records(1);
+            let predecessor = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .outputs(thruputs.clone())
+                    .fee(NativeCurrencyAmount::coins(1))
+                    .modify(predecessor_base.kernel),
+                proof: predecessor_base.proof,
+            };
+            mempool.insert(
+                predecessor.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            );
+
+            // Spends the predecessor's inputs as well as its output, at a
+            // higher fee density.
+            let link_kernel = TransactionKernelModifier::default()
+                .inputs(predecessor.kernel.inputs.clone())
+                .fee(NativeCurrencyAmount::coins(100))
+                .modify(tx.kernel);
+            let link = proof_backed_link(link_kernel, thruputs);
+            let events = mempool.insert_link(
+                link.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            );
+            assert!(events.is_empty());
+            assert!(mempool.contains(predecessor.txid()));
+            assert!(!mempool.contains(link.txid()));
+        }
+
+        #[test]
+        fn fixed_form_of_a_link_without_inputs_inherits_its_priority() {
+            let (mut mempool, tip_msh) = genesis_mempool();
+            let [tx] = make_plenty_mock_transaction_supported_by_invalid_single_proofs(1)
+                .try_into()
+                .unwrap();
+            let kernel = TransactionKernelModifier::default()
+                .inputs(vec![])
+                .mutator_set_hash(tip_msh)
+                .modify(tx.kernel);
+            let link = proof_backed_link(kernel.clone(), vec![]);
+            let txid = link.txid();
+            mempool.insert_link(link, UpgradePriority::Critical, AddReason::Submitted);
+            assert_eq!(1, mempool.num_own_txs());
+
+            let fixed = Transaction {
+                kernel,
+                proof: tx.proof,
+            };
+            mempool.insert(fixed, UpgradePriority::Irrelevant, AddReason::Upgraded);
+            assert!(mempool.get(txid).is_some());
+            assert_eq!(
+                Some(UpgradePriority::Critical),
+                mempool
+                    .get_with_priority(txid)
+                    .map(|(_, priority)| priority)
+            );
+            assert_eq!(1, mempool.num_own_txs());
         }
 
         #[test]

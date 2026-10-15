@@ -562,7 +562,7 @@ impl MainLoopHandler {
                         (msa_lookup_result, state.consensus_rule_set())
                     };
                     let Some((old_msa, mutator_set_update)) = msa_lookup_result else {
-                        result.push(MempoolUpdateJobResult::Failure(txid));
+                        result.push(MempoolUpdateJobResult::LinkFailure(txid));
                         continue;
                     };
                     let single_proof_digest = single_proof_program_digest(consensus_rule_set);
@@ -580,12 +580,13 @@ impl MainLoopHandler {
                         )
                         .await;
                     let Ok(new_link_tx) = update_result else {
-                        result.push(MempoolUpdateJobResult::Failure(txid));
+                        result.push(MempoolUpdateJobResult::LinkFailure(txid));
                         continue;
                     };
 
                     result.push(MempoolUpdateJobResult::SuccessLink {
                         new_link_tx: Box::new(new_link_tx),
+                        single_proof_digest,
                     });
                 }
                 MempoolUpdateJob::SingleProof {
@@ -633,6 +634,7 @@ impl MainLoopHandler {
     /// Handles a list of transactions whose witness data has been updated to be
     /// valid under a new mutator set.
     async fn handle_updated_mempool_txs(&mut self, update_results: Vec<MempoolUpdateJobResult>) {
+        let mut link_tx_notifications = vec![];
         {
             let mut state = self.global_state_lock.lock_guard_mut().await;
             for update_result in &update_results {
@@ -664,10 +666,36 @@ impl MainLoopHandler {
                             .mempool_insert(*new_transaction.to_owned(), UpgradePriority::Critical, AddReason::Updated)
                             .await;
                     }
-                    MempoolUpdateJobResult::SuccessLink { new_link_tx } => {
+                    MempoolUpdateJobResult::LinkFailure(txid) => {
+                        // Only remove the link transaction, not a transaction
+                        // that replaced it under the same id while updating.
+                        if state.mempool.get_link(*txid).is_some() {
+                            warn!(
+                                "Failed to update link transaction {txid} to be valid under new \
+                                 mutator set. Removing from the mempool."
+                            );
+                            state.mempool_remove(*txid).await
+                        }
+                    }
+                    MempoolUpdateJobResult::SuccessLink {
+                        new_link_tx,
+                        single_proof_digest,
+                    } => {
                         let txid = new_link_tx.txid();
-                        info!("Updated link transaction {txid} to be valid under new mutator set");
 
+                        // The update may have been proving while a block
+                        // changed the `SingleProof` program.
+                        let current_digest =
+                            single_proof_program_digest(state.consensus_rule_set());
+                        if *single_proof_digest != current_digest {
+                            warn!(
+                                "Discarding update of link transaction {txid}: it was made for \
+                                 another SingleProof program."
+                            );
+                            continue;
+                        }
+
+                        info!("Updated link transaction {txid} to be valid under new mutator set");
                         state
                             .mempool_insert_link(
                                 new_link_tx.as_ref().to_owned(),
@@ -675,6 +703,16 @@ impl MainLoopHandler {
                                 AddReason::Updated,
                             )
                             .await;
+
+                        // Only announce what the mempool now holds.
+                        if let Some(notification) = state
+                            .mempool
+                            .get_link(txid)
+                            .filter(|held| **held == **new_link_tx)
+                            .and_then(|held| LinkTxNotification::try_from(held).ok())
+                        {
+                            link_tx_notifications.push(notification);
+                        }
                     }
                 }
             }
@@ -691,14 +729,13 @@ impl MainLoopHandler {
                         self.main_to_peer_broadcast(pmsg);
                     }
                 }
-                MempoolUpdateJobResult::SuccessLink { new_link_tx } => {
-                    if let Ok(pmsg) = new_link_tx.as_ref().try_into() {
-                        let pmsg = MainToPeerTask::LinkTxNotification(pmsg);
-                        self.main_to_peer_broadcast(pmsg);
-                    }
-                }
-                MempoolUpdateJobResult::Failure(_) => {}
+                MempoolUpdateJobResult::SuccessLink { .. }
+                | MempoolUpdateJobResult::Failure(_)
+                | MempoolUpdateJobResult::LinkFailure(_) => {}
             }
+        }
+        for notification in link_tx_notifications {
+            self.main_to_peer_broadcast(MainToPeerTask::LinkTxNotification(notification));
         }
 
         // Tell miner that it can now continue either composing or guessing.

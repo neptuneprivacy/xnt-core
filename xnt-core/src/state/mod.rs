@@ -72,10 +72,12 @@ use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::link_tx_claim;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -86,7 +88,9 @@ use crate::protocol::peer::transfer_block::TransferBlock;
 use crate::protocol::peer::SyncChallenge;
 use crate::protocol::peer::SyncChallengeResponse;
 use crate::protocol::peer::SYNC_CHALLENGE_POW_WITNESS_LENGTH;
+use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
@@ -433,6 +437,20 @@ impl GlobalStateLock {
 
         if network != details.network {
             return Err(TxCreationArtifactsError::NetworkMismatch.into());
+        }
+
+        // The link proof must attest to the kernel under the tip's rule set,
+        // also if that changed while the link transaction was proving.
+        let block_height = gsm.chain.light_state().header().height;
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+        let LinkTxProof::Proof(proof) = &link_tx.proof else {
+            return Err(TxCreationArtifactsError::InvalidProof.into());
+        };
+        let claim = link_tx_claim(link_tx.kernel.mast_hash(), consensus_rule_set);
+        if !consensus_rule_set.has_chain_branches()
+            || !verify_transaction_proof(claim, proof.clone(), network).await
+        {
+            return Err(TxCreationArtifactsError::InvalidProof.into());
         }
 
         let utxos_sent_to_self = gsm
@@ -2036,11 +2054,11 @@ impl GlobalState {
         let network = self.cli().network;
         let new_tip_height = new_tip.header().height;
         let single_proof_program_changes = new_tip_height.previous().is_some_and(|parent_height| {
-            single_proof_program_digest(ConsensusRuleSet::infer_from(network, parent_height))
-                != single_proof_program_digest(ConsensusRuleSet::infer_from(
-                    network,
-                    new_tip_height,
-                ))
+            let parent_rules = ConsensusRuleSet::infer_from(network, parent_height);
+            let new_rules = ConsensusRuleSet::infer_from(network, new_tip_height);
+            parent_rules != new_rules
+                && single_proof_program_digest(parent_rules)
+                    != single_proof_program_digest(new_rules)
         });
         if single_proof_program_changes {
             mempool_events.extend(self.mempool.remove_link_txs(RemovalReason::Abandoned));
@@ -2485,11 +2503,16 @@ impl GlobalState {
     /// Remove one transaction from the mempool and notify wallet of changes.
     pub(crate) async fn mempool_remove(&mut self, transaction_id: TransactionKernelId) {
         let tip_height = self.chain.light_state().header().height;
-        let event = self.mempool.remove(transaction_id);
-        if let Some(ref e) = event {
-            self.mempool.log_events(&[e.clone()], tip_height);
+        let mut events = self
+            .mempool
+            .remove(transaction_id)
+            .into_iter()
+            .collect_vec();
+        if !events.is_empty() {
+            events.extend(self.mempool.remove_stranded_links());
         }
-        self.wallet_state.handle_mempool_events(event).await;
+        self.mempool.log_events(&events, tip_height);
+        self.wallet_state.handle_mempool_events(events).await;
     }
 
     /// Record that upgrading the proofs of these transactions failed, so the
@@ -3094,6 +3117,79 @@ mod tests {
                 kernel,
                 proof: TransactionProof::invalid(),
             }
+        }
+    }
+
+    mod own_link_transactions {
+        use std::sync::Arc;
+
+        use tasm_lib::triton_vm::proof::Claim;
+
+        use super::*;
+        use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+        use crate::state::transaction::chained_transaction_details::ChainedTransactionDetails;
+
+        #[apply(shared_tokio_runtime)]
+        async fn own_link_transaction_is_recorded_only_with_a_valid_proof() {
+            let network = Network::RegTest;
+            let mut state_lock = mock_genesis_global_state(
+                2,
+                WalletEntropy::devnet_wallet(),
+                cli_args::Args::default_with_network(network),
+            )
+            .await;
+            let mutator_set_accumulator = Block::genesis(network)
+                .mutator_set_accumulator_after()
+                .unwrap();
+            let details = ChainedTransactionDetails {
+                thruput_inputs: vec![],
+                tx_outputs: TxOutputList::default(),
+                fee: NativeCurrencyAmount::coins(1),
+                timestamp: Timestamp::now(),
+                mutator_set_accumulator: mutator_set_accumulator.clone(),
+                network,
+            };
+            let kernel = TransactionKernelProxy {
+                inputs: vec![],
+                outputs: vec![],
+                announcements: vec![],
+                fee: details.fee,
+                timestamp: details.timestamp,
+                coinbase: None,
+                mutator_set_hash: mutator_set_accumulator.hash(),
+                merge_bit: false,
+            }
+            .into_kernel();
+            let artifacts = |proof: NeptuneProof| LinkTxArtifacts {
+                link_tx: Arc::new(LinkTx {
+                    kernel: LinkKernel {
+                        kernel: kernel.clone(),
+                        thruputs: vec![],
+                    },
+                    proof: LinkTxProof::Proof(proof),
+                }),
+                details: Arc::new(details.clone()),
+            };
+
+            let claim = Claim::new(Digest::default());
+            let refused = state_lock
+                .record_own_link_transaction(&artifacts(NeptuneProof::invalid_mock(claim.clone())))
+                .await;
+            assert!(matches!(
+                refused,
+                Err(RecordTransactionError::InvalidTransaction(
+                    TxCreationArtifactsError::InvalidProof
+                ))
+            ));
+            assert!(state_lock.lock_guard().await.mempool.is_empty());
+
+            state_lock
+                .record_own_link_transaction(&artifacts(NeptuneProof::valid_mock(claim)))
+                .await
+                .unwrap();
+            assert_eq!(1, state_lock.lock_guard().await.mempool.len());
         }
     }
 

@@ -30,6 +30,7 @@ use crate::application::loops::channel::PeerTaskToMain;
 use crate::application::loops::channel::PeerTaskToMainLinkTx;
 use crate::application::loops::channel::PeerTaskToMainTransaction;
 use crate::application::loops::connect_to_peers::close_peer_connected_callback;
+use crate::application::loops::connect_to_peers::version_follows_rule_set;
 use crate::application::loops::main_loop::MAX_NUM_DIGESTS_IN_BATCH_REQUEST;
 use crate::macros::fn_name;
 use crate::macros::log_slow_scope;
@@ -60,6 +61,7 @@ use crate::protocol::peer::SyncChallenge;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::link_tx_admission::link_tx_admissible;
+use crate::state::mempool::link_tx_admission::link_tx_precheck;
 use crate::state::mempool::link_tx_admission::LinkTxAdmissionError;
 use crate::state::mempool::MEMPOOL_TX_THRESHOLD_AGE_IN_SECS;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
@@ -1767,13 +1769,7 @@ impl PeerLoopHandler {
 
                 let link_tx: LinkTx = (*transfer_link_tx).into();
 
-                let (
-                    tip,
-                    mutator_set_accumulator_after,
-                    current_block_height,
-                    already_known,
-                    thruputs_known,
-                ) = {
+                let (tip, mutator_set_accumulator_after, current_block_height) = {
                     let state = self.global_state_lock.lock_guard().await;
                     (
                         state.chain.light_state().hash(),
@@ -1783,6 +1779,34 @@ impl PeerLoopHandler {
                             .mutator_set_accumulator_after()
                             .expect("Block from state must have mutator set after"),
                         state.chain.light_state().header().height,
+                    )
+                };
+                let network = self.global_state_lock.cli().network;
+                let consensus_rule_set =
+                    ConsensusRuleSet::infer_from(network, current_block_height);
+
+                // The checks that read only the kernel come first: they bound
+                // the size of the link transaction, and so the work of looking
+                // it up in the mempool.
+                if let Err(rejection) = link_tx_precheck(
+                    &link_tx,
+                    mutator_set_accumulator_after.hash(),
+                    self.now(),
+                    consensus_rule_set,
+                ) {
+                    debug!(
+                        "Not admitting link transaction {}: {rejection:?}",
+                        link_tx.txid()
+                    );
+                    if let Some(sanction) = Self::sanction_for_inadmissible_link_tx(rejection) {
+                        self.punish(sanction).await?;
+                    }
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                let (already_known, thruputs_known) = {
+                    let state = self.global_state_lock.lock_guard().await;
+                    (
                         !state.mempool.accept_link_transaction(
                             link_tx.txid(),
                             link_tx.kernel.kernel.mutator_set_hash,
@@ -1801,9 +1825,6 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                let network = self.global_state_lock.cli().network;
-                let consensus_rule_set =
-                    ConsensusRuleSet::infer_from(network, current_block_height);
                 let admission = link_tx_admissible(
                     &link_tx,
                     &mutator_set_accumulator_after,
@@ -2077,6 +2098,22 @@ impl PeerLoopHandler {
                 // We don't currently differentiate whether a new block came from a peer, or from our
                 // own miner. It's always shared through this logic.
                 let new_block_height = block.kernel.header.height;
+
+                // A peer whose version does not follow the rule set of the new
+                // block cannot validate it; see `version_follows_rule_set`.
+                let rule_set = ConsensusRuleSet::infer_from(
+                    self.global_state_lock.cli().network,
+                    new_block_height,
+                );
+                if !version_follows_rule_set(&self.peer_handshake_data.version, rule_set) {
+                    info!(
+                        "Disconnecting from peer {}: version {} does not follow the consensus \
+                         rule set {rule_set} of the tip.",
+                        self.peer_address, self.peer_handshake_data.version
+                    );
+                    return Ok(DISCONNECT_CONNECTION);
+                }
+
                 if new_block_height > peer_state_info.highest_shared_block_height {
                     debug!("Sending PeerMessage::BlockNotification");
                     peer_state_info.highest_shared_block_height = new_block_height;
@@ -4947,6 +4984,67 @@ mod tests {
                 panic!("a valid link transaction must be relayed to the main loop");
             };
             assert_eq!(valid, relayed.link_tx);
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn link_tx_with_too_many_thruputs_is_punished() {
+            let mut setup = genesis_setup(NETWORK).await;
+            let limit = ConsensusRuleSet::infer_from(NETWORK, BlockHeight::genesis())
+                .max_num_inputs_in_mempool();
+            let thruputs = vec![AdditionRecord::new(Digest::default()); limit + 1];
+            let link_tx = link_tx(tip_mutator_set_hash(&setup).await, thruputs, true);
+            let mut stream = Mock::new(vec![]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::LinkTx(Box::new((&link_tx).try_into().unwrap())),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                NegativePeerSanction::UnrelayableTransaction.severity(),
+                standing(&setup).await
+            );
+            assert!(matches!(
+                setup.to_main_rx.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn peer_of_a_version_not_following_a_new_block_is_disconnected() {
+            let mut setup = genesis_setup(NETWORK).await;
+            let genesis = Block::genesis(NETWORK);
+            let block1 = invalid_empty_block(&genesis, NETWORK);
+            for (version, disconnect) in [("0.2.7", true), ("0.3.0", false)] {
+                setup.peer_loop_handler.peer_handshake_data.version =
+                    VersionString::try_from_str(version).unwrap();
+                setup.peer_state.highest_shared_block_height = BlockHeight::genesis();
+                let expected = if disconnect {
+                    vec![]
+                } else {
+                    vec![Action::Write(PeerMessage::BlockNotification(
+                        (&block1).into(),
+                    ))]
+                };
+                let mut stream = Mock::new(expected);
+                let disconnected = setup
+                    .peer_loop_handler
+                    .handle_main_task_message(
+                        MainToPeerTask::Block(Box::new(block1.clone())),
+                        &mut stream,
+                        &mut setup.peer_state,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(disconnect, disconnected, "version {version}");
+                assert!(stream.is_done(), "version {version}");
+            }
         }
 
         #[traced_test]
