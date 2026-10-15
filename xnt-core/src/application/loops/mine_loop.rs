@@ -1655,9 +1655,13 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        // The block stores its inputs packed, so compare their index sets.
         let block_kernel = &block.body().transaction_kernel;
         for input in &link_tx.kernel.kernel.inputs {
-            assert!(block_kernel.inputs.contains(input));
+            assert!(block_kernel
+                .inputs
+                .iter()
+                .any(|rr| rr.absolute_indices == input.absolute_indices));
         }
         for output in &link_tx.kernel.kernel.outputs {
             assert!(block_kernel.outputs.contains(output));

@@ -8,6 +8,9 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::time::Duration;
+
+use clap::Parser;
 
 use common::genesis_node::GenesisNode;
 use common::logging;
@@ -16,6 +19,7 @@ use neptune_privacy::api::export::KeyType;
 use neptune_privacy::api::export::NativeCurrencyAmount;
 use neptune_privacy::api::export::Network;
 use neptune_privacy::api::export::Timestamp;
+use neptune_privacy::api::export::TransactionKernelId;
 use neptune_privacy::api::export::TxProvingCapability;
 use neptune_privacy::api::tx_initiation::consolidate::CONSOLIDATION_FEE_SP;
 use neptune_privacy::application::config::cli_args::Args;
@@ -43,17 +47,29 @@ async fn tip_digest(node: &GenesisNode) -> Digest {
     node.gsl.lock_guard().await.chain.light_state().hash()
 }
 
-/// Arguments for a single-proof capable node that runs the proof upgrader and
-/// dials the given peers.
-async fn upgrading_node_args(peers: &[&Args]) -> Args {
-    let mut args = GenesisNode::default_args().await;
-    args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
-    args.tx_proof_upgrading = true;
-    args.peers = peers
-        .iter()
-        .map(|peer| SocketAddr::new(peer.peer_listen_addr, peer.peer_port))
-        .collect();
-    args
+/// Arguments for `num_nodes` single-proof capable nodes. Each node gets its
+/// own ports from the OS, and dials the nodes before it.
+async fn cluster_args(num_nodes: usize) -> Vec<Args> {
+    let mut all_args: Vec<Args> = vec![];
+    for _ in 0..num_nodes {
+        let mut args = GenesisNode::default_args().await;
+        args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
+        args.peers = all_args
+            .iter()
+            .map(|peer| SocketAddr::new(peer.peer_listen_addr, peer.peer_port))
+            .collect();
+        all_args.push(args);
+    }
+    all_args
+}
+
+async fn start_connected_nodes<const N: usize>(
+    all_args: Vec<Args>,
+    timeout_secs: u16,
+) -> anyhow::Result<[GenesisNode; N]> {
+    let nodes: [GenesisNode; N] = GenesisNode::start_nodes(all_args).await?;
+    GenesisNode::wait_until_all_peers_connected(&nodes, timeout_secs).await?;
+    Ok(nodes)
 }
 
 /// test: a chained payment spends the unconfirmed output of another chained
@@ -75,16 +91,8 @@ pub async fn chained_payment_spends_a_chained_payment_before_any_block() -> anyh
     logging::tracing_logger();
     let timeout_secs = 15;
 
-    let mut base_args = GenesisNode::default_args().await;
-    base_args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
-
-    let [mut alice, mut bob, mut charlie] = GenesisNode::start_connected_cluster(
-        &GenesisNode::cluster_id(),
-        3,
-        Some(base_args),
-        timeout_secs,
-    )
-    .await?;
+    let [mut alice, mut bob, mut charlie] =
+        start_connected_nodes(cluster_args(3).await, timeout_secs).await?;
 
     let bob_address = bob
         .gsl
@@ -239,16 +247,7 @@ pub async fn consolidation_is_relayed_and_confirmed() -> anyhow::Result<()> {
     // the proof upgrader ticks every ten seconds.
     let upgrade_timeout_secs = 30;
 
-    let mut base_args = GenesisNode::default_args().await;
-    base_args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
-
-    let [mut alice, mut bob] = GenesisNode::start_connected_cluster(
-        &GenesisNode::cluster_id(),
-        2,
-        Some(base_args),
-        timeout_secs,
-    )
-    .await?;
+    let [mut alice, mut bob] = start_connected_nodes(cluster_args(2).await, timeout_secs).await?;
 
     alice
         .gsl
@@ -346,15 +345,13 @@ pub async fn late_node_syncs_and_sends_a_link_transaction() -> anyhow::Result<()
     // the proof upgrader ticks every ten seconds.
     let upgrade_timeout_secs = 30;
 
-    // Each node gets its own ports from the OS. Only the joining node dials:
-    // bob dials alice, and charlie later dials both.
-    let alice_args = upgrading_node_args(&[]).await;
-    let bob_args = upgrading_node_args(&[&alice_args]).await;
-    let charlie_args = upgrading_node_args(&[&alice_args, &bob_args]).await;
-
-    let nodes: [GenesisNode; 2] = GenesisNode::start_nodes(vec![alice_args, bob_args]).await?;
-    GenesisNode::wait_until_all_peers_connected(&nodes, timeout_secs).await?;
-    let [mut alice, mut bob] = nodes;
+    // Charlie dials alice and bob once he starts.
+    let mut all_args = cluster_args(3).await;
+    for args in &mut all_args {
+        args.tx_proof_upgrading = true;
+    }
+    let charlie_args = all_args.pop().unwrap();
+    let [mut alice, mut bob] = start_connected_nodes(all_args, timeout_secs).await?;
 
     let alice_address = alice
         .gsl
@@ -537,6 +534,138 @@ pub async fn late_node_syncs_and_sends_a_link_transaction() -> anyhow::Result<()
         assert_eq!(alice_tip, tip_digest(node).await);
         assert!(node.gsl.lock_guard().await.mempool.is_empty());
     }
+
+    Ok(())
+}
+
+/// Wait until the node's mempool holds exactly one transaction, and return its
+/// txid.
+async fn wait_until_only_mempool_tx(
+    node: &GenesisNode,
+    timeout_secs: u16,
+) -> anyhow::Result<TransactionKernelId> {
+    let start = std::time::Instant::now();
+    loop {
+        {
+            let state = node.gsl.lock_guard().await;
+            if let Some((txid, _)) = state.mempool.fee_density_iter().next() {
+                anyhow::ensure!(1 == state.mempool.len(), "more than one transaction");
+                return Ok(txid);
+            }
+        }
+        if start.elapsed() > Duration::from_secs(timeout_secs.into()) {
+            anyhow::bail!("no transaction in mempool after {timeout_secs} seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// test: a node with auto-consolidation consolidates on its own when a block
+/// arrives from a peer, and the network confirms the consolidation.
+///
+/// scenario:
+/// 1. alice runs with `--auto-consolidate --num-consolidation-inputs 3`, bob
+///    without; both are single-proof capable.
+/// 2. alice mines 12 blocks, so that her oldest UTXOs have enough
+///    confirmations. Her own blocks do not start a consolidation.
+/// 3. bob mines a block; when it reaches alice, she consolidates 3 UTXOs, and
+///    her node upgrades the transaction to a single proof.
+/// 4. the consolidation reaches bob, and his next block confirms it.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn auto_consolidation_runs_on_a_block_from_a_peer() -> anyhow::Result<()> {
+    logging::tracing_logger();
+    let timeout_secs = 15;
+    // the proof upgrader ticks every ten seconds.
+    let upgrade_timeout_secs = 30;
+
+    let num_inputs = 3;
+    let mut alice_args = Args::try_parse_from([
+        "xnt-core".to_string(),
+        "--auto-consolidate".to_string(),
+        "--num-consolidation-inputs".to_string(),
+        num_inputs.to_string(),
+    ])?;
+    let defaults = GenesisNode::default_args().await;
+    alice_args.network = defaults.network;
+    alice_args.peer_listen_addr = defaults.peer_listen_addr;
+    alice_args.peer_port = defaults.peer_port;
+    alice_args.rpc_port = defaults.rpc_port;
+    alice_args.data_dir = defaults.data_dir;
+    alice_args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
+    alice_args
+        .validate_auto_consolidation()
+        .map_err(anyhow::Error::msg)?;
+
+    let mut bob_args = GenesisNode::default_args().await;
+    bob_args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
+    bob_args.peers = vec![SocketAddr::new(
+        alice_args.peer_listen_addr,
+        alice_args.peer_port,
+    )];
+
+    let [mut alice, mut bob] =
+        start_connected_nodes(vec![alice_args, bob_args], timeout_secs).await?;
+
+    alice
+        .gsl
+        .api_mut()
+        .regtest_mut()
+        .mine_blocks_to_wallet(12, false)
+        .await?;
+    bob.wait_until_block_height(12, timeout_secs).await?;
+    assert!(alice.gsl.lock_guard().await.mempool.is_empty());
+    assert_follows_upgrade_vm_v8(&alice).await;
+
+    // ## a block from bob starts alice's consolidation.
+    bob.gsl
+        .api_mut()
+        .regtest_mut()
+        .mine_blocks_to_wallet(1, false)
+        .await?;
+    alice.wait_until_block_height(13, timeout_secs).await?;
+    let txid = wait_until_only_mempool_tx(&alice, timeout_secs).await?;
+    let kernel = alice
+        .gsl
+        .lock_guard()
+        .await
+        .mempool
+        .get(txid)
+        .unwrap()
+        .kernel
+        .clone();
+    assert_eq!(num_inputs, kernel.inputs.len());
+    assert_eq!(1, kernel.outputs.len());
+    assert_eq!(CONSOLIDATION_FEE_SP, kernel.fee);
+
+    // ## the consolidation reaches bob, and his next block confirms it.
+    bob.wait_until_tx_in_mempool_has_single_proof(txid, upgrade_timeout_secs)
+        .await?;
+    bob.gsl
+        .api_mut()
+        .regtest_mut()
+        .mine_blocks_to_wallet(1, true)
+        .await?;
+    alice.wait_until_block_height(14, timeout_secs).await?;
+
+    let block_kernel = bob
+        .gsl
+        .lock_guard()
+        .await
+        .chain
+        .light_state()
+        .body()
+        .transaction_kernel
+        .clone();
+    // The block stores its inputs packed, so compare their index sets.
+    for input in &kernel.inputs {
+        assert!(block_kernel
+            .inputs
+            .iter()
+            .any(|rr| rr.absolute_indices == input.absolute_indices));
+    }
+    assert!(block_kernel.outputs.contains(&kernel.outputs[0]));
+    assert!(!alice.gsl.lock_guard().await.mempool.contains(txid));
+    assert!(!bob.gsl.lock_guard().await.mempool.contains(txid));
 
     Ok(())
 }

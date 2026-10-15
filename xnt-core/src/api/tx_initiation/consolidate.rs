@@ -325,11 +325,21 @@ mod tests {
     use super::*;
     use crate::application::config::cli_args;
     use crate::application::config::network::Network;
+    use crate::application::loops::main_loop::proof_upgrader::PrimitiveWitnessToSingleProof;
+    use crate::application::loops::mine_loop::compose_block_helper;
     use crate::protocol::consensus::block::block_height::BlockHeight;
     use crate::protocol::consensus::block::Block;
+    use crate::protocol::consensus::block::BlockProof;
+    use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
+    use crate::protocol::consensus::transaction::transaction_proof::TransactionProof;
     use crate::protocol::consensus::transaction::Transaction;
+    use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
+    use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
+    use crate::state::mempool::mempool_event::AddReason;
+    use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
     use crate::state::wallet::wallet_entropy::WalletEntropy;
+    use crate::tests::shared::blocks::invalid_empty_block;
     use crate::tests::shared::blocks::make_mock_block;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
     use crate::tests::shared_tokio_runtime;
@@ -617,5 +627,178 @@ mod tests {
             NativeCurrencyAmount::coins_from_str("0.1").unwrap(),
             CONSOLIDATION_FEE_PC
         );
+    }
+
+    /// On main net, consolidation waits for the v8 fork. While the tip is in
+    /// the legacy era it is refused, which auto-consolidation takes as nothing
+    /// to do; from the fork block on, it spends UTXOs confirmed before the
+    /// fork.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn consolidation_starts_at_the_v8_fork() {
+        let network = Network::Main;
+        let mut alice = alice_with_mined_blocks(3, TxProvingCapability::SingleProof).await;
+        let old_enough = spendable_aocl_indices(&alice).await;
+        assert!(old_enough.len() >= 2, "need at least two old UTXOs");
+
+        // The chain then reaches the last pre-fork block. It is a placeholder:
+        // its body extends the mutator set of block 3, and its height is that
+        // of the last pre-fork block. This version cannot make blocks of the
+        // legacy era, not even mock ones.
+        let fork_height = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
+        let successor = invalid_empty_block(&tip(&alice).await, network);
+        let mut header = *successor.header();
+        header.height = fork_height.previous().unwrap();
+        let last_pre_fork_block = Block::new(
+            header,
+            successor.body().clone(),
+            successor.appendix().clone(),
+            BlockProof::Invalid,
+        );
+        alice
+            .set_new_tip(last_pre_fork_block.clone())
+            .await
+            .unwrap();
+        assert!(ConsensusRuleSet::infer_from(network, header.height).is_legacy_era());
+
+        let refused = run_consolidation(&alice, 2, None).await.unwrap_err();
+        assert!(matches!(
+            refused,
+            ConsolidationError::LegacyEra(ConsensusRuleSet::UpgradeVMv7)
+        ));
+        assert!(refused.is_nothing_to_do());
+        assert!(alice.lock_guard().await.mempool.is_empty());
+
+        // The fork block arrives.
+        let fork_block = invalid_empty_block(&last_pre_fork_block, network);
+        assert_eq!(fork_height, fork_block.header().height);
+        alice.set_new_tip(fork_block).await.unwrap();
+
+        assert_eq!(2, run_consolidation(&alice, 2, None).await.unwrap());
+        let tx = only_mempool_transaction(&alice).await;
+        assert_eq!(2, tx.kernel.inputs.len());
+        assert_eq!(1, tx.kernel.outputs.len());
+        assert_eq!(CONSOLIDATION_FEE_SP, tx.kernel.fee);
+        let TransactionProof::Witness(primitive_witness) = &tx.proof else {
+            panic!("consolidation transaction must start out as a primitive witness");
+        };
+        primitive_witness.validate().await.unwrap();
+
+        let spendable_after = spendable_aocl_indices(&alice).await;
+        let spent = old_enough
+            .iter()
+            .filter(|index| !spendable_after.contains(index))
+            .copied()
+            .collect_vec();
+        assert_eq!(old_enough[..2].to_vec(), spent);
+    }
+
+    /// A consolidation, proven for real and mined under the v8 rule set, that
+    /// spends a UTXO tagged with the launch-era native-currency type-script
+    /// hash, which the v8 programs fold onto the current one.
+    ///
+    /// Testnet follows the v8 rule set from genesis, and its devnet wallet
+    /// holds a premine with that tag. The blocks that age the premine carry
+    /// mock proofs: validating the block that confirms the consolidation does
+    /// not re-verify its predecessor's proof.
+    ///
+    /// This test produces many proofs and might take a while to complete if
+    /// there is no proof cache.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn consolidation_of_legacy_tagged_utxo_is_proven_and_mined_under_upgrade_vm_v8() {
+        let network = Network::Testnet(0);
+        let cli = cli_args::Args {
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            rate_limit_until_height: 0,
+            ..cli_args::Args::default_with_network(network)
+        };
+        let wallet = WalletEntropy::devnet_wallet();
+        let composer_key = wallet.nth_generation_spending_key_for_tests(0);
+        let mut alice = mock_genesis_global_state(0, wallet, cli).await;
+
+        // At tip height 10, the premine and block 1 have 10 confirmations.
+        let mut tip = Block::genesis(network);
+        for _ in 0..10 {
+            let timestamp = tip.header().timestamp + Timestamp::minutes(10);
+            let (block, expected_utxos) =
+                make_mock_block(&tip, Some(timestamp), composer_key, random(), network).await;
+            alice
+                .set_new_self_composed_tip(block.clone(), expected_utxos)
+                .await
+                .unwrap();
+            tip = block;
+        }
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, tip.header().height.next());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, consensus_rule_set);
+
+        let spendable_before = spendable_aocl_indices(&alice).await;
+        assert_eq!(2, run_consolidation(&alice, 2, None).await.unwrap());
+        let tx = only_mempool_transaction(&alice).await;
+        let TransactionProof::Witness(primitive_witness) = tx.proof.clone() else {
+            panic!("consolidation transaction must start out as a primitive witness");
+        };
+        assert!(
+            primitive_witness
+                .input_utxos
+                .utxos
+                .iter()
+                .flat_map(|utxo| utxo.coins())
+                .any(|coin| coin.type_script_hash == NativeCurrency::legacy_type_script_hash()),
+            "the premine must be among the consolidated UTXOs"
+        );
+
+        // As the proof upgrader in the main loop does.
+        let proof_job_options = TritonVmProofJobOptions::default_with_network(network);
+        let upgraded = PrimitiveWitnessToSingleProof { primitive_witness }
+            .upgrade(vm_job_queue(), &proof_job_options, consensus_rule_set)
+            .await
+            .unwrap();
+        assert_eq!(tx.txid(), upgraded.txid());
+        assert!(upgraded.proof.is_single_proof());
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert(
+                upgraded.clone(),
+                UpgradePriority::Critical,
+                AddReason::Upgraded,
+            )
+            .await;
+
+        // The composer merges the consolidation into a valid block.
+        let block_timestamp = tip.header().timestamp + Timestamp::minutes(10);
+        let (block, _) = compose_block_helper(
+            tip.clone(),
+            alice.clone(),
+            block_timestamp,
+            proof_job_options,
+        )
+        .await
+        .unwrap();
+        // The block stores its inputs packed, so compare their index sets.
+        let block_kernel = &block.body().transaction_kernel;
+        for input in &upgraded.kernel.inputs {
+            assert!(block_kernel
+                .inputs
+                .iter()
+                .any(|rr| rr.absolute_indices == input.absolute_indices));
+        }
+        assert!(block_kernel.outputs.contains(&upgraded.kernel.outputs[0]));
+        assert!(
+            block
+                .is_valid(&tip, block.header().timestamp, network)
+                .await,
+            "block confirming the consolidation must be valid"
+        );
+
+        alice.set_new_tip(block).await.unwrap();
+        assert!(alice.lock_guard().await.mempool.is_empty());
+        let spendable_after = spendable_aocl_indices(&alice).await;
+        let spent = spendable_before
+            .iter()
+            .filter(|index| !spendable_after.contains(index))
+            .count();
+        assert_eq!(2, spent);
     }
 }
