@@ -843,6 +843,21 @@ impl Mempool {
         priority: UpgradePriority,
         add_reason: AddReason,
     ) -> Vec<MempoolEvent> {
+        let mut events = self.insert_without_cascade(new_tx, priority, add_reason);
+        events.extend(self.remove_stranded_links());
+
+        MempoolEvent::normalize(events)
+    }
+
+    /// Like [`Self::insert`], but leaves the link transactions that the
+    /// insertion strands in place. The caller must run
+    /// [`Self::remove_stranded_links`] once it is done inserting.
+    fn insert_without_cascade(
+        &mut self,
+        new_tx: Transaction,
+        priority: UpgradePriority,
+        add_reason: AddReason,
+    ) -> Vec<MempoolEvent> {
         // If transaction to be inserted conflicts with transactions already in
         // the mempool, we replace them -- but only if the new transaction has a
         // higher fee-density than the ones already in mempool, or if it has
@@ -985,7 +1000,6 @@ impl Mempool {
         }
 
         self.assert_queues_agree_and_shrink(&mut events);
-        events.extend(self.remove_stranded_links());
 
         MempoolEvent::normalize(events)
     }
@@ -1523,25 +1537,46 @@ impl Mempool {
     /// keeps the composed block within [`ConsensusRuleSet::max_block_size`]:
     /// the per-transaction proofs are discarded by the merge, whereas the
     /// kernels accumulate into the block body.
+    /// Numbers of outputs and announcements reserved for the coinbase
+    /// transaction that transactions for block composition are merged with. No
+    /// reservation is needed for inputs, as a coinbase transaction has none.
+    const COINBASE_NUM_OUTPUTS_RESERVATION: usize = 128;
+    const COINBASE_NUM_ANNOUNCEMENTS_RESERVATION: usize = 128;
+
+    /// Whether a transaction with this kernel fits a block of this rule set on
+    /// its own, next to the coinbase transaction it is merged with: the limits
+    /// that [`Self::get_transactions_for_block_composition`] applies to the
+    /// transactions it selects.
+    pub(crate) fn fits_block_composition(
+        kernel: &TransactionKernel,
+        consensus_rule_set: ConsensusRuleSet,
+        max_kernel_len: usize,
+    ) -> bool {
+        kernel.inputs.len() <= consensus_rule_set.max_num_inputs()
+            && kernel.outputs.len()
+                <= consensus_rule_set
+                    .max_num_outputs()
+                    .saturating_sub(Self::COINBASE_NUM_OUTPUTS_RESERVATION)
+            && kernel.announcements.len()
+                <= consensus_rule_set
+                    .max_num_announcements()
+                    .saturating_sub(Self::COINBASE_NUM_ANNOUNCEMENTS_RESERVATION)
+            && kernel.encode().len() <= max_kernel_len
+    }
+
     pub(crate) fn get_transactions_for_block_composition(
         &self,
         consensus_rule_set: ConsensusRuleSet,
         mut remaining_kernel_len: usize,
         max_num_txs: Option<usize>,
     ) -> Vec<Transaction> {
-        // Numbers of outputs and announcements reserved for the coinbase
-        // transaction that the returned transactions will be merged with. No
-        // reservation is needed for inputs, as a coinbase transaction has none.
-        const COINBASE_NUM_OUTPUTS_RESERVATION: usize = 128;
-        const COINBASE_NUM_ANNOUNCEMENTS_RESERVATION: usize = 128;
-
         let mut remaining_num_inputs = consensus_rule_set.max_num_inputs();
         let mut remaining_num_outputs = consensus_rule_set
             .max_num_outputs()
-            .saturating_sub(COINBASE_NUM_OUTPUTS_RESERVATION);
+            .saturating_sub(Self::COINBASE_NUM_OUTPUTS_RESERVATION);
         let mut remaining_num_announcements = consensus_rule_set
             .max_num_announcements()
-            .saturating_sub(COINBASE_NUM_ANNOUNCEMENTS_RESERVATION);
+            .saturating_sub(Self::COINBASE_NUM_ANNOUNCEMENTS_RESERVATION);
 
         let mut transactions = vec![];
 
@@ -1756,7 +1791,6 @@ impl Mempool {
             let removed = self.retain(no_mined_thruput, RemovalReason::Abandoned);
             events.extend(removed);
         }
-        events.extend(self.remove_stranded_links());
 
         // Restore transactions from blocks. Do this prior to the collection of
         // update jobs since we migth restore a transaction that we need to
@@ -1775,7 +1809,10 @@ impl Mempool {
                 kernel: tx_kernel,
                 proof: TransactionProof::SingleProof(single_proof),
             };
-            let inserted = self.insert(restored_tx, upgrade_priority, AddReason::Restored);
+            // Link transactions are checked for stranded thruputs only once
+            // every merge input is back, further below.
+            let inserted =
+                self.insert_without_cascade(restored_tx, upgrade_priority, AddReason::Restored);
             events.extend(inserted);
         }
 
@@ -4483,6 +4520,7 @@ mod tests {
         use crate::protocol::consensus::chaintx::link_primitive_witness::LinkPrimitiveWitness;
         use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
         use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+        use crate::tests::shared::blocks::invalid_block_with_kernel_and_mutator_set;
         use crate::tests::shared::blocks::invalid_empty_block;
         use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash_and_timestamp;
 
@@ -4975,6 +5013,91 @@ mod tests {
             assert!(!mempool.contains(first.txid()));
             assert!(mempool.contains(more_lavish.txid()));
             assert_eq!(2, mempool.len());
+        }
+
+        #[test]
+        fn link_survives_when_its_predecessor_returns_from_the_merge_input_cache() {
+            // p and q over one mutator set, so that a block can mine q.
+            let mut test_runner = TestRunner::deterministic();
+            let [p_witness, q_witness] =
+                PrimitiveWitness::arbitrary_tuple_with_matching_mutator_sets([
+                    (2, 2, 2),
+                    (2, 2, 2),
+                ])
+                .new_tree(&mut test_runner)
+                .unwrap()
+                .current();
+            let mutator_set = p_witness.mutator_set_accumulator.clone();
+            let [link_base] = make_plenty_mock_transaction_supported_by_invalid_single_proofs(1)
+                .try_into()
+                .unwrap();
+            let with_low_fee = |witness: PrimitiveWitness| Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .fee(NativeCurrencyAmount::coins(1))
+                    .modify(witness.kernel),
+                proof: link_base.proof.clone(),
+            };
+            let p = with_low_fee(p_witness);
+            let q = with_low_fee(q_witness);
+            let thruput = p.kernel.outputs[0];
+
+            let block1 = invalid_block_with_kernel_and_mutator_set(q.kernel.clone(), mutator_set);
+            let mut mempool = Mempool::new(
+                ByteSize::gb(1),
+                TxProvingCapability::SingleProof,
+                &Block::genesis(Network::Main),
+            );
+            mempool.tip_digest = block1.header().prev_block_digest;
+            mempool.insert(p.clone(), UpgradePriority::Irrelevant, AddReason::FromPeer);
+            mempool.insert(q.clone(), UpgradePriority::Irrelevant, AddReason::FromPeer);
+
+            // A merge of p and q replaces both, and puts them in the merge
+            // input cache.
+            let merged = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .inputs([p.kernel.inputs.clone(), q.kernel.inputs.clone()].concat())
+                    .outputs([p.kernel.outputs.clone(), q.kernel.outputs.clone()].concat())
+                    .announcements(
+                        [
+                            p.kernel.announcements.clone(),
+                            q.kernel.announcements.clone(),
+                        ]
+                        .concat(),
+                    )
+                    .fee(NativeCurrencyAmount::coins(100))
+                    .timestamp(std::cmp::max(p.kernel.timestamp, q.kernel.timestamp))
+                    .merge_bit(true)
+                    .modify(p.kernel.clone()),
+                proof: p.proof.clone(),
+            };
+            mempool.insert(
+                merged.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            );
+            assert!(mempool.contains(merged.txid()));
+            assert!(!mempool.contains(p.txid()));
+            assert!(!mempool.merge_input_cache.is_empty());
+
+            // A link spends p's output, which the merged transaction carries.
+            let link = proof_backed_link(link_base.kernel, vec![thruput]);
+            mempool.insert_link(
+                link.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            );
+            assert!(mempool.contains(link.txid()));
+
+            // A block mines q alone. The merged transaction is double-spent,
+            // and p returns from the merge input cache with the link's
+            // thruput.
+            mempool.update_with_block(&block1).unwrap();
+            assert!(!mempool.contains(merged.txid()));
+            assert!(mempool.contains(p.txid()));
+            assert!(
+                mempool.contains(link.txid()),
+                "a link whose predecessor returns from the merge input cache must stay"
+            );
         }
 
         #[test]

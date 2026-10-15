@@ -60,6 +60,7 @@ use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::shared::SIZE_20MB_IN_BYTES;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
+use crate::state::mempool::Mempool;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::transaction_output::TxOutputList;
@@ -506,6 +507,7 @@ pub(crate) async fn create_block_transaction(
 /// the composer falls back to a nop.
 async fn fix_resolved_link_tx_from_mempool(
     global_state_lock: &mut GlobalStateLock,
+    predecessor_block: &Block,
     predecessor_rule_set: ConsensusRuleSet,
     consensus_rule_set: ConsensusRuleSet,
     vm_job_queue: Arc<TritonVmJobQueue>,
@@ -524,6 +526,18 @@ async fn fix_resolved_link_tx_from_mempool(
     let Some(link_tx) = link_to_fix else {
         return Ok(None);
     };
+
+    // The fixed transaction keeps the link transaction's kernel. That kernel
+    // must be synced to the block's predecessor, which may no longer be the
+    // tip, and it must fit the block next to the coinbase transaction.
+    let kernel = &link_tx.kernel.kernel;
+    let predecessor_mutator_set_hash = predecessor_block.mutator_set_accumulator_after()?.hash();
+    let max_kernel_len = consensus_rule_set.max_recommended_block_tx_kernel_size();
+    if kernel.mutator_set_hash != predecessor_mutator_set_hash
+        || !Mempool::fits_block_composition(kernel, consensus_rule_set, max_kernel_len)
+    {
+        return Ok(None);
+    }
 
     info!("Fixing resolved link transaction from mempool instead of building a nop");
     let txid = link_tx.txid();
@@ -666,6 +680,7 @@ pub(crate) async fn create_block_transaction_from(
             ConsensusRuleSet::infer_from(network, predecessor_block.header().height);
         if let Some(fixed) = fix_resolved_link_tx_from_mempool(
             &mut global_state_lock,
+            predecessor_block,
             predecessor_rule_set,
             consensus_rule_set,
             vm_job_queue.clone(),
@@ -1165,6 +1180,7 @@ pub(crate) mod tests {
     use crate::state::wallet::wallet_entropy::WalletEntropy;
     use crate::tests::shared::blocks::fake_valid_deterministic_successor;
     use crate::tests::shared::blocks::invalid_empty_block;
+    use crate::tests::shared::blocks::make_mock_block;
     use crate::tests::shared::dummy_expected_utxo;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
     use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
@@ -1480,6 +1496,7 @@ pub(crate) mod tests {
         // Not across a change of rule set.
         let fixed = fix_resolved_link_tx_from_mempool(
             &mut alice,
+            &genesis_block,
             ConsensusRuleSet::UpgradeVMv7,
             rules,
             vm_job_queue(),
@@ -1491,6 +1508,7 @@ pub(crate) mod tests {
 
         let fixed = fix_resolved_link_tx_from_mempool(
             &mut alice,
+            &genesis_block,
             rules,
             rules,
             vm_job_queue(),
@@ -1510,6 +1528,125 @@ pub(crate) mod tests {
         );
         assert_eq!(Some(&fixed), state.mempool.get(txid));
         assert_eq!(1, state.mempool.num_own_txs(), "and inherits its priority");
+    }
+
+    /// A resolved link transaction, synced to `block`, with a proof that does
+    /// not verify.
+    fn resolved_link_tx_synced_to(
+        block: &Block,
+    ) -> crate::protocol::consensus::chaintx::link_tx::LinkTx {
+        use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+
+        let mutator_set_hash = block.mutator_set_accumulator_after().unwrap().hash();
+        LinkTx {
+            kernel: LinkKernel {
+                kernel: make_mock_transaction_with_mutator_set_hash(
+                    vec![],
+                    vec![],
+                    mutator_set_hash,
+                )
+                .kernel,
+                thruputs: vec![],
+            },
+            proof: LinkTxProof::Proof(NeptuneProof::invalid()),
+        }
+    }
+
+    /// The composer fixes a link transaction only if it is synced to the
+    /// predecessor of the block being composed, which is not the tip if a block
+    /// arrived meanwhile. Such a link transaction is not recorded as an upgrade
+    /// failure.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn composer_does_not_fix_a_link_transaction_synced_to_another_block() {
+        let network = Network::RegTest;
+        let mut alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let genesis_block = Block::genesis(network);
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(
+                resolved_link_tx_synced_to(&genesis_block),
+                UpgradePriority::Critical,
+                AddReason::Submitted,
+            )
+            .await;
+
+        let composer_key = GenerationSpendingKey::derive_from_seed(rand::random());
+        let (other_block, _) =
+            make_mock_block(&genesis_block, None, composer_key, rand::random(), network).await;
+        let rules = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            &other_block,
+            rules,
+            rules,
+            vm_job_queue(),
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        assert!(fixed.is_none());
+        assert!(alice
+            .lock_guard()
+            .await
+            .mempool
+            .preferred_link_fix(TxUpgradeFilter::match_all())
+            .is_some());
+    }
+
+    /// A link transaction that cannot be fixed does not fail the composition:
+    /// it is recorded as an upgrade failure and passed over, and the composer
+    /// falls back to a nop.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn composer_passes_over_a_link_transaction_that_cannot_be_fixed() {
+        let network = Network::Testnet(0);
+        let mut alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let genesis_block = Block::genesis(network);
+        let link_tx = resolved_link_tx_synced_to(&genesis_block);
+        let txid = link_tx.txid();
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(link_tx, UpgradePriority::Critical, AddReason::Submitted)
+            .await;
+
+        let rules = ConsensusRuleSet::infer_from(network, BlockHeight::genesis().next());
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            &genesis_block,
+            rules,
+            rules,
+            vm_job_queue(),
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        assert!(fixed.is_none());
+
+        let state = alice.lock_guard().await;
+        assert!(state.mempool.get_link(txid).is_some());
+        assert!(
+            state
+                .mempool
+                .preferred_link_fix(TxUpgradeFilter::match_all())
+                .is_none(),
+            "the failure to fix must be recorded"
+        );
     }
 
     /// A chained payment, proven for real from send to block under the v8
