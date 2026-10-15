@@ -97,6 +97,9 @@ pub enum CreateProofError {
          it produces proofs from the next hard fork on"
     )]
     LegacyEra(crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet),
+
+    #[error("link transaction cannot be fixed: {0}")]
+    LinkTxNotFixable(&'static str),
 }
 
 /// enumerates possible upgrade-proof errors

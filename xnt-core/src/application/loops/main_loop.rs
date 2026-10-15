@@ -55,6 +55,7 @@ use crate::protocol::consensus::block::block_header::BlockHeader;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::handshake_data::HandshakeData;
@@ -535,12 +536,55 @@ impl MainLoopHandler {
                                 }
                             }
                         }
-                        MempoolUpdateJob::SingleProof { .. } => unreachable!(),
+                        MempoolUpdateJob::Link { .. } | MempoolUpdateJob::SingleProof { .. } => {
+                            unreachable!()
+                        }
                     };
 
                     result.push(MempoolUpdateJobResult::Success {
                         new_primitive_witness: Some(Box::new(new_pw)),
                         new_transaction: Box::new(upgraded_tx),
+                    });
+                }
+                MempoolUpdateJob::Link { old_link_tx } => {
+                    // Acquire lock, and drop it immediately.
+                    let (msa_lookup_result, consensus_rule_set) = {
+                        let state = global_state_lock.lock_guard().await;
+                        let msa_lookup_result = state
+                            .chain
+                            .archival_state()
+                            .old_mutator_set_and_mutator_set_update_to_tip(
+                                old_link_tx.kernel.kernel.mutator_set_hash,
+                                SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
+                            )
+                            .await;
+                        (msa_lookup_result, state.consensus_rule_set())
+                    };
+                    let Some((old_msa, mutator_set_update)) = msa_lookup_result else {
+                        result.push(MempoolUpdateJobResult::Failure(txid));
+                        continue;
+                    };
+                    let single_proof_digest = single_proof_program_digest(consensus_rule_set);
+
+                    // No locks may be held here!
+                    let update_result = old_link_tx
+                        .as_ref()
+                        .clone()
+                        .new_with_updated_mutator_set_records(
+                            &old_msa,
+                            &mutator_set_update,
+                            single_proof_digest,
+                            job_queue.clone(),
+                            proof_job_options.clone(),
+                        )
+                        .await;
+                    let Ok(new_link_tx) = update_result else {
+                        result.push(MempoolUpdateJobResult::Failure(txid));
+                        continue;
+                    };
+
+                    result.push(MempoolUpdateJobResult::SuccessLink {
+                        new_link_tx: Box::new(new_link_tx),
                     });
                 }
                 MempoolUpdateJob::SingleProof {
@@ -617,6 +661,18 @@ impl MainLoopHandler {
                         }
                         state
                             .mempool_insert(*new_transaction.to_owned(), UpgradePriority::Critical, AddReason::Updated)
+                            .await;
+                    }
+                    MempoolUpdateJobResult::SuccessLink { new_link_tx } => {
+                        let txid = new_link_tx.txid();
+                        info!("Updated link transaction {txid} to be valid under new mutator set");
+
+                        state
+                            .mempool_insert_link(
+                                new_link_tx.as_ref().to_owned(),
+                                UpgradePriority::Critical,
+                                AddReason::Updated,
+                            )
                             .await;
                     }
                 }
@@ -2105,11 +2161,11 @@ impl MainLoopHandler {
                     let state = self.global_state_lock.lock_guard().await;
                     for (txid, _) in state.mempool.fee_density_iter() {
                         // Since a read-lock is held over global state, the
-                        // transaction must exist in the mempool.
-                        let tx = state
-                            .mempool
-                            .get(txid)
-                            .expect("Transaction from iter must exist in mempool");
+                        // transaction must exist in the mempool. It is on the
+                        // link pipeline if it is not on the standard one.
+                        let Some(tx) = state.mempool.get(txid) else {
+                            continue;
+                        };
                         let notification = TransactionNotification::try_from(tx);
                         match notification {
                             Ok(notification) => {

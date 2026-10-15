@@ -8,6 +8,7 @@ use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use super::link_kernel::LinkKernel;
 use super::link_primitive_witness::LinkPrimitiveWitness;
 use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 
 /// The proof backing a [`LinkTx`].
 ///
@@ -52,6 +53,14 @@ pub struct LinkTx {
 }
 
 impl LinkTx {
+    /// The id of the wrapped transaction kernel; thruputs are not part of it.
+    ///
+    /// So a link transaction shares its id with the transaction it is fixed
+    /// into, and with the transaction it is cast from.
+    pub fn txid(&self) -> TransactionKernelId {
+        self.kernel.kernel.txid()
+    }
+
     /// Calculates a fraction representing the fee-density, defined as:
     /// `transaction_fee/transaction_size`.
     pub fn fee_density(&self) -> BigRational {

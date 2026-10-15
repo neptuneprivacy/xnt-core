@@ -1,5 +1,6 @@
 use crate::api::export::NeptuneProof;
 use crate::api::export::TransactionKernelId;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::state::mempool::primitive_witness_update::PrimitiveWitnessUpdate;
 
@@ -23,6 +24,8 @@ pub enum MempoolUpdateJob {
         old_kernel: TransactionKernel,
         old_single_proof: NeptuneProof,
     },
+    /// The transaction was a proof-backed link transaction
+    Link { old_link_tx: Box<LinkTx> },
 }
 
 impl MempoolUpdateJob {
@@ -35,6 +38,7 @@ impl MempoolUpdateJob {
                 primitive_witness_update.old_primitive_witness.kernel.txid()
             }
             MempoolUpdateJob::SingleProof { old_kernel, .. } => old_kernel.txid(),
+            MempoolUpdateJob::Link { old_link_tx } => old_link_tx.txid(),
         }
     }
 }

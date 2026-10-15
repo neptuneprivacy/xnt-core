@@ -71,10 +71,12 @@ use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::peer::handshake_data::HandshakeData;
@@ -86,6 +88,7 @@ use crate::protocol::peer::SyncChallengeResponse;
 use crate::protocol::peer::SYNC_CHALLENGE_POW_WITNESS_LENGTH;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::AddReason;
+use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
@@ -1919,8 +1922,25 @@ impl GlobalState {
         // removing all transaction that became invalid/was mined by this
         // block. Also returns the list of update-jobs that should be
         // performed by this client.
-        let (update_events, update_jobs) = self.mempool.update_with_block(&new_tip)?;
+        let (update_events, mut update_jobs) = self.mempool.update_with_block(&new_tip)?;
         mempool_events.extend(update_events);
+
+        // A link proof attests to the `SingleProof` program of the rule set it
+        // was made under. When this block changes that program, the resident
+        // link transactions can no longer be fixed, updated, or shared.
+        let network = self.cli().network;
+        let new_tip_height = new_tip.header().height;
+        let single_proof_program_changes = new_tip_height.previous().is_some_and(|parent_height| {
+            single_proof_program_digest(ConsensusRuleSet::infer_from(network, parent_height))
+                != single_proof_program_digest(ConsensusRuleSet::infer_from(
+                    network,
+                    new_tip_height,
+                ))
+        });
+        if single_proof_program_changes {
+            mempool_events.extend(self.mempool.remove_link_txs(RemovalReason::Abandoned));
+            update_jobs.retain(|job| !matches!(job, MempoolUpdateJob::Link { .. }));
+        }
 
         let parent_ms_accumulator =
             self.chain
@@ -2409,6 +2429,30 @@ impl GlobalState {
         }
 
         let events = self.mempool.insert(transaction, priority, add_reason);
+        self.mempool.log_events(&events, tip_height);
+        self.wallet_state.handle_mempool_events(events).await
+    }
+
+    /// Adds a link transaction to the mempool and notifies wallet of change.
+    ///
+    /// Refused unless the tip's rule set has chain branches: before then, no
+    /// link transaction can be fixed into a block-eligible one.
+    pub(crate) async fn mempool_insert_link(
+        &mut self,
+        link_tx: LinkTx,
+        priority: UpgradePriority,
+        add_reason: AddReason,
+    ) {
+        let tip_height = self.chain.light_state().header().height;
+        if !ConsensusRuleSet::infer_from(self.cli().network, tip_height).has_chain_branches() {
+            debug!(
+                "Not adding link transaction {} to the mempool: chain branches are not active",
+                link_tx.txid()
+            );
+            return;
+        }
+
+        let events = self.mempool.insert_link(link_tx, priority, add_reason);
         self.mempool.log_events(&events, tip_height);
         self.wallet_state.handle_mempool_events(events).await
     }
