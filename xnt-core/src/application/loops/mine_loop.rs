@@ -1511,6 +1511,179 @@ pub(crate) mod tests {
         assert_eq!(1, state.mempool.num_own_txs(), "and inherits its priority");
     }
 
+    /// A chained payment, proven for real from send to block under the v8
+    /// rule set.
+    ///
+    /// On mock networks the chain steps produce no proofs, so this is where
+    /// `Forge`, `Cast`, `Chain`, and `Fix` run end to end: alice pays bob with
+    /// a single-proof transaction; before it is mined, bob pays most of it on
+    /// in a link transaction, which reaches alice; alice's composer fixes the
+    /// link transaction and merges it into the next block. That block must be
+    /// valid, and it must pay bob his change. Testnet follows the v8 rule set
+    /// from genesis, and its devnet wallet holds a premine.
+    ///
+    /// This test produces many proofs and might take a while to complete if
+    /// there is no proof cache.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn chained_payment_is_proven_and_mined_under_upgrade_vm_v8() {
+        use crate::api::export::KeyType;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+
+        let network = Network::Testnet(0);
+        let genesis_block = Block::genesis(network);
+        let consensus_rule_set =
+            ConsensusRuleSet::infer_from(network, genesis_block.header().height.next());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, consensus_rule_set);
+        assert!(consensus_rule_set.has_chain_branches());
+
+        let cli = cli_args::Args {
+            network,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        let mut alice =
+            mock_genesis_global_state(2, WalletEntropy::devnet_wallet(), cli.clone()).await;
+        let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let now = max(
+            Timestamp::now(),
+            genesis_block.header().timestamp + network.minimum_block_time(),
+        );
+
+        // alice pays bob 5 coins, in a single-proof transaction. Without a
+        // main loop to upgrade it, the transaction is proven up front.
+        let bob_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let fee = NativeCurrencyAmount::coins(1);
+        let mut rng = StdRng::seed_from_u64(5);
+        let output_to_bob = TxOutput::onchain_native_currency(
+            NativeCurrencyAmount::coins(5),
+            rng.random(),
+            bob_address,
+            false,
+        );
+        let alice_key = alice
+            .lock_guard()
+            .await
+            .wallet_state
+            .wallet_entropy
+            .nth_generation_spending_key_for_tests(0);
+        let config = TxCreationConfig::default()
+            .recover_change_on_chain(alice_key.into())
+            .with_prover_capability(TxProvingCapability::SingleProof);
+        let alice_artifacts = alice
+            .api()
+            .tx_initiator_internal()
+            .create_transaction(
+                vec![output_to_bob].into(),
+                fee,
+                now,
+                config,
+                consensus_rule_set,
+            )
+            .await
+            .unwrap();
+        let alice_tx: Transaction = alice_artifacts.transaction.clone().into();
+        assert!(alice_tx.proof.is_single_proof());
+        alice
+            .record_own_transaction(&alice_artifacts)
+            .await
+            .unwrap();
+        bob.lock_guard_mut()
+            .await
+            .mempool_insert(
+                alice_tx.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            )
+            .await;
+
+        // before any block, bob pays 3 of those coins to alice in a link
+        // transaction, which cuts through alice's transaction.
+        let alice_address = alice
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let link_tx = bob
+            .api_mut()
+            .tx_sender_mut()
+            .send_chained_link(
+                vec![(alice_address, NativeCurrencyAmount::coins(3))],
+                Default::default(),
+                fee,
+                now,
+            )
+            .await
+            .unwrap()
+            .link_tx()
+            .clone();
+        assert!(link_tx.kernel.thruputs.is_empty());
+        assert!(matches!(link_tx.proof, LinkTxProof::Proof(_)));
+        let txid = link_tx.txid();
+        assert!(bob.lock_guard().await.mempool.get_link(txid).is_some());
+
+        // the link transaction reaches alice, and replaces alice's own
+        // transaction there.
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(
+                link_tx.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            )
+            .await;
+        {
+            let state = alice.lock_guard().await;
+            assert!(state.mempool.get_link(txid).is_some());
+            assert!(!state.mempool.contains(alice_tx.txid()));
+        }
+
+        // alice's composer fixes the link transaction, and the block carrying
+        // it is valid.
+        let (block, _) = compose_block_helper(
+            genesis_block.clone(),
+            alice.clone(),
+            now,
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        let block_kernel = &block.body().transaction_kernel;
+        for input in &link_tx.kernel.kernel.inputs {
+            assert!(block_kernel.inputs.contains(input));
+        }
+        for output in &link_tx.kernel.kernel.outputs {
+            assert!(block_kernel.outputs.contains(output));
+        }
+        assert!(
+            block
+                .is_valid(&genesis_block, block.header().timestamp, network)
+                .await,
+            "block carrying the fixed link transaction must be valid"
+        );
+
+        // the block pays bob his change, and leaves no transaction behind.
+        for state in [&mut alice, &mut bob] {
+            state.set_new_tip(block.clone()).await.unwrap();
+            assert!(state.lock_guard().await.mempool.is_empty());
+        }
+        assert_eq!(
+            NativeCurrencyAmount::coins(1),
+            bob.api()
+                .wallet()
+                .balances(block.header().timestamp)
+                .await
+                .confirmed_available
+        );
+    }
+
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn block_proposal_for_height_one_is_valid_for_various_guesser_fee_fractions() {
