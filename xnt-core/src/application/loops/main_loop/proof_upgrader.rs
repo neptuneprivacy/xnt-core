@@ -20,12 +20,14 @@ use crate::application::triton_vm_job_queue::TritonVmJobPriority;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -66,6 +68,16 @@ pub enum UpgradeJob {
         upgrade_incentive: UpgradeIncentive,
     },
     UpdateMutatorSetData(UpdateMutatorSetDataJob),
+
+    /// Fix a resolved link transaction into a `SingleProof`-backed
+    /// transaction with the same txid. Gobbles nothing; the incentive
+    /// reflects this node's own interest in the transaction, e.g. having
+    /// initiated (part of) it.
+    Fix {
+        link_tx: LinkTx,
+        mutator_set: MutatorSetAccumulator,
+        upgrade_incentive: UpgradeIncentive,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +318,7 @@ impl UpgradeJob {
             UpgradeJob::UpdateMutatorSetData(update_mutator_set_data_job) => {
                 update_mutator_set_data_job.old_kernel.timestamp
             }
+            UpgradeJob::Fix { link_tx, .. } => link_tx.kernel.kernel.timestamp,
         }
     }
 
@@ -331,6 +344,9 @@ impl UpgradeJob {
             UpgradeJob::UpdateMutatorSetData(UpdateMutatorSetDataJob {
                 upgrade_incentive, ..
             }) => *upgrade_incentive,
+            UpgradeJob::Fix {
+                upgrade_incentive, ..
+            } => *upgrade_incentive,
         }
     }
 
@@ -357,6 +373,7 @@ impl UpgradeJob {
                 vec![pw_to_sp.primitive_witness.kernel.txid()]
             }
             UpgradeJob::UpdateMutatorSetData(update_job) => vec![update_job.old_kernel.txid()],
+            UpgradeJob::Fix { link_tx, .. } => vec![link_tx.txid()],
         }
     }
 
@@ -375,6 +392,7 @@ impl UpgradeJob {
                 ..
             }) => mutator_set.clone(),
             UpgradeJob::Merge { mutator_set, .. } => mutator_set.clone(),
+            UpgradeJob::Fix { mutator_set, .. } => mutator_set.clone(),
             UpgradeJob::UpdateMutatorSetData(update_mutator_set_data_job) => {
                 let mut new_msa = update_mutator_set_data_job.old_mutator_set.clone();
                 update_mutator_set_data_job
@@ -405,6 +423,9 @@ impl UpgradeJob {
             }
             UpgradeJob::UpdateMutatorSetData(_) => {
                 "Transaction got mined while this update job was running?"
+            }
+            UpgradeJob::Fix { .. } => {
+                "The link transaction got mined or fixed by someone else already?"
             }
         }
     }
@@ -601,6 +622,7 @@ impl UpgradeJob {
                         UpgradeJob::ProofCollectionToSingleProof { .. } => unreachable!(),
                         UpgradeJob::Merge { .. } => unreachable!(),
                         UpgradeJob::UpdateMutatorSetData(_) => unreachable!(),
+                        UpgradeJob::Fix { .. } => unreachable!(),
                     }
                 }
             };
@@ -867,6 +889,17 @@ impl UpgradeJob {
                     .await?;
                 Ok((ret, gobbler_expected_utxo))
             }
+            UpgradeJob::Fix { link_tx, .. } => {
+                let ret = fix_link_tx(
+                    link_tx,
+                    consensus_rule_set,
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await?;
+                info!("Proof-upgrader, fix: Done");
+                Ok((ret, gobbler_expected_utxo))
+            }
         }
     }
 }
@@ -888,6 +921,27 @@ pub(super) async fn get_upgrade_task_from_mempool(
     let num_proofs_threshold = global_state.max_num_proofs();
 
     let upgrade_filter = global_state.cli().tx_upgrade_filter;
+
+    // Do we have a resolved link transaction to fix? Fixing gobbles nothing,
+    // but our own interest in the transaction can still make it urgent. A
+    // foreign one is fixed only if this node upgrades for free. And only under
+    // a rule set whose `SingleProof` program has the `Fix` branch.
+    let fix_job = global_state
+        .consensus_rule_set()
+        .has_chain_branches()
+        .then(|| global_state.mempool.preferred_link_fix(upgrade_filter))
+        .flatten()
+        .map(|(link_tx, priority)| {
+            let upgrade_incentive =
+                priority.incentive_given_gobble_potential(NativeCurrencyAmount::zero());
+            (link_tx, upgrade_incentive)
+        })
+        .filter(|(_, upgrade_incentive)| upgrade_incentive.upgrade_is_worth_it(min_gobbling_fee))
+        .map(|(link_tx, upgrade_incentive)| UpgradeJob::Fix {
+            link_tx: link_tx.to_owned(),
+            mutator_set: tip_mutator_set.clone(),
+            upgrade_incentive,
+        });
 
     // Do we have any `ProofCollection`s?
     let proof_collection_job = if let Some((kernel, proof, upgrade_priority)) = global_state
@@ -974,7 +1028,7 @@ pub(super) async fn get_upgrade_task_from_mempool(
     };
 
     // pick the most profitable option
-    let mut jobs = [proof_collection_job, merge_job, update_job]
+    let mut jobs = [proof_collection_job, merge_job, update_job, fix_job]
         .into_iter()
         .flatten()
         .collect_vec();
@@ -1116,6 +1170,99 @@ mod tests {
                 "Returned job must be the one with a high fee"
             );
         }
+    }
+
+    /// A resolved, proof-backed link transaction synced to the genesis block of
+    /// the network, which has chain branches at every height.
+    fn resolved_link_tx(network: Network) -> LinkTx {
+        use tasm_lib::triton_vm::proof::Claim;
+
+        use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::tests::shared::mock_tx::make_plenty_mock_transaction_supported_by_invalid_single_proofs;
+
+        let mutator_set_hash = Block::genesis(network)
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .hash();
+        let [tx] = make_plenty_mock_transaction_supported_by_invalid_single_proofs(1)
+            .try_into()
+            .unwrap();
+        LinkTx {
+            kernel: LinkKernel {
+                kernel: TransactionKernelModifier::default()
+                    .mutator_set_hash(mutator_set_hash)
+                    .modify(tx.kernel),
+                thruputs: vec![],
+            },
+            proof: LinkTxProof::Proof(Proof::valid_mock(Claim::new(Digest::default()))),
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn foreign_link_is_fixed_only_when_upgrading_for_free() {
+        let network = Network::RegTest;
+        let resolved_foreign_link = resolved_link_tx(network);
+
+        for (min_gobbling_fee, expect_fix) in [
+            (NativeCurrencyAmount::coins(1), false),
+            (NativeCurrencyAmount::coins(0), true),
+        ] {
+            let cli_args = cli_args::Args {
+                min_gobbling_fee,
+                network,
+                tx_proving_capability: Some(TxProvingCapability::SingleProof),
+                ..Default::default()
+            };
+            let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli_args).await;
+            bob.lock_guard_mut()
+                .await
+                .mempool_insert_link(
+                    resolved_foreign_link.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+
+            let job = get_upgrade_task_from_mempool(&*bob.lock_guard().await).await;
+            assert_eq!(
+                expect_fix,
+                matches!(job, Some(UpgradeJob::Fix { .. })),
+                "min gobbling fee {min_gobbling_fee}"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn fix_job_yields_a_single_proof_transaction_with_the_same_txid() {
+        let network = Network::RegTest;
+        let link_tx = resolved_link_tx(network);
+        let txid = link_tx.txid();
+        let job = UpgradeJob::Fix {
+            mutator_set: Block::genesis(network)
+                .mutator_set_accumulator_after()
+                .unwrap(),
+            link_tx,
+            upgrade_incentive: UpgradeIncentive::Critical,
+        };
+        assert_eq!(vec![txid], job.affected_txids());
+
+        let (fixed, gobbler_utxo) = job
+            .upgrade(
+                TritonVmJobQueue::get_instance(),
+                TritonVmProofJobOptions::default_with_network(network),
+                &WalletEntropy::new_random(),
+                BlockHeight::genesis(),
+                FeeNotificationPolicy::OffChain,
+            )
+            .await
+            .unwrap();
+        assert_eq!(txid, fixed.txid());
+        assert!(fixed.proof.is_single_proof());
+        assert!(gobbler_utxo.is_none(), "fixing gobbles nothing");
     }
 
     #[traced_test]

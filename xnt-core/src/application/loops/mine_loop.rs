@@ -51,12 +51,15 @@ use crate::protocol::consensus::block::*;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
 use crate::protocol::consensus::transaction::*;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 #[cfg(test)]
 use crate::protocol::shared::SIZE_20MB_IN_BYTES;
+use crate::state::mempool::mempool_event::AddReason;
+use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::transaction_output::TxOutputList;
@@ -491,6 +494,50 @@ pub(crate) async fn create_block_transaction(
 
 /// # Panics
 ///  - If predecessor has a negative transaction fee
+/// Fix the mempool's preferred resolved link transaction into a
+/// `SingleProof`-backed transaction for the block being composed, if there is
+/// one. Only if the block keeps the rule set of its predecessor, under which
+/// the link transaction was admitted, and that rule set has the `Fix` branch.
+///
+/// The fixed transaction is inserted into the mempool, so it need not be fixed
+/// again for another block proposal. It replaces the link transaction under the
+/// same txid.
+async fn fix_resolved_link_tx_from_mempool(
+    global_state_lock: &mut GlobalStateLock,
+    predecessor_rule_set: ConsensusRuleSet,
+    consensus_rule_set: ConsensusRuleSet,
+    vm_job_queue: Arc<TritonVmJobQueue>,
+    proof_job_options: TritonVmProofJobOptions,
+) -> Result<Option<Transaction>> {
+    if predecessor_rule_set != consensus_rule_set || !consensus_rule_set.has_chain_branches() {
+        return Ok(None);
+    }
+
+    let link_to_fix = global_state_lock
+        .lock_guard()
+        .await
+        .mempool
+        .preferred_link_fix(TxUpgradeFilter::match_all())
+        .map(|(link_tx, _)| link_tx.to_owned());
+    let Some(link_tx) = link_to_fix else {
+        return Ok(None);
+    };
+
+    info!("Fixing resolved link transaction from mempool instead of building a nop");
+    let fixed = fix_link_tx(link_tx, consensus_rule_set, vm_job_queue, proof_job_options).await?;
+    global_state_lock
+        .lock_guard_mut()
+        .await
+        .mempool_insert(
+            fixed.clone(),
+            UpgradePriority::Irrelevant,
+            AddReason::Upgraded,
+        )
+        .await;
+
+    Ok(Some(fixed))
+}
+
 pub(crate) async fn create_block_transaction_from(
     predecessor_block: &Block,
     mut global_state_lock: GlobalStateLock,
@@ -583,6 +630,25 @@ pub(crate) async fn create_block_transaction_from(
             }
         } else {
             info!("No suitable transaction found for updating.");
+        }
+    }
+
+    // Before falling back to a nop, check for a synced link transaction with
+    // no thruputs in the mempool: fix + merge is much cheaper than nop
+    // proof-collection + raise + merge, and it confirms a real transaction.
+    if transactions_to_merge.is_empty() && tx_merge_origin == TxMergeOrigin::Mempool {
+        let predecessor_rule_set =
+            ConsensusRuleSet::infer_from(network, predecessor_block.header().height);
+        if let Some(fixed) = fix_resolved_link_tx_from_mempool(
+            &mut global_state_lock,
+            predecessor_rule_set,
+            consensus_rule_set,
+            vm_job_queue.clone(),
+            proof_job_options.clone(),
+        )
+        .await?
+        {
+            transactions_to_merge = vec![fixed];
         }
     }
 
@@ -1345,6 +1411,79 @@ pub(crate) mod tests {
             block2_tx.kernel.inputs.len(),
             "Block tx must have exactly one input from Alice's tx"
         );
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn composer_fixes_a_resolved_link_transaction_from_the_mempool() {
+        use crate::protocol::consensus::chaintx::cast::cast;
+        use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
+
+        let network = Network::RegTest;
+        let mut alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let genesis_block = Block::genesis(network);
+        let now = genesis_block.kernel.header.timestamp + Timestamp::months(7);
+        let tx = make_transaction(NativeCurrencyAmount::coins(4), &alice, now).await;
+
+        // Only the link transaction is in the mempool, not the transaction it
+        // is cast from.
+        let rules = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let proof_job_options = TritonVmProofJobOptions::default_with_network(network);
+        let link_tx = cast(
+            tx.clone(),
+            single_proof_program_digest(rules),
+            rules,
+            vm_job_queue(),
+            proof_job_options.clone(),
+        )
+        .await
+        .unwrap();
+        let txid = link_tx.txid();
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(link_tx, UpgradePriority::Critical, AddReason::Submitted)
+            .await;
+        assert!(alice.lock_guard().await.mempool.get_link(txid).is_some());
+
+        // Not across a change of rule set.
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            ConsensusRuleSet::UpgradeVMv7,
+            rules,
+            vm_job_queue(),
+            proof_job_options.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(fixed.is_none());
+
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            rules,
+            rules,
+            vm_job_queue(),
+            proof_job_options,
+        )
+        .await
+        .unwrap()
+        .expect("a resolved, synced link transaction must be fixed");
+        assert_eq!(txid, fixed.txid());
+        assert_eq!(tx.kernel, fixed.kernel);
+        assert!(fixed.proof.is_single_proof());
+
+        let state = alice.lock_guard().await;
+        assert!(
+            state.mempool.get_link(txid).is_none(),
+            "the fixed transaction replaces its link transaction"
+        );
+        assert_eq!(Some(&fixed), state.mempool.get(txid));
+        assert_eq!(1, state.mempool.num_own_txs(), "and inherits its priority");
     }
 
     #[traced_test]
