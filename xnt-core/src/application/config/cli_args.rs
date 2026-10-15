@@ -916,6 +916,33 @@ impl Args {
         self.into()
     }
 
+    /// Check if a link transaction pays enough fees to be relayed and accepted.
+    ///
+    /// It must clear a fraction of the proof-collection fee floor since a link
+    /// is cheaper to upgrade than a proof collection. A link transaction
+    /// without confirmed inputs pays the floor of one input.
+    pub(crate) fn relay_link_transaction(
+        &self,
+        num_inputs: u64,
+        tx_fee: NativeCurrencyAmount,
+    ) -> bool {
+        /// How much cheaper a link is to upgrade than a proof collection.
+        const LINK_TX_FEE_FLOOR_DIVISOR: i128 = 4;
+
+        let Ok(num_inputs) = u32::try_from(num_inputs) else {
+            return false;
+        };
+        let Some(pctx_floor) = self
+            .min_relay_pctx_fee_per_input
+            .checked_scalar_mul(num_inputs.max(1))
+        else {
+            error!("Multiplication overflowed in fee calculation. This should not happen.");
+            return false;
+        };
+
+        tx_fee >= NativeCurrencyAmount::from_nau(pctx_floor.to_nau() / LINK_TX_FEE_FLOOR_DIVISOR)
+    }
+
     /// Check if a transaction should be inserted into the mempool and relayed
     /// to peers. Proofcollection-backed transactions that pay too small fees
     /// are not relayed.
@@ -1054,6 +1081,31 @@ mod tests {
     #[test]
     fn cli_args_default_network_agrees_with_enum_default() {
         assert_eq!(Args::default().network, Network::default());
+    }
+
+    #[test]
+    fn relay_link_transaction_unit_test() {
+        let cli = Args::default();
+        let floor_per_input =
+            NativeCurrencyAmount::from_nau(cli.min_relay_pctx_fee_per_input.to_nau() / 4);
+        assert!(cli.relay_link_transaction(1, floor_per_input));
+        assert!(!cli.relay_link_transaction(
+            1,
+            NativeCurrencyAmount::from_nau(floor_per_input.to_nau() - 1)
+        ));
+        assert!(
+            cli.relay_link_transaction(0, floor_per_input),
+            "a link transaction without confirmed inputs pays the floor of one"
+        );
+        assert!(!cli.relay_link_transaction(0, NativeCurrencyAmount::zero()));
+        assert!(!cli.relay_link_transaction(
+            2,
+            NativeCurrencyAmount::from_nau(floor_per_input.scalar_mul(2).to_nau() - 1)
+        ));
+        assert!(
+            !cli.relay_link_transaction(u64::MAX, NativeCurrencyAmount::coins(1000)),
+            "an overflowing input count is refused"
+        );
     }
 
     #[test]

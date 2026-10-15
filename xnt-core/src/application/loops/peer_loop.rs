@@ -27,6 +27,7 @@ use tracing::warn;
 
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
+use crate::application::loops::channel::PeerTaskToMainLinkTx;
 use crate::application::loops::channel::PeerTaskToMainTransaction;
 use crate::application::loops::connect_to_peers::close_peer_connected_callback;
 use crate::application::loops::main_loop::MAX_NUM_DIGESTS_IN_BATCH_REQUEST;
@@ -37,6 +38,7 @@ use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionConfirmabilityError;
 use crate::protocol::consensus::transaction::Transaction;
@@ -44,6 +46,7 @@ use crate::protocol::peer::handshake_data::HandshakeData;
 use crate::protocol::peer::peer_info::PeerConnectionInfo;
 use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::transfer_block::TransferBlock;
+use crate::protocol::peer::transfer_link_tx::TransferLinkTx;
 use crate::protocol::peer::BlockProposalRequest;
 use crate::protocol::peer::BlockRequestBatch;
 use crate::protocol::peer::IssuedSyncChallenge;
@@ -56,6 +59,8 @@ use crate::protocol::peer::PositivePeerSanction;
 use crate::protocol::peer::SyncChallenge;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::mempool::link_tx_admission::link_tx_admissible;
+use crate::state::mempool::link_tx_admission::LinkTxAdmissionError;
 use crate::state::mempool::MEMPOOL_TX_THRESHOLD_AGE_IN_SECS;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
 use crate::state::GlobalState;
@@ -194,6 +199,59 @@ impl PeerLoopHandler {
             .height;
         ConsensusRuleSet::infer_from(self.global_state_lock.cli().network, tip_height)
             .is_legacy_era()
+    }
+
+    /// Whether the chain tip's rule set has chain branches, see
+    /// [`ConsensusRuleSet::has_chain_branches`]. Before then, link transactions
+    /// are ignored rather than punished, since the peers relaying them may be
+    /// honest.
+    async fn tip_has_chain_branches(&self) -> bool {
+        let tip_height = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        ConsensusRuleSet::infer_from(self.global_state_lock.cli().network, tip_height)
+            .has_chain_branches()
+    }
+
+    /// The sanction, if any, for a peer that sent a link transaction this node
+    /// does not admit. Reasons that describe a link transaction which may be
+    /// valid but is not admissible on this node right now earn none.
+    fn sanction_for_inadmissible_link_tx(
+        rejection: LinkTxAdmissionError,
+    ) -> Option<NegativePeerSanction> {
+        match rejection {
+            LinkTxAdmissionError::NotYetActive
+            | LinkTxAdmissionError::NotSynced
+            | LinkTxAdmissionError::TooOld
+            | LinkTxAdmissionError::FutureDated
+            | LinkTxAdmissionError::AlreadyKnown => None,
+            LinkTxAdmissionError::HasCoinbase => {
+                Some(NegativePeerSanction::NonMinedTransactionHasCoinbase)
+            }
+            LinkTxAdmissionError::NegativeFee => {
+                Some(NegativePeerSanction::TransactionWithNegativeFee)
+            }
+            LinkTxAdmissionError::TooBig(_) => Some(NegativePeerSanction::UnrelayableTransaction),
+            LinkTxAdmissionError::NotConfirmable(
+                TransactionConfirmabilityError::InvalidRemovalRecord(_),
+            ) => Some(NegativePeerSanction::UnconfirmableTransaction),
+            LinkTxAdmissionError::NotConfirmable(
+                TransactionConfirmabilityError::DuplicateInputs
+                | TransactionConfirmabilityError::AlreadySpentInput(_),
+            ) => Some(NegativePeerSanction::DoubleSpendingTransaction),
+            LinkTxAdmissionError::NotConfirmable(
+                TransactionConfirmabilityError::RemovalRecordUnpackFailure,
+            ) => Some(NegativePeerSanction::InvalidTransaction),
+            LinkTxAdmissionError::CannotApplyToMutatorSet => {
+                Some(NegativePeerSanction::CannotApplyTransactionToMutatorSet)
+            }
+            LinkTxAdmissionError::Invalid => Some(NegativePeerSanction::InvalidTransaction),
+        }
     }
 
     async fn punish(&mut self, reason: NegativePeerSanction) -> Result<()> {
@@ -1666,6 +1724,193 @@ impl PeerLoopHandler {
 
                 Ok(KEEP_CONNECTION_ALIVE)
             }
+            PeerMessage::LinkTx(transfer_link_tx) => {
+                log_slow_scope!(fn_name!() + "::PeerMessage::LinkTx");
+
+                if !self.tip_has_chain_branches().await {
+                    debug!("Ignoring link transaction: chain branches are not active");
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                // Check for oversized announcements before anything costlier.
+                for announcement in &transfer_link_tx.kernel.kernel.announcements {
+                    if announcement.message.len() > MAX_ANNOUNCEMENT_MESSAGE_SIZE {
+                        warn!(
+                            "Received link transaction with oversized announcement: {} BFEs \
+                             (max: {})",
+                            announcement.message.len(),
+                            MAX_ANNOUNCEMENT_MESSAGE_SIZE
+                        );
+                        self.punish(NegativePeerSanction::OversizedAnnouncement)
+                            .await?;
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                }
+
+                let num_inputs: u64 = transfer_link_tx
+                    .kernel
+                    .kernel
+                    .inputs
+                    .len()
+                    .try_into()
+                    .unwrap();
+                if !self
+                    .global_state_lock
+                    .cli()
+                    .relay_link_transaction(num_inputs, transfer_link_tx.kernel.kernel.fee)
+                {
+                    warn!("Received link transaction not meeting relay criteria");
+                    self.punish(NegativePeerSanction::UnrelayableTransaction)
+                        .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                let link_tx: LinkTx = (*transfer_link_tx).into();
+
+                let (
+                    tip,
+                    mutator_set_accumulator_after,
+                    current_block_height,
+                    already_known,
+                    thruputs_known,
+                ) = {
+                    let state = self.global_state_lock.lock_guard().await;
+                    (
+                        state.chain.light_state().hash(),
+                        state
+                            .chain
+                            .light_state()
+                            .mutator_set_accumulator_after()
+                            .expect("Block from state must have mutator set after"),
+                        state.chain.light_state().header().height,
+                        !state.mempool.accept_link_transaction(
+                            link_tx.txid(),
+                            link_tx.kernel.kernel.mutator_set_hash,
+                        ),
+                        state.mempool.contains_outputs(&link_tx.kernel.thruputs),
+                    )
+                };
+
+                // Every thruput must be an output of a mempool transaction;
+                // the mempool would refuse the link transaction anyway, so its
+                // proof is not worth verifying. Not punished since the peer
+                // might be acting in good faith: this node may simply not hold
+                // the predecessor.
+                if !thruputs_known {
+                    debug!("Received link transaction with unknown thruputs");
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                let network = self.global_state_lock.cli().network;
+                let consensus_rule_set =
+                    ConsensusRuleSet::infer_from(network, current_block_height);
+                let admission = link_tx_admissible(
+                    &link_tx,
+                    &mutator_set_accumulator_after,
+                    already_known,
+                    self.now(),
+                    network,
+                    consensus_rule_set,
+                )
+                .await;
+                if let Err(rejection) = admission {
+                    debug!(
+                        "Not admitting link transaction {}: {rejection:?}",
+                        link_tx.txid()
+                    );
+                    if let Some(sanction) = Self::sanction_for_inadmissible_link_tx(rejection) {
+                        self.punish(sanction).await?;
+                    }
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                // Otherwise, relay to main
+                let pt2m_link_tx = PeerTaskToMainLinkTx {
+                    link_tx,
+                    confirmable_for_block: tip,
+                };
+                self.to_main_tx
+                    .send(PeerTaskToMain::LinkTx(Box::new(pt2m_link_tx)))
+                    .await?;
+
+                Ok(KEEP_CONNECTION_ALIVE)
+            }
+            PeerMessage::LinkTxNotification(link_tx_notification) => {
+                if !self.tip_has_chain_branches().await {
+                    debug!("Ignoring link transaction notification: chain branches are not active");
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                // new scope for state read-lock to avoid holding across peer.send()
+                {
+                    log_slow_scope!(fn_name!() + "::PeerMessage::LinkTxNotification");
+
+                    // No negative fees anywhere in the chain pipeline.
+                    if link_tx_notification.fee.is_negative() {
+                        debug!("link transaction notification carries a negative fee");
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
+                    // Do not request what would be refused on arrival.
+                    if !self.global_state_lock.cli().relay_link_transaction(
+                        link_tx_notification.num_inputs,
+                        link_tx_notification.fee,
+                    ) {
+                        debug!("link transaction does not meet relay criteria");
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
+                    let state = self.global_state_lock.lock_guard().await;
+                    if !state.mempool.accept_link_transaction(
+                        link_tx_notification.txid,
+                        link_tx_notification.mutator_set_hash,
+                    ) {
+                        debug!("link transaction was already known");
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
+                    // Only accept link transactions synced to the tip.
+                    if state
+                        .chain
+                        .light_state()
+                        .mutator_set_accumulator_after()
+                        .expect("Block from state must have mutator set after")
+                        .hash()
+                        != link_tx_notification.mutator_set_hash
+                    {
+                        debug!("link transaction refers to non-canonical mutator set state");
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                }
+
+                debug!("requesting link transaction from peer");
+                peer.send(PeerMessage::LinkTxRequest(link_tx_notification.txid))
+                    .await?;
+
+                Ok(KEEP_CONNECTION_ALIVE)
+            }
+            PeerMessage::LinkTxRequest(link_tx_identifier) => {
+                let state = self.global_state_lock.lock_guard().await;
+                let Some(link_tx) = state.mempool.get_link(link_tx_identifier) else {
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                };
+
+                let Ok(transfer_link_tx) = TransferLinkTx::try_from(link_tx) else {
+                    warn!(
+                        "Peer requested link transaction that cannot be converted to \
+                         transfer object"
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                };
+
+                // Drop state immediately to prevent holding over a response.
+                drop(state);
+
+                peer.send(PeerMessage::LinkTx(Box::new(transfer_link_tx)))
+                    .await?;
+
+                Ok(KEEP_CONNECTION_ALIVE)
+            }
             PeerMessage::BlockProposalNotification(block_proposal_notification) => {
                 let peer_ip = self.peer_address.ip();
                 let verdict = self
@@ -1908,6 +2153,18 @@ impl PeerLoopHandler {
                 ))
                 .await?;
                 debug!("Sent PeerMessage::TransactionNotification");
+                Ok(KEEP_CONNECTION_ALIVE)
+            }
+            MainToPeerTask::LinkTxNotification(link_tx_notification) => {
+                // A peer that does not know the message cannot decode it.
+                if !self.peer_handshake_data.supports_link_transactions() {
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
+                debug!("Sending PeerMessage::LinkTxNotification");
+                peer.send(PeerMessage::LinkTxNotification(link_tx_notification))
+                    .await?;
+                debug!("Sent PeerMessage::LinkTxNotification");
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             MainToPeerTask::BlockProposalNotification(block_proposal_notification) => {
@@ -4451,6 +4708,291 @@ mod tests {
 
             drop(to_main_rx);
             drop(main_to_peer_tx);
+        }
+    }
+
+    mod link_transactions {
+        use tasm_lib::prelude::Digest;
+        use tasm_lib::triton_vm::proof::Claim;
+
+        use super::*;
+        use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+        use crate::protocol::peer::handshake_data::VersionString;
+        use crate::protocol::peer::link_tx_notification::LinkTxNotification;
+        use crate::util_types::mutator_set::addition_record::AdditionRecord;
+
+        /// Chain branches are active at every height of this network.
+        const NETWORK: Network = Network::RegTest;
+
+        struct TestSetup {
+            peer_loop_handler: PeerLoopHandler,
+            to_main_rx: mpsc::Receiver<PeerTaskToMain>,
+            peer_state: MutablePeerState,
+        }
+
+        async fn genesis_setup(network: Network) -> TestSetup {
+            let cli = cli_args::Args {
+                network,
+                ..Default::default()
+            };
+            let (_peer_broadcast_tx, _from_main_rx, to_main_tx, to_main_rx, state_lock, _hsd) =
+                get_test_genesis_setup(network, 1, cli).await.unwrap();
+            let peer_address = state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .keys()
+                .next()
+                .unwrap()
+                .to_owned();
+            let peer_handshake_data = get_dummy_handshake_data_for_genesis(network);
+            let peer_state = MutablePeerState::new(peer_handshake_data.tip_header.height);
+            let peer_loop_handler = PeerLoopHandler::new(
+                to_main_tx,
+                state_lock,
+                peer_address,
+                peer_handshake_data,
+                true,
+                1,
+            );
+
+            TestSetup {
+                peer_loop_handler,
+                to_main_rx,
+                peer_state,
+            }
+        }
+
+        async fn tip_mutator_set_hash(setup: &TestSetup) -> Digest {
+            setup
+                .peer_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .chain
+                .light_state()
+                .mutator_set_accumulator_after()
+                .unwrap()
+                .hash()
+        }
+
+        async fn standing(setup: &TestSetup) -> i32 {
+            setup
+                .peer_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .get(&setup.peer_loop_handler.peer_address)
+                .unwrap()
+                .standing
+                .standing
+        }
+
+        /// A proof-backed link transaction without confirmed inputs or
+        /// outputs, paying more than the relay floor.
+        fn link_tx(
+            mutator_set_hash: Digest,
+            thruputs: Vec<AdditionRecord>,
+            valid_proof: bool,
+        ) -> LinkTx {
+            let kernel = TransactionKernelProxy {
+                inputs: vec![],
+                outputs: vec![],
+                announcements: vec![],
+                fee: NativeCurrencyAmount::coins(1),
+                timestamp: Timestamp::now(),
+                coinbase: None,
+                mutator_set_hash,
+                merge_bit: false,
+            }
+            .into_kernel();
+            let claim = Claim::new(Digest::default());
+            let proof = if valid_proof {
+                NeptuneProof::valid_mock(claim)
+            } else {
+                NeptuneProof::invalid_mock(claim)
+            };
+
+            LinkTx {
+                kernel: LinkKernel { kernel, thruputs },
+                proof: LinkTxProof::Proof(proof),
+            }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn link_tx_notification_is_sent_only_to_peers_that_know_it() {
+            let mut setup = genesis_setup(NETWORK).await;
+            let notification =
+                LinkTxNotification::try_from(&link_tx(Digest::default(), vec![], true)).unwrap();
+            for (version, knows_it) in [("0.2.7", false), ("0.3.0", true)] {
+                setup.peer_loop_handler.peer_handshake_data.version =
+                    VersionString::try_from_str(version).unwrap();
+                let expected = if knows_it {
+                    vec![Action::Write(PeerMessage::LinkTxNotification(notification))]
+                } else {
+                    vec![]
+                };
+                let mut stream = Mock::new(expected);
+                setup
+                    .peer_loop_handler
+                    .handle_main_task_message(
+                        MainToPeerTask::LinkTxNotification(notification),
+                        &mut stream,
+                        &mut setup.peer_state,
+                    )
+                    .await
+                    .unwrap();
+                assert!(stream.is_done(), "version {version}");
+            }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn link_tx_notification_is_answered_with_a_request_once_active() {
+            for (network, active) in [(NETWORK, true), (Network::Main, false)] {
+                let mut setup = genesis_setup(network).await;
+                let link_tx = link_tx(tip_mutator_set_hash(&setup).await, vec![], true);
+                let notification = LinkTxNotification::try_from(&link_tx).unwrap();
+                let expected = if active {
+                    vec![Action::Write(PeerMessage::LinkTxRequest(link_tx.txid()))]
+                } else {
+                    vec![]
+                };
+                let mut stream = Mock::new(expected);
+                setup
+                    .peer_loop_handler
+                    .handle_peer_message(
+                        PeerMessage::LinkTxNotification(notification),
+                        &mut stream,
+                        &mut setup.peer_state,
+                    )
+                    .await
+                    .unwrap();
+                assert!(stream.is_done(), "network {network}");
+            }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn link_tx_with_unknown_thruputs_is_dropped_unpunished() {
+            let mut setup = genesis_setup(NETWORK).await;
+            let unknown_thruput = AdditionRecord::new(Digest::default());
+            let link_tx = link_tx(
+                tip_mutator_set_hash(&setup).await,
+                vec![unknown_thruput],
+                false,
+            );
+            let mut stream = Mock::new(vec![]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::LinkTx(Box::new((&link_tx).try_into().unwrap())),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(0, standing(&setup).await);
+            assert!(matches!(
+                setup.to_main_rx.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn invalid_link_tx_is_punished_and_valid_one_is_relayed_to_main() {
+            let mut setup = genesis_setup(NETWORK).await;
+            let tip_msh = tip_mutator_set_hash(&setup).await;
+
+            let invalid = link_tx(tip_msh, vec![], false);
+            let mut stream = Mock::new(vec![]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::LinkTx(Box::new((&invalid).try_into().unwrap())),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                NegativePeerSanction::InvalidTransaction.severity(),
+                standing(&setup).await
+            );
+            assert!(matches!(
+                setup.to_main_rx.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+
+            let valid = link_tx(tip_msh, vec![], true);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::LinkTx(Box::new((&valid).try_into().unwrap())),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            let Ok(PeerTaskToMain::LinkTx(relayed)) = setup.to_main_rx.try_recv() else {
+                panic!("a valid link transaction must be relayed to the main loop");
+            };
+            assert_eq!(valid, relayed.link_tx);
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn link_tx_request_is_answered_from_the_mempool() {
+            let mut setup = genesis_setup(NETWORK).await;
+            let link_tx = link_tx(tip_mutator_set_hash(&setup).await, vec![], true);
+            let txid = link_tx.txid();
+
+            // Unknown: no answer.
+            let mut stream = Mock::new(vec![]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::LinkTxRequest(txid),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(stream.is_done());
+
+            setup
+                .peer_loop_handler
+                .global_state_lock
+                .lock_guard_mut()
+                .await
+                .mempool_insert_link(
+                    link_tx.clone(),
+                    UpgradePriority::Critical,
+                    AddReason::Submitted,
+                )
+                .await;
+            let mut stream = Mock::new(vec![Action::Write(PeerMessage::LinkTx(Box::new(
+                (&link_tx).try_into().unwrap(),
+            )))]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::LinkTxRequest(txid),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(stream.is_done());
         }
     }
 

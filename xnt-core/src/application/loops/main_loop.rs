@@ -59,6 +59,7 @@ use crate::protocol::consensus::transaction::validity::single_proof_v2::single_p
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::handshake_data::HandshakeData;
+use crate::protocol::peer::link_tx_notification::LinkTxNotification;
 use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::peer::PeerSynchronizationState;
@@ -681,14 +682,22 @@ impl MainLoopHandler {
 
         // Then notify all peers about shareable transactions.
         for updated in update_results {
-            if let MempoolUpdateJobResult::Success {
-                new_transaction, ..
-            } = updated
-            {
-                if let Ok(pmsg) = new_transaction.as_ref().try_into() {
-                    let pmsg = MainToPeerTask::TransactionNotification(pmsg);
-                    self.main_to_peer_broadcast(pmsg);
+            match updated {
+                MempoolUpdateJobResult::Success {
+                    new_transaction, ..
+                } => {
+                    if let Ok(pmsg) = new_transaction.as_ref().try_into() {
+                        let pmsg = MainToPeerTask::TransactionNotification(pmsg);
+                        self.main_to_peer_broadcast(pmsg);
+                    }
                 }
+                MempoolUpdateJobResult::SuccessLink { new_link_tx } => {
+                    if let Ok(pmsg) = new_link_tx.as_ref().try_into() {
+                        let pmsg = MainToPeerTask::LinkTxNotification(pmsg);
+                        self.main_to_peer_broadcast(pmsg);
+                    }
+                }
+                MempoolUpdateJobResult::Failure(_) => {}
             }
         }
 
@@ -1216,6 +1225,49 @@ impl MainLoopHandler {
 
                     let pmsg = MainToPeerTask::TransactionNotification(transaction_notification);
                     self.main_to_peer_broadcast(pmsg);
+                }
+            }
+            PeerTaskToMain::LinkTx(pt2m_link_tx) => {
+                log_slow_scope!(fn_name!() + "::PeerTaskToMain::LinkTx");
+
+                let link_tx = pt2m_link_tx.link_tx;
+                let txid = link_tx.txid();
+                debug!(
+                    "`peer_loop` received link transaction {txid} from peer. {} inputs, {} \
+                     thruputs, {} outputs.",
+                    link_tx.kernel.kernel.inputs.len(),
+                    link_tx.kernel.thruputs.len(),
+                    link_tx.kernel.kernel.outputs.len(),
+                );
+
+                let notification = {
+                    let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
+                    if pt2m_link_tx.confirmable_for_block
+                        != global_state_mut.chain.light_state().hash()
+                    {
+                        warn!("main loop got link transaction with bad mutator set data, discarding it");
+                        return Ok(());
+                    }
+
+                    global_state_mut
+                        .mempool_insert_link(
+                            link_tx.clone(),
+                            UpgradePriority::Irrelevant,
+                            AddReason::FromPeer,
+                        )
+                        .await;
+
+                    // Only announce what the mempool now holds, so that peers
+                    // asking for it get it.
+                    global_state_mut
+                        .mempool
+                        .get_link(txid)
+                        .filter(|held| **held == link_tx)
+                        .and_then(|held| LinkTxNotification::try_from(held).ok())
+                };
+
+                if let Some(notification) = notification {
+                    self.main_to_peer_broadcast(MainToPeerTask::LinkTxNotification(notification));
                 }
             }
             PeerTaskToMain::BlockProposal(block) => {
@@ -2164,6 +2216,12 @@ impl MainLoopHandler {
                         // transaction must exist in the mempool. It is on the
                         // link pipeline if it is not on the standard one.
                         let Some(tx) = state.mempool.get(txid) else {
+                            if let Some(link_tx) = state.mempool.get_link(txid) {
+                                if let Ok(notification) = LinkTxNotification::try_from(link_tx) {
+                                    notifications
+                                        .push(MainToPeerTask::LinkTxNotification(notification));
+                                }
+                            }
                             continue;
                         };
                         let notification = TransactionNotification::try_from(tx);

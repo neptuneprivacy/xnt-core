@@ -11,8 +11,10 @@ use crate::application::loops::main_loop::proof_upgrader::UpgradeJob;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+use crate::protocol::peer::link_tx_notification::LinkTxNotification;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
@@ -127,6 +129,9 @@ pub(crate) enum MainToPeerTask {
     /// Publish knowledge of a transaction
     TransactionNotification(TransactionNotification),
 
+    /// Publish knowledge of a proof-backed link transaction
+    LinkTxNotification(LinkTxNotification),
+
     /// Disconnect from a specific peer
     Disconnect(SocketAddr),
 
@@ -145,6 +150,7 @@ impl MainToPeerTask {
                 "make specific peer discovery req"
             }
             MainToPeerTask::TransactionNotification(_) => "transaction notification",
+            MainToPeerTask::LinkTxNotification(_) => "link transaction notification",
             MainToPeerTask::Disconnect(_) => "disconnect",
             MainToPeerTask::DisconnectAll() => "disconnect all",
             MainToPeerTask::BlockProposalNotification(_) => "block proposal notification",
@@ -163,6 +169,7 @@ impl MainToPeerTask {
             MainToPeerTask::MakePeerDiscoveryRequest => false,
             MainToPeerTask::MakeSpecificPeerDiscoveryRequest(_) => false,
             MainToPeerTask::TransactionNotification(_) => true,
+            MainToPeerTask::LinkTxNotification(_) => true,
             MainToPeerTask::Disconnect(_) => false,
             MainToPeerTask::DisconnectAll() => false,
         }
@@ -187,6 +194,7 @@ pub(crate) enum PeerTaskToMain {
     PeerDiscoveryAnswer((Vec<(SocketAddr, u128)>, SocketAddr, u8)),
 
     Transaction(Box<PeerTaskToMainTransaction>),
+    LinkTx(Box<PeerTaskToMainLinkTx>),
     BlockProposal(Box<Block>),
     DisconnectFromLongestLivedPeer,
 }
@@ -194,6 +202,12 @@ pub(crate) enum PeerTaskToMain {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerTaskToMainTransaction {
     pub transaction: Transaction,
+    pub confirmable_for_block: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerTaskToMainLinkTx {
+    pub link_tx: LinkTx,
     pub confirmable_for_block: Digest,
 }
 
@@ -205,6 +219,7 @@ impl PeerTaskToMain {
             PeerTaskToMain::RemovePeerMaxBlockHeight(_) => "remove peer max block height",
             PeerTaskToMain::PeerDiscoveryAnswer(_) => "peer discovery answer",
             PeerTaskToMain::Transaction(_) => "transaction",
+            PeerTaskToMain::LinkTx(_) => "link transaction",
             PeerTaskToMain::BlockProposal(_) => "block proposal",
             PeerTaskToMain::DisconnectFromLongestLivedPeer => "disconnect from longest lived peer",
         }

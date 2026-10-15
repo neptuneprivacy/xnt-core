@@ -1,8 +1,10 @@
 pub(crate) mod handshake_data;
+pub mod link_tx_notification;
 pub mod peer_block_notifications;
 pub mod peer_info;
 pub mod transaction_notification;
 pub mod transfer_block;
+pub mod transfer_link_tx;
 pub mod transfer_transaction;
 
 use std::fmt::Display;
@@ -12,6 +14,7 @@ use std::time::SystemTime;
 
 use handshake_data::HandshakeData;
 use itertools::Itertools;
+use link_tx_notification::LinkTxNotification;
 use num_bigint::BigUint;
 use num_traits::CheckedSub;
 use num_traits::ToPrimitive;
@@ -31,6 +34,7 @@ use tracing::debug;
 use tracing::trace;
 use tracing::warn;
 use transaction_notification::TransactionNotification;
+use transfer_link_tx::TransferLinkTx;
 use transfer_transaction::TransferTransaction;
 
 use super::consensus::block::block_header::BlockHeader;
@@ -566,6 +570,14 @@ pub(crate) enum PeerMessage {
     /// Inform peer that we are disconnecting them.
     Bye,
     ConnectionStatus(TransferConnectionStatus),
+    /// Send a notification to a peer, informing it that this node stores the
+    /// proof-backed link transaction specified in `LinkTxNotification`.
+    LinkTxNotification(LinkTxNotification),
+    /// Send a request that this node would like a copy of the link
+    /// transaction with the given id.
+    LinkTxRequest(TransactionKernelId),
+    /// Send a full, proof-backed link transaction to a peer.
+    LinkTx(Box<TransferLinkTx>),
     // New variants must be added here at the bottom to be backwards compatible.
 }
 
@@ -593,6 +605,9 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => "unable to satisfy batch request",
             PeerMessage::SyncChallenge(_) => "sync challenge",
             PeerMessage::SyncChallengeResponse(_) => "sync challenge response",
+            PeerMessage::LinkTxNotification(_) => "link transaction notification",
+            PeerMessage::LinkTxRequest(_) => "link transaction request",
+            PeerMessage::LinkTx(_) => "link transaction",
         }
         .to_string()
     }
@@ -620,6 +635,9 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => true,
             PeerMessage::SyncChallenge(_) => false,
             PeerMessage::SyncChallengeResponse(_) => false,
+            PeerMessage::LinkTxNotification(_) => false,
+            PeerMessage::LinkTxRequest(_) => false,
+            PeerMessage::LinkTx(_) => false,
         }
     }
 
@@ -647,6 +665,9 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => false,
             PeerMessage::SyncChallenge(_) => false,
             PeerMessage::SyncChallengeResponse(_) => false,
+            PeerMessage::LinkTxNotification(_) => true,
+            PeerMessage::LinkTxRequest(_) => true,
+            PeerMessage::LinkTx(_) => true,
         }
     }
 
@@ -675,6 +696,9 @@ impl PeerMessage {
             PeerMessage::PeerListResponse(_) => false,
             PeerMessage::Bye => false,
             PeerMessage::ConnectionStatus(_) => false,
+            PeerMessage::LinkTxNotification(_) => true,
+            PeerMessage::LinkTxRequest(_) => true,
+            PeerMessage::LinkTx(_) => true,
         }
     }
 }
@@ -1259,6 +1283,23 @@ mod tests {
             block.header.cumulative_proof_of_work + [1u32];
 
         assert!(!response.check_pow(network, 1u64.into()));
+    }
+
+    /// Peer messages are encoded by variant index, so the link-transaction
+    /// messages are appended: every older variant keeps its index, and an
+    /// older peer can decode every message it knows.
+    #[test]
+    fn link_transaction_messages_are_appended() {
+        let tag = |message: &PeerMessage| -> u32 {
+            u32::from_le_bytes(
+                bincode::serialize(message).unwrap()[..4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(19, tag(&PeerMessage::Bye));
+        let txid = TransactionKernelId::default();
+        assert_eq!(22, tag(&PeerMessage::LinkTxRequest(txid)));
     }
 
     #[test]
