@@ -144,4 +144,7 @@ pub enum SendError {
 
     #[error("transaction can never be mined: {0}")]
     TooBig(#[from] TransactionTooBig),
+
+    #[error("chained send failed: {0}")]
+    Chained(String),
 }

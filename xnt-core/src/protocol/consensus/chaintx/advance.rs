@@ -233,27 +233,32 @@ impl LinkTx {
         let promotions = vec![];
 
         // compute new proof through recursion
-        let witness = AdvanceWitness::advance(
-            self,
-            previous_mutator_set_accumulator,
-            new_kernel.clone(),
-            &calculated_new_mutator_set,
-            aocl_successor_proof,
-            promotions,
-            single_proof_digest,
-        );
+        let proof = if proof_job_options.job_settings.network.use_mock_proof() {
+            Proof::valid_mock(Claim::new(Digest::default()))
+        } else {
+            let witness = AdvanceWitness::advance(
+                self,
+                previous_mutator_set_accumulator,
+                new_kernel.clone(),
+                &calculated_new_mutator_set,
+                aocl_successor_proof,
+                promotions,
+                single_proof_digest,
+            );
 
-        tracing::info!("starting link proof via advance ...");
-        let witness = LinkProofWitness::from_advance(witness);
-        let proof = LinkProof
-            .prove(
-                witness.claim(),
-                witness.nondeterminism(),
-                triton_vm_job_queue,
-                proof_job_options,
-            )
-            .await?;
-        tracing::info!("done.");
+            tracing::info!("starting link proof via advance ...");
+            let witness = LinkProofWitness::from_advance(witness);
+            let proof = LinkProof
+                .prove(
+                    witness.claim(),
+                    witness.nondeterminism(),
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await?;
+            tracing::info!("done.");
+            proof
+        };
 
         Ok(LinkTx {
             kernel: new_kernel,

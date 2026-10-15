@@ -242,6 +242,7 @@ pub(crate) struct ClaimUtxoData {
 #[derive(Clone, Debug, strum::Display)]
 pub enum RPCServerToMain {
     BroadcastTx(Arc<Transaction>),
+    BroadcastOwnLinkTx(Arc<LinkTx>),
     PerformTxProofUpgrade(Box<UpgradeJob>),
     BroadcastMempoolTransactions,
     BroadcastBlockProposal,

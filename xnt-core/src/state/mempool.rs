@@ -771,7 +771,7 @@ impl Mempool {
     /// id.
     ///
     /// Computes in O(1) from HashMap
-    pub(crate) fn get_link(&self, transaction_id: TransactionKernelId) -> Option<&LinkTx> {
+    pub fn get_link(&self, transaction_id: TransactionKernelId) -> Option<&LinkTx> {
         self.tx_dictionary
             .get(&transaction_id)
             .and_then(|x| x.transaction.as_link())

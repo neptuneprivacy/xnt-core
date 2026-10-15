@@ -20,6 +20,10 @@ use crate::application::triton_vm_job_queue::TritonVmJobPriority;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+use crate::protocol::consensus::chaintx::cast::cast;
+use crate::protocol::consensus::chaintx::chain::chain;
+use crate::protocol::consensus::chaintx::forge::forge;
+use crate::protocol::consensus::chaintx::link_primitive_witness::LinkPrimitiveWitness;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
@@ -28,6 +32,7 @@ use crate::protocol::consensus::transaction::transaction_proof::TransactionProof
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -78,6 +83,117 @@ pub enum UpgradeJob {
         mutator_set: MutatorSetAccumulator,
         upgrade_incentive: UpgradeIncentive,
     },
+}
+
+/// Forge a [`LinkPrimitiveWitness`] into a proof-backed [`LinkTx`]: the first
+/// step of a chained send.
+///
+/// Like its chain-pipeline siblings [`CastJob`], [`ChainJob`] and
+/// [`UpdateLinkJob`], not a variant of [`UpgradeJob`]: the output is a
+/// [`LinkTx`], not a [`Transaction`], so it does not fit that enum's `upgrade`
+/// interface.
+#[derive(Clone, Debug)]
+pub(crate) struct ForgeJob {
+    pub link_primitive_witness: LinkPrimitiveWitness,
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl ForgeJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        Ok(forge(
+            &self.link_primitive_witness,
+            single_proof_program_digest(self.consensus_rule_set),
+            self.consensus_rule_set,
+            triton_vm_job_queue,
+            proof_job_options,
+        )
+        .await?)
+    }
+}
+
+/// Cast a `SingleProof`-backed [`Transaction`] into a proof-backed
+/// [`LinkTx`], so it can be cut through, i.e. be an operand of [`ChainJob`].
+#[derive(Clone, Debug)]
+pub(crate) struct CastJob {
+    pub transaction: Transaction,
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl CastJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        Ok(cast(
+            self.transaction,
+            single_proof_program_digest(self.consensus_rule_set),
+            self.consensus_rule_set,
+            triton_vm_job_queue,
+            proof_job_options,
+        )
+        .await?)
+    }
+}
+
+/// Chain two proof-backed [`LinkTx`]s into one, with maximal cut-through.
+#[derive(Clone, Debug)]
+pub(crate) struct ChainJob {
+    pub left: LinkTx,
+    pub right: LinkTx,
+    pub shuffle_seed: [u8; 32],
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl ChainJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        Ok(chain(
+            self.left,
+            self.right,
+            single_proof_program_digest(self.consensus_rule_set),
+            self.consensus_rule_set,
+            self.shuffle_seed,
+            triton_vm_job_queue,
+            proof_job_options,
+        )
+        .await?)
+    }
+}
+
+/// Re-target a proof-backed [`LinkTx`] at a newer mutator set, after blocks
+/// arrived while a chained send was proving. See [`ForgeJob`].
+#[derive(Clone, Debug)]
+pub(crate) struct UpdateLinkJob {
+    pub link_tx: LinkTx,
+    pub old_mutator_set_accumulator: MutatorSetAccumulator,
+    pub mutator_set_update: MutatorSetUpdate,
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl UpdateLinkJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        self.link_tx
+            .new_with_updated_mutator_set_records(
+                &self.old_mutator_set_accumulator,
+                &self.mutator_set_update,
+                single_proof_program_digest(self.consensus_rule_set),
+                triton_vm_job_queue,
+                proof_job_options,
+            )
+            .await
+    }
 }
 
 #[derive(Clone, Debug)]

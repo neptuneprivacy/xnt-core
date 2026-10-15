@@ -338,7 +338,7 @@ impl TransactionDetailsBuilder {
     /// with claiming it later on.
     //
     // "Later on" meaning: as an [ExpectedUtxo].
-    fn create_change_output(
+    pub(crate) fn create_change_output(
         wallet_state: &WalletState,
         tip_height: BlockHeight,
         change_amount: NativeCurrencyAmount,

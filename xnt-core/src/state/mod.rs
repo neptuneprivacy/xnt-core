@@ -92,6 +92,8 @@ use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
+use crate::state::transaction::chained_tx_artifacts::ChainedTxArtifacts;
+use crate::state::transaction::link_tx_artifacts::LinkTxArtifacts;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::expected_utxo::UtxoNotifier;
 use crate::state::wallet::monitored_utxo::MonitoredUtxo;
@@ -360,6 +362,106 @@ impl GlobalStateLock {
 
         Ok(())
     }
+
+    /// Record a self-initiated chained transaction: the chain-pipeline analog
+    /// of [`Self::record_own_transaction`].
+    ///
+    /// A chained transaction has no primitive witness, so the caller is
+    /// responsible for having validated the link primitive witness it grew
+    /// from. No [`SentTransaction`] is recorded, as its data model assumes
+    /// confirmed inputs.
+    pub(crate) async fn record_own_chained_transaction(
+        &mut self,
+        tx_artifacts: &ChainedTxArtifacts,
+    ) -> std::result::Result<(), RecordTransactionError> {
+        // acquire write-lock
+        let mut gsm = self.lock_guard_mut().await;
+        let block_height = gsm.chain.light_state().header().height;
+        let network = gsm.cli().network;
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+
+        let transaction = tx_artifacts.transaction.clone();
+        let details = tx_artifacts.details.clone();
+
+        if network != details.network {
+            return Err(TxCreationArtifactsError::NetworkMismatch.into());
+        }
+        if !transaction.is_valid(network, consensus_rule_set).await {
+            return Err(TxCreationArtifactsError::InvalidProof.into());
+        }
+
+        let utxos_sent_to_self = gsm
+            .wallet_state
+            .extract_expected_utxos(details.tx_outputs.iter(), UtxoNotifier::Myself);
+        if !utxos_sent_to_self.is_empty() {
+            gsm.wallet_state
+                .add_expected_utxos(utxos_sent_to_self)
+                .await;
+        }
+
+        gsm.mempool_insert(
+            (*transaction).clone(),
+            UpgradePriority::Critical,
+            AddReason::Submitted,
+        )
+        .await;
+
+        // The insert runs the replacement contest; a transaction that loses
+        // it -- e.g. against a conflicting mempool member with a higher fee
+        // density -- is refused, and must not be broadcast.
+        if gsm.mempool.get(transaction.kernel.txid()).is_none() {
+            return Err(RecordTransactionError::RefusedByMempool);
+        }
+
+        gsm.flush_databases().await.expect("flushed DBs");
+
+        Ok(())
+    }
+
+    /// Record a self-initiated link transaction: the link-valued sibling of
+    /// [`Self::record_own_chained_transaction`].
+    pub(crate) async fn record_own_link_transaction(
+        &mut self,
+        tx_artifacts: &LinkTxArtifacts,
+    ) -> std::result::Result<(), RecordTransactionError> {
+        // acquire write-lock
+        let mut gsm = self.lock_guard_mut().await;
+        let network = gsm.cli().network;
+
+        let link_tx = tx_artifacts.link_tx.clone();
+        let details = tx_artifacts.details.clone();
+
+        if network != details.network {
+            return Err(TxCreationArtifactsError::NetworkMismatch.into());
+        }
+
+        let utxos_sent_to_self = gsm
+            .wallet_state
+            .extract_expected_utxos(details.tx_outputs.iter(), UtxoNotifier::Myself);
+        if !utxos_sent_to_self.is_empty() {
+            gsm.wallet_state
+                .add_expected_utxos(utxos_sent_to_self)
+                .await;
+        }
+
+        gsm.mempool_insert_link(
+            (*link_tx).clone(),
+            UpgradePriority::Critical,
+            AddReason::Submitted,
+        )
+        .await;
+
+        // The insert runs the replacement contest; a link transaction that
+        // loses it -- e.g. against a conflicting mempool member with a higher
+        // fee density -- is refused, and must not be broadcast.
+        if gsm.mempool.get_link(link_tx.txid()).is_none() {
+            return Err(RecordTransactionError::RefusedByMempool);
+        }
+
+        gsm.flush_databases().await.expect("flushed DBs");
+
+        Ok(())
+    }
 }
 
 impl Deref for GlobalStateLock {
@@ -381,6 +483,9 @@ impl DerefMut for GlobalStateLock {
 pub enum RecordTransactionError {
     #[error("Invalid transaction: {0}")]
     InvalidTransaction(#[from] TxCreationArtifactsError),
+
+    #[error("the mempool refused the transaction")]
+    RefusedByMempool,
 }
 
 /// abstracts over lock acquisition types for [GlobalStateLock]

@@ -2184,6 +2184,34 @@ impl MainLoopHandler {
                 // do not shut down
                 Ok(false)
             }
+            RPCServerToMain::BroadcastOwnLinkTx(link_tx) => {
+                debug!(
+                    "`main` received link transaction from RPC server. {} confirmed inputs, \
+                     {} thruputs, {} outputs. Synced to mutator set hash: {}",
+                    link_tx.kernel.kernel.inputs.len(),
+                    link_tx.kernel.thruputs.len(),
+                    link_tx.kernel.kernel.outputs.len(),
+                    link_tx.kernel.kernel.mutator_set_hash
+                );
+
+                // note: this link transaction must already have been added to
+                // the mempool by the sender.
+
+                // Only proof-backed link transactions can be shared; the
+                // conversion fails for witness-backed ones, which must never
+                // leave the node.
+                match LinkTxNotification::try_from(link_tx.as_ref()) {
+                    Ok(notification) => {
+                        let pmsg = MainToPeerTask::LinkTxNotification(notification);
+                        self.main_to_peer_broadcast(pmsg);
+                    }
+                    Err(e) => {
+                        warn!("Refusing to broadcast link transaction: {e}");
+                    }
+                }
+
+                Ok(false)
+            }
             RPCServerToMain::PerformTxProofUpgrade(upgrade_job) => {
                 let vm_job_queue = vm_job_queue();
                 let global_state_lock_clone = self.global_state_lock.clone();

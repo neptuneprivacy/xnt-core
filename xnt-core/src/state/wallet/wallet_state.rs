@@ -592,6 +592,17 @@ impl WalletState {
             .map(|iu| (&iu.utxo, iu.addition_record(), iu.payment_id.value()))
     }
 
+    /// Get an iterator over the unconfirmed incoming UTXOs, corresponding to
+    /// outputs of transactions that live in the mempool, along with the id of
+    /// the transaction that creates each.
+    pub(crate) fn mempool_incoming_utxos_with_txid(
+        &self,
+    ) -> impl Iterator<Item = (TransactionKernelId, &IncomingUtxo)> {
+        self.mempool_unspent_utxos
+            .iter()
+            .flat_map(|(txid, incoming)| incoming.iter().map(|iu| (*txid, iu)))
+    }
+
     pub(crate) fn mempool_balance_updates(
         &self,
     ) -> (

@@ -28,23 +28,41 @@ use crate::api::tx_initiation::builder::tx_input_list_builder::SortOrder;
 use crate::api::tx_initiation::builder::tx_input_list_builder::TxInputListBuilder;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
 use crate::api::tx_initiation::builder::tx_output_list_builder::TxOutputListBuilder;
+use crate::application::loops::main_loop::proof_upgrader::CastJob;
+use crate::application::loops::main_loop::proof_upgrader::ChainJob;
+use crate::application::loops::main_loop::proof_upgrader::ForgeJob;
+use crate::application::loops::main_loop::proof_upgrader::UpdateLinkJob;
+use crate::application::loops::main_loop::proof_upgrader::SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE;
 use crate::application::triton_vm_job_queue::vm_job_queue;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::transaction::lock_script::LockScript;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
+use crate::protocol::consensus::transaction::utxo::Utxo;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
+use crate::state::transaction::chained_transaction_details::ChainedTransactionDetails;
+use crate::state::transaction::chained_transaction_details::ThruputInput;
+use crate::state::transaction::chained_tx_artifacts::ChainedTxArtifacts;
+use crate::state::transaction::link_tx_artifacts::LinkTxArtifacts;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
+use itertools::Itertools;
+use num_traits::CheckedAdd;
 use num_traits::CheckedSub;
+use num_traits::Zero;
 
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::address::ReceivingAddress;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::transaction_input::TxInput;
 use crate::state::wallet::transaction_input::TxInputList;
+use crate::state::wallet::transaction_output::TxOutput;
 use crate::state::wallet::transaction_output::TxOutputList;
 use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
 use crate::GlobalStateLock;
@@ -59,6 +77,25 @@ pub enum MigrationDestination {
     NewGeneration { index: u64 },
     /// This wallet's current-format dCTIDH address at the given derivation index.
     NewDctidh { index: u64 },
+}
+
+/// A mempool transaction a chained transaction spends an unconfirmed output of.
+///
+/// A standard predecessor must be cast into the chain pipeline before it can
+/// be chained onto; a link predecessor is chained onto directly.
+enum ChainPredecessor {
+    Standard(Box<Transaction>),
+    Link(Box<LinkTx>),
+}
+
+/// The proof-backed link transaction a chained send builds, together with what
+/// it was built from and under.
+struct ChainedLink {
+    link_tx: LinkTx,
+    details: ChainedTransactionDetails,
+    consensus_rule_set: ConsensusRuleSet,
+    proof_job_options: TritonVmProofJobOptions,
+    predecessor_txids: Vec<TransactionKernelId>,
 }
 
 /// provides an API for building and sending neptune transactions.
@@ -281,6 +318,392 @@ impl TransactionInitiator {
             .get(txid)
             .map(|tx| (&tx.proof).into())
             .ok_or(error::UpgradeProofError::TxNotInMempool)
+    }
+
+    /// Verify, between the proving steps of a chained send, that proving on
+    /// is still worthwhile: every predecessor must still sit in the mempool.
+    ///
+    /// A vanished predecessor is unrecoverable -- mined away, double-spent,
+    /// or replaced, the thruput it resolves can never confirm. A moved tip,
+    /// by contrast, is no reason to stop: every kernel in the chain still
+    /// agrees on the old mutator set, and the result is one `Advance` proof
+    /// away from the new tip.
+    ///
+    /// Proof construction can take a long time, so the world may well move
+    /// while a step runs; checking costs one read lock.
+    async fn chained_send_still_viable(
+        &self,
+        predecessor_txids: &[TransactionKernelId],
+    ) -> Result<(), error::SendError> {
+        let state = self.global_state_lock.lock_guard().await;
+        if let Some(gone) = predecessor_txids
+            .iter()
+            .find(|txid| !state.mempool.contains(**txid))
+        {
+            return Err(error::SendError::Chained(format!(
+                "predecessor transaction {gone} left the mempool while proving"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Build and broadcast a chained transaction, paying with unconfirmed
+    /// funds: UTXOs created by transactions that sit in the mempool but are
+    /// not yet confirmed by any block.
+    ///
+    /// Internally this runs the chain pipeline on this node alone: the
+    /// unconfirmed UTXOs become thruputs of a forged link transaction, the
+    /// predecessor transactions are cast into the pipeline and chained on --
+    /// cut-through cancelling each thruput against the predecessor output it
+    /// spends -- and the resolved link is fixed into an ordinary
+    /// `SingleProof`-backed transaction. Only that final transaction is
+    /// recorded and broadcast; no link transaction leaves the node.
+    pub async fn send_chained(
+        &mut self,
+        outputs: impl IntoIterator<Item = impl Into<OutputFormat>>,
+        change_policy: ChangePolicy,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+    ) -> Result<ChainedTxArtifacts, error::SendError> {
+        let ChainedLink {
+            link_tx,
+            details,
+            consensus_rule_set,
+            proof_job_options,
+            predecessor_txids,
+        } = self
+            .build_chained_link(outputs, change_policy, fee, timestamp)
+            .await?;
+
+        if !link_tx.kernel.thruputs.is_empty() {
+            return Err(error::SendError::Chained(
+                "chained transaction has unresolved thruputs".into(),
+            ));
+        }
+        self.chained_send_still_viable(&predecessor_txids).await?;
+        let transaction = fix_link_tx(
+            link_tx,
+            consensus_rule_set,
+            vm_job_queue(),
+            proof_job_options,
+        )
+        .await
+        .map_err(|err| error::SendError::Chained(err.to_string()))?;
+
+        self.chained_send_still_viable(&predecessor_txids).await?;
+        let tx_artifacts = ChainedTxArtifacts {
+            transaction: Arc::new(transaction),
+            details: Arc::new(details),
+        };
+        self.global_state_lock
+            .record_own_chained_transaction(&tx_artifacts)
+            .await?;
+        self.private()
+            .broadcast_transaction(tx_artifacts.transaction.clone())
+            .await?;
+
+        Ok(tx_artifacts)
+    }
+
+    /// Like [`Self::send_chained`], but the result stays a [`LinkTx`]: the
+    /// chain pipeline runs without the final `Fix`, and the chained,
+    /// cut-through link transaction is inserted into the mempool and shared
+    /// with peers. Whoever finalizes the chain pays for the `Fix`; unresolved
+    /// thruputs are not an error here.
+    pub async fn send_chained_link(
+        &mut self,
+        outputs: impl IntoIterator<Item = impl Into<OutputFormat>>,
+        change_policy: ChangePolicy,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+    ) -> Result<LinkTxArtifacts, error::SendError> {
+        let ChainedLink {
+            link_tx,
+            details,
+            predecessor_txids,
+            ..
+        } = self
+            .build_chained_link(outputs, change_policy, fee, timestamp)
+            .await?;
+
+        self.chained_send_still_viable(&predecessor_txids).await?;
+        let tx_artifacts = LinkTxArtifacts {
+            link_tx: Arc::new(link_tx),
+            details: Arc::new(details),
+        };
+        self.global_state_lock
+            .record_own_link_transaction(&tx_artifacts)
+            .await?;
+        self.private()
+            .broadcast_link_transaction(tx_artifacts.link_tx.clone())
+            .await?;
+
+        Ok(tx_artifacts)
+    }
+
+    /// The shared front of [`Self::send_chained`] and
+    /// [`Self::send_chained_link`]: select unconfirmed inputs, build the link
+    /// witness, forge, chain with every predecessor, and -- if blocks arrived
+    /// while proving -- re-target the chained link at the current mutator
+    /// set.
+    async fn build_chained_link(
+        &mut self,
+        outputs: impl IntoIterator<Item = impl Into<OutputFormat>>,
+        change_policy: ChangePolicy,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+    ) -> Result<ChainedLink, error::SendError> {
+        self.private().check_proceed_with_send(fee).await?;
+
+        let mut tx_outputs = self.generate_tx_outputs(outputs).await;
+        let spend_amount = tx_outputs
+            .total_native_coins()
+            .checked_add(&fee)
+            .ok_or(error::CreateTxError::TotalSpendTooLarge)?;
+
+        let (link_primitive_witness, details, predecessors, consensus_rule_set, proof_job_options) = {
+            let mut gsm = self.global_state_lock.lock_guard_mut().await;
+            let network = gsm.cli().network;
+            let tip = gsm.chain.light_state_clone();
+            let block_height = tip.header().height;
+            let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+            if !consensus_rule_set.has_chain_branches() {
+                return Err(error::SendError::Chained(format!(
+                    "consensus rule set {consensus_rule_set} has no chain branches"
+                )));
+            }
+            let mutator_set_accumulator = tip
+                .mutator_set_accumulator_after()
+                .map_err(|_| error::CreateTxError::NoMutatorSetAccumulatorAfter)?;
+            let tip_mutator_set_hash = mutator_set_accumulator.hash();
+
+            // Select unconfirmed incoming UTXOs whose creating transaction is
+            // a tip-synced, proof-backed mempool member -- on either
+            // pipeline: single-proof transactions are cast into the chain,
+            // link transactions are chained onto directly.
+            let mut selected: Vec<(TransactionKernelId, ThruputInput)> = vec![];
+            let mut selected_amount = NativeCurrencyAmount::zero();
+            for (predecessor_txid, incoming_utxo) in
+                gsm.wallet_state.mempool_incoming_utxos_with_txid()
+            {
+                if selected_amount >= spend_amount {
+                    break;
+                }
+                if incoming_utxo.is_guesser_fee || !incoming_utxo.utxo.can_spend_at(timestamp) {
+                    continue;
+                }
+                let predecessor_is_chainable = match gsm.mempool.get(predecessor_txid) {
+                    Some(predecessor) => {
+                        matches!(predecessor.proof, TransactionProof::SingleProof(_))
+                            && predecessor.kernel.mutator_set_hash == tip_mutator_set_hash
+                    }
+                    None => gsm.mempool.get_link(predecessor_txid).is_some_and(|link| {
+                        link.proof.is_proof()
+                            && link.kernel.kernel.mutator_set_hash == tip_mutator_set_hash
+                    }),
+                };
+                if !predecessor_is_chainable {
+                    continue;
+                }
+                let Some(spending_key) = gsm
+                    .wallet_state
+                    .find_spending_key_for_utxo(&incoming_utxo.utxo)
+                else {
+                    continue;
+                };
+
+                selected_amount = selected_amount + incoming_utxo.utxo.get_native_currency_amount();
+                selected.push((
+                    predecessor_txid,
+                    ThruputInput {
+                        incoming_utxo: incoming_utxo.clone(),
+                        lock_script_and_witness: spending_key.lock_script_and_witness(),
+                    },
+                ));
+            }
+            if selected_amount < spend_amount {
+                return Err(error::CreateTxError::InsufficientFunds {
+                    requested: spend_amount,
+                    available: selected_amount,
+                }
+                .into());
+            }
+
+            let change_amount = selected_amount
+                .checked_sub(&spend_amount)
+                .expect("selected amount covers spend amount");
+            if change_amount.is_positive() {
+                let change_output = match change_policy {
+                    ChangePolicy::ExactChange => {
+                        return Err(error::CreateTxError::NotExactChange.into());
+                    }
+                    ChangePolicy::RecoverToNextUnusedKey { key_type, medium } => {
+                        let key = gsm.wallet_state.next_unused_spending_key(key_type).await;
+                        TransactionDetailsBuilder::create_change_output(
+                            &gsm.wallet_state,
+                            block_height,
+                            change_amount,
+                            key,
+                            medium,
+                        )
+                    }
+                    ChangePolicy::RecoverToProvidedKey { key, medium } => {
+                        TransactionDetailsBuilder::create_change_output(
+                            &gsm.wallet_state,
+                            block_height,
+                            change_amount,
+                            (*key).clone(),
+                            medium,
+                        )
+                    }
+                    ChangePolicy::Burn => TxOutput::no_notification_as_change(
+                        Utxo::new_native_currency(LockScript::burn().hash(), change_amount),
+                        Digest::default(),
+                        Digest::default(),
+                    ),
+                };
+                tx_outputs.push(change_output);
+            }
+
+            let details = ChainedTransactionDetails {
+                thruput_inputs: selected
+                    .iter()
+                    .map(|(_, thruput)| thruput.clone())
+                    .collect(),
+                tx_outputs,
+                fee,
+                timestamp,
+                mutator_set_accumulator,
+                network,
+            };
+
+            // The reference validation is the integrity gate: under mock
+            // proofs, nothing else checks the kernel this pipeline produces.
+            let link_primitive_witness = details.link_primitive_witness();
+            link_primitive_witness
+                .validate()
+                .await
+                .map_err(|err| error::SendError::Chained(err.to_string()))?;
+
+            let predecessors: Vec<(TransactionKernelId, ChainPredecessor)> = selected
+                .iter()
+                .map(|(txid, _)| *txid)
+                .unique()
+                .map(|txid| {
+                    let predecessor = if let Some(transaction) = gsm.mempool.get(txid) {
+                        ChainPredecessor::Standard(Box::new(transaction.clone()))
+                    } else {
+                        ChainPredecessor::Link(Box::new(
+                            gsm.mempool
+                                .get_link(txid)
+                                .expect("selected predecessor must be in mempool")
+                                .clone(),
+                        ))
+                    };
+                    (txid, predecessor)
+                })
+                .collect();
+
+            let proof_job_options = gsm.cli().as_proof_job_options();
+
+            (
+                link_primitive_witness,
+                details,
+                predecessors,
+                consensus_rule_set,
+                proof_job_options,
+            )
+        };
+        let predecessor_txids = predecessors.iter().map(|(txid, _)| *txid).collect_vec();
+
+        // Run the chain pipeline, one step at a time, checking between the
+        // (potentially long-running) steps that the chain is still worth
+        // proving.
+        let job_queue = vm_job_queue();
+        self.chained_send_still_viable(&predecessor_txids).await?;
+        let mut link_tx = ForgeJob {
+            link_primitive_witness,
+            consensus_rule_set,
+        }
+        .upgrade(job_queue.clone(), proof_job_options.clone())
+        .await
+        .map_err(|err| error::SendError::Chained(err.to_string()))?;
+        for (_, predecessor) in predecessors {
+            self.chained_send_still_viable(&predecessor_txids).await?;
+            let predecessor_link = match predecessor {
+                ChainPredecessor::Link(link) => *link,
+                ChainPredecessor::Standard(transaction) => CastJob {
+                    transaction: *transaction,
+                    consensus_rule_set,
+                }
+                .upgrade(job_queue.clone(), proof_job_options.clone())
+                .await
+                .map_err(|err| error::SendError::Chained(err.to_string()))?,
+            };
+            link_tx = ChainJob {
+                left: link_tx,
+                right: predecessor_link,
+                shuffle_seed: rand::random(),
+                consensus_rule_set,
+            }
+            .upgrade(job_queue.clone(), proof_job_options.clone())
+            .await
+            .map_err(|err| error::SendError::Chained(err.to_string()))?;
+        }
+
+        // If blocks arrived while proving, re-target the chain at the current
+        // mutator set -- repeatedly, since blocks may keep arriving while the
+        // update itself proves. The predecessors still being in the mempool
+        // means the chain's inputs are still unspent, so the update must
+        // succeed. Peers only accept tip-synced link transactions, so a
+        // shared link must leave this loop synced.
+        loop {
+            let lookup = {
+                let state = self.global_state_lock.lock_guard().await;
+                let tip_mutator_set_hash = state
+                    .chain
+                    .light_state()
+                    .mutator_set_accumulator_after()
+                    .map_err(|_| error::CreateTxError::NoMutatorSetAccumulatorAfter)?
+                    .hash();
+                if tip_mutator_set_hash == link_tx.kernel.kernel.mutator_set_hash {
+                    break;
+                }
+                state
+                    .chain
+                    .archival_state()
+                    .old_mutator_set_and_mutator_set_update_to_tip(
+                        link_tx.kernel.kernel.mutator_set_hash,
+                        SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
+                    )
+                    .await
+            };
+            let Some((old_mutator_set_accumulator, mutator_set_update)) = lookup else {
+                return Err(error::SendError::Chained(
+                    "could not find mutator-set path from chained link to tip".into(),
+                ));
+            };
+
+            self.chained_send_still_viable(&predecessor_txids).await?;
+            link_tx = UpdateLinkJob {
+                link_tx,
+                old_mutator_set_accumulator,
+                mutator_set_update,
+                consensus_rule_set,
+            }
+            .upgrade(job_queue.clone(), proof_job_options.clone())
+            .await
+            .map_err(|err| error::SendError::Chained(err.to_string()))?;
+        }
+
+        Ok(ChainedLink {
+            link_tx,
+            details,
+            consensus_rule_set,
+            proof_job_options,
+            predecessor_txids,
+        })
     }
 
     fn worker(&self) -> super::private::TransactionInitiatorPrivate {
