@@ -373,7 +373,7 @@ impl TransactionInitiator {
             proof_job_options,
             predecessor_txids,
         } = self
-            .build_chained_link(outputs, change_policy, fee, timestamp)
+            .build_chained_link(outputs, change_policy, fee, timestamp, true)
             .await?;
 
         if !link_tx.kernel.thruputs.is_empty() {
@@ -424,7 +424,7 @@ impl TransactionInitiator {
             predecessor_txids,
             ..
         } = self
-            .build_chained_link(outputs, change_policy, fee, timestamp)
+            .build_chained_link(outputs, change_policy, fee, timestamp, false)
             .await?;
 
         self.chained_send_still_viable(&predecessor_txids).await?;
@@ -447,14 +447,31 @@ impl TransactionInitiator {
     /// witness, forge, chain with every predecessor, and -- if blocks arrived
     /// while proving -- re-target the chained link at the current mutator
     /// set.
+    ///
+    /// If `resolved`, only predecessors without thruputs of their own are
+    /// chained onto, so that the chained link has none either and can be
+    /// fixed.
     async fn build_chained_link(
         &mut self,
         outputs: impl IntoIterator<Item = impl Into<OutputFormat>>,
         change_policy: ChangePolicy,
         fee: NativeCurrencyAmount,
         timestamp: Timestamp,
+        resolved: bool,
     ) -> Result<ChainedLink, error::SendError> {
         self.private().check_proceed_with_send(fee).await?;
+
+        // Every step of the chain pipeline is a recursive proof.
+        let cli = self.global_state_lock.cli();
+        let capability = cli.proving_capability();
+        let proof_type = TransactionProofType::SingleProof;
+        if !cli.network.use_mock_proof() && !capability.can_prove(proof_type) {
+            return Err(error::CreateProofError::TooWeak {
+                proof_type,
+                capability,
+            }
+            .into());
+        }
 
         let mut tx_outputs = self.generate_tx_outputs(outputs).await;
         let spend_amount = tx_outputs
@@ -501,6 +518,7 @@ impl TransactionInitiator {
                     None => gsm.mempool.get_link(predecessor_txid).is_some_and(|link| {
                         link.proof.is_proof()
                             && link.kernel.kernel.mutator_set_hash == tip_mutator_set_hash
+                            && (!resolved || link.kernel.thruputs.is_empty())
                     }),
                 };
                 if !predecessor_is_chainable {
