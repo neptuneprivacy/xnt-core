@@ -11,13 +11,20 @@ use crate::application::config::cli_args;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::peer::handshake_data::VersionString;
 use crate::protocol::peer::peer_info::PeerConnectionInfo;
 use crate::protocol::peer::peer_info::PeerInfo;
+use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::blockchain_state::BlockchainState;
 use crate::state::light_state::LightState;
 use crate::state::mempool::Mempool;
 use crate::state::networking_state::NetworkingState;
+use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;
+use crate::state::transaction::tx_creation_config::TxCreationConfig;
+use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+use crate::state::wallet::address::ReceivingAddress;
+use crate::state::wallet::transaction_output::TxOutput;
 use crate::state::wallet::wallet_configuration::WalletConfiguration;
 use crate::state::wallet::wallet_entropy::WalletEntropy;
 use crate::state::GlobalState;
@@ -106,6 +113,42 @@ pub(crate) async fn mock_genesis_global_state(
 ) -> GlobalStateLock {
     let genesis_block = Block::genesis(cli.network);
     mock_genesis_global_state_with_block(peer_count, wallet, cli, genesis_block).await
+}
+
+/// A single-proof-backed transaction from the wallet of `sender`, paying
+/// `amount` to `address` with an on-chain notification, and the change back to
+/// the sender. Proven up front, as the main loop of a node that initiates
+/// transactions would upgrade it. Not recorded anywhere.
+pub(crate) async fn single_proof_payment(
+    sender: &GlobalStateLock,
+    address: ReceivingAddress,
+    amount: NativeCurrencyAmount,
+    fee: NativeCurrencyAmount,
+    timestamp: Timestamp,
+) -> TxCreationArtifacts {
+    let output = TxOutput::onchain_native_currency(amount, rand::random(), address, false);
+    let change_key = sender
+        .lock_guard()
+        .await
+        .wallet_state
+        .wallet_entropy
+        .nth_generation_spending_key_for_tests(0);
+    let config = TxCreationConfig::default()
+        .recover_change_on_chain(change_key.into())
+        .with_prover_capability(TxProvingCapability::SingleProof);
+    let consensus_rule_set = sender.lock_guard().await.consensus_rule_set();
+    sender
+        .api()
+        .tx_initiator_internal()
+        .create_transaction(
+            vec![output].into(),
+            fee,
+            timestamp,
+            config,
+            consensus_rule_set,
+        )
+        .await
+        .unwrap()
 }
 
 /// A state with a premine UTXO and self-mined blocks. Both composing and

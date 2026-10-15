@@ -3193,6 +3193,133 @@ mod tests {
         }
     }
 
+    mod link_transactions_on_reorganization {
+        use super::*;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+        use crate::tests::shared::globalstate::single_proof_payment;
+
+        /// alice pays bob 5 coins in a single-proof transaction, which reaches
+        /// bob's mempool, and bob pays 3 of the unconfirmed coins back to alice
+        /// in a link transaction.
+        async fn pay_and_chain_back(
+            alice: &GlobalStateLock,
+            bob: &mut GlobalStateLock,
+            timestamp: Timestamp,
+        ) -> LinkTx {
+            let fee = NativeCurrencyAmount::coins(1);
+            let bob_address = bob
+                .api_mut()
+                .wallet_mut()
+                .next_receiving_address(KeyType::Generation)
+                .await
+                .unwrap();
+            let alice_address: ReceivingAddress = alice
+                .lock_guard()
+                .await
+                .wallet_state
+                .wallet_entropy
+                .nth_generation_spending_key_for_tests(0)
+                .to_address()
+                .into();
+            let payment = single_proof_payment(
+                alice,
+                bob_address,
+                NativeCurrencyAmount::coins(5),
+                fee,
+                timestamp,
+            )
+            .await;
+            bob.lock_guard_mut()
+                .await
+                .mempool_insert(
+                    payment.transaction.as_ref().clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+
+            bob.api_mut()
+                .tx_sender_mut()
+                .send_chained_link(
+                    vec![(alice_address, NativeCurrencyAmount::coins(3))],
+                    Default::default(),
+                    fee,
+                    timestamp,
+                )
+                .await
+                .unwrap()
+                .link_tx()
+                .clone()
+        }
+
+        /// A reorganization clears the mempool, own link transactions
+        /// included: no update job is scheduled for them, the wallet drops
+        /// their unconfirmed funds, and chaining works again on the new tip.
+        #[apply(shared_tokio_runtime)]
+        async fn reorganization_drops_own_link_transaction() {
+            let network = Network::RegTest;
+            let cli = cli_args::Args {
+                network,
+                tx_proving_capability: Some(TxProvingCapability::SingleProof),
+                ..Default::default()
+            };
+            let mut alice =
+                mock_genesis_global_state(2, WalletEntropy::devnet_wallet(), cli.clone()).await;
+            let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+
+            let genesis = Block::genesis(network);
+            let block_1a = invalid_empty_block_with_timestamp(
+                &genesis,
+                genesis.header().timestamp + Timestamp::hours(1),
+                network,
+            );
+            let block_1b = invalid_empty_block_with_timestamp(
+                &genesis,
+                genesis.header().timestamp + Timestamp::hours(2),
+                network,
+            );
+            for state in [&mut alice, &mut bob] {
+                state.set_new_tip(block_1a.clone()).await.unwrap();
+            }
+
+            let now = Timestamp::now();
+            let link_tx = pay_and_chain_back(&alice, &mut bob, now).await;
+            assert!(bob
+                .lock_guard()
+                .await
+                .mempool
+                .get_link(link_tx.txid())
+                .is_some());
+            let balances = bob.api().wallet().balances(now).await;
+            assert!(balances.confirmed_total.is_zero());
+            assert!(!balances.unconfirmed_total.is_zero());
+
+            // Block 1b replaces block 1a.
+            let update_jobs = bob.set_new_tip(block_1b.clone()).await.unwrap();
+            assert!(
+                update_jobs.is_empty(),
+                "no update job for a link transaction the reorganization cleared"
+            );
+            assert!(bob.lock_guard().await.mempool.is_empty());
+            let balances = bob.api().wallet().balances(now).await;
+            assert!(balances.confirmed_total.is_zero());
+            assert!(
+                balances.unconfirmed_total.is_zero(),
+                "the wallet must drop the unconfirmed funds of the cleared link transaction"
+            );
+
+            // Chaining works again on the new tip.
+            alice.set_new_tip(block_1b).await.unwrap();
+            let link_tx = pay_and_chain_back(&alice, &mut bob, now).await;
+            assert!(bob
+                .lock_guard()
+                .await
+                .mempool
+                .get_link(link_tx.txid())
+                .is_some());
+        }
+    }
+
     mod handshake {
 
         use super::*;

@@ -1042,3 +1042,136 @@ impl TransactionInitiator {
         super::private::TransactionInitiatorPrivate::new(self.global_state_lock.clone())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::time::Duration;
+
+    use macro_rules_attr::apply;
+    use tracing_test::traced_test;
+
+    use super::*;
+    use crate::application::config::cli_args;
+    use crate::application::config::network::Network;
+    use crate::protocol::consensus::block::Block;
+    use crate::state::mempool::mempool_event::AddReason;
+    use crate::state::mempool::upgrade_priority::UpgradePriority;
+    use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+    use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
+    use crate::state::wallet::wallet_entropy::WalletEntropy;
+    use crate::tests::shared::globalstate::mock_genesis_global_state;
+    use crate::tests::shared::globalstate::single_proof_payment;
+    use crate::tests::shared::wait_until;
+    use crate::tests::shared_tokio_runtime;
+
+    /// A chained send stops, and records nothing, once a predecessor leaves
+    /// the mempool while the chain pipeline proves -- whether it was mined,
+    /// double-spent, or replaced.
+    ///
+    /// Real proofs give the pipeline its duration: the predecessor leaves
+    /// right after the inputs are selected, while `Forge` proves. The change
+    /// key that the selection derives marks that moment.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn chained_send_stops_when_a_predecessor_leaves_the_mempool_while_proving() {
+        let network = Network::Testnet(0);
+        let cli = cli_args::Args {
+            network,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        let alice = mock_genesis_global_state(2, WalletEntropy::devnet_wallet(), cli.clone()).await;
+        let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let genesis_block = Block::genesis(network);
+        let now = std::cmp::max(
+            Timestamp::now(),
+            genesis_block.header().timestamp + network.minimum_block_time(),
+        );
+
+        let bob_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let fee = NativeCurrencyAmount::coins(1);
+        let alice_tx = single_proof_payment(
+            &alice,
+            bob_address,
+            NativeCurrencyAmount::coins(5),
+            fee,
+            now,
+        )
+        .await
+        .transaction
+        .as_ref()
+        .clone();
+        bob.lock_guard_mut()
+            .await
+            .mempool_insert(
+                alice_tx.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            )
+            .await;
+
+        // The default change policy derives the next symmetric key.
+        let change_key_type = KeyType::Symmetric;
+        let num_change_keys = bob
+            .lock_guard()
+            .await
+            .wallet_state
+            .spending_key_counter(change_key_type);
+        let charlie_address: ReceivingAddress =
+            GenerationReceivingAddress::derive_from_seed(rand::random()).into();
+        let mut sender = bob.clone();
+        let send = tokio::spawn(async move {
+            sender
+                .api_mut()
+                .tx_sender_mut()
+                .send_chained(
+                    vec![(charlie_address, NativeCurrencyAmount::coins(3))],
+                    ChangePolicy::default(),
+                    fee,
+                    now,
+                )
+                .await
+        });
+
+        // The selection derives the change key under the state's write lock;
+        // the predecessor leaves as soon as that lock is free again.
+        let watched = bob.clone();
+        wait_until(Duration::from_secs(120), move || {
+            let watched = watched.clone();
+            async move {
+                watched
+                    .lock_guard()
+                    .await
+                    .wallet_state
+                    .spending_key_counter(change_key_type)
+                    > num_change_keys
+            }
+        })
+        .await
+        .unwrap();
+        bob.lock_guard_mut()
+            .await
+            .mempool_remove(alice_tx.txid())
+            .await;
+        assert!(
+            !send.is_finished(),
+            "the predecessor must leave while the pipeline proves"
+        );
+
+        let result = send.await.unwrap();
+        let Err(error::SendError::Chained(reason)) = &result else {
+            panic!("chained send must stop, got {result:?}");
+        };
+        assert!(reason.contains("left the mempool"), "{reason}");
+        assert!(
+            bob.lock_guard().await.mempool.is_empty(),
+            "a stopped chained send must not record anything"
+        );
+    }
+}

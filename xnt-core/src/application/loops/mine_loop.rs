@@ -1168,6 +1168,7 @@ pub(crate) mod tests {
     use crate::tests::shared::dummy_expected_utxo;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
     use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
+    use crate::tests::shared::globalstate::single_proof_payment;
     use crate::tests::shared::mock_tx::make_mock_block_transaction_with_mutator_set_hash;
     use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
     use crate::tests::shared::wait_until;
@@ -1550,8 +1551,7 @@ pub(crate) mod tests {
             genesis_block.header().timestamp + network.minimum_block_time(),
         );
 
-        // alice pays bob 5 coins, in a single-proof transaction. Without a
-        // main loop to upgrade it, the transaction is proven up front.
+        // alice pays bob 5 coins, in a single-proof transaction.
         let bob_address = bob
             .api_mut()
             .wallet_mut()
@@ -1559,34 +1559,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let fee = NativeCurrencyAmount::coins(1);
-        let mut rng = StdRng::seed_from_u64(5);
-        let output_to_bob = TxOutput::onchain_native_currency(
-            NativeCurrencyAmount::coins(5),
-            rng.random(),
+        let alice_artifacts = single_proof_payment(
+            &alice,
             bob_address,
-            false,
-        );
-        let alice_key = alice
-            .lock_guard()
-            .await
-            .wallet_state
-            .wallet_entropy
-            .nth_generation_spending_key_for_tests(0);
-        let config = TxCreationConfig::default()
-            .recover_change_on_chain(alice_key.into())
-            .with_prover_capability(TxProvingCapability::SingleProof);
-        let alice_artifacts = alice
-            .api()
-            .tx_initiator_internal()
-            .create_transaction(
-                vec![output_to_bob].into(),
-                fee,
-                now,
-                config,
-                consensus_rule_set,
-            )
-            .await
-            .unwrap();
+            NativeCurrencyAmount::coins(5),
+            fee,
+            now,
+        )
+        .await;
         let alice_tx: Transaction = alice_artifacts.transaction.clone().into();
         assert!(alice_tx.proof.is_single_proof());
         alice
@@ -1683,6 +1663,214 @@ pub(crate) mod tests {
             bob.api()
                 .wallet()
                 .balances(block.header().timestamp)
+                .await
+                .confirmed_available
+        );
+    }
+
+    /// Chained payments between dCTIDH addresses, proven for real, two hops
+    /// deep, and mined under the v8 rule set.
+    ///
+    /// `Forge` proves the lock script of every thruput it spends, so here the
+    /// dCTIDH lock script runs, which mock networks skip. Each hop runs the
+    /// whole pipeline on the sender's node -- `Forge`, `Cast`, `Chain`, and
+    /// `Fix` -- and the second hop casts the transaction the first hop fixed:
+    /// alice pays bob's dCTIDH address; bob pays on to charlie's dCTIDH
+    /// address; charlie pays some back to bob. One block confirms all three
+    /// payments.
+    ///
+    /// This test produces many proofs and might take a while to complete if
+    /// there is no proof cache.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn chained_payments_between_dctidh_addresses_are_proven_and_mined_under_upgrade_vm_v8() {
+        use crate::api::export::ChainedTxArtifacts;
+        use crate::api::export::KeyType;
+
+        let network = Network::Testnet(0);
+        let genesis_block = Block::genesis(network);
+        assert!(
+            ConsensusRuleSet::infer_from(network, genesis_block.header().height.next())
+                .has_chain_branches()
+        );
+        let cli = cli_args::Args {
+            network,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        let mut alice =
+            mock_genesis_global_state(2, WalletEntropy::devnet_wallet(), cli.clone()).await;
+        let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli.clone()).await;
+        let mut charlie = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let now = max(
+            Timestamp::now(),
+            genesis_block.header().timestamp + network.minimum_block_time(),
+        );
+        let fee = NativeCurrencyAmount::coins(1);
+
+        let bob_dctidh_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::dCTIDH)
+            .await
+            .unwrap();
+        let bob_generation_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let charlie_dctidh_address = charlie
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::dCTIDH)
+            .await
+            .unwrap();
+
+        // Every thruput of a chained send must be locked to the sender's
+        // dCTIDH address, so that `Forge` proves the dCTIDH lock script.
+        let bob_dctidh_lock_script_hash = bob_dctidh_address.lock_script_hash();
+        let charlie_dctidh_lock_script_hash = charlie_dctidh_address.lock_script_hash();
+        let assert_spends_utxos_locked_to =
+            |artifacts: &ChainedTxArtifacts, lock_script_hash: Digest| {
+                assert!(!artifacts.details().thruput_inputs.is_empty());
+                for thruput in &artifacts.details().thruput_inputs {
+                    assert_eq!(
+                        lock_script_hash,
+                        thruput.incoming_utxo.utxo.lock_script_hash()
+                    );
+                }
+            };
+
+        // alice pays bob's dCTIDH address 5 coins.
+        let alice_tx: Transaction = single_proof_payment(
+            &alice,
+            bob_dctidh_address,
+            NativeCurrencyAmount::coins(5),
+            fee,
+            now,
+        )
+        .await
+        .transaction
+        .as_ref()
+        .clone();
+        for state in [&mut bob, &mut charlie] {
+            state
+                .lock_guard_mut()
+                .await
+                .mempool_insert(
+                    alice_tx.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+        }
+
+        // before any block, bob pays 3 of those coins on to charlie.
+        let bob_artifacts = bob
+            .api_mut()
+            .tx_sender_mut()
+            .send_chained(
+                vec![(charlie_dctidh_address, NativeCurrencyAmount::coins(3))],
+                Default::default(),
+                fee,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_spends_utxos_locked_to(&bob_artifacts, bob_dctidh_lock_script_hash);
+        let bob_tx = bob_artifacts.transaction().clone();
+        assert!(bob_tx.proof.is_single_proof());
+        for state in [&mut alice, &mut charlie] {
+            let mut state = state.lock_guard_mut().await;
+            state
+                .mempool_insert(
+                    bob_tx.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+            assert!(state.mempool.contains(bob_tx.txid()));
+            assert!(!state.mempool.contains(alice_tx.txid()));
+        }
+
+        // still before any block, charlie pays 1 coin back to bob, chaining
+        // onto bob's chained transaction.
+        let charlie_artifacts = charlie
+            .api_mut()
+            .tx_sender_mut()
+            .send_chained(
+                vec![(bob_generation_address, NativeCurrencyAmount::coins(1))],
+                Default::default(),
+                fee,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_spends_utxos_locked_to(&charlie_artifacts, charlie_dctidh_lock_script_hash);
+        let charlie_tx = charlie_artifacts.transaction().clone();
+        {
+            let mut state = alice.lock_guard_mut().await;
+            state
+                .mempool_insert(
+                    charlie_tx.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+            assert!(state.mempool.contains(charlie_tx.txid()));
+            assert_eq!(1, state.mempool.len());
+        }
+
+        // alice's composer mines the whole chain into a valid block.
+        let (block, _) = compose_block_helper(
+            genesis_block.clone(),
+            alice.clone(),
+            now,
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        // The block stores its inputs packed, so compare their index sets.
+        let block_kernel = &block.body().transaction_kernel;
+        for input in &charlie_tx.kernel.inputs {
+            assert!(block_kernel
+                .inputs
+                .iter()
+                .any(|rr| rr.absolute_indices == input.absolute_indices));
+        }
+        for output in &charlie_tx.kernel.outputs {
+            assert!(block_kernel.outputs.contains(output));
+        }
+        assert!(
+            block
+                .is_valid(&genesis_block, block.header().timestamp, network)
+                .await,
+            "block carrying the chained dCTIDH payments must be valid"
+        );
+
+        for state in [&mut alice, &mut bob, &mut charlie] {
+            state.set_new_tip(block.clone()).await.unwrap();
+            assert!(state.lock_guard().await.mempool.is_empty());
+        }
+
+        // bob holds 1 coin of change and the 1 coin from charlie; charlie
+        // holds 1 coin of change.
+        let timestamp = block.header().timestamp;
+        assert_eq!(
+            NativeCurrencyAmount::coins(2),
+            bob.api()
+                .wallet()
+                .balances(timestamp)
+                .await
+                .confirmed_available
+        );
+        assert_eq!(
+            NativeCurrencyAmount::coins(1),
+            charlie
+                .api()
+                .wallet()
+                .balances(timestamp)
                 .await
                 .confirmed_available
         );
