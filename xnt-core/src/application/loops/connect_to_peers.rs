@@ -33,6 +33,7 @@ use crate::application::config::cli_args;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
 use crate::application::loops::peer_loop::PeerLoopHandler;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::peer::ConnectionRefusedReason;
 use crate::protocol::peer::InternalConnectionStatus;
 use crate::protocol::peer::NegativePeerSanction;
@@ -105,6 +106,34 @@ fn versions_are_compatible(own_version: &str, other_version: &str) -> bool {
     }
 
     true
+}
+
+/// The lowest node version that follows the given consensus rule set, if
+/// earlier versions that are otherwise compatible do not.
+///
+/// Past the `UpgradeVMv8` fork, a node of an earlier version cannot validate
+/// the chain's blocks, so a connection to it serves neither side.
+fn min_version_following(consensus_rule_set: ConsensusRuleSet) -> Option<semver::Version> {
+    match consensus_rule_set {
+        ConsensusRuleSet::Reboot
+        | ConsensusRuleSet::HardforkAlpha
+        | ConsensusRuleSet::Xnt
+        | ConsensusRuleSet::TimelockExtension
+        | ConsensusRuleSet::UpgradeVM
+        | ConsensusRuleSet::UpgradeVMv4
+        | ConsensusRuleSet::UpgradeVMv5
+        | ConsensusRuleSet::UpgradeVMv7 => None,
+        ConsensusRuleSet::UpgradeVMv8 => Some(semver::Version::new(0, 3, 0)),
+    }
+}
+
+/// Whether a peer of the given version follows the given consensus rule set.
+/// See [`min_version_following`].
+fn version_follows_rule_set(other_version: &str, consensus_rule_set: ConsensusRuleSet) -> bool {
+    let Some(min_version) = min_version_following(consensus_rule_set) else {
+        return true;
+    };
+    semver::Version::parse(other_version).is_ok_and(|version| version >= min_version)
 }
 
 /// Infallible absolute difference between two timestamps, in seconds.
@@ -273,6 +302,21 @@ async fn check_if_connection_is_allowed(
             "Attempting to connect to incompatible version. You might have to upgrade, or the other node does. Own version: {}, other version: {}",
             own_handshake.version,
             other_handshake.version);
+        return InternalConnectionStatus::Refused(ConnectionRefusedReason::IncompatibleVersion);
+    }
+
+    // Disallow connection if the peer's version does not follow the rule set
+    // of our tip.
+    let tip_rule_set = ConsensusRuleSet::infer_from(
+        cli_arguments.network,
+        global_state.chain.light_state().header().height,
+    );
+    if !version_follows_rule_set(&other_handshake.version, tip_rule_set) {
+        warn!(
+            "Refusing connection with {peer_address}: version {} does not follow the \
+             consensus rule set {tip_rule_set} of the tip.",
+            other_handshake.version
+        );
         return InternalConnectionStatus::Refused(ConnectionRefusedReason::IncompatibleVersion);
     }
 
@@ -807,6 +851,61 @@ mod tests {
                 assert!(versions_are_compatible(a, b));
             }
         }
+    }
+
+    #[test]
+    fn only_versions_from_0_3_0_follow_upgrade_vm_v8() {
+        for (version, follows) in [
+            ("0.2.7", false),
+            ("0.3.0-rc.1", false),
+            ("0.3.0", true),
+            ("0.3.1", true),
+            ("1.0.0", true),
+            ("potato", false),
+        ] {
+            assert_eq!(
+                follows,
+                version_follows_rule_set(version, ConsensusRuleSet::UpgradeVMv8),
+                "version {version}"
+            );
+            assert!(
+                version_follows_rule_set(version, ConsensusRuleSet::UpgradeVMv7),
+                "before the fork, version {version} is not refused for its rule set"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn refuse_connection_from_version_not_following_the_tip_rule_set() -> Result<()> {
+        // Main's genesis tip precedes the fork; regtest follows `UpgradeVMv8`
+        // from genesis.
+        for (network, refused) in [(Network::Main, false), (Network::RegTest, true)] {
+            let cli = cli_args::Args {
+                network,
+                ..Default::default()
+            };
+            let (_, _, _, _, state_lock, own_handshake) =
+                get_test_genesis_setup(network, 1, cli).await?;
+            let (mut other_handshake, peer_sa) = get_dummy_peer_connection_data_genesis(network, 1);
+            other_handshake.version = VersionString::try_from_str("0.2.7").unwrap();
+
+            let status = check_if_connection_is_allowed(
+                state_lock.clone(),
+                &own_handshake,
+                &other_handshake,
+                &peer_sa,
+            )
+            .await;
+            let expected = if refused {
+                InternalConnectionStatus::Refused(ConnectionRefusedReason::IncompatibleVersion)
+            } else {
+                InternalConnectionStatus::Accepted
+            };
+            assert_eq!(expected, status, "network {network}");
+        }
+
+        Ok(())
     }
 
     #[test]
