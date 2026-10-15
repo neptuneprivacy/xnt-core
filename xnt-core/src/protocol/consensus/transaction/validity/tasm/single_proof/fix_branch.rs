@@ -95,7 +95,7 @@ impl FixWitness {
     /// `Link[D]` indexed by a `SingleProof` digest it never names itself, and
     /// `Fix` is what instantiates `D` -- with the digest of the very program
     /// doing the instantiating, which the outer verifier has already pinned.
-    fn link_proof_claim(&self, single_proof_digest: Digest) -> Claim {
+    pub(crate) fn link_proof_claim(&self, single_proof_digest: Digest) -> Claim {
         let input = link_proof_public_input(self.link_kernel_mast_hash(), single_proof_digest);
         Claim::new(LinkProof.hash())
             .with_input(input.individual_tokens)

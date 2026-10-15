@@ -492,8 +492,6 @@ pub(crate) async fn create_block_transaction(
     .await
 }
 
-/// # Panics
-///  - If predecessor has a negative transaction fee
 /// Fix the mempool's preferred resolved link transaction into a
 /// `SingleProof`-backed transaction for the block being composed, if there is
 /// one. Only if the block keeps the rule set of its predecessor, under which
@@ -502,6 +500,10 @@ pub(crate) async fn create_block_transaction(
 /// The fixed transaction is inserted into the mempool, so it need not be fixed
 /// again for another block proposal. It replaces the link transaction under the
 /// same txid.
+///
+/// A failure to fix is not a failure to compose: it is recorded as an upgrade
+/// failure, so the link transaction is passed over until the next block, and
+/// the composer falls back to a nop.
 async fn fix_resolved_link_tx_from_mempool(
     global_state_lock: &mut GlobalStateLock,
     predecessor_rule_set: ConsensusRuleSet,
@@ -524,20 +526,43 @@ async fn fix_resolved_link_tx_from_mempool(
     };
 
     info!("Fixing resolved link transaction from mempool instead of building a nop");
-    let fixed = fix_link_tx(link_tx, consensus_rule_set, vm_job_queue, proof_job_options).await?;
-    global_state_lock
-        .lock_guard_mut()
-        .await
-        .mempool_insert(
-            fixed.clone(),
-            UpgradePriority::Irrelevant,
-            AddReason::Upgraded,
-        )
-        .await;
+    let txid = link_tx.txid();
+    let fixed =
+        match fix_link_tx(link_tx, consensus_rule_set, vm_job_queue, proof_job_options).await {
+            Ok(fixed) => fixed,
+            Err(error) => {
+                warn!("Failed to fix link transaction {txid} for composition: {error}");
+                global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .mempool_record_upgrade_failure([txid]);
+                return Ok(None);
+            }
+        };
+
+    // Insert only if a block did not arrive while fixing: the fixed
+    // transaction must still be synced to the tip and confirmable.
+    {
+        let mut state = global_state_lock.lock_guard_mut().await;
+        let tip_mutator_set = state.chain.light_state().mutator_set_accumulator_after()?;
+        if fixed.kernel.mutator_set_hash == tip_mutator_set.hash()
+            && fixed.is_confirmable_relative_to(&tip_mutator_set)
+        {
+            state
+                .mempool_insert(
+                    fixed.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::Upgraded,
+                )
+                .await;
+        }
+    }
 
     Ok(Some(fixed))
 }
 
+/// # Panics
+///  - If predecessor has a negative transaction fee
 pub(crate) async fn create_block_transaction_from(
     predecessor_block: &Block,
     mut global_state_lock: GlobalStateLock,

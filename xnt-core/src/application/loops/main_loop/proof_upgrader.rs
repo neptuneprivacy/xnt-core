@@ -1041,10 +1041,13 @@ pub(super) async fn get_upgrade_task_from_mempool(
     // Do we have a resolved link transaction to fix? Fixing gobbles nothing,
     // but our own interest in the transaction can still make it urgent. A
     // foreign one is fixed only if this node upgrades for free. And only under
-    // a rule set whose `SingleProof` program has the `Fix` branch.
-    let fix_job = global_state
-        .consensus_rule_set()
-        .has_chain_branches()
+    // a rule set whose `SingleProof` program has the `Fix` branch, and that
+    // the next block keeps, since a fixed transaction is mined no earlier.
+    let tip_height = global_state.chain.light_state().header().height;
+    let network = global_state.cli().network;
+    let tip_rule_set = ConsensusRuleSet::infer_from(network, tip_height);
+    let next_rule_set = ConsensusRuleSet::infer_from(network, tip_height.next());
+    let fix_job = (tip_rule_set == next_rule_set && tip_rule_set.has_chain_branches())
         .then(|| global_state.mempool.preferred_link_fix(upgrade_filter))
         .flatten()
         .map(|(link_tx, priority)| {

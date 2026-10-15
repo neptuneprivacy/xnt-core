@@ -49,6 +49,7 @@ use crate::protocol::consensus::chaintx::link_proof::link_proof_claim;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProof;
 use crate::protocol::consensus::transaction::Transaction;
+use crate::protocol::proof_abstractions::verifier::verify;
 
 pub(crate) const DISCRIMINANT_FOR_PROOF_COLLECTION: u64 = 0;
 pub(crate) const DISCRIMINANT_FOR_UPDATE: u64 = 1;
@@ -512,9 +513,20 @@ pub(crate) async fn fix_link_tx(
     let witness = FixWitness::fix(link_tx);
     let kernel = witness.kernel.clone();
 
-    let proof = if proof_job_options.job_settings.network.use_mock_proof() {
+    let network = proof_job_options.job_settings.network;
+    let proof = if network.use_mock_proof() {
         Proof::valid_mock(Claim::new(Digest::default()))
     } else {
+        // The link proof must answer the claim `Fix` builds for it, which
+        // names this rule set's `SingleProof` program. Checked here, as an
+        // error, rather than while assembling the nondeterminism.
+        let claim = witness.link_proof_claim(single_proof_program_digest(consensus_rule_set));
+        if !verify(claim, witness.link_proof.clone(), network).await {
+            return Err(CreateProofError::LinkTxNotFixable(
+                "its link proof does not answer the Fix claim",
+            ));
+        }
+
         SingleProofV2Witness::from_fix(witness)
             .produce(triton_vm_job_queue, proof_job_options)
             .await?
