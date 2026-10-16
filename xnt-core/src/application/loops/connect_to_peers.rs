@@ -23,7 +23,6 @@ use tokio::time::timeout;
 use tokio_serde::formats::Bincode;
 use tokio_serde::SymmetricallyFramed;
 use tokio_util::codec::Framed;
-use tokio_util::codec::LengthDelimitedCodec;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -32,6 +31,7 @@ use tracing::warn;
 use crate::application::config::cli_args;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
+use crate::application::loops::frame_codec::PeerFrameCodec;
 use crate::application::loops::peer_loop::PeerLoopHandler;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::peer::ConnectionRefusedReason;
@@ -57,10 +57,8 @@ const PEER_TIME_DIFFERENCE_THRESHOLD_IN_SECONDS: u128 = 90;
 /// Use this function to ensure that the same rules apply for both
 /// ingoing and outgoing connections. This limits the size of messages
 /// peers can send.
-fn get_codec_rules() -> LengthDelimitedCodec {
-    let mut codec_rules = LengthDelimitedCodec::new();
-    codec_rules.set_max_frame_length(MAX_PEER_FRAME_LENGTH_IN_BYTES);
-    codec_rules
+fn get_codec_rules() -> PeerFrameCodec {
+    PeerFrameCodec::new()
 }
 
 /// Returns a bincode codec with allocation limits to prevent OOM attacks.
@@ -489,6 +487,7 @@ where
     // checked in `check_if_connection_is_allowed`. So if we get here, we are
     // good to go.
     info!("Connection accepted from {peer_address}");
+    peer.get_mut().codec_mut().complete_handshake();
 
     // Release the handshake permit now that handshake is complete.
     // This allows new incoming connections to start their handshake.
@@ -668,6 +667,7 @@ where
         peer.send(PeerMessage::Bye).await?;
         bail!("Attempted to connect to peer ({peer_address}) that was not allowed. This connection attempt should not have been made.");
     }
+    peer.get_mut().codec_mut().complete_handshake();
 
     // By default, start by asking the peer for its peers. In an adversarial
     // context, we want the network topology to be as robust as possible.

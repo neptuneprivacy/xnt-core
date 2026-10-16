@@ -530,7 +530,15 @@ impl BlockProposalRequest {
 }
 
 #[non_exhaustive]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, strum::EnumDiscriminants)]
+#[strum_discriminants(
+    name(PeerMessageKind),
+    derive(Hash, strum::Display, strum::FromRepr),
+    doc = "The kind of a [`PeerMessage`], without the payload.",
+    doc = "",
+    doc = "The variant index is the tag that starts a bincode encoding of the",
+    doc = "message."
+)]
 pub(crate) enum PeerMessage {
     Handshake {
         magic_value: [u8; 15],
@@ -579,6 +587,53 @@ pub(crate) enum PeerMessage {
     /// Send a full, proof-backed link transaction to a peer.
     LinkTx(Box<TransferLinkTx>),
     // New variants must be added here at the bottom to be backwards compatible.
+}
+
+impl PeerMessageKind {
+    /// The kind of message that a bincode frame carries, given the variant
+    /// index that starts the frame.
+    pub(crate) fn from_bincode_tag(tag: u32) -> Option<Self> {
+        Self::from_repr(usize::try_from(tag).ok()?)
+    }
+
+    /// Upper bound on the bincode size of a message of this kind, or `None`
+    /// if only the frame limit of the transport applies.
+    ///
+    /// The bounds leave room for the largest message consensus allows. A block
+    /// has at most one million field elements, nine bytes each as bincode, and
+    /// a sync challenge response carries 22 blocks. A transaction can carry a
+    /// proof collection with a proof per input, each around a megabyte. A
+    /// block batch response carries up to `STANDARD_BLOCK_BATCH_SIZE` blocks.
+    pub(crate) fn max_frame_length(self) -> Option<usize> {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+
+        let limit = match self {
+            Self::Handshake
+            | Self::BlockNotificationRequest
+            | Self::BlockNotification
+            | Self::BlockRequestByHeight
+            | Self::BlockRequestByHash
+            | Self::UnableToSatisfyBatchRequest
+            | Self::SyncChallenge
+            | Self::BlockProposalNotification
+            | Self::BlockProposalRequest
+            | Self::TransactionNotification
+            | Self::TransactionRequest
+            | Self::PeerListRequest
+            | Self::Bye
+            | Self::ConnectionStatus
+            | Self::LinkTxNotification
+            | Self::LinkTxRequest => 64 * KIB,
+            Self::BlockRequestBatch | Self::PeerListResponse => 2 * MIB,
+            Self::Block | Self::BlockProposal => 20 * MIB,
+            Self::LinkTx => 64 * MIB,
+            Self::Transaction | Self::SyncChallengeResponse => 270 * MIB,
+            Self::BlockResponseBatch => return None,
+        };
+
+        Some(limit)
+    }
 }
 
 impl PeerMessage {
@@ -1300,6 +1355,52 @@ mod tests {
         assert_eq!(19, tag(&PeerMessage::Bye));
         let txid = TransactionKernelId::default();
         assert_eq!(22, tag(&PeerMessage::LinkTxRequest(txid)));
+    }
+
+    /// The kind of a message is read from the start of its frame, so the
+    /// kinds must follow the bincode tags of the messages.
+    #[test]
+    fn peer_message_kinds_follow_the_bincode_tags() {
+        use bincode::Options;
+
+        let txid = TransactionKernelId::default();
+        let messages = [
+            PeerMessage::BlockNotificationRequest,
+            PeerMessage::BlockRequestByHeight(1u64.into()),
+            PeerMessage::UnableToSatisfyBatchRequest,
+            PeerMessage::TransactionRequest(txid),
+            PeerMessage::PeerListRequest,
+            PeerMessage::Bye,
+            PeerMessage::LinkTxRequest(txid),
+        ];
+        for message in messages {
+            let options = bincode::DefaultOptions::new();
+            let bytes = options.serialize(&message).unwrap();
+            let tag = options.deserialize_from::<_, u32>(&bytes[..]).unwrap();
+            assert_eq!(
+                Some(PeerMessageKind::from(&message)),
+                PeerMessageKind::from_bincode_tag(tag)
+            );
+        }
+    }
+
+    /// The frame limits leave room for the largest messages consensus allows:
+    /// blocks of `max_block_size` field elements, nine bytes each as bincode.
+    #[test]
+    fn frame_limits_leave_room_for_the_largest_blocks() {
+        use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+
+        let max_block_len = 9 * ConsensusRuleSet::UpgradeVMv8.max_block_size();
+        let limit = |kind: PeerMessageKind| kind.max_frame_length().unwrap();
+
+        assert!(max_block_len <= limit(PeerMessageKind::Block));
+        assert!(max_block_len <= limit(PeerMessageKind::BlockProposal));
+        let num_blocks_in_sync_challenge_response = 2 * SYNC_CHALLENGE_NUM_BLOCK_PAIRS + 2;
+        assert!(
+            num_blocks_in_sync_challenge_response * max_block_len
+                <= limit(PeerMessageKind::SyncChallengeResponse)
+        );
+        assert_eq!(None, PeerMessageKind::BlockResponseBatch.max_frame_length());
     }
 
     #[test]
