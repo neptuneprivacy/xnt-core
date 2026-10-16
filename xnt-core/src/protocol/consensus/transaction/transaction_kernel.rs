@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -25,7 +26,6 @@ use crate::util_types::mutator_set::removal_record::removal_record_list::Removal
 use crate::util_types::mutator_set::removal_record::RemovalRecord;
 use crate::util_types::mutator_set::shared::deserialize_bounded_vec;
 use crate::util_types::mutator_set::shared::deserialize_checked_vec;
-use crate::util_types::mutator_set::shared::NUM_TRIALS;
 
 /// TransactionKernel is immutable and its hash never changes.
 ///
@@ -61,24 +61,28 @@ pub struct TransactionKernel {
     mast_sequences: OnceLock<Vec<Vec<BFieldElement>>>,
 }
 
+/// Upper bound on the number of chunk dictionary entries over all inputs of a
+/// kernel. A block holds at most `max_block_size` field elements and every
+/// entry takes several of them, so no block comes near this bound.
+const MAX_NUM_INPUT_CHUNKS: usize = 1_000_000;
+
 /// Deserialize the inputs of a kernel, refusing more than the maximum number of
-/// inputs and refusing a removal record after the first that has more chunks
-/// than its indices can hit. Only the first record of a packed list carries the
-/// chunks of the other records.
+/// inputs, and more chunk dictionary entries over all inputs than
+/// [`MAX_NUM_INPUT_CHUNKS`]. The entries may sit in any of the records.
 fn deserialize_inputs<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<RemovalRecord>, D::Error> {
-    let max_chunks = NUM_TRIALS as usize;
+    let num_chunks = Cell::new(0usize);
     deserialize_checked_vec::<D, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>(
         deserializer,
-        |index, record: &RemovalRecord| {
-            let num_chunks = record.target_chunks.len();
-            if index > 0 && num_chunks > max_chunks {
+        |_, record: &RemovalRecord| {
+            let total = num_chunks.get().saturating_add(record.target_chunks.len());
+            if total > MAX_NUM_INPUT_CHUNKS {
                 return Err(format!(
-                    "removal record {index} has {num_chunks} chunks, more than the {max_chunks} \
-                     its indices can hit"
+                    "inputs have more than {MAX_NUM_INPUT_CHUNKS} chunk dictionary entries"
                 ));
             }
+            num_chunks.set(total);
             Ok(())
         },
     )
@@ -714,8 +718,9 @@ pub mod tests {
 
     /// A packed list of inputs carries the chunks of every input in the
     /// dictionary of its first record; an unpacked list carries up to
-    /// `NUM_TRIALS` chunks per record. Both shapes survive the encodings used
-    /// between peers, on disk, and over JSON-RPC.
+    /// `NUM_TRIALS` chunks per record; the entries may also sit in a later
+    /// record. Every shape survives the encodings used between peers, on disk,
+    /// and over JSON-RPC.
     #[test]
     fn kernels_with_packed_and_unpacked_inputs_round_trip() {
         use bincode::Options;
@@ -724,6 +729,7 @@ pub mod tests {
         use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
         use crate::util_types::mutator_set::removal_record::chunk::Chunk;
         use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
+        use crate::util_types::mutator_set::shared::NUM_TRIALS;
 
         let record_with_chunks = |num_chunks: u64| RemovalRecord {
             absolute_indices: AbsoluteIndexSet::new([0; NUM_TRIALS as usize]),
@@ -754,19 +760,26 @@ pub mod tests {
             record_with_chunks(0),
         ]);
         let unpacked = kernel_with_inputs(vec![record_with_chunks(full); 3]);
+        let in_later_record = kernel_with_inputs(vec![
+            record_with_chunks(full),
+            record_with_chunks(full * 1000),
+            record_with_chunks(0),
+        ]);
 
-        for kernel in [packed, unpacked] {
+        for kernel in [packed, unpacked, in_later_record] {
             let options = bincode::DefaultOptions::new();
-            let bytes = options.serialize(&kernel).unwrap();
+            let varint_bytes = options.serialize(&kernel).unwrap();
             assert_eq!(
                 kernel,
-                options.deserialize::<TransactionKernel>(&bytes).unwrap()
+                options
+                    .deserialize::<TransactionKernel>(&varint_bytes)
+                    .unwrap()
             );
 
-            let bytes = bincode::serialize(&kernel).unwrap();
+            let fixint_bytes = bincode::serialize(&kernel).unwrap();
             assert_eq!(
                 kernel,
-                bincode::deserialize::<TransactionKernel>(&bytes).unwrap()
+                bincode::deserialize::<TransactionKernel>(&fixint_bytes).unwrap()
             );
 
             let json = serde_json::to_vec(&kernel).unwrap();
@@ -775,5 +788,27 @@ pub mod tests {
                 serde_json::from_slice::<TransactionKernel>(&json).unwrap()
             );
         }
+    }
+
+    /// The bound on the chunk dictionary entries of a kernel's inputs is
+    /// looser than what any block can hold.
+    #[test]
+    fn input_chunk_bound_exceeds_what_a_block_can_hold() {
+        use strum::IntoEnumIterator;
+        use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
+
+        use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+        use crate::util_types::mutator_set::removal_record::chunk::Chunk;
+        use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
+
+        let entry = (0, (MmrMembershipProof::new(vec![]), Chunk::empty_chunk()));
+        let entry_len = ChunkDictionary::new(vec![entry]).encode().len()
+            - ChunkDictionary::empty().encode().len();
+        let max_block_size = ConsensusRuleSet::iter()
+            .map(|rule_set| rule_set.max_block_size())
+            .max()
+            .unwrap();
+
+        assert!(max_block_size < MAX_NUM_INPUT_CHUNKS * entry_len);
     }
 }
