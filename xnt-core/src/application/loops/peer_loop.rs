@@ -31,6 +31,7 @@ use crate::application::loops::channel::PeerTaskToMainLinkTx;
 use crate::application::loops::channel::PeerTaskToMainTransaction;
 use crate::application::loops::connect_to_peers::close_peer_connected_callback;
 use crate::application::loops::connect_to_peers::version_follows_rule_set;
+use crate::application::loops::frame_codec::OversizedFrame;
 use crate::application::loops::main_loop::MAX_NUM_DIGESTS_IN_BATCH_REQUEST;
 use crate::macros::fn_name;
 use crate::macros::log_slow_scope;
@@ -2227,7 +2228,7 @@ impl PeerLoopHandler {
     where
         S: Sink<PeerMessage> + TryStream<Ok = PeerMessage> + Unpin,
         <S as Sink<PeerMessage>>::Error: std::error::Error + Sync + Send + 'static,
-        <S as TryStream>::Error: std::error::Error,
+        <S as TryStream>::Error: std::error::Error + 'static,
     {
         // If the peer indicates a more canonical block, request a block
         // notification to catch up ASAP. This lives here rather than in
@@ -2252,6 +2253,14 @@ impl PeerLoopHandler {
                     let peer_message = match peer_message {
                         Ok(message) => message,
                         Err(err) => {
+                            // The rest of the frame cannot be read, so the
+                            // connection is of no further use.
+                            if let Some(oversized) = OversizedFrame::behind(&err) {
+                                warn!("Closing connection to {peer_address}: {oversized}");
+                                self.punish(NegativePeerSanction::OversizedBlock).await?;
+                                break;
+                            }
+
                             // Don't disconnect if message type is unknown, as
                             // this allows the adding of new message types in
                             // the future. Consider only keeping connection open
@@ -2356,7 +2365,7 @@ impl PeerLoopHandler {
     where
         S: Sink<PeerMessage> + TryStream<Ok = PeerMessage> + Unpin,
         <S as Sink<PeerMessage>>::Error: std::error::Error + Sync + Send + 'static,
-        <S as TryStream>::Error: std::error::Error,
+        <S as TryStream>::Error: std::error::Error + 'static,
     {
         let cli_args = self.global_state_lock.cli().clone();
 

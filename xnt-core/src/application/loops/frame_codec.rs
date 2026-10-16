@@ -43,6 +43,16 @@ pub(crate) struct OversizedFrame {
     pub(crate) limit: usize,
 }
 
+impl OversizedFrame {
+    /// The oversized frame that an error from a peer stream reports, if any.
+    pub(crate) fn behind<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
+        error
+            .downcast_ref::<io::Error>()?
+            .get_ref()?
+            .downcast_ref::<Self>()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PeerFrameCodec {
     inner: LengthDelimitedCodec,
