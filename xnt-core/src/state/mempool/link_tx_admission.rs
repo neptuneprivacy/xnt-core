@@ -19,6 +19,8 @@
 //! [`Mempool::insert_link`]: super::Mempool::insert_link
 //! [`Mempool::contains_outputs`]: super::Mempool::contains_outputs
 
+use std::collections::HashSet;
+
 use crate::application::config::network::Network;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
@@ -58,6 +60,12 @@ pub(crate) enum LinkTxAdmissionError {
     /// More items than a mempool transaction may have. Thruputs count as
     /// inputs.
     TooBig(TransactionTooBig),
+
+    /// The same output is listed as a thruput more than once.
+    DuplicateThruput,
+
+    /// A thruput is also one of the link transaction's own outputs.
+    ThruputIsOwnOutput,
 
     /// Older than the mempool is willing to hold.
     TooOld,
@@ -179,6 +187,8 @@ pub(crate) fn link_tx_precheck(
         .mempool_size_check(num_inputs, kernel.outputs.len(), kernel.announcements.len())
         .map_err(LinkTxAdmissionError::TooBig)?;
 
+    check_thruputs(link_tx)?;
+
     let timestamp = kernel.timestamp;
     if timestamp < now - Timestamp::seconds(MEMPOOL_TX_THRESHOLD_AGE_IN_SECS) {
         return Err(LinkTxAdmissionError::TooOld);
@@ -190,11 +200,35 @@ pub(crate) fn link_tx_precheck(
     Ok(())
 }
 
+/// Refuse thruput shapes that no wallet produces: a thruput listed twice, or a
+/// thruput that is also one of the link transaction's own outputs.
+pub(crate) fn check_thruputs(link_tx: &LinkTx) -> Result<(), LinkTxAdmissionError> {
+    let mut thruputs = HashSet::with_capacity(link_tx.kernel.thruputs.len());
+    for thruput in &link_tx.kernel.thruputs {
+        if !thruputs.insert(thruput) {
+            return Err(LinkTxAdmissionError::DuplicateThruput);
+        }
+    }
+
+    if link_tx
+        .kernel
+        .kernel
+        .outputs
+        .iter()
+        .any(|output| thruputs.contains(output))
+    {
+        return Err(LinkTxAdmissionError::ThruputIsOwnOutput);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use macro_rules_attr::apply;
     use tasm_lib::prelude::Digest;
+    use tasm_lib::triton_vm::prelude::BFieldElement;
 
     use super::*;
     use crate::protocol::consensus::block::Block;
@@ -339,13 +373,13 @@ mod tests {
         let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
         let (tip_msa, mut link_tx) = setup(true);
         let limit = consensus_rule_set.max_num_inputs_in_mempool();
-        link_tx.kernel.thruputs = vec![AdditionRecord::new(Digest::default()); limit];
+        let thruput = |i: usize| {
+            AdditionRecord::new(Digest::new([BFieldElement::new(i as u64); Digest::LEN]))
+        };
+        link_tx.kernel.thruputs = (0..limit).map(thruput).collect();
         assert_eq!(Ok(()), admit(&link_tx, &tip_msa, consensus_rule_set).await);
 
-        link_tx
-            .kernel
-            .thruputs
-            .push(AdditionRecord::new(Digest::default()));
+        link_tx.kernel.thruputs.push(thruput(limit));
         assert_eq!(
             Err(LinkTxAdmissionError::TooBig(
                 TransactionTooBig::TooManyInputs

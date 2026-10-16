@@ -239,7 +239,11 @@ impl PeerLoopHandler {
             LinkTxAdmissionError::NegativeFee => {
                 Some(NegativePeerSanction::TransactionWithNegativeFee)
             }
-            LinkTxAdmissionError::TooBig(_) => Some(NegativePeerSanction::UnrelayableTransaction),
+            LinkTxAdmissionError::TooBig(_)
+            | LinkTxAdmissionError::DuplicateThruput
+            | LinkTxAdmissionError::ThruputIsOwnOutput => {
+                Some(NegativePeerSanction::UnrelayableTransaction)
+            }
             LinkTxAdmissionError::NotConfirmable(
                 TransactionConfirmabilityError::InvalidRemovalRecord(_),
             ) => Some(NegativePeerSanction::UnconfirmableTransaction),

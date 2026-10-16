@@ -1026,6 +1026,11 @@ impl Mempool {
     ) -> Vec<MempoolEvent> {
         let txid = new_link.txid();
 
+        if link_tx_admission::check_thruputs(&new_link).is_err() {
+            debug!("Attempted to insert link transaction with ill-formed thruputs.");
+            return vec![];
+        }
+
         if !self.contains_outputs(&new_link.kernel.thruputs) {
             debug!("Attempted to insert link transaction with unknown thruputs.");
             return vec![];
@@ -1173,46 +1178,65 @@ impl Mempool {
         MempoolEvent::normalize(events)
     }
 
-    /// Remove the link transactions with a thruput that is no longer an
-    /// output of any transaction in the mempool: their predecessor left the
-    /// mempool unmined, so the thruput can never be cut through.
+    /// Remove the link transactions that are not anchored: their predecessor
+    /// left the mempool unmined, so their thruputs can never be cut through.
     ///
-    /// Repeats until none is left, since a removed link transaction may have
-    /// provided another one's thruput.
+    /// A link transaction is anchored if each of its thruputs is an output of
+    /// a standard transaction in the mempool, of a link transaction without
+    /// thruputs, or of an anchored link transaction. The outputs of a link
+    /// transaction that is not anchored anchor nothing.
     pub(super) fn remove_stranded_links(&mut self) -> Vec<MempoolEvent> {
-        let mut events = vec![];
-        loop {
-            let holds_link_with_thruputs = self.tx_dictionary.values().any(|member| {
-                matches!(&member.transaction, AnyTx::Link(link) if !link.kernel.thruputs.is_empty())
-            });
-            if !holds_link_with_thruputs {
-                break;
-            }
-
-            let outputs: HashSet<AdditionRecord> = self
-                .tx_dictionary
-                .values()
-                .flat_map(|member| member.transaction.kernel().outputs.iter().copied())
-                .collect();
-            let not_stranded = |(_transaction_id, tx): LookupItem| -> bool {
-                match tx {
-                    AnyTx::Standard(_) => true,
-                    AnyTx::Link(link) => link
-                        .kernel
-                        .thruputs
-                        .iter()
-                        .all(|thruput| outputs.contains(thruput)),
+        let mut unanchored = vec![];
+        for (txid, member) in &self.tx_dictionary {
+            if let AnyTx::Link(link) = &member.transaction {
+                if !link.kernel.thruputs.is_empty() {
+                    unanchored.push((*txid, &link.kernel));
                 }
-            };
-            self.warn_about_own_links_removed_by(&not_stranded, "its predecessor left the mempool");
-            let removed = self.retain(not_stranded, RemovalReason::Abandoned);
-            if removed.is_empty() {
-                break;
             }
-            events.extend(removed);
+        }
+        if unanchored.is_empty() {
+            return vec![];
         }
 
-        events
+        let mut anchored_outputs: HashSet<AdditionRecord> = self
+            .tx_dictionary
+            .values()
+            .filter(|member| match &member.transaction {
+                AnyTx::Standard(_) => true,
+                AnyTx::Link(link) => link.kernel.thruputs.is_empty(),
+            })
+            .flat_map(|member| member.transaction.kernel().outputs.iter().copied())
+            .collect();
+
+        // Anchor link transactions in rounds, so that a link transaction
+        // chained onto another one is anchored once that one is.
+        loop {
+            let num_unanchored = unanchored.len();
+            unanchored.retain(|(_, link_kernel)| {
+                let is_anchored = link_kernel
+                    .thruputs
+                    .iter()
+                    .all(|thruput| anchored_outputs.contains(thruput));
+                if is_anchored {
+                    anchored_outputs.extend(link_kernel.kernel.outputs.iter().copied());
+                }
+                !is_anchored
+            });
+            if unanchored.len() == num_unanchored {
+                break;
+            }
+        }
+
+        if unanchored.is_empty() {
+            return vec![];
+        }
+
+        let stranded: HashSet<TransactionKernelId> =
+            unanchored.into_iter().map(|(txid, _)| txid).collect();
+        let not_stranded =
+            |(transaction_id, _tx): LookupItem| -> bool { !stranded.contains(&transaction_id) };
+        self.warn_about_own_links_removed_by(&not_stranded, "its predecessor left the mempool");
+        self.retain(not_stranded, RemovalReason::Abandoned)
     }
 
     /// Warn about the link transactions of interest to this node that the
@@ -5098,6 +5122,61 @@ mod tests {
                 mempool.contains(link.txid()),
                 "a link whose predecessor returns from the merge input cache must stay"
             );
+        }
+
+        /// A link transaction chained onto another link transaction is
+        /// anchored through it: both stay while the standard predecessor at
+        /// the root of the chain is in the mempool, and both leave with it.
+        #[test]
+        fn chained_link_transactions_stay_while_anchored_and_leave_with_their_predecessor() {
+            let (mut mempool, _) = genesis_mempool();
+            let [first_base, second_base, predecessor_base, rival_base] =
+                make_plenty_mock_transaction_supported_by_invalid_single_proofs(4)
+                    .try_into()
+                    .unwrap();
+            let [first_thruput, second_thruput] = arbitrary_addition_records(2).try_into().unwrap();
+
+            let predecessor = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .outputs(vec![first_thruput])
+                    .fee(NativeCurrencyAmount::coins(1))
+                    .modify(predecessor_base.kernel),
+                proof: predecessor_base.proof,
+            };
+            mempool.insert(
+                predecessor.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            );
+
+            let first_kernel = TransactionKernelModifier::default()
+                .outputs(vec![second_thruput])
+                .modify(first_base.kernel);
+            let first = proof_backed_link(first_kernel, vec![first_thruput]);
+            let second = proof_backed_link(second_base.kernel, vec![second_thruput]);
+            let (first_txid, second_txid) = (first.txid(), second.txid());
+            mempool.insert_link(first, UpgradePriority::Critical, AddReason::Submitted);
+            mempool.insert_link(second, UpgradePriority::Critical, AddReason::Submitted);
+            assert_eq!(3, mempool.len());
+
+            assert!(mempool.remove_stranded_links().is_empty());
+            assert!(mempool.contains(first_txid));
+            assert!(mempool.contains(second_txid));
+
+            let rival = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .inputs(predecessor.kernel.inputs.clone())
+                    .fee(NativeCurrencyAmount::coins(100))
+                    .modify(rival_base.kernel),
+                proof: rival_base.proof,
+            };
+            let rival_txid = rival.txid();
+            mempool.insert(rival, UpgradePriority::Irrelevant, AddReason::FromPeer);
+            assert!(!mempool.contains(predecessor.txid()));
+            assert!(!mempool.contains(first_txid));
+            assert!(!mempool.contains(second_txid));
+            assert!(mempool.contains(rival_txid));
+            assert_eq!(1, mempool.len());
         }
 
         #[test]
