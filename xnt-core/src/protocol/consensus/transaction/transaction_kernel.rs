@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use get_size2::GetSize;
 use itertools::Itertools;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 use strum::EnumCount;
 use strum::VariantArray;
@@ -13,6 +14,7 @@ use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 
 use super::announcement::Announcement;
+use crate::protocol::consensus::block::MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
@@ -21,6 +23,9 @@ use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 use crate::util_types::mutator_set::removal_record::removal_record_list::RemovalRecordListUnpackError;
 use crate::util_types::mutator_set::removal_record::RemovalRecord;
+use crate::util_types::mutator_set::shared::deserialize_bounded_vec;
+use crate::util_types::mutator_set::shared::deserialize_checked_vec;
+use crate::util_types::mutator_set::shared::NUM_TRIALS;
 
 /// TransactionKernel is immutable and its hash never changes.
 ///
@@ -29,8 +34,15 @@ use crate::util_types::mutator_set::removal_record::RemovalRecord;
 #[derive(Debug, Clone, Serialize, Deserialize, GetSize, BFieldCodec, TasmObject)]
 pub struct TransactionKernel {
     // note: see field descriptions in [`TransactionKernelProxy`]
+    #[serde(deserialize_with = "deserialize_inputs")]
     pub inputs: Vec<RemovalRecord>,
+    #[serde(
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>"
+    )]
     pub outputs: Vec<AdditionRecord>,
+    #[serde(
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>"
+    )]
     pub announcements: Vec<Announcement>,
     pub fee: NativeCurrencyAmount,
     pub coinbase: Option<NativeCurrencyAmount>,
@@ -47,6 +59,29 @@ pub struct TransactionKernel {
     #[tasm_object(ignore)]
     #[get_size(ignore)]
     mast_sequences: OnceLock<Vec<Vec<BFieldElement>>>,
+}
+
+/// Deserialize the inputs of a kernel, refusing more than the maximum number of
+/// inputs and refusing a removal record after the first that has more chunks
+/// than its indices can hit. Only the first record of a packed list carries the
+/// chunks of the other records.
+fn deserialize_inputs<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<RemovalRecord>, D::Error> {
+    let max_chunks = NUM_TRIALS as usize;
+    deserialize_checked_vec::<D, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>(
+        deserializer,
+        |index, record: &RemovalRecord| {
+            let num_chunks = record.target_chunks.len();
+            if index > 0 && num_chunks > max_chunks {
+                return Err(format!(
+                    "removal record {index} has {num_chunks} chunks, more than the {max_chunks} \
+                     its indices can hit"
+                ));
+            }
+            Ok(())
+        },
+    )
 }
 
 impl std::fmt::Display for TransactionKernel {
@@ -674,6 +709,71 @@ pub mod tests {
             );
             let decoded = *TransactionKernel::decode(&encoded).unwrap();
             assert_eq!(kernel, decoded);
+        }
+    }
+
+    /// A packed list of inputs carries the chunks of every input in the
+    /// dictionary of its first record; an unpacked list carries up to
+    /// `NUM_TRIALS` chunks per record. Both shapes survive the encodings used
+    /// between peers, on disk, and over JSON-RPC.
+    #[test]
+    fn kernels_with_packed_and_unpacked_inputs_round_trip() {
+        use bincode::Options;
+        use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
+
+        use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+        use crate::util_types::mutator_set::removal_record::chunk::Chunk;
+        use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
+
+        let record_with_chunks = |num_chunks: u64| RemovalRecord {
+            absolute_indices: AbsoluteIndexSet::new([0; NUM_TRIALS as usize]),
+            target_chunks: ChunkDictionary::new(
+                (0..num_chunks)
+                    .map(|i| (i, (MmrMembershipProof::new(vec![]), Chunk::empty_chunk())))
+                    .collect(),
+            ),
+        };
+        let kernel_with_inputs = |inputs: Vec<RemovalRecord>| {
+            TransactionKernelProxy {
+                inputs,
+                outputs: vec![],
+                announcements: vec![],
+                fee: NativeCurrencyAmount::coins(0),
+                coinbase: None,
+                timestamp: Timestamp::now(),
+                mutator_set_hash: Digest::default(),
+                merge_bit: false,
+            }
+            .into_kernel()
+        };
+
+        let full = u64::from(NUM_TRIALS);
+        let packed = kernel_with_inputs(vec![
+            record_with_chunks(full * 1000),
+            record_with_chunks(0),
+            record_with_chunks(0),
+        ]);
+        let unpacked = kernel_with_inputs(vec![record_with_chunks(full); 3]);
+
+        for kernel in [packed, unpacked] {
+            let options = bincode::DefaultOptions::new();
+            let bytes = options.serialize(&kernel).unwrap();
+            assert_eq!(
+                kernel,
+                options.deserialize::<TransactionKernel>(&bytes).unwrap()
+            );
+
+            let bytes = bincode::serialize(&kernel).unwrap();
+            assert_eq!(
+                kernel,
+                bincode::deserialize::<TransactionKernel>(&bytes).unwrap()
+            );
+
+            let json = serde_json::to_vec(&kernel).unwrap();
+            assert_eq!(
+                kernel,
+                serde_json::from_slice::<TransactionKernel>(&json).unwrap()
+            );
         }
     }
 }

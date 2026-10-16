@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
 use itertools::Itertools;
+use serde::de::SeqAccess;
+use serde::de::Visitor;
+use serde::Deserialize;
+use serde::Deserializer;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
@@ -14,6 +19,66 @@ pub const WINDOW_SIZE: u32 = 1 << 20;
 pub const CHUNK_SIZE: u32 = 1 << 12;
 pub const BATCH_SIZE: u32 = 1 << 3;
 pub const NUM_TRIALS: u32 = 45;
+
+/// Deserialize a list of at most `MAX` elements, for use with
+/// `#[serde(deserialize_with = "...")]`. An announced length above `MAX` is
+/// refused before any element is read, so that a short encoding cannot make
+/// the receiver allocate a long list.
+pub fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserialize_checked_vec::<D, T, MAX>(deserializer, |_, _| Ok(()))
+}
+
+/// Like [`deserialize_bounded_vec`], additionally refusing the list as soon as
+/// `check` rejects an element, given its index. The error message is the
+/// returned string.
+pub fn deserialize_checked_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+    check: impl Fn(usize, &T) -> Result<(), String>,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Checked<T, F, const MAX: usize>(F, PhantomData<T>);
+
+    impl<'de, T, F, const MAX: usize> Visitor<'de> for Checked<T, F, MAX>
+    where
+        T: Deserialize<'de>,
+        F: Fn(usize, &T) -> Result<(), String>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(formatter, "a list of at most {MAX} elements")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let announced = seq.size_hint().unwrap_or(0);
+            if announced > MAX {
+                return Err(serde::de::Error::invalid_length(announced, &self));
+            }
+
+            let mut elements = Vec::with_capacity(announced);
+            while let Some(element) = seq.next_element()? {
+                if elements.len() == MAX {
+                    return Err(serde::de::Error::invalid_length(elements.len() + 1, &self));
+                }
+                self.0(elements.len(), &element).map_err(serde::de::Error::custom)?;
+                elements.push(element);
+            }
+
+            Ok(elements)
+        }
+    }
+
+    deserializer.deserialize_seq(Checked::<T, _, MAX>(check, PhantomData))
+}
 
 /// Given a set of absolute indices, return a hashmap of
 /// {chunk_index => absolute_indices}

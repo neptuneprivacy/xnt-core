@@ -18,6 +18,7 @@ use super::removal_records_integrity::RemovalRecordsIntegrity;
 use crate::api::tx_initiation::error::CreateProofError;
 use crate::application::config::network::Network;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
+use crate::protocol::consensus::block::MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
@@ -34,14 +35,19 @@ use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 use crate::protocol::proof_abstractions::SecretWitness;
+use crate::util_types::mutator_set::shared::deserialize_bounded_vec;
+
+const MAX_NUM_SCRIPT_PROOFS: usize = 2 * MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, GetSize, BFieldCodec, TasmObject)]
 pub struct ProofCollection {
     pub removal_records_integrity: Proof,
     pub collect_lock_scripts: Proof,
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_SCRIPT_PROOFS>")]
     pub lock_scripts_halt: Vec<Proof>,
     pub kernel_to_outputs: Proof,
     pub collect_type_scripts: Proof,
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_SCRIPT_PROOFS>")]
     pub type_scripts_halt: Vec<Proof>,
     pub lock_script_hashes: Vec<Digest>,
     pub type_script_hashes: Vec<Digest>,
