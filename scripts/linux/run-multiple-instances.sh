@@ -28,13 +28,13 @@ CARGO_ARGS=""
 # to build at the same time.
 cargo $CARGO_ARGS build $BUILD_ARGS
 
-RUST_BACKTRACE=1 XDG_DATA_HOME=~/.local/share/neptune-integration-test/0/ nice -n 18 --  cargo $CARGO_ARGS run $BUILD_ARGS -- $NEPTUNE_ARGS --peer-port 29790 --rpc-port 19790 --compose --guess 2>&1 | tee -a integration_test.log | sed 's/(.*)/\0 \[I0\]/g'  &
+RUST_BACKTRACE=1 XDG_DATA_HOME=~/.local/share/neptune-integration-test/0/ nice -n 18 --  cargo $CARGO_ARGS run $BUILD_ARGS -- $NEPTUNE_ARGS --peer-port 29790 --rpc-port 19790 --quic-port 29800 --tcp-port 29810 --compose --guess 2>&1 | tee -a integration_test.log | sed 's/(.*)/\0 \[I0\]/g'  &
 pid[0]=$!
 sleep 5s;
-RUST_BACKTRACE=1 XDG_DATA_HOME=~/.local/share/neptune-integration-test/1/ nice -n 18 --  cargo $CARGO_ARGS run $BUILD_ARGS -- $NEPTUNE_ARGS --peer-port 29791 --rpc-port 19791 --peers 127.0.0.1:29790 2>&1 | tee -a integration_test.log | sed 's/(.*)/\0 \[I1\]/g'  &
+RUST_BACKTRACE=1 XDG_DATA_HOME=~/.local/share/neptune-integration-test/1/ nice -n 18 --  cargo $CARGO_ARGS run $BUILD_ARGS -- $NEPTUNE_ARGS --peer-port 29791 --rpc-port 19791 --quic-port 29801 --tcp-port 29811 --peers 127.0.0.1:29790 2>&1 | tee -a integration_test.log | sed 's/(.*)/\0 \[I1\]/g'  &
 pid[1]=$!
 sleep 5s;
-RUST_BACKTRACE=1 XDG_DATA_HOME=~/.local/share/neptune-integration-test/2/ nice -n 18 --  cargo $CARGO_ARGS run $BUILD_ARGS -- $NEPTUNE_ARGS --peer-port 29792 --rpc-port 19792 --guess --peers 127.0.0.1:29791 --sync-mode-threshold 1000 2>&1 | tee -a integration_test.log | sed 's/(.*)/\0 \[I2\]/g'  &
+RUST_BACKTRACE=1 XDG_DATA_HOME=~/.local/share/neptune-integration-test/2/ nice -n 18 --  cargo $CARGO_ARGS run $BUILD_ARGS -- $NEPTUNE_ARGS --peer-port 29792 --rpc-port 19792 --quic-port 29802 --tcp-port 29812 --guess --peers 127.0.0.1:29791 --sync-mode-threshold 1000 2>&1 | tee -a integration_test.log | sed 's/(.*)/\0 \[I2\]/g'  &
 pid[2]=$!
 
 # Inspired by https://stackoverflow.com/a/52033580/2574407

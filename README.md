@@ -77,6 +77,7 @@ Windows should just work out-of-the-box with cargo build etc.
 - Run xnt-core daemon: `xnt-core` with flags
     - `--peer [ip_address:port]` to connect to a given peer, for instance
       `--peer 161.97.150.88:9898` or `--peer 154.38.160.61:9898` or `--peer 37.27.134.39:9898 --peer 65.21.215.25:9898 --peer 69.143.221.78:8080 --peer 161.97.150.88:9898 --peer 154.38.160.61:9898`
+    - `--peer /ip4/[ip_address]/udp/9901/quic-v1` to connect to a given peer over QUIC instead
     - `--compose` to become a composer — generate blocks for miners and earn fees from them
     - `--guess` to mine — if you want to generate coins
     - `--help` to get a list of available command-line arguments
@@ -88,6 +89,39 @@ The minimum requirements for composing are:
 If you don't have a static IPv4, then try connecting to other nodes with IPv6. It's our experience
 that you will then be able to open and receive connections to other nodes through Nepture Core's
 built-in peer-discovery process.
+
+### Network Ports
+
+`xnt-core` connects to peers over two network stacks that run side by side: the legacy stack,
+plain TCP, which every version of `xnt-core` speaks, and the libp2p stack, with QUIC and TCP
+transports. Both carry the same peer protocol, so nodes of this version and older nodes keep
+talking to each other.
+
+| Port     | Used for                        | Option         |
+|----------|---------------------------------|----------------|
+| 9898/tcp | peers, legacy stack             | `--peer-port`  |
+| 9901/udp | peers, libp2p over QUIC         | `--quic-port`  |
+| 9902/tcp | peers, libp2p over TCP          | `--tcp-port`   |
+| 9899/tcp | RPC for `xnt-cli` and dashboard | `--rpc-port`   |
+
+To accept connections from other nodes, open 9898/tcp, 9901/udp and 9902/tcp in your firewall.
+The RPC port only listens on localhost and should stay closed.
+
+How a `--peer` entry is reached depends on how it is written:
+
+- `ip:port`, for instance `--peer 1.2.3.4:9898`, uses the legacy stack;
+- `--peer /ip4/1.2.3.4/udp/9901/quic-v1` or `--peer 1.2.3.4:9901` uses QUIC;
+- `--peer /ip4/1.2.3.4/tcp/9902` or `--peer 1.2.3.4:9902` uses libp2p over TCP;
+- a bare IP, `--peer 1.2.3.4`, tries both the legacy stack and QUIC.
+
+A running node can be asked to connect to a peer over QUIC with
+`xnt-cli dial /ip4/1.2.3.4/udp/9901/quic-v1`. `xnt-cli peer-info` lists the connected peers,
+whichever stack they are connected over, and `xnt-cli network-overview` shows the state of the
+libp2p stack: its peer ID, reachability, external addresses and number of connections. To run the
+legacy stack only, start the node with `--disable-libp2p`.
+
+See [Network Stack](docs/src/neptune-core/network_stack.md) for the details: the libp2p identity,
+bans, relays and NAT traversal, and compatibility with older nodes.
 
 ## Wallet
 
@@ -132,6 +166,9 @@ xnt-cli block-height
 
 If you set up `xnt-core` to listen for RPC requests on a different port from the default (9899),
 then the flag `--port <port>` is your friend.
+
+Commands for the peer network include `peer-info`, `network-overview`, `dial`, `ban`, `unban` and
+`probe-nat`; `xnt-cli <command> --help` describes each.
 
 ## Setup for Development (Ubuntu)
 
