@@ -17,6 +17,8 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -178,6 +180,15 @@ pub struct GlobalStateLock {
     // for broadcasting Tx as well as the RPC API.
     // (we might consider renaming the channel.)
     rpc_server_to_main_tx: tokio::sync::mpsc::Sender<RPCServerToMain>,
+
+    /// A cache for the synchronous handshake getter, used as a fallback when
+    /// acquiring the read lock on `global_state_lock` without waiting fails.
+    #[cfg(feature = "libp2p")]
+    handshake_cache: Arc<std::sync::RwLock<HandshakeData>>,
+
+    /// Set if the libp2p network stack is enabled but has stopped, or could
+    /// not be started. See [`Self::libp2p_runs`].
+    libp2p_stopped: Arc<AtomicBool>,
 }
 
 impl GlobalStateLock {
@@ -186,6 +197,9 @@ impl GlobalStateLock {
         rpc_server_to_main_tx: tokio::sync::mpsc::Sender<RPCServerToMain>,
     ) -> Self {
         let cli = global_state.cli.clone();
+        #[cfg(feature = "libp2p")]
+        let handshake_cache =
+            Arc::new(std::sync::RwLock::new(global_state.get_own_handshakedata()));
         let global_state_lock = sync_tokio::AtomicRw::from((
             global_state,
             Some("GlobalState"),
@@ -196,7 +210,53 @@ impl GlobalStateLock {
             global_state_lock,
             cli,
             rpc_server_to_main_tx,
+            #[cfg(feature = "libp2p")]
+            handshake_cache,
+            libp2p_stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the libp2p network stack runs: it is enabled, see
+    /// [`cli_args::Args::libp2p_enabled`], and has not stopped.
+    pub fn libp2p_runs(&self) -> bool {
+        self.cli.libp2p_enabled() && !self.libp2p_stopped.load(Ordering::Relaxed)
+    }
+
+    /// Record that the libp2p network stack has stopped, or could not be
+    /// started. The node goes on with the legacy network stack only.
+    pub(crate) fn set_libp2p_stopped(&self) {
+        self.libp2p_stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// Fetches handshake data synchronously.
+    ///
+    /// Tries to acquire the read lock on the global state without waiting. If
+    /// that succeeds, the cache is updated. Otherwise, the cached handshake
+    /// data is returned. Either way, the timestamp is the current time.
+    ///
+    /// This function is for obtaining the node's [`HandshakeData`] without
+    /// blocking, in a synchronous context. In other cases, call
+    /// [`GlobalState::get_own_handshakedata`] instead.
+    #[cfg(feature = "libp2p")]
+    pub(crate) fn get_own_handshakedata_sync(&self) -> HandshakeData {
+        // Happy path: we obtain the read lock on global state.
+        if let Ok(global_state) = self.global_state_lock.try_lock_guard() {
+            let handshake_data = global_state.get_own_handshakedata();
+
+            // `write()` only blocks while another thread writes, which is
+            // rare and brief.
+            if let Ok(mut cache) = self.handshake_cache.write() {
+                *cache = handshake_data;
+            }
+
+            return handshake_data;
+        }
+
+        // Fallback: read from the cache. `read()` only blocks while another
+        // thread that did obtain the read lock above updates the cache.
+        let mut handshake_data = *self.handshake_cache.read().expect("Lock poisoned");
+        handshake_data.timestamp = SystemTime::now();
+        handshake_data
     }
 
     // check if mining

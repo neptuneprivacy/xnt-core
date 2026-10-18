@@ -45,6 +45,7 @@
 //! [tarpc::Response] by the rpc server.
 pub mod coinbase_output_readable;
 pub mod mempool_transaction_info;
+pub mod network_overview_data;
 pub mod overview_data;
 pub mod proof_of_work_puzzle;
 pub mod ui_utxo;
@@ -59,6 +60,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use get_size2::GetSize;
 use itertools::Itertools;
+use multiaddr::Multiaddr;
 use num_traits::Zero;
 use serde::Deserialize;
 use serde::Serialize;
@@ -79,6 +81,9 @@ use crate::api::tx_initiation;
 use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
 use crate::application::config::network::Network;
+use crate::application::config::parser::multiaddr::ip_of;
+use crate::application::config::parser::multiaddr::is_relayed;
+use crate::application::config::parser::multiaddr::refuse_dns;
 use crate::application::database::storage::storage_vec::traits::StorageVecBase;
 use crate::application::loops::channel::ClaimUtxoData;
 use crate::application::loops::channel::RPCServerToMain;
@@ -87,6 +92,8 @@ use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseDistrib
 use crate::application::rpc::server::coinbase_output_readable::CoinbaseOutputReadable;
 use crate::application::rpc::server::error::RpcError;
 use crate::application::rpc::server::mempool_transaction_info::MempoolTransactionInfo;
+use crate::application::rpc::server::network_overview_data::request_network_overview;
+use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
 use crate::application::rpc::server::overview_data::OverviewData;
 use crate::application::rpc::server::proof_of_work_puzzle::ProofOfWorkPuzzle;
 use crate::application::rpc::server::ui_utxo::UiUtxo;
@@ -1542,7 +1549,9 @@ pub trait RPC {
     /******** CHANGE THINGS ********/
     // Place all things that change state here
 
-    /// Clears standing for all peers, connected or not
+    /// Clears standing for all peers, connected or not, and lifts all bans on
+    /// the libp2p network stack, except those given with `--ban`. All peers can
+    /// reconnect at once, without waiting for the reconnect cooldown.
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -1575,7 +1584,10 @@ pub trait RPC {
     /// ```
     async fn clear_all_standings(token: auth::Token) -> RpcResult<()>;
 
-    /// Clears standing for ip, whether connected or not
+    /// Clears standing for ip, whether connected or not, and lifts its ban on
+    /// the libp2p network stack, unless it was given with `--ban`. The peers at
+    /// the ip can reconnect at once, without waiting for the reconnect
+    /// cooldown.
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -2036,6 +2048,52 @@ pub trait RPC {
         num_inputs: Option<usize>,
         to_address: Option<ReceivingAddress>,
     ) -> RpcResult<usize>;
+
+    /// Give the IP addresses a bad standing, disconnect the peers at them, and
+    /// refuse connections from them on both network stacks.
+    ///
+    /// Each address is a multiaddress that names an IP address, such as
+    /// `/ip4/1.2.3.4` or `/ip4/1.2.3.4/udp/9901/quic-v1`. Only the IP address
+    /// counts. If an address routes through a relay (`/p2p-circuit`) or names
+    /// no IP address, no address is banned and an error is returned.
+    async fn ban(token: auth::Token, addresses: Vec<Multiaddr>) -> RpcResult<()>;
+
+    /// Clear the standings of the IP addresses, and lift their bans on both
+    /// network stacks. Bans given with `--ban` stand. The peers at the IP
+    /// addresses can reconnect at once, without waiting for the reconnect
+    /// cooldown.
+    ///
+    /// The addresses are given as for `ban`.
+    async fn unban(token: auth::Token, addresses: Vec<Multiaddr>) -> RpcResult<()>;
+
+    /// Clear all standings, and lift all bans on both network stacks, except
+    /// those given with `--ban`. All peers can reconnect at once, without
+    /// waiting for the reconnect cooldown.
+    async fn unban_all(token: auth::Token) -> RpcResult<()>;
+
+    /// Dial the multiaddress over the libp2p network stack, e.g.
+    /// `/ip4/1.2.3.4/udp/9901/quic-v1`. A bad standing of its IP address is
+    /// cleared first, unless the IP address was banned with `--ban`, and so is
+    /// the reconnect cooldown.
+    ///
+    /// Fails if the libp2p network stack does not run on this node, or if the
+    /// multiaddress names a host by DNS name.
+    async fn dial(token: auth::Token, address: Multiaddr) -> RpcResult<()>;
+
+    /// Probe whether this node is reachable from the outside, over the libp2p
+    /// network stack. The outcome shows in `network_overview`.
+    ///
+    /// Fails if the libp2p network stack does not run on this node.
+    async fn probe_nat(token: auth::Token) -> RpcResult<()>;
+
+    /// Drop and renew the relay reservations of the libp2p network stack.
+    ///
+    /// Fails if the libp2p network stack does not run on this node.
+    async fn reset_relay_reservations(token: auth::Token) -> RpcResult<()>;
+
+    /// An overview of the libp2p network stack, or `None` if it does not run
+    /// on this node.
+    async fn network_overview(token: auth::Token) -> RpcResult<Option<NetworkOverviewData>>;
 }
 
 #[derive(Clone)]
@@ -2066,6 +2124,45 @@ impl NeptuneRPCServer {
             rpc_server_to_main_tx,
             data_directory,
         }
+    }
+
+    /// Send the message to the main loop, or fail if the main loop has stopped.
+    async fn send_to_main_loop(&self, message: RPCServerToMain) -> RpcResult<()> {
+        self.rpc_server_to_main_tx
+            .send(message)
+            .await
+            .map_err(|e| RpcError::SendError(format!("could not send message to main loop: {e}")))
+    }
+
+    /// Fail unless the libp2p network stack runs on this node: it is enabled,
+    /// and has not stopped.
+    fn ensure_libp2p_runs(&self) -> RpcResult<()> {
+        if self.state.libp2p_runs() {
+            Ok(())
+        } else {
+            Err(RpcError::Libp2pNotRunning)
+        }
+    }
+
+    /// The IP addresses named by the multiaddresses. Fails if any of them
+    /// routes through a relay, which names the relay rather than the peer, or
+    /// names no IP address.
+    fn ips_of(addresses: &[Multiaddr]) -> RpcResult<Vec<IpAddr>> {
+        addresses
+            .iter()
+            .map(|address| {
+                refuse_dns(address).map_err(RpcError::InvalidPeerAddress)?;
+                if is_relayed(address) {
+                    return Err(RpcError::InvalidPeerAddress(format!(
+                        "`{address}` names a relay rather than the peer"
+                    )));
+                }
+
+                ip_of(address).ok_or_else(|| {
+                    RpcError::InvalidPeerAddress(format!("`{address}` does not name an IP address"))
+                })
+            })
+            .collect()
     }
 
     async fn confirmations_internal(&self, state: &GlobalState) -> Option<BlockHeight> {
@@ -3147,7 +3244,18 @@ impl RPC for NeptuneRPCServer {
         // iterates and modifies standing field for all connected peers
         global_state_mut.net.clear_all_standings_in_database().await;
 
-        Ok(global_state_mut.flush_databases().await?)
+        // Let the peers reconnect at once.
+        global_state_mut.net.forget_all_disconnections();
+
+        global_state_mut.flush_databases().await?;
+        drop(global_state_mut);
+
+        // Lift the bans on the libp2p network stack, too.
+        if self.state.libp2p_runs() {
+            self.send_to_main_loop(RPCServerToMain::UnbanAll).await?;
+        }
+
+        Ok(())
     }
 
     // Locking:
@@ -3163,13 +3271,14 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
+        let ip = ip.to_canonical();
         let mut global_state_mut = self.state.lock_guard_mut().await;
         global_state_mut
             .net
             .peer_map
             .iter_mut()
             .for_each(|(socketaddr, peerinfo)| {
-                if socketaddr.ip() == ip {
+                if socketaddr.ip().to_canonical() == ip {
                     peerinfo.standing.clear_standing();
                 }
             });
@@ -3177,7 +3286,18 @@ impl RPC for NeptuneRPCServer {
         //Also clears this IP's standing in database, whether it is connected or not.
         global_state_mut.net.clear_ip_standing_in_database(ip).await;
 
-        Ok(global_state_mut.flush_databases().await?)
+        // Let the peers at the IP reconnect at once.
+        global_state_mut.net.forget_disconnections_at(ip);
+
+        global_state_mut.flush_databases().await?;
+        drop(global_state_mut);
+
+        // Lift the ban on the libp2p network stack, too.
+        if self.state.libp2p_runs() {
+            self.send_to_main_loop(RPCServerToMain::Unban(ip)).await?;
+        }
+
+        Ok(())
     }
 
     // documented in trait. do not add doc-comment.
@@ -4306,6 +4426,98 @@ impl RPC for NeptuneRPCServer {
 
         Ok(encoded)
     }
+
+    // documented in trait. do not add doc-comment.
+    async fn ban(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        addresses: Vec<Multiaddr>,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        for ip in Self::ips_of(&addresses)? {
+            self.send_to_main_loop(RPCServerToMain::Ban(ip)).await?;
+        }
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn unban(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        addresses: Vec<Multiaddr>,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        for ip in Self::ips_of(&addresses)? {
+            self.send_to_main_loop(RPCServerToMain::Unban(ip)).await?;
+        }
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn unban_all(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.send_to_main_loop(RPCServerToMain::UnbanAll).await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn dial(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        address: Multiaddr,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+        self.ensure_libp2p_runs()?;
+        refuse_dns(&address).map_err(RpcError::InvalidPeerAddress)?;
+
+        self.send_to_main_loop(RPCServerToMain::Dial(address)).await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn probe_nat(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+        self.ensure_libp2p_runs()?;
+
+        self.send_to_main_loop(RPCServerToMain::ProbeNat).await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn reset_relay_reservations(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+        self.ensure_libp2p_runs()?;
+
+        self.send_to_main_loop(RPCServerToMain::ResetRelayReservations)
+            .await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn network_overview(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<Option<NetworkOverviewData>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(request_network_overview(self.state.libp2p_runs(), &self.rpc_server_to_main_tx).await?)
+    }
 }
 
 pub mod error {
@@ -4365,6 +4577,12 @@ pub mod error {
 
         #[error("consolidation error: {0}")]
         ConsolidationError(String),
+
+        #[error("the libp2p network stack does not run on this node")]
+        Libp2pNotRunning,
+
+        #[error("invalid peer address: {0}")]
+        InvalidPeerAddress(String),
     }
 
     impl From<tx_initiation::consolidate::ConsolidationError> for RpcError {
@@ -5262,6 +5480,398 @@ mod tests {
         assert!(after_global_forgiveness.is_empty());
 
         Ok(())
+    }
+
+    /// A test RPC server, and the receiving end of its channel to the main
+    /// loop.
+    async fn test_rpc_server_and_main_loop_rx(
+        cli: cli_args::Args,
+    ) -> (
+        NeptuneRPCServer,
+        tokio::sync::mpsc::Receiver<RPCServerToMain>,
+    ) {
+        let mut rpc_server = test_rpc_server(WalletEntropy::new_random(), 2, cli).await;
+        let (rpc_server_to_main_tx, rpc_server_to_main_rx) = tokio::sync::mpsc::channel(10);
+        rpc_server.rpc_server_to_main_tx = rpc_server_to_main_tx;
+
+        (rpc_server, rpc_server_to_main_rx)
+    }
+
+    fn cli_without_libp2p() -> cli_args::Args {
+        cli_args::Args {
+            disable_libp2p: true,
+            ..cli_args::Args::default_with_network(Network::Main)
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn clearing_standings_lifts_libp2p_bans() {
+        let ip = IpAddr::from([198, 51, 100, 7]);
+        for cli in [
+            cli_args::Args::default_with_network(Network::Main),
+            cli_without_libp2p(),
+        ] {
+            let libp2p_enabled = cli.libp2p_enabled();
+            let (rpc_server, mut main_loop_rx) = test_rpc_server_and_main_loop_rx(cli).await;
+            let token = cookie_token(&rpc_server).await;
+
+            rpc_server
+                .clone()
+                .clear_standing_by_ip(context::current(), token, ip)
+                .await
+                .unwrap();
+            rpc_server
+                .clone()
+                .clear_all_standings(context::current(), token)
+                .await
+                .unwrap();
+
+            if libp2p_enabled {
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::Unban(unbanned)) if unbanned == ip
+                ));
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::UnbanAll)
+                ));
+            }
+            assert!(main_loop_rx.try_recv().is_err());
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn ban_and_unban_reach_main_loop_with_and_without_libp2p() {
+        let addresses: Vec<Multiaddr> = vec![
+            "/ip4/198.51.100.7".parse().unwrap(),
+            "/ip6/2001:db8::7/udp/9901/quic-v1".parse().unwrap(),
+        ];
+        let ips = [
+            IpAddr::from([198, 51, 100, 7]),
+            "2001:db8::7".parse::<IpAddr>().unwrap(),
+        ];
+        for cli in [
+            cli_args::Args::default_with_network(Network::Main),
+            cli_without_libp2p(),
+        ] {
+            let (rpc_server, mut main_loop_rx) = test_rpc_server_and_main_loop_rx(cli).await;
+            let token = cookie_token(&rpc_server).await;
+
+            rpc_server
+                .clone()
+                .ban(context::current(), token, addresses.clone())
+                .await
+                .unwrap();
+            for ip in ips {
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::Ban(banned)) if banned == ip
+                ));
+            }
+
+            rpc_server
+                .clone()
+                .unban(context::current(), token, addresses.clone())
+                .await
+                .unwrap();
+            for ip in ips {
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::Unban(unbanned)) if unbanned == ip
+                ));
+            }
+
+            rpc_server
+                .unban_all(context::current(), token)
+                .await
+                .unwrap();
+            assert!(matches!(
+                main_loop_rx.try_recv(),
+                Ok(RPCServerToMain::UnbanAll)
+            ));
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn ban_and_unban_refuse_addresses_that_name_no_peer_ip_address() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+
+        for refused in [
+            "/dns4/example.com/tcp/9902",
+            "/ip4/198.51.100.7/udp/9901/quic-v1/p2p-circuit",
+        ] {
+            let addresses: Vec<Multiaddr> = vec![
+                "/ip4/203.0.113.7".parse().unwrap(),
+                refused.parse().unwrap(),
+            ];
+
+            let ban_result = rpc_server
+                .clone()
+                .ban(context::current(), token, addresses.clone())
+                .await;
+            assert!(matches!(ban_result, Err(RpcError::InvalidPeerAddress(_))));
+
+            let unban_result = rpc_server
+                .clone()
+                .unban(context::current(), token, addresses)
+                .await;
+            assert!(matches!(unban_result, Err(RpcError::InvalidPeerAddress(_))));
+
+            assert!(
+                main_loop_rx.try_recv().is_err(),
+                "no address may be banned or unbanned if one is refused"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn libp2p_commands_fail_without_libp2p() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_without_libp2p()).await;
+        let token = cookie_token(&rpc_server).await;
+        let address: Multiaddr = "/ip4/198.51.100.7/udp/9901/quic-v1".parse().unwrap();
+
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .dial(context::current(), token, address)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .probe_nat(context::current(), token)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .reset_relay_reservations(context::current(), token)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert_eq!(
+            None,
+            rpc_server
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+
+        assert!(main_loop_rx.try_recv().is_err());
+    }
+
+    /// Once the libp2p network stack has stopped, the node reports so, as it
+    /// does when the stack is disabled.
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn libp2p_commands_fail_once_libp2p_has_stopped() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        rpc_server.state.set_libp2p_stopped();
+        let address: Multiaddr = "/ip4/198.51.100.7/udp/9901/quic-v1".parse().unwrap();
+
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .dial(context::current(), token, address)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .probe_nat(context::current(), token)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert_eq!(
+            None,
+            rpc_server
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+
+        assert!(main_loop_rx.try_recv().is_err());
+    }
+
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn dial_refuses_dns_names() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        let address: Multiaddr = "/dns4/example.com/udp/9901/quic-v1".parse().unwrap();
+
+        assert!(matches!(
+            rpc_server.dial(context::current(), token, address).await,
+            Err(RpcError::InvalidPeerAddress(_))
+        ));
+        assert!(main_loop_rx.try_recv().is_err());
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn clearing_standings_lifts_the_reconnect_cooldown() {
+        let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+        let (rpc_server, _main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_without_libp2p()).await;
+        let token = cookie_token(&rpc_server).await;
+        let disconnected = |server: &NeptuneRPCServer, instance_id| {
+            let state = server.state.clone();
+            async move {
+                state
+                    .lock_guard()
+                    .await
+                    .net
+                    .last_disconnection_time_of_peer(instance_id)
+                    .is_some()
+            }
+        };
+
+        {
+            let mut state = rpc_server.state.clone();
+            let mut global_state = state.lock_guard_mut().await;
+            global_state.net.register_peer_disconnection(
+                1,
+                IpAddr::V4(ipv4),
+                std::time::SystemTime::now(),
+            );
+            global_state.net.register_peer_disconnection(
+                2,
+                IpAddr::from([203, 0, 113, 9]),
+                std::time::SystemTime::now(),
+            );
+        }
+
+        // Either form of the IP address will do.
+        rpc_server
+            .clone()
+            .clear_standing_by_ip(context::current(), token, IpAddr::V6(ipv4.to_ipv6_mapped()))
+            .await
+            .unwrap();
+        assert!(!disconnected(&rpc_server, 1).await);
+        assert!(disconnected(&rpc_server, 2).await);
+
+        rpc_server
+            .clone()
+            .clear_all_standings(context::current(), token)
+            .await
+            .unwrap();
+        assert!(!disconnected(&rpc_server, 2).await);
+    }
+
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn libp2p_commands_reach_main_loop() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        let address: Multiaddr = "/ip4/198.51.100.7/udp/9901/quic-v1".parse().unwrap();
+
+        rpc_server
+            .clone()
+            .dial(context::current(), token, address.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            main_loop_rx.try_recv(),
+            Ok(RPCServerToMain::Dial(dialed)) if dialed == address
+        ));
+
+        rpc_server
+            .clone()
+            .probe_nat(context::current(), token)
+            .await
+            .unwrap();
+        assert!(matches!(
+            main_loop_rx.try_recv(),
+            Ok(RPCServerToMain::ProbeNat)
+        ));
+
+        rpc_server
+            .reset_relay_reservations(context::current(), token)
+            .await
+            .unwrap();
+        assert!(matches!(
+            main_loop_rx.try_recv(),
+            Ok(RPCServerToMain::ResetRelayReservations)
+        ));
+    }
+
+    /// The main loop answers the first request for a network overview, as it
+    /// does with a running network actor, and drops the second, as it does
+    /// without one.
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_the_answer_of_the_main_loop() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        let network_overview = NetworkOverviewData {
+            nat_status: "private".to_string(),
+            reachability_state: "unknown".to_string(),
+            external_addresses: vec!["/ip4/198.51.100.7/udp/9901/quic-v1".to_string()],
+            connection_count: 3,
+            connection_limit: 10,
+            num_active_relays: 1,
+            peer_id: "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string(),
+            address_book_size: 5,
+            num_banned_peers: 2,
+        };
+
+        let answer = network_overview.clone();
+        let main_loop = tokio::spawn(async move {
+            let Some(RPCServerToMain::GetNetworkOverview(answered_reply)) =
+                main_loop_rx.recv().await
+            else {
+                panic!("main loop must be asked for a network overview");
+            };
+            answered_reply.send(answer).unwrap();
+
+            let Some(RPCServerToMain::GetNetworkOverview(dropped_reply)) =
+                main_loop_rx.recv().await
+            else {
+                panic!("main loop must be asked for a network overview");
+            };
+            drop(dropped_reply);
+        });
+
+        assert_eq!(
+            Some(network_overview),
+            rpc_server
+                .clone()
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            rpc_server
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+        main_loop.await.unwrap();
     }
 
     #[traced_test]

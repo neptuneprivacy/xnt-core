@@ -531,4 +531,14 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: GetArchivalMutatorSetRequest,
     ) -> RpcResult<GetArchivalMutatorSetResponse>;
+
+    /* Networking */
+
+    async fn network_overview(&self) -> RpcResult<NetworkOverviewResponse> {
+        self.network_overview_call(NetworkOverviewRequest {}).await
+    }
+    async fn network_overview_call(
+        &self,
+        request: NetworkOverviewRequest,
+    ) -> RpcResult<NetworkOverviewResponse>;
 }

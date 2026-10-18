@@ -483,6 +483,12 @@ impl ConnectionRefusedReason {
     pub(crate) fn bad_timestamp() -> Self {
         Self::Other(0)
     }
+
+    /// The peer is not among the peers given with `--peer`, and connections
+    /// are restricted to those with `--restrict-peers-to-list`.
+    pub(crate) fn not_on_peer_list() -> Self {
+        Self::Other(1)
+    }
 }
 
 impl From<InternalConnectionStatus> for TransferConnectionStatus {

@@ -24,7 +24,7 @@ ffi = ["dep:cbindgen"]
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 
 [dependencies]
-neptune-privacy = { version = "0.3.0", path = "../xnt-core" }
+neptune-privacy = { version = "0.3.0", path = "../xnt-core", default-features = false }
 libc = "0.2"
 thiserror = "1.0"
 reqwest = { version = "0.12", features = ["blocking", "json"] }

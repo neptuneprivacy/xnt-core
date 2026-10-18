@@ -189,6 +189,7 @@ impl DashboardApp {
         network: Network,
         token: auth::Token,
         listen_addr_for_peers: Option<SocketAddr>,
+        network_overview_supported: bool,
     ) -> Self {
         let mut screens = HashMap::<MenuItem, Rc<RefCell<dyn Screen>>>::new();
 
@@ -197,6 +198,7 @@ impl DashboardApp {
             network,
             token,
             listen_addr_for_peers,
+            network_overview_supported,
         )));
         let overview_screen_dyn = Rc::clone(&overview_screen) as Rc<RefCell<dyn Screen>>;
         screens.insert(MenuItem::Overview, Rc::clone(&overview_screen_dyn));
@@ -316,6 +318,7 @@ impl DashboardApp {
         network: Network,
         token: auth::Token,
         listen_addr_for_peers: Option<SocketAddr>,
+        network_overview_supported: bool,
     ) -> Result<String, Box<dyn Error>> {
         // create app
         let mut app = DashboardApp::new(
@@ -324,6 +327,7 @@ impl DashboardApp {
             network,
             token,
             listen_addr_for_peers,
+            network_overview_supported,
         );
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<()>(2);
 

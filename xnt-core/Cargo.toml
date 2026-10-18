@@ -14,6 +14,11 @@ repository = "https://github.com/neptuneprivacy/xnt-core/"
 default-run = "xnt-core"
 
 [features]
+default = ["libp2p"]
+
+# libp2p network stack (QUIC and libp2p-TCP) that runs next to the legacy TCP
+# peer stack. Disable for builds that do not run a node, such as the SDK.
+libp2p = ["dep:libp2p", "dep:const_format", "tokio-util/compat"]
 
 # logs write-lock acquisitions that are held over 100 millis.  requires nightly.
 # to enable: cargo +nightly build --features log-slow-write-lock
@@ -71,13 +76,33 @@ bytes = "1.8"
 bytesize = "1.3"
 chrono = "^0.4.34"
 clap = { version = "4.5", features = ["derive"] }
+const_format = { version = "0.2.35", optional = true }
 console-subscriber = { version = "0.2", optional = true }
 directories = "5.0"
 field_count = "0.1"
 futures = "0.3"
 get-size2 = { version = "0.9", features = ["derive"] }
 itertools = "0.11"
+libp2p = { version = "0.57.0", optional = true, features = [
+    "autonat",
+    "dcutr",
+    "ed25519",
+    "identify",
+    "kad",
+    "macros",
+    "noise",
+    "ping",
+    "quic",
+    "relay",
+    "serde",
+    "tcp",
+    "tls",
+    "tokio",
+    "upnp",
+    "yamux",
+] }
 memmap2 = "0.9"
+multiaddr = "0.19"
 num-bigint = { version = "0.4", features = ["serde"] }
 num-rational = "0.4"
 num-traits = "0.2"

@@ -62,6 +62,11 @@ pub struct OverviewData {
     max_num_peers: Option<usize>,
     authenticated_peer_count: Option<usize>,
 
+    /// Connections and reachability of the libp2p network stack, or "not
+    /// running" if it does not run. Not set if the node does not support the
+    /// request.
+    libp2p_summary: Option<String>,
+
     up_since: Option<u64>,
     cpu_load: Option<f64>,
     cpu_capacity: Option<f64>,
@@ -95,6 +100,11 @@ pub struct OverviewScreen {
     token: auth::Token,
     poll_task: Option<Arc<Mutex<JoinHandle<()>>>>,
     escalatable_event: Arc<std::sync::Mutex<Option<DashboardEvent>>>,
+
+    /// Whether the node answers the request for an overview of its libp2p
+    /// network stack. A node that does not know the request closes the
+    /// connection, so it is not sent then.
+    network_overview_supported: bool,
 }
 
 impl OverviewScreen {
@@ -103,6 +113,7 @@ impl OverviewScreen {
         network: Network,
         token: auth::Token,
         listen_addr_for_peers: Option<SocketAddr>,
+        network_overview_supported: bool,
     ) -> Self {
         Self {
             active: false,
@@ -117,6 +128,7 @@ impl OverviewScreen {
             token,
             poll_task: None,
             escalatable_event: Arc::new(std::sync::Mutex::new(None)),
+            network_overview_supported,
         }
     }
 
@@ -125,6 +137,7 @@ impl OverviewScreen {
         token: auth::Token,
         overview_data: Arc<std::sync::Mutex<OverviewData>>,
         escalatable_event: Arc<std::sync::Mutex<Option<DashboardEvent>>>,
+        network_overview_supported: bool,
     ) {
         // use macros to reduce boilerplate
         macro_rules! setup_poller {
@@ -147,6 +160,19 @@ impl OverviewScreen {
                 _ = &mut dashboard_overview_data => {
                         match rpc_client.dashboard_overview_data(context::current(), token).await {
                         Ok(Ok(resp)) => {
+                            let libp2p_summary = if network_overview_supported {
+                                match rpc_client.network_overview(context::current(), token).await {
+                                    Ok(Ok(Some(network_overview))) => Some(format!(
+                                        "{} connections, {}",
+                                        network_overview.connection_count,
+                                        network_overview.reachability_state
+                                    )),
+                                    Ok(Ok(None)) => Some("not running".to_string()),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
 
                             {
                                 let mut own_overview_data = overview_data.lock().unwrap();
@@ -158,6 +184,7 @@ impl OverviewScreen {
                                 own_overview_data.peer_count=resp.peer_count;
                                 own_overview_data.max_num_peers = Some(resp.max_num_peers);
                                 own_overview_data.authenticated_peer_count=Some(0);
+                                own_overview_data.libp2p_summary = libp2p_summary;
                                 own_overview_data.syncing=resp.syncing;
                                 own_overview_data.confirmed_available_balance = Some(resp.confirmed_available_balance);
                                 own_overview_data.confirmed_total_balance = Some(resp.confirmed_total_balance);
@@ -198,9 +225,16 @@ impl Screen for OverviewScreen {
         let data_arc = self.data.clone();
         let token = self.token;
         let escalatable_event_arc = self.escalatable_event.clone();
+        let network_overview_supported = self.network_overview_supported;
         self.poll_task = Some(Arc::new(Mutex::new(tokio::spawn(async move {
-            OverviewScreen::run_polling_loop(server_arc, token, data_arc, escalatable_event_arc)
-                .await;
+            OverviewScreen::run_polling_loop(
+                server_arc,
+                token,
+                data_arc,
+                escalatable_event_arc,
+                network_overview_supported,
+            )
+            .await;
         }))));
     }
 
@@ -428,6 +462,10 @@ impl Widget for OverviewScreen {
         lines.push(format!(
             "↪ authenticated: {}",
             dashifnotset!(data.authenticated_peer_count)
+        ));
+        lines.push(format!(
+            "libp2p: {}",
+            dashifnotset!(data.libp2p_summary.as_ref())
         ));
         Self::report(&lines, "Peers")
             .style(style)

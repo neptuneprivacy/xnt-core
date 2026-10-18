@@ -1,6 +1,7 @@
 use std::cmp;
 use std::marker::Unpin;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::time::SystemTime;
 
 use anyhow::bail;
@@ -10,6 +11,7 @@ use futures::sink::Sink;
 use futures::sink::SinkExt;
 use futures::stream::TryStream;
 use futures::stream::TryStreamExt;
+use futures::FutureExt;
 use rand::rngs::StdRng;
 use rand::RngExt;
 use rand::SeedableRng;
@@ -25,6 +27,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::application::config::parser::multiaddr::canonical_socket_addr;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
 use crate::application::loops::channel::PeerTaskToMainLinkTx;
@@ -262,24 +265,35 @@ impl PeerLoopHandler {
     }
 
     async fn punish(&mut self, reason: NegativePeerSanction) -> Result<()> {
-        let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
-        warn!("Punishing peer {} for {:?}", self.peer_address.ip(), reason);
-        debug!(
-            "Peer standing before punishment is {}",
-            global_state_mut
-                .net
-                .peer_map
-                .get(&self.peer_address)
-                .unwrap()
-                .standing
-        );
+        let sanction_result = {
+            let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
+            warn!("Punishing peer {} for {:?}", self.peer_address.ip(), reason);
+            debug!(
+                "Peer standing before punishment is {}",
+                global_state_mut
+                    .net
+                    .peer_map
+                    .get(&self.peer_address)
+                    .unwrap()
+                    .standing
+            );
 
-        let Some(peer_info) = global_state_mut.net.peer_map.get_mut(&self.peer_address) else {
-            bail!("Could not read peer map.");
+            let Some(peer_info) = global_state_mut.net.peer_map.get_mut(&self.peer_address) else {
+                bail!("Could not read peer map.");
+            };
+            peer_info.standing.sanction(PeerSanction::Negative(reason))
         };
-        let sanction_result = peer_info.standing.sanction(PeerSanction::Negative(reason));
+
         if let Err(err) = sanction_result {
             warn!("Banning peer: {err}");
+
+            // The legacy stack refuses the IP through its standing, which the
+            // connection-close callback stores. Have the main loop refuse it on
+            // the libp2p stack too. The lock is released before the send.
+            let _ = self
+                .to_main_tx
+                .send(PeerTaskToMain::Ban(self.peer_address))
+                .await;
         }
 
         sanction_result.map_err(|err| anyhow::anyhow!("Banning peer: {err}"))
@@ -762,8 +776,14 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
+                // Older nodes list IPv4 peers in IPv4-mapped form if they
+                // listen on `::`. Key them by their IPv4 address, as the peer
+                // map does.
                 let peers = peers
                     .into_iter()
+                    .map(|(socket_addr, instance_id)| {
+                        (canonical_socket_addr(socket_addr), instance_id)
+                    })
                     .filter(|(socket_addr, _)| !PeerInfo::ip_is_local(socket_addr.ip()))
                     .collect();
 
@@ -2373,31 +2393,6 @@ impl PeerLoopHandler {
     {
         let cli_args = self.global_state_lock.cli().clone();
 
-        let standing = self
-            .global_state_lock
-            .lock_guard()
-            .await
-            .net
-            .peer_databases
-            .peer_standings
-            .get(self.peer_address.ip())
-            .await
-            .unwrap_or_else(|| PeerStanding::new(cli_args.peer_tolerance));
-
-        // Add peer to peer map
-        let peer_connection_info = PeerConnectionInfo::new(
-            self.peer_handshake_data.listen_port,
-            self.peer_address,
-            self.inbound_connection,
-        );
-        let new_peer = PeerInfo::new(
-            peer_connection_info,
-            &self.peer_handshake_data,
-            SystemTime::now(),
-            cli_args.peer_tolerance,
-        )
-        .with_standing(standing);
-
         // Multiple tasks might attempt to set up a connection concurrently. So
         // even though we've checked that this connection is allowed, this check
         // could have been invalidated by another task, for one accepting an
@@ -2407,6 +2402,35 @@ impl PeerLoopHandler {
         // since it would have to be dropped before acquiring the write-lock.
         {
             let mut global_state = self.global_state_lock.lock_guard_mut().await;
+
+            // The standing is read under the write lock, too, so that a ban
+            // stored since the admission check is honored.
+            let standing = global_state
+                .net
+                .get_peer_standing_from_database(self.peer_address.ip())
+                .await
+                .unwrap_or_else(|| PeerStanding::new(cli_args.peer_tolerance));
+            if standing.is_bad() {
+                bail!(
+                    "Peer {} is in bad standing. Aborting connection.",
+                    self.peer_address
+                );
+            }
+
+            // Add peer to peer map
+            let peer_connection_info = PeerConnectionInfo::new(
+                self.peer_handshake_data.listen_port,
+                self.peer_address,
+                self.inbound_connection,
+            );
+            let new_peer = PeerInfo::new(
+                peer_connection_info,
+                &self.peer_handshake_data,
+                SystemTime::now(),
+                cli_args.peer_tolerance,
+            )
+            .with_standing(standing);
+
             let peer_map = &mut global_state.net.peer_map;
             if peer_map
                 .values()
@@ -2425,6 +2449,20 @@ impl PeerLoopHandler {
                 bail!("Already connected to peer. Aborting connection");
             }
 
+            // Concurrent handshakes from one IP can all pass the per-IP cap of
+            // the admission check before any of them is in the peer map, so
+            // apply it again here, for either network stack.
+            if let Some(max_connections_per_ip) = cli_args.max_connections_per_ip {
+                let peer_ip = self.peer_address.ip().to_canonical();
+                let num_connections_to_this_ip = peer_map
+                    .keys()
+                    .filter(|address| address.ip().to_canonical() == peer_ip)
+                    .count();
+                if num_connections_to_this_ip >= max_connections_per_ip {
+                    bail!("Attempted to connect to more peers from {peer_ip} than allowed. Aborting connection.");
+                }
+            }
+
             peer_map.insert(self.peer_address, new_peer);
         }
 
@@ -2438,7 +2476,22 @@ impl PeerLoopHandler {
         // peer in the map for good. The catch-up request that used to live here
         // now runs at the top of `run`, where a failed send is an ordinary loop
         // exit and the callback still fires. Upstream 5fec44b1.
-        let res = self.run(peer, from_main_rx, &mut peer_state).await;
+        //
+        // The loop runs inside a catch-unwind, so that the callback also fires
+        // if the loop panics, whichever network stack the connection uses.
+        let res = match AssertUnwindSafe(self.run(peer, from_main_rx, &mut peer_state))
+            .catch_unwind()
+            .await
+        {
+            Ok(res) => res,
+            Err(_panic) => {
+                error!(
+                    "Peer loop for {} panicked. Invoking close connection callback",
+                    self.peer_address
+                );
+                Ok(())
+            }
+        };
         debug!("Exited peer loop for {}", self.peer_address);
 
         close_peer_connected_callback(
@@ -2469,7 +2522,7 @@ impl PeerLoopHandler {
             .lock_guard_mut()
             .await
             .net
-            .register_peer_disconnection(peer_id, SystemTime::now());
+            .register_peer_disconnection(peer_id, self.peer_address.ip(), SystemTime::now());
     }
 }
 
@@ -2637,6 +2690,122 @@ mod tests {
         Ok(())
     }
 
+    /// Two handshakes from one IP can both pass admission before either is
+    /// in the peer map, so the insertion applies the per-IP cap again.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn peer_beyond_ip_cap_is_refused_at_insertion() -> Result<()> {
+        use crate::tests::shared::globalstate::get_dummy_peer_incoming;
+
+        let network = Network::Main;
+        let cli = cli_args::Args {
+            max_connections_per_ip: Some(1),
+            network,
+            ..Default::default()
+        };
+        for inbound in [true, false] {
+            let (peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, mut state_lock, hsd) =
+                get_test_genesis_setup(network, 0, cli.clone()).await?;
+
+            // One peer from the IP is already connected.
+            let first: SocketAddr = "253.4.5.1:28011".parse()?;
+            state_lock
+                .lock_guard_mut()
+                .await
+                .net
+                .peer_map
+                .insert(first, get_dummy_peer_incoming(first));
+
+            let second: SocketAddr = "253.4.5.1:28012".parse()?;
+            let mut peer_loop_handler =
+                PeerLoopHandler::new(to_main_tx, state_lock.clone(), second, hsd, inbound, 1);
+            let mock = Mock::new(vec![Action::Read(PeerMessage::Bye)]);
+            let result = peer_loop_handler
+                .run_wrapper(mock, peer_broadcast_tx.subscribe())
+                .await;
+            assert!(result.is_err(), "second peer from the IP must be refused");
+            assert_eq!(1, state_lock.lock_guard().await.net.peer_map.len());
+        }
+
+        Ok(())
+    }
+
+    /// A peer at an IP address of bad standing is refused at insertion, even
+    /// if it passed the admission check before the standing was stored.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn peer_in_bad_standing_is_refused_at_insertion() -> Result<()> {
+        let network = Network::Main;
+        let cli = cli_args::Args {
+            network,
+            ..Default::default()
+        };
+        let (peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, mut state_lock, hsd) =
+            get_test_genesis_setup(network, 0, cli.clone()).await?;
+
+        let peer_address: SocketAddr = "253.4.5.2:28011".parse()?;
+        let mut bad_standing = PeerStanding::new(cli.peer_tolerance);
+        bad_standing.standing = -i32::from(cli.peer_tolerance);
+        state_lock
+            .lock_guard_mut()
+            .await
+            .net
+            .write_peer_standing(peer_address.ip(), bad_standing)
+            .await;
+
+        let mut peer_loop_handler =
+            PeerLoopHandler::new(to_main_tx, state_lock.clone(), peer_address, hsd, true, 1);
+        let mock = Mock::new(vec![Action::Read(PeerMessage::Bye)]);
+        let result = peer_loop_handler
+            .run_wrapper(mock, peer_broadcast_tx.subscribe())
+            .await;
+        assert!(result.is_err(), "peer in bad standing must be refused");
+        assert!(state_lock.lock_guard().await.net.peer_map.is_empty());
+
+        Ok(())
+    }
+
+    /// The per-IP cap at insertion counts an IPv4 address and its IPv4-mapped
+    /// IPv6 form as one IP address.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn ip_cap_at_insertion_counts_both_forms_of_an_ipv4_address() -> Result<()> {
+        use crate::tests::shared::globalstate::get_dummy_peer_incoming;
+
+        let network = Network::Main;
+        let cli = cli_args::Args {
+            max_connections_per_ip: Some(1),
+            network,
+            ..Default::default()
+        };
+        let ipv4 = std::net::Ipv4Addr::new(253, 4, 5, 3);
+        let first_ipv4 = SocketAddr::new(ipv4.into(), 28011);
+        let first_mapped = SocketAddr::new(ipv4.to_ipv6_mapped().into(), 28011);
+        let second_ipv4 = SocketAddr::new(ipv4.into(), 28012);
+        let second_mapped = SocketAddr::new(ipv4.to_ipv6_mapped().into(), 28012);
+        for (first, second) in [(first_ipv4, second_mapped), (first_mapped, second_ipv4)] {
+            let (peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, mut state_lock, hsd) =
+                get_test_genesis_setup(network, 0, cli.clone()).await?;
+            state_lock
+                .lock_guard_mut()
+                .await
+                .net
+                .peer_map
+                .insert(first, get_dummy_peer_incoming(first));
+
+            let mut peer_loop_handler =
+                PeerLoopHandler::new(to_main_tx, state_lock.clone(), second, hsd, true, 1);
+            let mock = Mock::new(vec![Action::Read(PeerMessage::Bye)]);
+            let result = peer_loop_handler
+                .run_wrapper(mock, peer_broadcast_tx.subscribe())
+                .await;
+            assert!(result.is_err(), "{second} must be refused next to {first}");
+            assert_eq!(1, state_lock.lock_guard().await.net.peer_map.len());
+        }
+
+        Ok(())
+    }
+
     mod peer_discovery {
         use std::str::FromStr;
 
@@ -2773,6 +2942,73 @@ mod tests {
             assert_eq!(vec![potential_peer_public_ip], potential_peers);
         }
 
+        #[apply(shared_tokio_runtime)]
+        async fn ipv4_mapped_addresses_in_incoming_response_become_ipv4() {
+            let network = Network::Main;
+
+            let num_already_connected_peers = 2;
+            let (
+                peer_broadcast_tx,
+                _from_main_rx_clone,
+                to_main_tx,
+                mut to_main_rx,
+                state_lock,
+                hsd,
+            ) = get_test_genesis_setup(
+                network,
+                num_already_connected_peers,
+                cli_args::Args::default(),
+            )
+            .await
+            .unwrap();
+
+            let response_with_mapped_ips = vec![
+                (
+                    std::net::SocketAddr::from_str("[::ffff:123.123.123.123]:8080").unwrap(),
+                    7,
+                ),
+                (
+                    std::net::SocketAddr::from_str("[::ffff:192.168.0.23]:8080").unwrap(),
+                    55,
+                ),
+            ];
+
+            let mock = Mock::new(vec![
+                Action::Write(PeerMessage::PeerListRequest),
+                Action::Read(PeerMessage::PeerListResponse(response_with_mapped_ips)),
+                Action::Read(PeerMessage::Bye),
+            ]);
+            let from_main_rx_clone = peer_broadcast_tx.subscribe();
+            let mut peer_loop_handler = PeerLoopHandler::new(
+                to_main_tx.clone(),
+                state_lock.clone(),
+                std::net::SocketAddr::from_str("22.21.20.122:8080").unwrap(),
+                hsd,
+                true,
+                1,
+            );
+            peer_loop_handler
+                .run_wrapper(mock, from_main_rx_clone)
+                .await
+                .unwrap();
+
+            // The public address reaches the main loop in IPv4 form, and the
+            // local one not at all.
+            let Some(PeerTaskToMain::PeerDiscoveryAnswer((potential_peers, _, _))) =
+                to_main_rx.recv().await
+            else {
+                panic!("Main loop must receive peer discovery info")
+            };
+
+            assert_eq!(
+                vec![(
+                    std::net::SocketAddr::from_str("123.123.123.123:8080").unwrap(),
+                    7
+                )],
+                potential_peers
+            );
+        }
+
         #[traced_test]
         #[apply(shared_tokio_runtime)]
         async fn test_peer_loop_peer_list() {
@@ -2837,6 +3073,60 @@ mod tests {
                 state_lock.lock_guard().await.net.peer_map.len(),
                 "peer map must have length 2 after saying goodbye to peer 2"
             );
+        }
+
+        /// A peer connected over libp2p is in the peer map under the address of
+        /// its libp2p connection. The peer list names it at the legacy address
+        /// from its handshake instead, the address at which any node can dial
+        /// it.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn peer_list_names_legacy_address_of_peer_connected_over_libp2p() {
+            use crate::protocol::peer::peer_info::PeerConnectionInfo;
+
+            let network = Network::Main;
+            let (peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, mut state_lock, _hsd) =
+                get_test_genesis_setup(network, 0, cli_args::Args::default())
+                    .await
+                    .unwrap();
+
+            let (libp2p_peer_handshake, _) = get_dummy_peer_connection_data_genesis(network, 4);
+            let quic_address = SocketAddr::from_str("198.51.100.4:9901").unwrap();
+            let legacy_address = SocketAddr::new(
+                quic_address.ip(),
+                libp2p_peer_handshake.listen_port.unwrap(),
+            );
+            let libp2p_peer = PeerInfo::new(
+                PeerConnectionInfo::new(libp2p_peer_handshake.listen_port, quic_address, false),
+                &libp2p_peer_handshake,
+                SystemTime::now(),
+                state_lock.cli().peer_tolerance,
+            );
+            state_lock
+                .lock_guard_mut()
+                .await
+                .net
+                .peer_map
+                .insert(quic_address, libp2p_peer);
+
+            let (hsd2, sa2) = get_dummy_peer_connection_data_genesis(network, 2);
+            let mut expected_response = vec![
+                (legacy_address, libp2p_peer_handshake.instance_id),
+                (sa2, hsd2.instance_id),
+            ];
+            expected_response.sort_by_cached_key(|x| x.0);
+            let mock = Mock::new(vec![
+                Action::Read(PeerMessage::PeerListRequest),
+                Action::Write(PeerMessage::PeerListResponse(expected_response)),
+                Action::Read(PeerMessage::Bye),
+            ]);
+
+            let mut peer_loop_handler =
+                PeerLoopHandler::new(to_main_tx, state_lock.clone(), sa2, hsd2, true, 0);
+            peer_loop_handler
+                .run_wrapper(mock, peer_broadcast_tx.subscribe())
+                .await
+                .unwrap();
         }
     }
 
@@ -2912,6 +3202,13 @@ mod tests {
                 res.is_err(),
                 "run_wrapper must return failure when genesis is different"
             );
+
+            // The bad standing is reported, so that the IP is refused on the
+            // libp2p stack, too.
+            match to_main_rx1.recv().await {
+                Some(PeerTaskToMain::Ban(banned)) => assert_eq!(peer_address, banned),
+                _ => bail!("Must receive ban of peer in bad standing"),
+            }
 
             match to_main_rx1.recv().await {
                 Some(PeerTaskToMain::RemovePeerMaxBlockHeight(_)) => (),

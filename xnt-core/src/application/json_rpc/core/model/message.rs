@@ -15,6 +15,7 @@ use crate::application::json_rpc::core::model::wallet::block::*;
 use crate::application::json_rpc::core::model::wallet::mutator_set::*;
 use crate::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
 use crate::application::json_rpc::core::model::wallet::transaction::RpcTransactionProof;
+use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
 
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
@@ -797,6 +798,17 @@ pub struct GetSpentStatusRequest {
 pub struct GetSpentStatusResponse {
     /// For each hash: Some(height) if spent (and not orphaned), None if unspent
     pub spent_at_heights: Vec<Option<BlockHeight>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkOverviewRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkOverviewResponse {
+    /// `None` if the libp2p network stack does not run on this node.
+    pub network_overview: Option<NetworkOverviewData>,
 }
 
 impl From<crate::state::utxo_indexer::IndexedUtxo> for RpcIndexedUtxo {

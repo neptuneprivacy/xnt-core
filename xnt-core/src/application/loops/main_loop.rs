@@ -1,3 +1,5 @@
+pub(crate) mod network_actor_link;
+mod network_event_handler;
 pub mod proof_upgrader;
 pub(crate) mod upgrade_incentive;
 
@@ -11,6 +13,10 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use itertools::Itertools;
+use network_actor_link::next_network_event;
+use network_actor_link::NetworkActorLink;
+use network_event_handler::cli_peer_addresses;
+use network_event_handler::is_cli_peer;
 use proof_upgrader::get_upgrade_task_from_mempool;
 use proof_upgrader::UpgradeJob;
 use rand::prelude::IteratorRandom;
@@ -34,6 +40,7 @@ use tracing::warn;
 
 use crate::api::tx_initiation::initiator::MigrationDestination;
 use crate::application::config::auto_consolidation::ConsolidationTarget;
+use crate::application::config::parser::multiaddr::canonical_socket_addr;
 use crate::application::loops::channel::MainToMiner;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::MainToPeerTaskBatchBlockRequest;
@@ -142,6 +149,9 @@ pub struct MainLoopHandler {
     miner_to_main_rx: mpsc::Receiver<MinerToMain>,
     rpc_server_to_main_rx: mpsc::Receiver<RPCServerToMain>,
     task_handles: Vec<JoinHandle<()>>,
+
+    /// The channels to the libp2p network actor, if it runs.
+    network_actor: Option<NetworkActorLink>,
 
     /// Held by the task that migrates and consolidates wallet funds after a
     /// new block, so that two such tasks never select the same inputs.
@@ -358,15 +368,18 @@ impl PotentialPeersState {
         // Prefer candidates with IPs that we are not already connected to but
         // connect to repeated IPs in case we don't have other options, as
         // repeated IPs may just be multiple machines on the same NAT'ed IPv4
-        // address.
-        let mut connected_ips = peers_listen_addresses.into_iter().map(|x| x.ip());
+        // address. An IPv4 address counts as the same in either form.
+        let connected_ips = peers_listen_addresses
+            .into_iter()
+            .map(|x| x.ip().to_canonical())
+            .collect_vec();
         let candidates = if candidates
             .iter()
-            .any(|candidate| !connected_ips.contains(&candidate.0.ip()))
+            .any(|candidate| !connected_ips.contains(&candidate.0.ip().to_canonical()))
         {
             candidates
                 .into_iter()
-                .filter(|candidate| !connected_ips.contains(&candidate.0.ip()))
+                .filter(|candidate| !connected_ips.contains(&candidate.0.ip().to_canonical()))
                 .collect()
         } else {
             candidates
@@ -421,6 +434,7 @@ impl MainLoopHandler {
         miner_to_main_rx: mpsc::Receiver<MinerToMain>,
         rpc_server_to_main_rx: mpsc::Receiver<RPCServerToMain>,
         task_handles: Vec<JoinHandle<()>>,
+        network_actor: Option<NetworkActorLink>,
     ) -> Self {
         let maybe_main_to_miner_tx = if global_state_lock.cli().mine() {
             Some(main_to_miner_tx)
@@ -438,6 +452,7 @@ impl MainLoopHandler {
             miner_to_main_rx,
             rpc_server_to_main_rx,
             task_handles,
+            network_actor,
             wallet_maintenance: Arc::new(tokio::sync::Mutex::new(())),
 
             #[cfg(test)]
@@ -1362,8 +1377,10 @@ impl MainLoopHandler {
                 let all_peers = global_state.net.peer_map.iter();
 
                 // filter out CLI peers
+                let cli_args = global_state.cli();
+                let cli_peers = cli_peer_addresses(cli_args);
                 let disconnect_candidates =
-                    all_peers.filter(|p| !global_state.cli().peers.contains(p.0));
+                    all_peers.filter(|p| !is_cli_peer(cli_args, &cli_peers, p.1));
 
                 // find the one with the oldest connection
                 let longest_lived_peer = disconnect_candidates.min_by(
@@ -1380,6 +1397,11 @@ impl MainLoopHandler {
                     let pmsg = MainToPeerTask::Disconnect(peer_socket.to_owned());
                     self.main_to_peer_broadcast(pmsg);
                 }
+            }
+            PeerTaskToMain::Ban(peer_address) => {
+                log_slow_scope!(fn_name!() + "::PeerTaskToMain::Ban");
+
+                self.ban_peer_in_bad_standing(peer_address).await;
             }
         }
 
@@ -1425,9 +1447,10 @@ impl MainLoopHandler {
         }
 
         let num_peers_to_disconnect = num_peers - max_num_peers;
+        let cli_peers = cli_peer_addresses(cli_args);
         let peers_to_disconnect = connected_peers
             .into_iter()
-            .filter(|peer| !cli_args.peers.contains(&peer.connected_address()))
+            .filter(|peer| !is_cli_peer(cli_args, &cli_peers, peer))
             .sample(&mut rand::rng(), num_peers_to_disconnect);
         match peers_to_disconnect.len() {
             0 => warn!("Not disconnecting from any peer because of manual override."),
@@ -1452,15 +1475,20 @@ impl MainLoopHandler {
             .await
             .net
             .peer_map
-            .keys()
-            .copied()
+            .values()
+            .cloned()
             .collect_vec();
-        let peers_with_lost_connection = self
-            .global_state_lock
-            .cli()
-            .peers
-            .iter()
-            .filter(|peer| !connected_peers.contains(peer));
+        let cli_args = self.global_state_lock.cli();
+        let cli_peers = cli_args.legacy_peers();
+
+        // A peer that is connected over libp2p, or that dialed in from another
+        // port, is connected all the same; see `is_cli_peer`. Dialing it again
+        // would only be refused as a duplicate.
+        let peers_with_lost_connection = cli_peers.iter().filter(|&&cli_peer| {
+            !connected_peers
+                .iter()
+                .any(|peer| is_cli_peer(cli_args, &[cli_peer], peer))
+        });
 
         // If no connection was lost, there's nothing to do.
         if peers_with_lost_connection.clone().count() == 0 {
@@ -1578,8 +1606,10 @@ impl MainLoopHandler {
 
         // Immediately request the new peer's peer list. This allows
         // incorporating the new peer's peers into the list of potential peers,
-        // to be used in the next round of peer discovery.
-        let m2pmsg = MainToPeerTask::MakeSpecificPeerDiscoveryRequest(peer_candidate);
+        // to be used in the next round of peer discovery. The peer loop knows
+        // the peer by the canonical form of its address; see `call_peer`.
+        let m2pmsg =
+            MainToPeerTask::MakeSpecificPeerDiscoveryRequest(canonical_socket_addr(peer_candidate));
         self.main_to_peer_broadcast(m2pmsg);
 
         Ok(())
@@ -1982,13 +2012,18 @@ impl MainLoopHandler {
 
                 // Handle incoming connections from peer
                 Ok((stream, peer_address)) = self.incoming_peer_listener.accept() => {
+                    // A listener on `::` reports IPv4 peers in IPv4-mapped
+                    // form. Key them by their IPv4 address, as the libp2p
+                    // stack does, so that standings, bans, and caps apply to
+                    // an IP address in either form.
+                    let peer_address = canonical_socket_addr(peer_address);
                     let ip = peer_address.ip();
                     if !precheck_incoming_connection_is_allowed(self.global_state_lock.cli(), ip) {
                         continue;
                     }
 
                     // Is this IP banned through database entry?
-                    let peer_banned = self.global_state_lock.lock_guard().await.net.peer_databases.peer_standings.get(ip).await.is_some_and(|x| x.is_bad());
+                    let peer_banned = self.global_state_lock.lock_guard().await.net.get_peer_standing_from_database(ip).await.is_some_and(|x| x.is_bad());
                     if peer_banned {
                         debug!("Banned peer {ip} attempted incoming connection. Hanging up.");
                         continue;
@@ -2052,6 +2087,19 @@ impl MainLoopHandler {
 
                 }
 
+                // Handle events from the libp2p network actor. Never ready if
+                // the actor does not run.
+                maybe_network_event = next_network_event(&mut self.network_actor) => {
+                    let Some(network_event) = maybe_network_event else {
+                        // The event sender lives in the network actor, so the
+                        // actor has stopped. The legacy stack keeps running.
+                        self.handle_network_actor_stopped();
+                        continue;
+                    };
+
+                    self.handle_network_event(network_event, &mut main_loop_state);
+                }
+
                 // Handle the completion of mempool tx-update jobs after new block.
                 Some(ms_updated_transactions) = main_loop_state.update_mempool_receiver.recv() => {
                     self.handle_updated_mempool_txs(ms_updated_transactions).await;
@@ -2059,7 +2107,7 @@ impl MainLoopHandler {
 
                 // Handle messages from rpc server task
                 Some(rpc_server_message) = self.rpc_server_to_main_rx.recv() => {
-                    let shutdown_after_execution = self.handle_rpc_server_message(rpc_server_message.clone(), &mut main_loop_state).await?;
+                    let shutdown_after_execution = self.handle_rpc_server_message(rpc_server_message, &mut main_loop_state).await?;
                     if shutdown_after_execution {
                         break SUCCESS_EXIT_CODE
                     }
@@ -2400,6 +2448,42 @@ impl MainLoopHandler {
 
                 Ok(false)
             }
+            RPCServerToMain::Ban(ip) => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::Ban");
+
+                self.ban_ip(ip).await;
+                Ok(false)
+            }
+            RPCServerToMain::Unban(ip) => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::Unban");
+
+                self.unban_ip(ip).await;
+                Ok(false)
+            }
+            RPCServerToMain::UnbanAll => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::UnbanAll");
+
+                self.unban_all().await;
+                Ok(false)
+            }
+            RPCServerToMain::Dial(address) => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::Dial");
+
+                self.dial(address).await;
+                Ok(false)
+            }
+            RPCServerToMain::ProbeNat => {
+                self.probe_nat().await;
+                Ok(false)
+            }
+            RPCServerToMain::ResetRelayReservations => {
+                self.reset_relay_reservations().await;
+                Ok(false)
+            }
+            RPCServerToMain::GetNetworkOverview(reply) => {
+                self.request_network_overview(reply).await;
+                Ok(false)
+            }
         }
     }
 
@@ -2413,6 +2497,12 @@ impl MainLoopHandler {
         let pmsg = MainToPeerTask::DisconnectAll();
         self.main_to_peer_broadcast(pmsg);
         debug!("sent bye");
+
+        // Stop the libp2p network actor, which closes its connections and
+        // stores its address book and ban list.
+        if let Some(network_actor) = self.network_actor.take() {
+            network_actor.shutdown().await;
+        }
 
         // Flush all databases
         self.global_state_lock.flush_databases().await?;
@@ -2539,6 +2629,7 @@ mod tests {
             miner_to_main_rx,
             rpc_server_to_main_rx,
             task_join_handles,
+            None,
         );
         TestSetup {
             main_loop_handler,
@@ -3018,6 +3109,27 @@ mod tests {
 
     mod peer_discovery {
         use super::*;
+
+        #[test]
+        fn candidate_at_connected_ip_in_ipv4_mapped_form_is_not_preferred() {
+            let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+            let connected = get_dummy_peer_incoming(SocketAddr::new(ipv4.into(), 9898));
+            let at_connected_ip = SocketAddr::new(ipv4.to_ipv6_mapped().into(), 9899);
+            let elsewhere = SocketAddr::from_str("198.51.100.8:9898").unwrap();
+
+            let reported_by = SocketAddr::from_str("198.51.100.9:9898").unwrap();
+            let now = SystemTime::now();
+            let mut potential_peers = PotentialPeersState::default();
+            potential_peers.add(reported_by, (at_connected_ip, 1), 10, 2, now);
+            potential_peers.add(reported_by, (elsewhere, 2), 10, 2, now);
+
+            for _ in 0..20 {
+                assert_eq!(
+                    Some((elsewhere, 2)),
+                    potential_peers.get_candidate(std::slice::from_ref(&connected), 0)
+                );
+            }
+        }
 
         #[apply(shared_tokio_runtime)]
         #[traced_test]
@@ -3608,6 +3720,549 @@ mod tests {
                 .await
                 .unwrap();
             let _ = fs::remove_file(&expected_file_location);
+        }
+    }
+
+    /// The main loop's side of the libp2p stack: bans and unbans that reach
+    /// both stacks, and peers given on the command line that are reached over
+    /// either stack.
+    mod network_stacks {
+        use std::net::IpAddr;
+
+        use super::*;
+        use crate::application::config::parser::peer_address::PeerAddress;
+        use crate::protocol::peer::peer_info::PeerConnectionInfo;
+        use crate::tests::shared::globalstate::get_dummy_handshake_data_for_genesis;
+
+        /// Give the main loop a link to a network actor that does not run, and
+        /// return the receiver of the commands sent to it.
+        #[cfg(feature = "libp2p")]
+        fn link_network_actor(
+            main_loop_handler: &mut MainLoopHandler,
+        ) -> mpsc::Receiver<crate::application::network::channel::NetworkActorCommand> {
+            let (command_tx, command_rx) = mpsc::channel(10);
+            let (_event_tx, event_rx) = mpsc::unbounded_channel();
+            let actor_task = tokio::spawn(async {});
+            main_loop_handler.network_actor =
+                Some(NetworkActorLink::new(command_tx, event_rx, actor_task));
+            command_rx
+        }
+
+        async fn standing_in_database(
+            main_loop_handler: &MainLoopHandler,
+            ip: IpAddr,
+        ) -> Option<crate::protocol::peer::PeerStanding> {
+            main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .get_peer_standing_from_database(ip)
+                .await
+        }
+
+        #[cfg(feature = "libp2p")]
+        async fn standing_in_peer_map(
+            main_loop_handler: &MainLoopHandler,
+            peer_address: SocketAddr,
+        ) -> crate::protocol::peer::PeerStanding {
+            main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map[&peer_address]
+                .standing
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn peer_in_bad_standing_is_banned_on_libp2p_stack() {
+            use crate::application::network::channel::NetworkActorCommand;
+
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let mut command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+
+            let peer_address = SocketAddr::from_str("198.51.100.7:9901").unwrap();
+            main_loop_handler
+                .handle_peer_task_message(PeerTaskToMain::Ban(peer_address), &mut main_loop_state)
+                .await
+                .unwrap();
+
+            let Ok(NetworkActorCommand::Ban(itertools::Either::Right(ip))) = command_rx.try_recv()
+            else {
+                panic!("network actor must be told to ban the IP");
+            };
+            assert_eq!(peer_address.ip(), ip);
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn ban_and_unban_reach_both_stacks() {
+            use crate::application::network::channel::NetworkActorCommand;
+
+            let TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            } = setup(0, 1, cli_args::Args::default()).await;
+            let mut command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+            let peer_address = SocketAddr::from_str("255.254.253.0:8080").unwrap();
+            let ip = peer_address.ip();
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Ban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| standing.is_bad()));
+            assert!(standing_in_peer_map(&main_loop_handler, peer_address)
+                .await
+                .is_bad());
+            assert!(matches!(
+                main_to_peer_rx.try_recv(),
+                Ok(MainToPeerTask::Disconnect(address)) if address == peer_address
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Ban(itertools::Either::Right(banned))) if banned == ip
+            ));
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Unban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| !standing.is_bad()));
+            assert!(!standing_in_peer_map(&main_loop_handler, peer_address)
+                .await
+                .is_bad());
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Unban(unbanned)) if unbanned == ip
+            ));
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Ban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::UnbanAll, &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| !standing.is_bad()));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Ban(_))
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::UnbanAll)
+            ));
+        }
+
+        /// An IPv4 peer address, and the same address in IPv4-mapped IPv6
+        /// form.
+        fn ipv4_peer_in_both_forms() -> (SocketAddr, SocketAddr) {
+            let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+            (
+                SocketAddr::new(IpAddr::V4(ipv4), 9898),
+                SocketAddr::new(IpAddr::V6(ipv4.to_ipv6_mapped()), 9898),
+            )
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn ban_of_either_form_of_an_ipv4_address_reaches_both_stacks() {
+            use crate::application::network::channel::NetworkActorCommand;
+            use crate::tests::shared::globalstate::get_dummy_peer_incoming;
+
+            let (ipv4_peer, mapped_peer) = ipv4_peer_in_both_forms();
+            for banned in [ipv4_peer, mapped_peer] {
+                let TestSetup {
+                    mut main_loop_handler,
+                    mut main_to_peer_rx,
+                    ..
+                } = setup(0, 0, cli_args::Args::default()).await;
+                let mut command_rx = link_network_actor(&mut main_loop_handler);
+                let mut main_loop_state = main_loop_handler.mutable();
+
+                // Peers are keyed by the canonical form of their address.
+                main_loop_handler
+                    .global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .peer_map
+                    .insert(ipv4_peer, get_dummy_peer_incoming(ipv4_peer));
+
+                main_loop_handler
+                    .handle_rpc_server_message(
+                        RPCServerToMain::Ban(banned.ip()),
+                        &mut main_loop_state,
+                    )
+                    .await
+                    .unwrap();
+
+                for ip in [ipv4_peer.ip(), mapped_peer.ip()] {
+                    assert!(standing_in_database(&main_loop_handler, ip)
+                        .await
+                        .is_some_and(|standing| standing.is_bad()));
+                }
+                assert!(standing_in_peer_map(&main_loop_handler, ipv4_peer)
+                    .await
+                    .is_bad());
+                assert!(matches!(
+                    main_to_peer_rx.try_recv(),
+                    Ok(MainToPeerTask::Disconnect(address)) if address == ipv4_peer
+                ));
+                assert!(matches!(
+                    command_rx.try_recv(),
+                    Ok(NetworkActorCommand::Ban(itertools::Either::Right(ip)))
+                        if ip == ipv4_peer.ip()
+                ));
+            }
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn lifted_bans_let_peers_reconnect_without_cooldown() {
+            let cli = cli_args::Args {
+                disable_libp2p: true,
+                ..Default::default()
+            };
+            let (ipv4_peer, mapped_peer) = ipv4_peer_in_both_forms();
+            let other_peer = SocketAddr::from_str("203.0.113.9:9898").unwrap();
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli).await;
+            let mut main_loop_state = main_loop_handler.mutable();
+
+            let state_lock = main_loop_handler.global_state_lock.clone();
+            let disconnect = |instance_id, ip| {
+                let mut global_state_lock = state_lock.clone();
+                async move {
+                    global_state_lock
+                        .lock_guard_mut()
+                        .await
+                        .net
+                        .register_peer_disconnection(instance_id, ip, SystemTime::now());
+                }
+            };
+            let disconnected = |instance_id| {
+                let global_state_lock = state_lock.clone();
+                async move {
+                    global_state_lock
+                        .lock_guard()
+                        .await
+                        .net
+                        .last_disconnection_time_of_peer(instance_id)
+                        .is_some()
+                }
+            };
+
+            // Lifting the ban of one form of the IP address lifts the cooldown
+            // of peers seen at the other form, and of no other peers.
+            disconnect(1, ipv4_peer.ip()).await;
+            disconnect(2, other_peer.ip()).await;
+            main_loop_handler
+                .handle_rpc_server_message(
+                    RPCServerToMain::Unban(mapped_peer.ip()),
+                    &mut main_loop_state,
+                )
+                .await
+                .unwrap();
+            assert!(!disconnected(1).await);
+            assert!(disconnected(2).await);
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::UnbanAll, &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(!disconnected(2).await);
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn dial_lets_peers_at_the_ip_reconnect_without_cooldown() {
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let _command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+            let (ipv4_peer, _) = ipv4_peer_in_both_forms();
+            main_loop_handler
+                .global_state_lock
+                .lock_guard_mut()
+                .await
+                .net
+                .register_peer_disconnection(1, ipv4_peer.ip(), SystemTime::now());
+
+            let address =
+                multiaddr::Multiaddr::from_str("/ip4/198.51.100.7/udp/9901/quic-v1").unwrap();
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Dial(address), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .last_disconnection_time_of_peer(1)
+                .is_none());
+        }
+
+        /// The node keeps running on the legacy stack once the network actor
+        /// stops, and no longer reports the libp2p stack as running.
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn stopped_network_actor_leaves_the_legacy_stack_running() {
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let (command_tx, _command_rx) = mpsc::channel(10);
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let actor_task = tokio::spawn(async {});
+            main_loop_handler.network_actor =
+                Some(NetworkActorLink::new(command_tx, event_rx, actor_task));
+            assert!(main_loop_handler.global_state_lock.libp2p_runs());
+
+            drop(event_tx);
+            assert!(next_network_event(&mut main_loop_handler.network_actor)
+                .await
+                .is_none());
+            main_loop_handler.handle_network_actor_stopped();
+
+            assert!(main_loop_handler.network_actor.is_none());
+            assert!(!main_loop_handler.global_state_lock.libp2p_runs());
+
+            // Network commands are dropped with a warning.
+            let mut main_loop_state = main_loop_handler.mutable();
+            let (overview_tx, overview_rx) = tokio::sync::oneshot::channel();
+            main_loop_handler
+                .handle_rpc_server_message(
+                    RPCServerToMain::GetNetworkOverview(overview_tx),
+                    &mut main_loop_state,
+                )
+                .await
+                .unwrap();
+            assert!(overview_rx.await.is_err());
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn ban_without_network_actor_applies_to_legacy_stack() {
+            let cli = cli_args::Args {
+                disable_libp2p: true,
+                ..Default::default()
+            };
+            let TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            } = setup(0, 1, cli).await;
+            assert!(main_loop_handler.network_actor.is_none());
+            let mut main_loop_state = main_loop_handler.mutable();
+            let peer_address = SocketAddr::from_str("255.254.253.0:8080").unwrap();
+            let ip = peer_address.ip();
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Ban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| standing.is_bad()));
+            assert!(matches!(
+                main_to_peer_rx.try_recv(),
+                Ok(MainToPeerTask::Disconnect(address)) if address == peer_address
+            ));
+        }
+
+        /// A peer given with its legacy address, connected over libp2p and
+        /// therefore keyed by its QUIC address.
+        fn peer_connected_over_libp2p(legacy_address: SocketAddr) -> (SocketAddr, PeerInfo) {
+            let quic_address = SocketAddr::new(legacy_address.ip(), 9901);
+            let peer_info = PeerInfo::new(
+                PeerConnectionInfo::new(Some(legacy_address.port()), quic_address, false),
+                &get_dummy_handshake_data_for_genesis(Network::Main),
+                SystemTime::now(),
+                cli_args::Args::default().peer_tolerance,
+            );
+            (quic_address, peer_info)
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn cli_peer_connected_over_libp2p_is_not_dialed_again() {
+            // A closed port, so that a dial fails at once.
+            let legacy_address = SocketAddr::from_str("127.0.0.1:1").unwrap();
+            for disable_libp2p in [false, true] {
+                let cli = cli_args::Args {
+                    peers: vec![PeerAddress::Socket(legacy_address)],
+                    disable_libp2p,
+                    ..Default::default()
+                };
+                let libp2p_enabled = cli.libp2p_enabled();
+                let TestSetup {
+                    mut main_loop_handler,
+                    ..
+                } = setup(0, 0, cli).await;
+                let (quic_address, peer_info) = peer_connected_over_libp2p(legacy_address);
+                main_loop_handler
+                    .global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .peer_map
+                    .insert(quic_address, peer_info);
+
+                let mut main_loop_state = main_loop_handler.mutable();
+                main_loop_handler
+                    .reconnect(&mut main_loop_state)
+                    .await
+                    .unwrap();
+
+                // Without libp2p, the peer map holds legacy connections only,
+                // and the behavior is as it was: only the connected address
+                // counts.
+                let num_dials = main_loop_state.task_handles.len();
+                if libp2p_enabled {
+                    assert_eq!(0, num_dials);
+                } else {
+                    assert_eq!(1, num_dials);
+                }
+            }
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn cli_peers_connected_over_libp2p_are_not_pruned() {
+            let legacy_cli_peer = SocketAddr::from_str("198.51.100.9:9898").unwrap();
+            let libp2p_cli_peer = SocketAddr::from_str("198.51.100.10:9901").unwrap();
+            let cli = cli_args::Args {
+                peers: vec![
+                    PeerAddress::Socket(legacy_cli_peer),
+                    PeerAddress::Multiaddr("/ip4/198.51.100.10/udp/9901/quic-v1".parse().unwrap()),
+                ],
+                max_num_peers: 1,
+                ..Default::default()
+            };
+            if !cli.libp2p_enabled() {
+                return;
+            }
+
+            // One incoming peer and the two CLI peers, two more than allowed.
+            let TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            } = setup(0, 1, cli).await;
+            let (quic_address, legacy_cli_peer_info) = peer_connected_over_libp2p(legacy_cli_peer);
+            let (_, libp2p_cli_peer_info) = peer_connected_over_libp2p(libp2p_cli_peer);
+            {
+                let mut global_state = main_loop_handler.global_state_lock.lock_guard_mut().await;
+                let peer_map = &mut global_state.net.peer_map;
+                peer_map.insert(quic_address, legacy_cli_peer_info);
+                peer_map.insert(libp2p_cli_peer, libp2p_cli_peer_info);
+            }
+
+            main_loop_handler.prune_peers().await.unwrap();
+            let incoming_peer = SocketAddr::from_str("255.254.253.0:8080").unwrap();
+            assert!(matches!(
+                main_to_peer_rx.try_recv(),
+                Ok(MainToPeerTask::Disconnect(address)) if address == incoming_peer
+            ));
+            assert!(main_to_peer_rx.try_recv().is_err());
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn network_overview_request_is_dropped_without_network_actor() {
+            let cli = cli_args::Args {
+                disable_libp2p: true,
+                ..Default::default()
+            };
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli).await;
+            assert!(main_loop_handler.network_actor.is_none());
+            let mut main_loop_state = main_loop_handler.mutable();
+
+            let (overview_tx, overview_rx) = tokio::sync::oneshot::channel();
+            main_loop_handler
+                .handle_rpc_server_message(
+                    RPCServerToMain::GetNetworkOverview(overview_tx),
+                    &mut main_loop_state,
+                )
+                .await
+                .unwrap();
+            assert!(overview_rx.await.is_err());
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn libp2p_commands_reach_network_actor() {
+            use crate::application::network::channel::NetworkActorCommand;
+
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let mut command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+            let address =
+                multiaddr::Multiaddr::from_str("/ip4/198.51.100.7/udp/9901/quic-v1").unwrap();
+            let (overview_tx, _overview_rx) = tokio::sync::oneshot::channel();
+
+            for message in [
+                RPCServerToMain::Dial(address.clone()),
+                RPCServerToMain::ProbeNat,
+                RPCServerToMain::ResetRelayReservations,
+                RPCServerToMain::GetNetworkOverview(overview_tx),
+            ] {
+                main_loop_handler
+                    .handle_rpc_server_message(message, &mut main_loop_state)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Dial(dialed)) if dialed == address
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::ProbeNat)
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::ResetRelayReservations)
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::GetNetworkOverview(_))
+            ));
         }
     }
 }

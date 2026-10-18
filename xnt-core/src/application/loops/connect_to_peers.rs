@@ -29,6 +29,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::application::config::cli_args;
+use crate::application::config::parser::multiaddr::canonical_socket_addr;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
 use crate::application::loops::frame_codec::PeerFrameCodec;
@@ -52,12 +53,12 @@ pub const MAX_PEER_FRAME_LENGTH_IN_BYTES: usize = 500 * 1024 * 1024;
 
 /// Only accept connections where peer's reported timestamp deviates from our
 /// by less than this value.
-const PEER_TIME_DIFFERENCE_THRESHOLD_IN_SECONDS: u128 = 90;
+pub(crate) const PEER_TIME_DIFFERENCE_THRESHOLD_IN_SECONDS: u128 = 90;
 
 /// Use this function to ensure that the same rules apply for both
 /// ingoing and outgoing connections. This limits the size of messages
 /// peers can send.
-fn get_codec_rules() -> PeerFrameCodec {
+pub(crate) fn get_codec_rules() -> PeerFrameCodec {
     PeerFrameCodec::new()
 }
 
@@ -68,7 +69,7 @@ fn get_codec_rules() -> PeerFrameCodec {
 /// bincode would pre-allocate memory based on the claimed length, causing OOM.
 ///
 /// The limit is set to match MAX_PEER_FRAME_LENGTH_IN_BYTES (500MB).
-fn get_bincode_codec<Item, SinkItem>() -> Bincode<Item, SinkItem, impl Options + Copy>
+pub(crate) fn get_bincode_codec<Item, SinkItem>() -> Bincode<Item, SinkItem, impl Options + Copy>
 where
     Item: serde::de::DeserializeOwned,
     SinkItem: serde::Serialize,
@@ -83,7 +84,7 @@ where
 /// # Panics
 ///
 /// panics if own version could not be parsed.
-fn versions_are_compatible(own_version: &str, other_version: &str) -> bool {
+pub(crate) fn versions_are_compatible(own_version: &str, other_version: &str) -> bool {
     let own_version = semver::Version::parse(own_version)
         .unwrap_or_else(|_| panic!("Must be able to parse own version string. Got: {own_version}"));
     let other_version = match semver::Version::parse(other_version) {
@@ -138,7 +139,7 @@ pub(crate) fn version_follows_rule_set(
 }
 
 /// Infallible absolute difference between two timestamps, in seconds.
-fn system_time_diff_seconds(peer: SystemTime, own: SystemTime) -> u128 {
+pub(crate) fn system_time_diff_seconds(peer: SystemTime, own: SystemTime) -> u128 {
     let peer = peer
         .duration_since(UNIX_EPOCH)
         .map(|d| i128::from(d.as_secs()))
@@ -154,19 +155,16 @@ fn system_time_diff_seconds(peer: SystemTime, own: SystemTime) -> u128 {
 
 /// Initial check if incoming connection is allowed. Performed prior to the
 /// sending of the handshake.
+///
+/// IP addresses are compared in canonical form, so that an IPv4 address
+/// matches its IPv4-mapped IPv6 form.
 pub(crate) fn precheck_incoming_connection_is_allowed(
     cli: &cli_args::Args,
     connecting_ip: IpAddr,
 ) -> bool {
-    let connecting_ip = match connecting_ip {
-        IpAddr::V4(_) => connecting_ip,
-        IpAddr::V6(v6) => match v6.to_ipv4() {
-            Some(v4) => std::net::IpAddr::V4(v4),
-            None => connecting_ip,
-        },
-    };
+    let connecting_ip = connecting_ip.to_canonical();
     if cli.restrict_peers_to_list {
-        let allowed_ips: Vec<std::net::IpAddr> = cli.peers.iter().map(|p| p.ip()).collect();
+        let allowed_ips: Vec<std::net::IpAddr> = cli.peer_ips();
         let is_allowed = allowed_ips.contains(&connecting_ip);
         if !is_allowed {
             debug!("Rejecting incoming connection from unlisted peer {connecting_ip} due to --restrict-peers-to-list",);
@@ -174,7 +172,7 @@ pub(crate) fn precheck_incoming_connection_is_allowed(
         }
     }
 
-    if cli.ban.contains(&connecting_ip) {
+    if cli.banned_ips().contains(&connecting_ip) {
         debug!("Rejecting incoming connection because it's explicitly banned");
         return false;
     }
@@ -187,11 +185,16 @@ pub(crate) fn precheck_incoming_connection_is_allowed(
     true
 }
 
-/// Check if connection is allowed. Used for both ingoing and outgoing connections.
+/// Check if connection is allowed. Used for both ingoing and outgoing
+/// connections, on the legacy TCP stack and on the libp2p stack alike.
+///
+/// IP addresses are compared in canonical form, so that bans, standings, and
+/// the per-IP cap apply to an IPv4 address and to its IPv4-mapped IPv6 form
+/// alike.
 ///
 /// Locking:
 ///   * acquires `global_state_lock` for read
-async fn check_if_connection_is_allowed(
+pub(crate) async fn check_if_connection_is_allowed(
     global_state_lock: GlobalStateLock,
     own_handshake: &HandshakeData,
     other_handshake: &HandshakeData,
@@ -201,10 +204,28 @@ async fn check_if_connection_is_allowed(
     let global_state = global_state_lock.lock_guard().await;
 
     // Disallow connection if peer is banned via CLI arguments
-    if cli_arguments.ban.contains(&peer_address.ip()) {
+    if cli_arguments
+        .banned_ips()
+        .contains(&peer_address.ip().to_canonical())
+    {
         let ip = peer_address.ip();
         debug!("Peer {ip}, banned via CLI argument, attempted to connect. Disallowing.");
         return InternalConnectionStatus::Refused(ConnectionRefusedReason::BadStanding);
+    }
+
+    // Disallow connection if connections are restricted to the peers given on
+    // the command line, and this is not one of them. Incoming connections over
+    // the legacy stack are already refused before the handshake, see
+    // `precheck_incoming_connection_is_allowed`.
+    if cli_arguments.restrict_peers_to_list
+        && !cli_arguments
+            .peer_ips()
+            .contains(&peer_address.ip().to_canonical())
+    {
+        debug!(
+            "Refusing connection with unlisted peer {peer_address} due to --restrict-peers-to-list"
+        );
+        return InternalConnectionStatus::Refused(ConnectionRefusedReason::not_on_peer_list());
     }
 
     // Disallow connection if we disagree about time.
@@ -277,12 +298,12 @@ async fn check_if_connection_is_allowed(
 
     // Cap connections per IP, if specified.
     if let Some(max_connections_per_ip) = cli_arguments.max_connections_per_ip {
-        let peer_ip = peer_address.ip();
+        let peer_ip = peer_address.ip().to_canonical();
         let num_connections_to_this_ip = global_state
             .net
             .peer_map
             .keys()
-            .map(|x| x.ip())
+            .map(|x| x.ip().to_canonical())
             .filter(|ip| *ip == peer_ip)
             .count();
         if num_connections_to_this_ip >= max_connections_per_ip {
@@ -531,6 +552,9 @@ pub(crate) async fn call_peer(
     own_handshake_data: HandshakeData,
     peer_distance: u8,
 ) {
+    // Key the peer by its IPv4 address if it is given in IPv4-mapped form, as
+    // peers that connect to this node are.
+    let peer_address = canonical_socket_addr(peer_address);
     let state_clone = state.clone();
     let peer_task_to_main_tx_clone = peer_task_to_main_tx.clone();
     let panic_result = std::panic::AssertUnwindSafe(async {
@@ -920,7 +944,7 @@ mod tests {
             "Default behavior: connection allowed"
         );
 
-        cli.peers.push(socket_address);
+        cli.peers.push(socket_address.into());
         assert!(
             precheck_incoming_connection_is_allowed(&cli, socket_address.ip()),
             "Incoming allowed when incoming is specified peer"
@@ -944,6 +968,50 @@ mod tests {
             !precheck_incoming_connection_is_allowed(&cli, socket_address.ip()),
             "Incoming disallowed when peer is banned via CLI argument"
         );
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn only_listed_peers_are_allowed_if_restricted_to_peer_list() -> Result<()> {
+        let network = Network::Main;
+        let (other_handshake, listed_peer) = get_dummy_peer_connection_data_genesis(network, 1);
+        let cli = cli_args::Args {
+            network,
+            restrict_peers_to_list: true,
+            peers: vec![listed_peer.into()],
+            ..Default::default()
+        };
+        let (_, _, _, _, state_lock, own_handshake) =
+            get_test_genesis_setup(network, 0, cli).await?;
+
+        // The list names IPs: the port does not matter, so that a peer can
+        // connect from any port, and over either network stack.
+        let listed_peer_on_quic_port = SocketAddr::new(listed_peer.ip(), 9901);
+        for peer_address in [listed_peer, listed_peer_on_quic_port] {
+            let status = check_if_connection_is_allowed(
+                state_lock.clone(),
+                &own_handshake,
+                &other_handshake,
+                &peer_address,
+            )
+            .await;
+            assert_eq!(InternalConnectionStatus::Accepted, status);
+        }
+
+        let unlisted_peer = get_dummy_socket_address(2);
+        let status = check_if_connection_is_allowed(
+            state_lock.clone(),
+            &own_handshake,
+            &other_handshake,
+            &unlisted_peer,
+        )
+        .await;
+        assert_eq!(
+            InternalConnectionStatus::Refused(ConnectionRefusedReason::not_on_peer_list()),
+            status,
+        );
+
+        Ok(())
     }
 
     #[traced_test]
@@ -1080,6 +1148,139 @@ mod tests {
         Ok(())
     }
 
+    /// An IPv4 address, and the same address in IPv4-mapped IPv6 form, as a
+    /// listener on `::` reports it.
+    fn ipv4_peer_in_both_forms(port: u16) -> (SocketAddr, SocketAddr) {
+        let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+        (
+            SocketAddr::new(IpAddr::V4(ipv4), port),
+            SocketAddr::new(IpAddr::V6(ipv4.to_ipv6_mapped()), port),
+        )
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn standing_and_bans_of_an_ipv4_address_apply_to_either_form() -> Result<()> {
+        let network = Network::Main;
+        let (other_handshake, _) = get_dummy_peer_connection_data_genesis(network, 1);
+        let (ipv4, mapped) = ipv4_peer_in_both_forms(9898);
+        let peer_tolerance = cli_args::Args::default().peer_tolerance;
+        let mut bad_standing = PeerStanding::new(peer_tolerance);
+        bad_standing.standing = -i32::from(peer_tolerance);
+
+        let refused = InternalConnectionStatus::Refused(ConnectionRefusedReason::BadStanding);
+        for (stored, connecting) in [(ipv4, mapped), (mapped, ipv4)] {
+            // A standing stored by this version, under the canonical form.
+            {
+                let (_, _, _, _, mut state_lock, own_handshake) =
+                    get_test_genesis_setup(network, 0, cli_args::Args::default()).await?;
+                state_lock
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .write_peer_standing(stored.ip(), bad_standing)
+                    .await;
+                let status = check_if_connection_is_allowed(
+                    state_lock.clone(),
+                    &own_handshake,
+                    &other_handshake,
+                    &connecting,
+                )
+                .await;
+                assert_eq!(refused, status, "stored {stored}, connecting {connecting}");
+            }
+
+            // A standing stored by an earlier version, under the form the
+            // address was seen in.
+            {
+                let (_, _, _, _, mut state_lock, own_handshake) =
+                    get_test_genesis_setup(network, 0, cli_args::Args::default()).await?;
+                state_lock
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .peer_databases
+                    .peer_standings
+                    .put(stored.ip(), bad_standing)
+                    .await;
+                let status = check_if_connection_is_allowed(
+                    state_lock.clone(),
+                    &own_handshake,
+                    &other_handshake,
+                    &connecting,
+                )
+                .await;
+                assert_eq!(refused, status, "stored {stored}, connecting {connecting}");
+            }
+
+            // A ban given with `--ban`.
+            {
+                let cli = cli_args::Args {
+                    ban: vec![stored.ip()],
+                    ..Default::default()
+                };
+                assert!(!precheck_incoming_connection_is_allowed(
+                    &cli,
+                    connecting.ip()
+                ));
+                let (_, _, _, _, state_lock, own_handshake) =
+                    get_test_genesis_setup(network, 0, cli).await?;
+                let status = check_if_connection_is_allowed(
+                    state_lock.clone(),
+                    &own_handshake,
+                    &other_handshake,
+                    &connecting,
+                )
+                .await;
+                assert_eq!(refused, status, "banned {stored}, connecting {connecting}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn per_ip_cap_counts_both_forms_of_an_ipv4_address_as_one_ip() -> Result<()> {
+        let network = Network::Main;
+        let (other_handshake, _) = get_dummy_peer_connection_data_genesis(network, 1);
+        let (connected_ipv4, connected_mapped) = ipv4_peer_in_both_forms(28011);
+        let (connecting_ipv4, connecting_mapped) = ipv4_peer_in_both_forms(28012);
+        let cli = cli_args::Args {
+            max_connections_per_ip: Some(1),
+            ..Default::default()
+        };
+
+        for (connected, connecting) in [
+            (connected_ipv4, connecting_mapped),
+            (connected_mapped, connecting_ipv4),
+        ] {
+            let (_, _, _, _, mut state_lock, own_handshake) =
+                get_test_genesis_setup(network, 0, cli.clone()).await?;
+            state_lock
+                .lock_guard_mut()
+                .await
+                .net
+                .peer_map
+                .insert(connected, get_dummy_peer_incoming(connected));
+
+            let status = check_if_connection_is_allowed(
+                state_lock.clone(),
+                &own_handshake,
+                &other_handshake,
+                &connecting,
+            )
+            .await;
+            assert_eq!(
+                InternalConnectionStatus::Refused(ConnectionRefusedReason::MaxPeerNumberExceeded),
+                status,
+                "connected {connected}, connecting {connecting}"
+            );
+        }
+
+        Ok(())
+    }
+
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn refuse_connection_bad_timestamp() {
@@ -1143,7 +1344,11 @@ mod tests {
             .lock_guard_mut()
             .await
             .net
-            .register_peer_disconnection(node_0_handshake.instance_id, SystemTime::now());
+            .register_peer_disconnection(
+                node_0_handshake.instance_id,
+                node_0_address.ip(),
+                SystemTime::now(),
+            );
 
         let handshake_request = PeerMessage::Handshake {
             magic_value: *MAGIC_STRING_REQUEST,

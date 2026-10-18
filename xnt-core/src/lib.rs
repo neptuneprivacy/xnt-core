@@ -67,7 +67,10 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::debug;
+#[cfg(feature = "libp2p")]
+use tracing::error;
 use tracing::info;
+use tracing::warn;
 use triton_vm::prelude::BFieldElement;
 
 use crate::application::config::data_directory::DataDirectory;
@@ -79,6 +82,7 @@ use crate::application::loops::channel::MinerToMain;
 use crate::application::loops::channel::PeerTaskToMain;
 use crate::application::loops::channel::RPCServerToMain;
 use crate::application::loops::connect_to_peers::call_peer;
+use crate::application::loops::main_loop::network_actor_link::NetworkActorLink;
 use crate::application::loops::main_loop::MainLoopHandler;
 use crate::application::rpc::server::RPC;
 use crate::state::archival_state::ArchivalState;
@@ -211,6 +215,34 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
         .await?;
     info!("UTXO restoration check complete");
 
+    // Start the libp2p network stack, which runs next to the legacy TCP stack.
+    #[cfg(feature = "libp2p")]
+    let network_actor = if cli_args.libp2p_enabled() {
+        start_network_actor(
+            &cli_args,
+            &data_directory,
+            &global_state_lock,
+            &peer_task_to_main_tx,
+            &main_to_peer_broadcast_tx,
+        )
+        .await
+    } else {
+        info!("The libp2p network stack is disabled.");
+        None
+    };
+    #[cfg(not(feature = "libp2p"))]
+    let network_actor: Option<NetworkActorLink> = None;
+
+    // Without libp2p, the peers that only libp2p reaches are not dialed.
+    let libp2p_absence = if cfg!(feature = "libp2p") {
+        "the libp2p network stack is disabled"
+    } else {
+        "this build has no libp2p network stack"
+    };
+    for peer in cli_args.peers_dialed_by_neither_stack() {
+        warn!("Not dialing peer {peer}: it is reached over libp2p only, and {libp2p_absence}.");
+    }
+
     // Bind socket to port on this machine, to handle incoming connections from peers
     let incoming_peer_listener = if let Some(incoming_peer_listener) = cli_args.own_listen_port() {
         let ret = TcpListener::bind((cli_args.peer_listen_addr, incoming_peer_listener))
@@ -231,7 +263,7 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
         own_handshake_data.tip_header.height
     );
     let mut task_join_handles = vec![];
-    for peer_address in global_state_lock.cli().peers.clone() {
+    for peer_address in global_state_lock.cli().legacy_peers() {
         let peer_state_var = global_state_lock.clone(); // bump arc refcount
         let main_to_peer_broadcast_rx_clone: broadcast::Receiver<MainToPeerTask> =
             main_to_peer_broadcast_tx.subscribe();
@@ -378,7 +410,125 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
         miner_to_main_rx,
         rpc_server_to_main_rx,
         task_join_handles,
+        network_actor,
     ))
+}
+
+/// Start the libp2p network actor with the configuration from the command
+/// line, and have it listen on the QUIC and libp2p TCP ports, unless incoming
+/// connections are disallowed.
+///
+/// The actor dials the `--peer` addresses meant for libp2p, and dials them
+/// again whenever their connection is lost.
+///
+/// If the libp2p identity cannot be read or created, or if the actor cannot be
+/// set up or stops during setup, an error is logged and `None` is returned:
+/// the node then runs the legacy network stack only. An identity file that
+/// cannot be read is left as it is.
+#[cfg(feature = "libp2p")]
+async fn start_network_actor(
+    cli_args: &cli_args::Args,
+    data_directory: &DataDirectory,
+    global_state_lock: &GlobalStateLock,
+    peer_task_to_main_tx: &mpsc::Sender<PeerTaskToMain>,
+    main_to_peer_broadcast_tx: &broadcast::Sender<MainToPeerTask>,
+) -> Option<NetworkActorLink> {
+    use crate::application::config::identity::resolve_identity;
+    use crate::application::network::actor::NetworkActor;
+    use crate::application::network::actor::NetworkActorChannels;
+    use crate::application::network::channel::NetworkActorCommand;
+    use crate::application::network::config::NetworkConfig;
+    use crate::application::network::source_limits::SourceLimitsConfig;
+
+    info!("Setting up the libp2p network actor.");
+    let peer_allow_list = cli_args.restrict_peers_to_list.then(|| cli_args.peer_ips());
+    let network_config = NetworkConfig::default()
+        .with_subdirectory(data_directory.network_subdirectory())
+        .with_network(cli_args.network)
+        .with_max_num_peers(cli_args.max_num_peers)
+        .with_source_limits(SourceLimitsConfig {
+            max_per_ip: cli_args.max_connections_per_ip,
+            max_per_prefix: cli_args.max_connections_per_prefix,
+            max_attempts_per_minute: cli_args.max_connection_attempts_per_ip_per_minute,
+        })
+        .with_cli_bans(cli_args.banned_ips())
+        .with_cli_peers(cli_args.libp2p_peers())
+        .with_peer_allow_list(peer_allow_list)
+        .with_external_addresses(cli_args.own_public_addresses())
+        .with_relay_server(!cli_args.disable_relay_server);
+
+    let identity_file = cli_args
+        .identity_file
+        .clone()
+        .unwrap_or_else(|| network_config.identity_file());
+    let identity = match resolve_identity(identity_file.clone(), cli_args.new_identity) {
+        Ok(identity) => identity,
+        Err(e) => {
+            error!(
+                "Failed to read or create the libp2p identity at '{}': {e:#}. \
+                 Running without the libp2p network stack; the legacy network \
+                 stack runs as usual.",
+                identity_file.display()
+            );
+            global_state_lock.set_libp2p_stopped();
+            return None;
+        }
+    };
+
+    let (channels, command_tx, event_rx) = NetworkActorChannels::setup(
+        peer_task_to_main_tx.clone(),
+        main_to_peer_broadcast_tx.clone(),
+    );
+    let mut actor = match NetworkActor::new(
+        identity,
+        channels,
+        global_state_lock.clone(),
+        network_config,
+    ) {
+        Ok(actor) => actor,
+        Err(e) => {
+            error!(
+                "Failed to set up the libp2p network actor: {e}. Running \
+                 without the libp2p network stack; the legacy network stack \
+                 runs as usual."
+            );
+            global_state_lock.set_libp2p_stopped();
+            return None;
+        }
+    };
+    let actor_task = tokio::spawn(async move {
+        actor.dial_initial_peers();
+        if let Err(e) = actor.run().await {
+            error!("Network actor stopped: {e}");
+        }
+    });
+
+    if cli_args.disallow_all_incoming_peer_connections() {
+        info!("Not accepting incoming libp2p connections");
+    } else {
+        let own_listen_addresses = cli_args.own_listen_addresses();
+        debug!(
+            "libp2p listen addresses: {}",
+            own_listen_addresses.iter().join("; ")
+        );
+        for address in own_listen_addresses {
+            if command_tx
+                .send(NetworkActorCommand::Listen(address))
+                .await
+                .is_err()
+            {
+                error!(
+                    "The libp2p network actor stopped during setup. Running \
+                     without the libp2p network stack; the legacy network \
+                     stack runs as usual."
+                );
+                global_state_lock.set_libp2p_stopped();
+                return None;
+            }
+        }
+    }
+
+    Some(NetworkActorLink::new(command_tx, event_rx, actor_task))
 }
 
 /// Time a fn call.  Duration is returned as a float in seconds.

@@ -1,13 +1,16 @@
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::channel::oneshot;
+use multiaddr::Multiaddr;
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::triton_vm::prelude::Digest;
 use tasm_lib::twenty_first::util_types::mmr::mmr_accumulator::MmrAccumulator;
 
 use crate::application::loops::main_loop::proof_upgrader::UpgradeJob;
+use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::Block;
@@ -197,6 +200,10 @@ pub(crate) enum PeerTaskToMain {
     LinkTx(Box<PeerTaskToMainLinkTx>),
     BlockProposal(Box<Block>),
     DisconnectFromLongestLivedPeer,
+
+    /// The peer at this address has reached a bad standing. Its IP address is
+    /// to be refused on the libp2p stack as well.
+    Ban(SocketAddr),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +229,7 @@ impl PeerTaskToMain {
             PeerTaskToMain::LinkTx(_) => "link transaction",
             PeerTaskToMain::BlockProposal(_) => "block proposal",
             PeerTaskToMain::DisconnectFromLongestLivedPeer => "disconnect from longest lived peer",
+            PeerTaskToMain::Ban(_) => "ban",
         }
         .to_string()
     }
@@ -239,7 +247,7 @@ pub(crate) struct ClaimUtxoData {
 }
 
 /// represents messages that can be sent from RPC server to main loop.
-#[derive(Clone, Debug, strum::Display)]
+#[derive(Debug, strum::Display)]
 pub enum RPCServerToMain {
     BroadcastTx(Arc<Transaction>),
     BroadcastOwnLinkTx(Arc<LinkTx>),
@@ -255,6 +263,33 @@ pub enum RPCServerToMain {
 
     // Used by JSON-RPC
     SubmitTx(Box<Transaction>),
+
+    /// Give the IP address a bad standing, disconnect the peers at it, and
+    /// refuse it on both network stacks.
+    Ban(IpAddr),
+
+    /// Clear the standing of the IP address, and lift its ban on both network
+    /// stacks. A ban given with `--ban` stands.
+    Unban(IpAddr),
+
+    /// Clear all standings, and lift all bans on both network stacks, except
+    /// those given with `--ban`.
+    UnbanAll,
+
+    /// Dial the address over the libp2p stack. A bad standing of its IP
+    /// address is cleared first, unless the IP address was banned with
+    /// `--ban`.
+    Dial(Multiaddr),
+
+    /// Probe whether the node is reachable from the outside, over libp2p.
+    ProbeNat,
+
+    /// Drop and renew the relay reservations of the libp2p stack.
+    ResetRelayReservations,
+
+    /// Report on the libp2p stack. The sender is dropped without an answer if
+    /// the libp2p stack does not run.
+    GetNetworkOverview(tokio::sync::oneshot::Sender<NetworkOverviewData>),
 }
 
 pub trait Cancelable: Send + Sync {

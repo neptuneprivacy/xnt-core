@@ -1,4 +1,6 @@
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::num::NonZero;
 use std::ops::RangeInclusive;
@@ -11,12 +13,16 @@ use clap::builder::RangedI64ValueParser;
 use clap::builder::TypedValueParser;
 use clap::Parser;
 use itertools::Itertools;
+use multiaddr::Multiaddr;
+use multiaddr::Protocol;
 use num_traits::Zero;
 use sysinfo::System;
 use tracing::error;
 
 use super::fee_notification_policy::FeeNotificationPolicy;
 use super::network::Network;
+use super::parser::multiaddr::parse_ip_or_multiaddr;
+use super::parser::peer_address::PeerAddress;
 use crate::application::config::auto_consolidation::AutoConsolidationSettings;
 use crate::application::config::auto_consolidation::ConsolidationTarget;
 use crate::application::config::triton_vm_env_vars::TritonVmEnvVars;
@@ -88,8 +94,10 @@ pub struct Args {
     ///
     /// To do this, see `--peer`.
     ///
-    /// E.g.: --ban 1.2.3.4 --ban 5.6.7.8
-    #[clap(long, value_name = "IP")]
+    /// If a multiaddress is given, the IP address it names is banned.
+    ///
+    /// E.g.: --ban 1.2.3.4 --ban 5.6.7.8 --ban /ip4/8.8.4.4/udp/1337/quic-v1
+    #[clap(long, value_name = "IP|MULTIADDR", value_parser = parse_ip_or_multiaddr)]
     pub(crate) ban: Vec<IpAddr>,
 
     /// The threshold at which a peer's standing is considered “bad”. Current
@@ -133,12 +141,24 @@ pub struct Args {
     #[clap(long)]
     pub(crate) max_connections_per_ip: Option<usize>,
 
+    /// Maximum number of inbound libp2p connections to accept from each
+    /// address prefix, /24 for IPv4 and /64 for IPv6, which is the granularity
+    /// at which one operator usually controls addresses.
+    #[clap(long, default_value = "8", value_name = "COUNT")]
+    pub max_connections_per_prefix: Option<usize>,
+
+    /// Maximum number of inbound libp2p connection attempts to accept from one
+    /// IP address per minute, refused attempts included.
+    #[clap(long, default_value = "6", value_name = "COUNT")]
+    pub max_connection_attempts_per_ip_per_minute: Option<usize>,
+
     /// Handshake timeout in seconds.
     ///
     /// The timeout used for all messages received and sent during the handshake
-    /// protocol for incoming connections. Can be lowered if the client is
-    /// attacked by many connection attempts. Can be raised if client is running
-    /// on a machine with a bad internet connection.
+    /// protocol for incoming connections, and for libp2p connections in either
+    /// direction. Can be lowered if the client receives many connection
+    /// attempts. Can be raised if client is running on a machine with a bad
+    /// internet connection.
     #[clap(long, default_value = "4", value_name = "SECONDS")]
     pub(crate) handshake_timeout: u8,
 
@@ -151,6 +171,14 @@ pub struct Args {
     /// refuse incoming connections when the max is reached.
     #[clap(long)]
     pub(crate) bootstrap: bool,
+
+    /// Do not act as a libp2p relay server for peers behind NATs.
+    ///
+    /// By default, the node offers relay reservations so that peers behind
+    /// NATs can be reached through it. Setting this flag turns that service
+    /// off. The node can still use other nodes this way.
+    #[clap(long)]
+    pub disable_relay_server: bool,
 
     /// If this flag is set, the node will refuse to initiate a transaction.
     /// This flag makes sense for machines whose resources are dedicated to
@@ -419,6 +447,14 @@ pub struct Args {
     #[clap(long, default_value = "9899", value_name = "PORT")]
     pub rpc_port: u16,
 
+    /// Port on which to listen for libp2p QUIC peer connections (UDP).
+    #[clap(long, default_value = "9901", value_name = "PORT")]
+    pub quic_port: u16,
+
+    /// Port on which to listen for libp2p TCP peer connections.
+    #[clap(long, default_value = "9902", value_name = "PORT")]
+    pub tcp_port: u16,
+
     /// Enable REST API server.
     #[clap(long)]
     pub(crate) rest_api_enable: bool,
@@ -435,6 +471,20 @@ pub struct Args {
     #[clap(short, long, default_value = "::")]
     pub peer_listen_addr: IpAddr,
 
+    /// Public IP where the node is reachable over libp2p.
+    ///
+    /// Only use for globally accessible IPs. Setting this value overrides
+    /// libp2p AutoNAT behaviour. If no public IPs are set, libp2p's AutoNAT
+    /// protocol will automatically try to guess the NAT status and external
+    /// addresses.
+    ///
+    /// Examples:
+    /// ```text
+    /// --public-ip 93.7.1.1 --public-ip 2001:db8::1428:57ab
+    /// ```
+    #[clap(long = "public-ip", value_name = "IP")]
+    pub public_ips: Vec<IpAddr>,
+
     /// Maximum number of blocks that the client can catch up to without going
     /// into sync mode.
     ///
@@ -450,9 +500,39 @@ pub struct Args {
     #[clap(long, default_value = "1000", value_parser(RangedI64ValueParser::<usize>::new().range(10..100000)))]
     pub(crate) sync_mode_threshold: usize,
 
-    /// IPs of nodes to connect to, e.g.: --peer 8.8.8.8:9898 --peer 8.8.4.4:1337.
-    #[structopt(long = "peer")]
-    pub peers: Vec<SocketAddr>,
+    /// Nodes to connect to, as `ip:port`, as an IP, or as a multiaddress, e.g.:
+    /// ```text
+    /// --peer 8.8.8.8:9898 \
+    /// --peer 8.8.4.4:1337 \
+    /// --peer 8.8.8.8 \
+    /// --peer /ip4/8.8.4.4/udp/9901/quic-v1
+    /// ```
+    ///
+    /// `ip:port` is dialed over the legacy TCP stack, unless the port is
+    /// 9901 (libp2p QUIC) or 9902 (libp2p TCP). A bare IP is dialed over both
+    /// stacks, on ports 9898 and 9901. A multiaddress is dialed over libp2p,
+    /// except `/ip4/<ip>/tcp/9898`, which is dialed over the legacy stack.
+    ///
+    /// A multiaddress ending in `/p2p/<peer id>` only connects to the peer
+    /// with that identity.
+    #[structopt(long = "peer", value_name = "ADDRESS")]
+    pub peers: Vec<PeerAddress>,
+
+    /// Generate a new libp2p identity to use going forward.
+    ///
+    /// The old identity file is kept as a backup.
+    #[clap(long)]
+    pub new_identity: bool,
+
+    /// Use the libp2p identity contained in the given file. By default, the
+    /// identity is kept in the `network` subdirectory of the data directory.
+    #[clap(long, value_name = "FILE")]
+    pub identity_file: Option<PathBuf>,
+
+    /// Do not run the libp2p network stack (QUIC and libp2p TCP). Peers are
+    /// then only reached over the legacy TCP stack.
+    #[clap(long)]
+    pub disable_libp2p: bool,
 
     /// Specify network, `main`, `alpha`, `beta`, `testnet`, or `regtest`
     #[structopt(long, default_value = "main", short)]
@@ -758,6 +838,116 @@ impl Args {
         }
     }
 
+    /// Whether the libp2p network stack runs: it is compiled in, and not
+    /// switched off with `--disable-libp2p`.
+    pub fn libp2p_enabled(&self) -> bool {
+        cfg!(feature = "libp2p") && !self.disable_libp2p
+    }
+
+    /// The `--peer` addresses that the legacy TCP stack dials.
+    ///
+    /// Without libp2p, every `ip:port` is dialed over the legacy stack,
+    /// whatever its port.
+    pub fn legacy_peers(&self) -> Vec<SocketAddr> {
+        let libp2p_enabled = self.libp2p_enabled();
+        self.peers
+            .iter()
+            .filter_map(|peer| match peer {
+                PeerAddress::Socket(socket_addr) if !libp2p_enabled => Some(*socket_addr),
+                _ => peer.legacy_address(),
+            })
+            .collect()
+    }
+
+    /// The `--peer` addresses that the libp2p stack dials. Empty if libp2p does
+    /// not run.
+    pub fn libp2p_peers(&self) -> Vec<Multiaddr> {
+        if !self.libp2p_enabled() {
+            return vec![];
+        }
+
+        self.peers
+            .iter()
+            .filter_map(PeerAddress::libp2p_address)
+            .collect()
+    }
+
+    /// The `--peer` entries that neither network stack dials: those only the
+    /// libp2p stack can reach, if it does not run.
+    pub fn peers_dialed_by_neither_stack(&self) -> Vec<&PeerAddress> {
+        if self.libp2p_enabled() {
+            return vec![];
+        }
+
+        self.peers
+            .iter()
+            .filter(|peer| {
+                !matches!(peer, PeerAddress::Socket(_)) && peer.legacy_address().is_none()
+            })
+            .collect()
+    }
+
+    /// The IP addresses of the `--peer` entries, for those that name one, in
+    /// canonical form.
+    pub fn peer_ips(&self) -> Vec<IpAddr> {
+        self.peers
+            .iter()
+            .filter_map(PeerAddress::ip)
+            .map(|ip| ip.to_canonical())
+            .collect()
+    }
+
+    /// The IP addresses banned with `--ban`, in canonical form, so that a ban
+    /// of an IPv4 address applies to its IPv4-mapped IPv6 form, too.
+    pub fn banned_ips(&self) -> Vec<IpAddr> {
+        self.ban.iter().map(|ip| ip.to_canonical()).collect()
+    }
+
+    /// The local addresses the libp2p stack binds to.
+    ///
+    /// For each IP, there is a TCP multiaddress on [`Self::tcp_port`] and a
+    /// QUIC multiaddress on [`Self::quic_port`]. If [`Self::peer_listen_addr`]
+    /// is `::`, on which the legacy stack accepts IPv4 and IPv6 alike, both
+    /// the IPv4 and the IPv6 unspecified addresses are used, since libp2p
+    /// sockets accept one IP version each. Any other address, `0.0.0.0`
+    /// included, is used as given.
+    ///
+    /// [`Self::peer_port`] belongs to the legacy TCP stack and is not included.
+    pub fn own_listen_addresses(&self) -> Vec<Multiaddr> {
+        let ips = if self.peer_listen_addr == IpAddr::V6(Ipv6Addr::UNSPECIFIED) {
+            vec![
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ]
+        } else {
+            vec![self.peer_listen_addr]
+        };
+
+        self.libp2p_multiaddrs(&ips)
+    }
+
+    /// The publicly reachable libp2p addresses given with `--public-ip`.
+    ///
+    /// If non-empty, this list overrides libp2p's AutoNAT behaviour and informs
+    /// libp2p of the external addresses this node is reachable on.
+    pub fn own_public_addresses(&self) -> Vec<Multiaddr> {
+        self.libp2p_multiaddrs(&self.public_ips)
+    }
+
+    /// A TCP and a QUIC multiaddress on the libp2p ports, for each IP.
+    fn libp2p_multiaddrs(&self, ips: &[IpAddr]) -> Vec<Multiaddr> {
+        ips.iter()
+            .flat_map(|&ip| {
+                [
+                    Multiaddr::from(ip).with(Protocol::Tcp(self.tcp_port)),
+                    Multiaddr::from(ip)
+                        .with(Protocol::Udp(self.quic_port))
+                        .with(Protocol::QuicV1),
+                ]
+            })
+            .collect()
+    }
+
     /// Whether to engage in mining (composing or guessing or both)
     pub(crate) fn mine(&self) -> bool {
         self.guess || self.compose
@@ -1009,6 +1199,9 @@ mod tests {
     use std::ops::RangeBounds;
 
     use super::*;
+    use crate::application::config::parser::peer_address::DEFAULT_LIBP2P_TCP_PORT;
+    use crate::application::config::parser::peer_address::DEFAULT_PEER_PORT;
+    use crate::application::config::parser::peer_address::DEFAULT_QUIC_PORT;
     use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 
     // extra methods for tests.
@@ -1048,6 +1241,267 @@ mod tests {
         );
         assert_eq!(1, default_args.max_num_compose_mergers.get());
         assert_eq!(TxUpgradeFilter::match_all(), default_args.tx_upgrade_filter);
+    }
+
+    #[test]
+    fn libp2p_default_args_test() {
+        let default_args = Args::default();
+
+        assert_eq!(DEFAULT_PEER_PORT, default_args.peer_port);
+        assert_eq!(DEFAULT_QUIC_PORT, default_args.quic_port);
+        assert_eq!(DEFAULT_LIBP2P_TCP_PORT, default_args.tcp_port);
+        assert_eq!(9901, default_args.quic_port);
+        assert_eq!(9902, default_args.tcp_port);
+        assert!(!default_args.disable_relay_server);
+        assert_eq!(Some(8), default_args.max_connections_per_prefix);
+        assert_eq!(
+            Some(6),
+            default_args.max_connection_attempts_per_ip_per_minute
+        );
+        assert_eq!(None, default_args.max_connections_per_ip);
+        assert!(default_args.public_ips.is_empty());
+        assert!(!default_args.new_identity);
+        assert!(default_args.identity_file.is_none());
+        assert_eq!(cfg!(feature = "libp2p"), default_args.libp2p_enabled());
+        assert!(default_args.peers.is_empty());
+        assert!(default_args.ban.is_empty());
+    }
+
+    #[test]
+    fn peers_are_split_between_the_stacks() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--peer",
+            "1.2.3.4:9898",
+            "--peer",
+            "127.0.0.1:29790",
+            "--peer",
+            "5.6.7.8:9902",
+            "--peer",
+            "/ip4/9.9.9.9/udp/9901/quic-v1",
+            "--peer",
+            "/ip4/10.0.0.1/tcp/9898",
+            "--peer",
+            "11.0.0.1",
+        ])
+        .unwrap();
+
+        let socket = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let multiaddr = |s: &str| s.parse::<Multiaddr>().unwrap();
+        let mut expected_legacy_peers = vec![socket("1.2.3.4:9898"), socket("127.0.0.1:29790")];
+        if !args.libp2p_enabled() {
+            expected_legacy_peers.push(socket("5.6.7.8:9902"));
+        }
+        expected_legacy_peers.extend([socket("10.0.0.1:9898"), socket("11.0.0.1:9898")]);
+        assert_eq!(expected_legacy_peers, args.legacy_peers());
+
+        if args.libp2p_enabled() {
+            assert_eq!(
+                vec![
+                    multiaddr("/ip4/5.6.7.8/tcp/9902"),
+                    multiaddr("/ip4/9.9.9.9/udp/9901/quic-v1"),
+                    multiaddr("/ip4/11.0.0.1/udp/9901/quic-v1"),
+                ],
+                args.libp2p_peers()
+            );
+        }
+
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            vec![
+                ip("1.2.3.4"),
+                ip("127.0.0.1"),
+                ip("5.6.7.8"),
+                ip("9.9.9.9"),
+                ip("10.0.0.1"),
+                ip("11.0.0.1"),
+            ],
+            args.peer_ips()
+        );
+    }
+
+    #[test]
+    fn without_libp2p_every_socket_address_peer_is_legacy() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--disable-libp2p",
+            "--peer",
+            "1.2.3.4:9898",
+            "--peer",
+            "5.6.7.8:9902",
+            "--peer",
+            "5.6.7.8:9901",
+            "--peer",
+            "/ip4/9.9.9.9/udp/9901/quic-v1",
+        ])
+        .unwrap();
+
+        assert!(!args.libp2p_enabled());
+        assert_eq!(
+            vec![
+                "1.2.3.4:9898".parse::<SocketAddr>().unwrap(),
+                "5.6.7.8:9902".parse().unwrap(),
+                "5.6.7.8:9901".parse().unwrap(),
+            ],
+            args.legacy_peers()
+        );
+        assert!(args.libp2p_peers().is_empty());
+    }
+
+    #[test]
+    fn socket_address_peers_keep_working() {
+        let peer = "8.8.4.4:1337".parse::<SocketAddr>().unwrap();
+        let args = Args::try_parse_from(["xnt-core", "--peer", "8.8.4.4:1337"]).unwrap();
+        assert_eq!(vec![PeerAddress::Socket(peer)], args.peers);
+        assert_eq!(vec![peer], args.legacy_peers());
+
+        let mut default_args = Args::default();
+        default_args.peers.push(peer.into());
+        assert_eq!(vec![peer], default_args.legacy_peers());
+    }
+
+    #[test]
+    fn invalid_peers_are_refused() {
+        for peer in ["8.8.4.4:", "example.com:9898", "/ip4/8.8.4.4/tcp", ""] {
+            assert!(
+                Args::try_parse_from(["xnt-core", "--peer", peer]).is_err(),
+                "{peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn bans_accept_ips_and_multiaddrs() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--ban",
+            "1.2.3.4",
+            "--ban",
+            "/ip4/8.8.4.4/udp/1337/quic-v1",
+            "--ban",
+            "/ip6/2001:db8::1/tcp/9898",
+        ])
+        .unwrap();
+
+        let expected: Vec<IpAddr> = vec![
+            "1.2.3.4".parse().unwrap(),
+            "8.8.4.4".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        assert_eq!(expected, args.ban);
+        assert_eq!(expected, args.banned_ips());
+    }
+
+    #[test]
+    fn bans_without_an_ip_are_refused() {
+        for ban in ["/dns4/example.com/tcp/9898", "1.2.3.4:9898", "example.com"] {
+            assert!(
+                Args::try_parse_from(["xnt-core", "--ban", ban]).is_err(),
+                "{ban}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_libp2p_addresses() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--quic-port",
+            "19901",
+            "--tcp-port",
+            "19902",
+            "--public-ip",
+            "93.7.1.1",
+        ])
+        .unwrap();
+
+        let multiaddrs = |list: &[&str]| {
+            list.iter()
+                .map(|s| s.parse::<Multiaddr>().unwrap())
+                .collect_vec()
+        };
+        assert_eq!(
+            multiaddrs(&[
+                "/ip4/0.0.0.0/tcp/19902",
+                "/ip4/0.0.0.0/udp/19901/quic-v1",
+                "/ip6/::/tcp/19902",
+                "/ip6/::/udp/19901/quic-v1",
+            ]),
+            args.own_listen_addresses()
+        );
+        assert_eq!(
+            multiaddrs(&["/ip4/93.7.1.1/tcp/19902", "/ip4/93.7.1.1/udp/19901/quic-v1"]),
+            args.own_public_addresses()
+        );
+
+        let loopback_args =
+            Args::try_parse_from(["xnt-core", "--peer-listen-addr", "127.0.0.1"]).unwrap();
+        assert_eq!(
+            multiaddrs(&["/ip4/127.0.0.1/tcp/9902", "/ip4/127.0.0.1/udp/9901/quic-v1"]),
+            loopback_args.own_listen_addresses()
+        );
+        assert!(loopback_args.own_public_addresses().is_empty());
+
+        // An IPv4 listen address keeps libp2p on IPv4, too.
+        let ipv4_args =
+            Args::try_parse_from(["xnt-core", "--peer-listen-addr", "0.0.0.0"]).unwrap();
+        assert_eq!(
+            multiaddrs(&["/ip4/0.0.0.0/tcp/9902", "/ip4/0.0.0.0/udp/9901/quic-v1"]),
+            ipv4_args.own_listen_addresses()
+        );
+    }
+
+    #[test]
+    fn peers_only_libp2p_can_reach_are_dialed_by_neither_stack_without_libp2p() {
+        let peers = [
+            "1.2.3.4:9898",
+            "5.6.7.8:9902",
+            "9.9.9.9",
+            "/ip4/10.0.0.1/tcp/9898",
+            "/ip4/11.0.0.1/udp/9901/quic-v1",
+            "/ip4/12.0.0.1/tcp/40123",
+        ];
+        let args_with = |disable_libp2p: bool| {
+            let mut args = vec!["xnt-core"];
+            if disable_libp2p {
+                args.push("--disable-libp2p");
+            }
+            for peer in peers {
+                args.extend(["--peer", peer]);
+            }
+            Args::try_parse_from(args).unwrap()
+        };
+
+        let without_libp2p = args_with(true);
+        assert_eq!(
+            vec!["/ip4/11.0.0.1/udp/9901/quic-v1", "/ip4/12.0.0.1/tcp/40123"],
+            without_libp2p
+                .peers_dialed_by_neither_stack()
+                .iter()
+                .map(ToString::to_string)
+                .collect_vec()
+        );
+
+        let with_libp2p = args_with(false);
+        if with_libp2p.libp2p_enabled() {
+            assert!(with_libp2p.peers_dialed_by_neither_stack().is_empty());
+        }
+    }
+
+    #[test]
+    fn ipv4_bans_and_peers_are_in_canonical_form() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--ban",
+            "::ffff:198.51.100.7",
+            "--peer",
+            "[::ffff:198.51.100.8]:9898",
+        ])
+        .unwrap();
+
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(vec![ip("198.51.100.7")], args.banned_ips());
+        assert_eq!(vec![ip("198.51.100.8")], args.peer_ips());
     }
 
     #[test]

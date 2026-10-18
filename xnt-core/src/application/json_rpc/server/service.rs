@@ -27,6 +27,7 @@ use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplat
 use crate::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipSnapshot;
 use crate::application::json_rpc::server::rpc::RpcServer;
 use crate::application::loops::channel::RPCServerToMain;
+use crate::application::rpc::server::network_overview_data::request_network_overview;
 use crate::protocol::consensus::block::block_selector::BlockSelector;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
@@ -1455,6 +1456,23 @@ impl RpcApi for RpcServer {
             archival_mutator_set: (&accumulator).into(),
         })
     }
+
+    async fn network_overview_call(
+        &self,
+        _: NetworkOverviewRequest,
+    ) -> RpcResult<NetworkOverviewResponse> {
+        let network_overview = request_network_overview(self.state.libp2p_runs(), &self.to_main_tx)
+            .await
+            .map_err(|e| {
+                RpcError::Server(JsonError::Custom {
+                    code: -32000,
+                    message: format!("Failed to report on the libp2p network stack: {e}"),
+                    data: None,
+                })
+            })?;
+
+        Ok(NetworkOverviewResponse { network_overview })
+    }
 }
 
 #[cfg(test)]
@@ -1519,6 +1537,89 @@ pub mod tests {
             BlockHeight::genesis(),
             rpc_server.height().await.unwrap().height
         );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_none_without_libp2p() {
+        let cli = cli_args::Args {
+            disable_libp2p: true,
+            ..cli_args::Args::default_with_network(Network::Main)
+        };
+        let global_state_lock =
+            mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let rpc_server = RpcServer::new(global_state_lock, None);
+
+        assert!(rpc_server
+            .network_overview()
+            .await
+            .unwrap()
+            .network_overview
+            .is_none());
+    }
+
+    #[cfg(feature = "libp2p")]
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_the_answer_of_the_main_loop() {
+        use crate::application::loops::channel::RPCServerToMain;
+        use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
+
+        let mut rpc_server = test_rpc_server().await;
+        let (to_main_tx, mut to_main_rx) = tokio::sync::mpsc::channel(1);
+        rpc_server.to_main_tx = to_main_tx;
+        let network_overview = NetworkOverviewData {
+            nat_status: "public(/ip4/198.51.100.7/udp/9901/quic-v1)".to_string(),
+            reachability_state: "public: /ip4/198.51.100.7/udp/9901/quic-v1".to_string(),
+            external_addresses: vec!["/ip4/198.51.100.7/udp/9901/quic-v1".to_string()],
+            connection_count: 4,
+            connection_limit: 10,
+            num_active_relays: 0,
+            peer_id: "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string(),
+            address_book_size: 7,
+            num_banned_peers: 0,
+        };
+
+        let answer = network_overview.clone();
+        tokio::spawn(async move {
+            if let Some(RPCServerToMain::GetNetworkOverview(reply)) = to_main_rx.recv().await {
+                let _ = reply.send(answer);
+            }
+        });
+
+        assert_eq!(
+            Some(network_overview),
+            rpc_server
+                .network_overview()
+                .await
+                .unwrap()
+                .network_overview
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_in_networking_namespace_only() {
+        use std::sync::Arc;
+
+        use serde_json::json;
+
+        use crate::application::json_rpc::core::api::ops::Namespace;
+        use crate::application::json_rpc::core::api::ops::RpcMethods;
+        use crate::application::json_rpc::core::model::json::JsonError;
+
+        const METHOD: &str = "networking_networkOverview";
+
+        let default_namespaces = HashSet::from([Namespace::Node, Namespace::Chain]);
+        let default_router =
+            RpcMethods::new_router(Arc::new(test_rpc_server().await), default_namespaces);
+        assert!(matches!(
+            default_router.dispatch(METHOD, json!([])).await,
+            Err(JsonError::MethodNotFound)
+        ));
+
+        let networking_router = RpcMethods::new_router(
+            Arc::new(test_rpc_server().await),
+            HashSet::from([Namespace::Networking]),
+        );
+        assert!(networking_router.dispatch(METHOD, json!([])).await.is_ok());
     }
 
     #[apply(shared_tokio_runtime)]

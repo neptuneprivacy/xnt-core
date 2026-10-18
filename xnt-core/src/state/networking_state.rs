@@ -104,8 +104,9 @@ pub struct NetworkingState {
     /// - Graceful disconnect initiated by the peer.
     /// - Abrupt disconnections, for example due to network failures.
     ///
-    /// Only the peer tasks may update this map.
-    disconnection_times: HashMap<InstanceId, SystemTime>,
+    /// Only the peer tasks may update this map, and the main loop and the RPC
+    /// server, to lift the reconnect cooldown of an IP address.
+    disconnection_times: HashMap<InstanceId, (IpAddr, SystemTime)>,
 }
 
 impl NetworkingState {
@@ -148,17 +149,46 @@ impl NetworkingState {
         sanctions
     }
 
+    /// The standing of the IP address, as stored in the database.
+    ///
+    /// The canonical form of the IP address is the key, so that an IPv4
+    /// address and its IPv4-mapped IPv6 form share one standing. Standings
+    /// stored under the IPv4-mapped form by earlier versions are read, too; of
+    /// two standings, the lower one counts.
     pub async fn get_peer_standing_from_database(&self, ip: IpAddr) -> Option<PeerStanding> {
-        self.peer_databases.peer_standings.get(ip).await
+        let mut standings = vec![];
+        for key in Self::standing_keys(ip) {
+            standings.extend(self.peer_databases.peer_standings.get(key).await);
+        }
+
+        standings
+            .into_iter()
+            .min_by_key(|standing| standing.standing_now())
     }
 
+    /// Clear the standing of the IP address in the database, under the
+    /// canonical form of the address and under the IPv4-mapped form that
+    /// earlier versions used.
     pub async fn clear_ip_standing_in_database(&mut self, ip: IpAddr) {
-        let old_standing = self.peer_databases.peer_standings.get(ip).await;
+        for key in Self::standing_keys(ip) {
+            let old_standing = self.peer_databases.peer_standings.get(key).await;
 
-        if let Some(mut standing) = old_standing {
-            standing.clear_standing();
+            if let Some(mut standing) = old_standing {
+                standing.clear_standing();
 
-            self.peer_databases.peer_standings.put(ip, standing).await;
+                self.peer_databases.peer_standings.put(key, standing).await;
+            }
+        }
+    }
+
+    /// The keys under which the standing of the IP address may be stored: its
+    /// canonical form, and for an IPv4 address, also the IPv4-mapped IPv6
+    /// form, under which earlier versions stored the standings of peers that
+    /// connected over IPv4 to a listener on `::`.
+    fn standing_keys(ip: IpAddr) -> Vec<IpAddr> {
+        match ip.to_canonical() {
+            IpAddr::V4(ipv4) => vec![IpAddr::V4(ipv4), IpAddr::V6(ipv4.to_ipv6_mapped())],
+            IpAddr::V6(ipv6) => vec![IpAddr::V6(ipv6)],
         }
     }
 
@@ -190,10 +220,13 @@ impl NetworkingState {
     /// meant a peer could never work its way back out of a bad standing, and
     /// the time-decay applied by [`PeerStanding::standing_now`] was never
     /// written back either.
+    ///
+    /// The standing is stored under the canonical form of the IP address; see
+    /// [`Self::get_peer_standing_from_database`].
     pub async fn write_peer_standing(&mut self, ip: IpAddr, current_standing: PeerStanding) {
         self.peer_databases
             .peer_standings
-            .put(ip, current_standing)
+            .put(ip.to_canonical(), current_standing)
             .await
     }
 
@@ -206,11 +239,31 @@ impl NetworkingState {
     /// - Abrupt disconnections, for example due to network failures.
     ///
     /// Only the peer tasks may call this method.
-    pub(crate) fn register_peer_disconnection(&mut self, id: InstanceId, time: SystemTime) {
-        self.disconnection_times.insert(id, time);
+    pub(crate) fn register_peer_disconnection(
+        &mut self,
+        id: InstanceId,
+        ip: IpAddr,
+        time: SystemTime,
+    ) {
+        self.disconnection_times
+            .insert(id, (ip.to_canonical(), time));
     }
 
     pub(crate) fn last_disconnection_time_of_peer(&self, id: InstanceId) -> Option<SystemTime> {
-        self.disconnection_times.get(&id).copied()
+        self.disconnection_times.get(&id).map(|&(_, time)| time)
+    }
+
+    /// Forget the disconnections of peers at the IP address, so that they can
+    /// reconnect without waiting for the reconnect cooldown.
+    pub(crate) fn forget_disconnections_at(&mut self, ip: IpAddr) {
+        let ip = ip.to_canonical();
+        self.disconnection_times
+            .retain(|_, &mut (disconnected_ip, _)| disconnected_ip != ip);
+    }
+
+    /// Forget the disconnections of all peers, so that they can reconnect
+    /// without waiting for the reconnect cooldown.
+    pub(crate) fn forget_all_disconnections(&mut self) {
+        self.disconnection_times.clear();
     }
 }

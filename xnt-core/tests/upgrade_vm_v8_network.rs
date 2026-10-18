@@ -56,7 +56,7 @@ async fn cluster_args(num_nodes: usize) -> Vec<Args> {
         args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
         args.peers = all_args
             .iter()
-            .map(|peer| SocketAddr::new(peer.peer_listen_addr, peer.peer_port))
+            .map(|peer| SocketAddr::new(peer.peer_listen_addr, peer.peer_port).into())
             .collect();
         all_args.push(args);
     }
@@ -590,6 +590,8 @@ pub async fn auto_consolidation_runs_on_a_block_from_a_peer() -> anyhow::Result<
     alice_args.peer_listen_addr = defaults.peer_listen_addr;
     alice_args.peer_port = defaults.peer_port;
     alice_args.rpc_port = defaults.rpc_port;
+    alice_args.quic_port = defaults.quic_port;
+    alice_args.tcp_port = defaults.tcp_port;
     alice_args.data_dir = defaults.data_dir;
     alice_args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
     alice_args
@@ -598,10 +600,8 @@ pub async fn auto_consolidation_runs_on_a_block_from_a_peer() -> anyhow::Result<
 
     let mut bob_args = GenesisNode::default_args().await;
     bob_args.tx_proving_capability = Some(TxProvingCapability::SingleProof);
-    bob_args.peers = vec![SocketAddr::new(
-        alice_args.peer_listen_addr,
-        alice_args.peer_port,
-    )];
+    bob_args.peers =
+        vec![SocketAddr::new(alice_args.peer_listen_addr, alice_args.peer_port).into()];
 
     let [mut alice, mut bob] =
         start_connected_nodes(vec![alice_args, bob_args], timeout_secs).await?;

@@ -14,6 +14,7 @@ use neptune_privacy::api::export::Timestamp;
 use neptune_privacy::api::export::TxCreationArtifacts;
 use neptune_privacy::application::rpc::auth;
 use neptune_privacy::application::rpc::server::mempool_transaction_info::MempoolTransactionInfo;
+use neptune_privacy::application::rpc::server::network_overview_data::NetworkOverviewData;
 use neptune_privacy::application::rpc::server::overview_data::OverviewData;
 use neptune_privacy::application::rpc::server::ui_utxo::UiUtxo;
 use neptune_privacy::application::rpc::server::RPCClient;
@@ -96,6 +97,21 @@ impl DashboardRpcClient {
             DashboardRpcClient::Mock(mock_client) => {
                 mock_client.dashboard_overview_data(ctx, token).await
             }
+        }
+    }
+
+    pub async fn network_overview(
+        &self,
+        ctx: ::tarpc::context::Context,
+        token: auth::Token,
+    ) -> ::core::result::Result<RpcResult<Option<NetworkOverviewData>>, ::tarpc::client::RpcError>
+    {
+        match self {
+            DashboardRpcClient::Authentic(rpcclient) => {
+                rpcclient.network_overview(ctx, token).await
+            }
+            #[cfg(feature = "mock")]
+            DashboardRpcClient::Mock(mock_client) => mock_client.network_overview(ctx, token).await,
         }
     }
 

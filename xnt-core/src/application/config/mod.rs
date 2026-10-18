@@ -2,6 +2,9 @@ pub(crate) mod auto_consolidation;
 pub mod cli_args;
 pub mod data_directory;
 pub(crate) mod fee_notification_policy;
+#[cfg(feature = "libp2p")]
+pub(crate) mod identity;
 pub mod network;
+pub mod parser;
 pub mod triton_vm_env_vars;
 pub mod tx_upgrade_filter;
