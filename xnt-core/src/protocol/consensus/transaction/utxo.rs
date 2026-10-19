@@ -14,6 +14,7 @@ use rand::RngExt;
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::prelude::TasmObject;
+use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use tasm_lib::twenty_first::tip5::digest::Digest;
@@ -23,6 +24,7 @@ use crate::protocol::consensus::type_scripts::known_type_scripts::is_timelock_ty
 use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
+use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 
@@ -215,7 +217,23 @@ impl Utxo {
     /// assuming it can be unlocked. Currently, this boils down to checking
     /// whether it has a time lock and if it does, verifying that the release
     /// date is in the past.
+    ///
+    /// Like `TimeLockV2`, the release date of a `TimeLock` coin on one of the
+    /// UTXOs in [`TimeLockV2::target_utxo_digests`] is extended by
+    /// [`TimeLockV2::EXTENSION_MS`].
     pub fn can_spend_at(&self, timestamp: Timestamp) -> bool {
+        self.can_spend_at_with_extension_targets(timestamp, |utxo| {
+            TimeLockV2::target_utxo_digests().contains(&Tip5::hash(utxo))
+        })
+    }
+
+    /// [`Self::can_spend_at`] with the UTXOs whose `TimeLock` release date is
+    /// extended given by `is_extension_target`.
+    fn can_spend_at_with_extension_targets(
+        &self,
+        timestamp: Timestamp,
+        is_extension_target: impl Fn(&Utxo) -> bool,
+    ) -> bool {
         crate::macros::log_slow_scope!();
         // unknown type script
         if !self.all_type_script_states_are_valid() {
@@ -223,15 +241,22 @@ impl Utxo {
         }
 
         // decode and test release date(s) (if any)
-        for state in self
+        for coin in self
             .coins
             .iter()
             .filter(|c| is_timelock_type_script_hash(c.type_script_hash))
-            .map(|c| c.state.clone())
         {
-            match Timestamp::decode(&state) {
+            match Timestamp::decode(&coin.state) {
                 Ok(release_date) => {
-                    if timestamp <= *release_date {
+                    let is_time_lock_coin = coin.type_script_hash == TimeLock.hash()
+                        || TimeLock::historical_type_script_hashes()
+                            .contains(&coin.type_script_hash);
+                    let extension = if is_time_lock_coin && is_extension_target(self) {
+                        Timestamp::millis(TimeLockV2::EXTENSION_MS)
+                    } else {
+                        Timestamp::zero()
+                    };
+                    if timestamp <= *release_date + extension {
                         return false;
                     }
                 }
@@ -440,6 +465,54 @@ mod tests {
 
         assert!(utxo.all_type_script_states_are_valid());
         assert!(utxo.can_spend_at(Timestamp::now()));
+    }
+
+    #[test]
+    fn timelock_extension_targets_are_released_one_extension_later() {
+        let release = Timestamp::now() + Timestamp::days(30);
+        let extension = Timestamp::millis(TimeLockV2::EXTENSION_MS);
+        let utxo_with_coin = |time_lock: Coin| {
+            Utxo::new(
+                Digest::default(),
+                vec![
+                    Coin::new_native_currency(NativeCurrencyAmount::coins(1)),
+                    time_lock,
+                ],
+            )
+        };
+        let state = vec![release.0];
+
+        // A `TimeLock` coin, under any of its hashes, on a target UTXO is
+        // released one extension period later, as `TimeLockV2` enforces it.
+        for type_script_hash in [TimeLock.hash()]
+            .into_iter()
+            .chain(TimeLock::historical_type_script_hashes())
+        {
+            let utxo = utxo_with_coin(Coin {
+                type_script_hash,
+                state: state.clone(),
+            });
+            let is_target = |u: &Utxo| *u == utxo;
+            let just_after_release = release + Timestamp::millis(1);
+            assert!(utxo.can_spend_at_with_extension_targets(just_after_release, |_| false));
+            assert!(!utxo.can_spend_at_with_extension_targets(just_after_release, is_target));
+            assert!(!utxo.can_spend_at_with_extension_targets(release + extension, is_target));
+            assert!(utxo.can_spend_at_with_extension_targets(
+                release + extension + Timestamp::millis(1),
+                is_target
+            ));
+        }
+
+        // A `TimeLockV2` coin is not extended.
+        let utxo = utxo_with_coin(Coin {
+            type_script_hash: TimeLockV2.hash(),
+            state,
+        });
+        let is_target = |u: &Utxo| *u == utxo;
+        assert!(utxo.can_spend_at_with_extension_targets(release + Timestamp::millis(1), is_target));
+
+        // The production target set holds no UTXO built here.
+        assert!(utxo.can_spend_at(release + Timestamp::millis(1)));
     }
 
     #[test]

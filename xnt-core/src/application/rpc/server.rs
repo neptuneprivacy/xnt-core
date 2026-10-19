@@ -80,6 +80,11 @@ use crate::api;
 use crate::api::tx_initiation;
 use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use crate::api::tx_initiation::consolidate::NUM_RECENT_BLOCKS_EXCLUDED;
+use crate::api::tx_initiation::migrate_dctidh::is_own_address;
+use crate::api::tx_initiation::migrate_dctidh::DctidhMigrationReport;
+use crate::api::tx_initiation::migrate_dctidh::MigrationDestination;
+use crate::application::config::dctidh_migration::MAX_NUM_MIGRATION_INPUTS;
 use crate::application::config::network::Network;
 use crate::application::config::parser::multiaddr::ip_of;
 use crate::application::config::parser::multiaddr::is_relayed;
@@ -135,6 +140,7 @@ use crate::state::wallet::monitored_utxo::MonitoredUtxo;
 use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutputList;
 use crate::state::wallet::wallet_status::WalletStatus;
+use crate::state::wallet::wallet_status::WalletStatusElement;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
 use crate::twenty_first::prelude::Tip5;
@@ -1134,6 +1140,10 @@ pub trait RPC {
 
     /// Determine whether the user-supplied string is a valid address
     ///
+    /// Returns `None` for strings that are not receiving addresses, including
+    /// symmetric keys, for dCTIDH addresses with a legacy-format lock, and for
+    /// dCTIDH addresses whose public key is invalid.
+    ///
     /// ```no_run
     /// # use anyhow::Result;
     /// use neptune_privacy::application::config::network::Network;
@@ -2094,6 +2104,61 @@ pub trait RPC {
     /// An overview of the libp2p network stack, or `None` if it does not run
     /// on this node.
     async fn network_overview(token: auth::Token) -> RpcResult<Option<NetworkOverviewData>>;
+
+    /// The wallet's synced, unspent UTXOs held at legacy-format dCTIDH locks.
+    ///
+    /// Such UTXOs are recognized only if they were confirmed below the legacy
+    /// cutoff height (on main net, the `UpgradeVMv8` activation height). They
+    /// count towards the total balance but not towards the available balance,
+    /// and should be moved to a current-format address.
+    async fn legacy_dctidh_utxos(token: auth::Token) -> RpcResult<Vec<WalletStatusElement>>;
+
+    /// Move a batch of the wallet's funds held at legacy-format dCTIDH locks
+    /// now, as `--migrate-dctidh` does for every new block.
+    ///
+    /// Spends the largest such UTXOs that are worth more than their share of
+    /// the fee to one output at the destination, announced on-chain. Returns
+    /// what was moved and what still waits. Before the `UpgradeVMv8` hard
+    /// fork, the transaction is made for the era before it, with at most 10
+    /// inputs and at least the proof collection fee, and it fails within
+    /// `--fork-tx-cutoff-margin` blocks of the fork.
+    ///
+    /// # Parameters
+    ///
+    ///  - `destination` -- where the funds go. Defaults to the node's
+    ///    `--migrate-dctidh` setting, or else the next unused Generation
+    ///    address of this wallet.
+    ///  - `max_inputs` -- the maximum number of UTXOs to spend, between 1 and
+    ///    200. Defaults to the node's `--migrate-dctidh-batch` setting.
+    ///  - `fee` -- defaults to the node's `--migrate-dctidh-fee` setting, or
+    ///    else is chosen from the node's proving capability and the number of
+    ///    inputs. Must be at least the node's `--min-relay-pctx-fee-per-input`
+    ///    times `max_inputs`.
+    ///  - `allow_foreign` -- allow an explicit destination address that is not
+    ///    owned by this wallet.
+    async fn migrate_dctidh(
+        token: auth::Token,
+        destination: Option<MigrationDestination>,
+        max_inputs: Option<usize>,
+        fee: Option<NativeCurrencyAmount>,
+        allow_foreign: bool,
+    ) -> RpcResult<DctidhMigrationReport>;
+
+    /// Return the number of transactions in the legacy relay pool: the
+    /// transactions of the era before the next hard fork, which the node holds
+    /// apart from its mempool until the next block belongs to the era after
+    /// the fork. See [`mempool_tx_count`](Self::mempool_tx_count) for the
+    /// mempool.
+    async fn legacy_relay_pool_tx_count(token: auth::Token) -> RpcResult<usize>;
+
+    /// Return info about the transactions in the legacy relay pool, in
+    /// descending order of fee density, like
+    /// [`mempool_overview`](Self::mempool_overview) does for the mempool.
+    async fn legacy_relay_pool_overview(
+        token: auth::Token,
+        start_index: usize,
+        number: usize,
+    ) -> RpcResult<Vec<MempoolTransactionInfo>>;
 }
 
 #[derive(Clone)]
@@ -2255,7 +2320,15 @@ impl NeptuneRPCServer {
         }
 
         if incoming_utxo.utxo.lock_script_hash() != spending_key.lock_script_hash() {
-            let err = error::ClaimError::ForeignLockScript;
+            let is_legacy_lock = state
+                .wallet_state
+                .legacy_dctidh_lock_hashes()
+                .contains(&incoming_utxo.utxo.lock_script_hash());
+            let err = if is_legacy_lock {
+                error::ClaimError::LegacyFormatLock
+            } else {
+                error::ClaimError::ForeignLockScript
+            };
             warn!("{}", err.to_string());
             return Err(err);
         }
@@ -2876,9 +2949,14 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        let ret = ReceivingAddress::from_bech32m(&address_string, network).ok();
+        // A symmetric key also parses, but it is a secret, not an address. The
+        // submitted string is never logged.
+        let ret = ReceivingAddress::from_bech32m(&address_string, network)
+            .ok()
+            .filter(|address| !matches!(address, ReceivingAddress::Symmetric(_)))
+            .filter(|address| address.validate_as_recipient().is_ok());
         tracing::debug!(
-            "Responding to address validation request of {address_string}: {}",
+            "Responding to address validation request: {}",
             ret.is_some()
         );
         Ok(ret)
@@ -4374,8 +4452,7 @@ impl RPC for NeptuneRPCServer {
             .state
             .lock_guard()
             .await
-            .mempool
-            .get(tx_kernel_id)
+            .mempool_or_legacy_pool_get(tx_kernel_id)
             .map(|tx| &tx.kernel)
             .cloned())
     }
@@ -4518,6 +4595,162 @@ impl RPC for NeptuneRPCServer {
 
         Ok(request_network_overview(self.state.libp2p_runs(), &self.rpc_server_to_main_tx).await?)
     }
+
+    // documented in trait. do not add doc-comment.
+    async fn legacy_dctidh_utxos(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<Vec<WalletStatusElement>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let wallet_status = self
+            .state
+            .lock_guard()
+            .await
+            .get_wallet_status_for_tip()
+            .await;
+        Ok(wallet_status
+            .synced_unspent
+            .into_iter()
+            .map(|(element, _)| element)
+            .filter(|element| element.is_legacy)
+            .collect())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn migrate_dctidh(
+        mut self,
+        _: context::Context,
+        token: auth::Token,
+        destination: Option<MigrationDestination>,
+        max_inputs: Option<usize>,
+        fee: Option<NativeCurrencyAmount>,
+        allow_foreign: bool,
+    ) -> RpcResult<DctidhMigrationReport> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let cli = self.state.cli().clone();
+        let settings = cli.dctidh_migration();
+
+        let max_inputs = max_inputs.unwrap_or(cli.migrate_dctidh_batch);
+        if !(1..=MAX_NUM_MIGRATION_INPUTS).contains(&max_inputs) {
+            return Err(RpcError::Failed(format!(
+                "the number of inputs must be between 1 and {MAX_NUM_MIGRATION_INPUTS}, got \
+                 {max_inputs}"
+            )));
+        }
+
+        let fee = fee.or(cli.migrate_dctidh_fee);
+        if let Some(fee) = fee {
+            let per_input = cli.min_relay_pctx_fee_per_input;
+            let relay_minimum = u32::try_from(max_inputs)
+                .ok()
+                .and_then(|max_inputs| per_input.checked_scalar_mul(max_inputs));
+            if !relay_minimum.is_some_and(|relay_minimum| fee >= relay_minimum) {
+                return Err(RpcError::Failed(format!(
+                    "fee {fee} is below the minimum at which peers relay a transaction with \
+                     {max_inputs} inputs ({per_input} per input)"
+                )));
+            }
+        }
+
+        let destination = match destination {
+            Some(MigrationDestination::Address(address)) => {
+                if !allow_foreign
+                    && !is_own_address(&self.state.lock_guard().await.wallet_state, &address)
+                {
+                    return Err(RpcError::Failed(
+                        "the destination address is not owned by this wallet; set allow_foreign \
+                         to move the funds there anyway"
+                            .to_string(),
+                    ));
+                }
+                MigrationDestination::Address(address)
+            }
+            Some(destination) => destination,
+            None => settings
+                .map(|settings| settings.destination)
+                .unwrap_or(MigrationDestination::Generation { index: None }),
+        };
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_initiator_mut()
+            .migrate_dctidh_utxos(
+                destination,
+                fee,
+                Timestamp::now(),
+                NUM_RECENT_BLOCKS_EXCLUDED,
+                max_inputs,
+            )
+            .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn legacy_relay_pool_tx_count(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+    ) -> RpcResult<usize> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self.state.lock_guard().await.legacy_relay_pool.len())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn legacy_relay_pool_overview(
+        self,
+        _context: ::tarpc::context::Context,
+        token: auth::Token,
+        start_index: usize,
+        number: usize,
+    ) -> RpcResult<Vec<MempoolTransactionInfo>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let global_state = self.state.lock_guard().await;
+        let (incoming, outgoing): (HashMap<_, _>, HashMap<_, _>) = {
+            let (incoming_iter, outgoing_iter) =
+                global_state.wallet_state.mempool_balance_updates();
+            (incoming_iter.collect(), outgoing_iter.collect())
+        };
+        let tip_msah = global_state
+            .chain
+            .light_state()
+            .mutator_set_accumulator_after()
+            .expect("Block from state must have mutator set after")
+            .hash();
+
+        let pool = &global_state.legacy_relay_pool;
+        let transactions = pool
+            .txids_by_fee_density()
+            .into_iter()
+            .skip(start_index)
+            .take(number)
+            .filter_map(|txid| {
+                let tx = pool.get(txid)?;
+                let mut info = MempoolTransactionInfo::from(tx);
+                if tx.kernel.mutator_set_hash == tip_msah {
+                    info = info.synced();
+                }
+                if let Some(positive_effect) = incoming.get(&txid) {
+                    info = info.with_positive_effect_on_balance(*positive_effect);
+                }
+                if let Some(negative_effect) = outgoing.get(&txid) {
+                    info = info.with_negative_effect_on_balance(*negative_effect);
+                }
+
+                Some(info)
+            })
+            .collect_vec();
+
+        Ok(transactions)
+    }
 }
 
 pub mod error {
@@ -4651,6 +4884,12 @@ pub mod error {
         // catch-all error, eg for anyhow errors
         #[error("claim unsuccessful")]
         Failed(String),
+
+        #[error(
+            "claimed utxo is held at a legacy-format dCTIDH lock; off-chain notifications for \
+             legacy-format locks cannot be claimed"
+        )]
+        LegacyFormatLock,
     }
 
     // convert anyhow::Error to a ClaimError::Failed.
@@ -4685,6 +4924,7 @@ mod tests {
     use crate::protocol::peer::NegativePeerSanction;
     use crate::protocol::peer::PeerSanction;
     use crate::protocol::proof_abstractions::mast_hash::MastHash;
+    use crate::state::transaction::tx_proving_capability::TxProvingCapability;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
     use crate::state::wallet::address::generation_address::GenerationSpendingKey;
     use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
@@ -4983,6 +5223,15 @@ mod tests {
             )
             .await;
 
+        let _ = rpc_server
+            .clone()
+            .legacy_dctidh_utxos(ctx, token)
+            .await
+            .unwrap();
+        let _ = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, None, None, None, false)
+            .await;
         let _ = rpc_server.clone().pause_miner(ctx, token).await;
         let _ = rpc_server.clone().restart_miner(ctx, token).await;
         let _ = rpc_server
@@ -5000,6 +5249,54 @@ mod tests {
         let _ = rpc_server.shutdown(ctx, token).await;
 
         Ok(())
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn migrate_dctidh_checks_destination_batch_and_fee() {
+        let cli = cli_args::Args {
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..cli_args::Args::default_with_network(Network::Testnet(0))
+        };
+        let rpc_server = test_rpc_server(WalletEntropy::new_random(), 2, cli).await;
+        let token = cookie_token(&rpc_server).await;
+        let ctx = context::current();
+
+        let foreign_address: ReceivingAddress =
+            GenerationReceivingAddress::derive_from_seed(rand::random()).into();
+        let destination = Some(MigrationDestination::Address(Box::new(foreign_address)));
+        let foreign_refused = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, destination.clone(), None, None, false)
+            .await;
+        assert!(matches!(foreign_refused, Err(RpcError::Failed(_))));
+
+        // Allowed, but the wallet holds nothing to move.
+        let report = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, destination, None, None, true)
+            .await
+            .unwrap();
+        assert!(report.txid.is_none());
+        assert_eq!(0, report.num_waiting);
+
+        for max_inputs in [0, MAX_NUM_MIGRATION_INPUTS + 1] {
+            let batch_refused = rpc_server
+                .clone()
+                .migrate_dctidh(ctx, token, None, Some(max_inputs), None, false)
+                .await;
+            assert!(
+                matches!(batch_refused, Err(RpcError::Failed(_))),
+                "{max_inputs}"
+            );
+        }
+
+        // 10 inputs at 0.0005 each
+        let fee = NativeCurrencyAmount::coins_from_str("0.004").unwrap();
+        let fee_refused = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, None, Some(10), Some(fee), false)
+            .await;
+        assert!(matches!(fee_refused, Err(RpcError::Failed(_))));
     }
 
     #[apply(shared_tokio_runtime)]
@@ -6810,7 +7107,7 @@ mod tests {
             let sender_randomness: Digest = rand::random();
             let off_chain_notification = |utxo: Utxo| {
                 let payload = UtxoNotificationPayload::new(utxo, sender_randomness);
-                own_address.private_notification(payload, network)
+                own_address.private_notification(payload, network).unwrap()
             };
 
             let foreign_utxo =
@@ -7569,6 +7866,132 @@ mod tests {
 
                 Ok(())
             }
+        }
+    }
+
+    mod legacy_dctidh {
+        use bech32::FromBase32;
+        use bech32::ToBase32;
+
+        use super::*;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey;
+        use crate::state::wallet::address::symmetric_key::SymmetricKey;
+        use crate::state::wallet::address::SpendingKey;
+        use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
+
+        const NETWORK: Network = Network::RegTest;
+
+        async fn rpc_server() -> NeptuneRPCServer {
+            let cli = cli_args::Args::default_with_network(NETWORK);
+            test_rpc_server(WalletEntropy::new_random(), 2, cli).await
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn validate_address_refuses_symmetric_keys_and_unusable_dctidh_addresses() {
+            let rpc_server = rpc_server().await;
+            let token = cookie_token(&rpc_server).await;
+            let validate = |address: String| {
+                rpc_server
+                    .clone()
+                    .validate_address(context::current(), token, address, NETWORK)
+            };
+
+            let dctidh = ReceivingAddress::from(
+                dCTIDHSpendingKey::derive_from_seed(rand::random()).to_address(),
+            );
+            let encoded = dctidh.to_bech32m(NETWORK).unwrap();
+            assert_eq!(Some(dctidh), validate(encoded.clone()).await.unwrap());
+
+            let symmetric = ReceivingAddress::from(SymmetricKey::from_seed(rand::random()));
+            let symmetric = symmetric.to_bech32m(NETWORK).unwrap();
+            assert!(ReceivingAddress::from_bech32m(&symmetric, NETWORK).is_ok());
+            assert_eq!(None, validate(symmetric).await.unwrap());
+
+            // the same address with a public key that is not a valid curve
+            let (hrp, data, variant) = bech32::decode(&encoded).unwrap();
+            let mut payload = Vec::<u8>::from_base32(&data).unwrap();
+            payload[..64].fill(0xff);
+            let invalid_key = bech32::encode(&hrp, payload.to_base32(), variant).unwrap();
+            assert!(ReceivingAddress::from_bech32m(&invalid_key, NETWORK).is_ok());
+            assert_eq!(None, validate(invalid_key).await.unwrap());
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn claim_utxo_reports_legacy_format_lock() {
+            let mut rpc_server = rpc_server().await;
+            let (key, legacy_key) = {
+                let mut state = rpc_server.state.lock_guard_mut().await;
+                state.wallet_state.set_legacy_dctidh_key_bound(1).await;
+                state
+                    .wallet_state
+                    .wallet_entropy
+                    .nth_dctidh_spending_key_with_legacy(0)
+            };
+
+            // A notification for the legacy-format lock of index 0, encrypted
+            // to the public key that both address formats of the index share.
+            let utxo = Utxo::new_native_currency(
+                SpendingKey::from(legacy_key).lock_script_hash(),
+                NativeCurrencyAmount::coins(1),
+            );
+            let payload = UtxoNotificationPayload::new(utxo, rand::random());
+            let notification = ReceivingAddress::from(key.to_address())
+                .private_notification(payload, NETWORK)
+                .unwrap();
+
+            let result = rpc_server.claim_utxo_inner(notification, None).await;
+            assert!(
+                matches!(result, Err(error::ClaimError::LegacyFormatLock)),
+                "{result:?}"
+            );
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn send_to_address_with_invalid_public_key_is_an_error() {
+            let rpc_server = rpc_server().await;
+            let token = cookie_token(&rpc_server).await;
+
+            let address = ReceivingAddress::from(
+                dCTIDHSpendingKey::derive_from_seed(rand::random()).to_address(),
+            );
+            let (hrp, data, variant) =
+                bech32::decode(&address.to_bech32m(NETWORK).unwrap()).unwrap();
+            let mut payload = Vec::<u8>::from_base32(&data).unwrap();
+            payload[..64].fill(0xff);
+            let invalid_key = bech32::encode(&hrp, payload.to_base32(), variant).unwrap();
+            let invalid_key = ReceivingAddress::from_bech32m(&invalid_key, NETWORK).unwrap();
+
+            let outputs = rpc_server
+                .clone()
+                .generate_tx_outputs(
+                    context::current(),
+                    token,
+                    vec![OutputFormat::AddressAndAmount(
+                        invalid_key,
+                        NativeCurrencyAmount::coins(1),
+                    )],
+                )
+                .await
+                .unwrap();
+            let result = rpc_server
+                .clone()
+                .generate_tx_details(
+                    context::current(),
+                    token,
+                    TxInputList::default(),
+                    outputs,
+                    ChangePolicy::default(),
+                    NativeCurrencyAmount::zero(),
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(RpcError::CreateTxError(e)) if e.contains("invalid public key")),
+                "{result:?}"
+            );
         }
     }
 }

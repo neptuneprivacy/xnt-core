@@ -1306,6 +1306,17 @@ impl Mempool {
         self.remove_with_reason(transaction_id, RemovalReason::Explicit)
     }
 
+    /// The primitive witness of the transaction with this id, if the mempool
+    /// knows it.
+    pub(crate) fn primitive_witness(
+        &self,
+        transaction_id: TransactionKernelId,
+    ) -> Option<&PrimitiveWitness> {
+        self.tx_dictionary
+            .get(&transaction_id)
+            .and_then(|tx| tx.primitive_witness.as_ref())
+    }
+
     /// Update the primitive witness of a transaction already in the mempool.
     /// If transaction is not already present in the mempool, it is inserted as
     /// a primitive-witness backed transaction in order to ensure that the
@@ -2421,6 +2432,7 @@ mod tests {
                         .upgrade(
                             TritonVmJobQueue::get_instance(),
                             &TritonVmProofJobOptions::default(),
+                            ConsensusRuleSet::UpgradeVMv8,
                         )
                         .await
                         .unwrap();

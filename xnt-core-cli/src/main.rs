@@ -23,6 +23,7 @@ use itertools::Itertools;
 use multiaddr::Multiaddr;
 use neptune_privacy::api::export::TransactionKernelId;
 use neptune_privacy::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use neptune_privacy::api::tx_initiation::migrate_dctidh::MigrationDestination;
 use neptune_privacy::application::config::data_directory::DataDirectory;
 use neptune_privacy::application::config::network::Network;
 use neptune_privacy::application::rpc::auth;
@@ -124,6 +125,10 @@ enum Command {
     /// retrieve unconfirmed balance (includes unconfirmed transactions, excludes time-locked utxos)
     UnconfirmedAvailableBalance,
 
+    /// list unspent utxos held at legacy-format dCTIDH locks, which are not
+    /// part of the available balance, and their total
+    LegacyDctidhUtxos,
+
     /// Export wallet status information.
     ///
     /// Available formats:
@@ -186,6 +191,11 @@ enum Command {
 
     /// list mempool transaction IDs
     ListMempoolTransactionIds,
+
+    /// retrieve count of transactions in the legacy relay pool: those of the
+    /// era before the next hard fork, which the node holds apart from the
+    /// mempool
+    LegacyRelayPoolTxCount,
 
     /******** BLOCKCHAIN STATISTICS ********/
     /// Show block intervals in milliseconds, in reverse chronological order.
@@ -407,6 +417,42 @@ enum Command {
         /// own wallet.
         #[clap(long)]
         address: Option<String>,
+    },
+
+    /// Move a batch of the wallet's funds held at legacy-format dCTIDH locks
+    /// now, as the node's `--migrate-dctidh` does for every new block.
+    ///
+    /// Spends the largest such UTXOs that are worth more than their share of
+    /// the fee to one output at the destination, announced on-chain. Prints
+    /// what was moved and what still waits.
+    MigrateDctidh {
+        /// `generation` (a Generation address of the node's wallet), `dctidh`
+        /// (a current-format dCTIDH address of the node's wallet), or an
+        /// explicit address. Defaults to the node's `--migrate-dctidh`
+        /// setting, or else `generation`.
+        #[clap(long, value_name = "generation|dctidh|ADDRESS")]
+        to: Option<String>,
+
+        /// Derivation index of the destination for `generation` or `dctidh`.
+        /// Defaults to the next unused index.
+        #[clap(long)]
+        index: Option<u64>,
+
+        /// Maximum number of UTXOs to spend, between 1 and 200. Defaults to
+        /// the node's `--migrate-dctidh-batch` setting.
+        #[clap(long)]
+        batch: Option<usize>,
+
+        /// Fee to pay. Defaults to the node's `--migrate-dctidh-fee` setting,
+        /// or else is chosen from the node's proving capability and the
+        /// number of inputs.
+        #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+        fee: Option<NativeCurrencyAmount>,
+
+        /// Allow an explicit destination address that is not owned by the
+        /// node's wallet.
+        #[clap(long)]
+        allow_foreign: bool,
     },
 
     /// Upgrade the specified transaction. Transaction must be either unsynced
@@ -1006,6 +1052,18 @@ async fn main() -> Result<()> {
             let val = client.unconfirmed_available_balance(ctx, token).await??;
             println!("{val}");
         }
+        Command::LegacyDctidhUtxos => {
+            let utxos = client.legacy_dctidh_utxos(ctx, token).await??;
+            for element in &utxos {
+                let amount = element.utxo.get_native_currency_amount();
+                println!("aocl leaf index {}: {amount}", element.aocl_leaf_index);
+            }
+            let total = utxos
+                .iter()
+                .map(|element| element.utxo.get_native_currency_amount())
+                .sum::<NativeCurrencyAmount>();
+            println!("total: {total}");
+        }
         Command::WalletStatus { json, table } => {
             let wallet_status: WalletStatus = client.wallet_status(ctx, token).await??;
             let exported_string = if json {
@@ -1090,6 +1148,10 @@ async fn main() -> Result<()> {
         Command::ListMempoolTransactionIds => {
             let txids = client.mempool_tx_ids(ctx, token).await??;
             println!("{}", txids.iter().join("\n"));
+        }
+        Command::LegacyRelayPoolTxCount => {
+            let count: usize = client.legacy_relay_pool_tx_count(ctx, token).await??;
+            println!("{count}");
         }
 
         /******** BLOCKCHAIN STATISTICS ********/
@@ -1567,6 +1629,46 @@ async fn main() -> Result<()> {
             let num_utxos_consolidated = client.consolidate(ctx, token, batch, address).await??;
             println!("Initiating transaction to consolidate {num_utxos_consolidated} UTXOs.");
         }
+        Command::MigrateDctidh {
+            to,
+            index,
+            batch,
+            fee,
+            allow_foreign,
+        } => {
+            let destination = match (to, index) {
+                (None, None) => None,
+                (to, index) => Some(MigrationDestination::parse(
+                    to.as_deref().unwrap_or("generation"),
+                    index,
+                    network,
+                )?),
+            };
+            let report = client
+                .migrate_dctidh(ctx, token, destination, batch, fee, allow_foreign)
+                .await??;
+            match report.txid {
+                Some(txid) => println!(
+                    "Moving {} UTXOs held at legacy-format dCTIDH locks, {} after a fee of {}, \
+                     in transaction {txid}.",
+                    report.num_inputs, report.amount, report.fee
+                ),
+                None => println!("Nothing to move."),
+            }
+            if report.num_skipped > 0 {
+                println!(
+                    "{} UTXOs were left out because no valid transaction spends them.",
+                    report.num_skipped
+                );
+            }
+            if report.num_waiting > 0 {
+                println!(
+                    "{} UTXOs worth {} still wait to be moved, of which {} worth {} are not \
+                     worth more than their share of the fee and are not moved.",
+                    report.num_waiting, report.amount_waiting, report.num_dust, report.amount_dust
+                );
+            }
+        }
         Command::Upgrade { tx_kernel_id } => {
             println!("Attempting to upgrade transaction {tx_kernel_id}");
             let response = client.upgrade(ctx, token, tx_kernel_id).await??;
@@ -1949,5 +2051,48 @@ mod tests {
             Ok(Command::NetworkOverview)
         ));
         assert!(parse(&["probe-nat", "1.2.3.4"]).is_err());
+    }
+
+    #[test]
+    fn migrate_dctidh_options_parse() {
+        assert!(matches!(
+            parse(&["migrate-dctidh"]),
+            Ok(Command::MigrateDctidh {
+                to: None,
+                index: None,
+                batch: None,
+                fee: None,
+                allow_foreign: false,
+            })
+        ));
+
+        let Ok(Command::MigrateDctidh {
+            to,
+            index,
+            batch,
+            fee,
+            allow_foreign,
+        }) = parse(&[
+            "migrate-dctidh",
+            "--to",
+            "dctidh",
+            "--index",
+            "3",
+            "--batch",
+            "20",
+            "--fee",
+            "0.02",
+            "--allow-foreign",
+        ])
+        else {
+            panic!("`migrate-dctidh` must parse");
+        };
+        assert_eq!(Some("dctidh".to_string()), to);
+        assert_eq!(Some(3), index);
+        assert_eq!(Some(20), batch);
+        assert_eq!(NativeCurrencyAmount::coins_from_str("0.02").ok(), fee);
+        assert!(allow_foreign);
+
+        assert!(parse(&["migrate-dctidh", "--fee", "lots"]).is_err());
     }
 }

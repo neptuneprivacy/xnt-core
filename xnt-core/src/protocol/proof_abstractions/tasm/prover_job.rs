@@ -26,6 +26,8 @@ use crate::macros::fn_name;
 use crate::macros::log_scope_duration;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+use crate::protocol::proof_abstractions::tasm::legacy_v7;
+use crate::protocol::proof_abstractions::tasm::legacy_v7::LegacyProvingError;
 #[cfg(test)]
 use crate::protocol::proof_abstractions::tasm::program::tests;
 use crate::protocol::proof_abstractions::Claim;
@@ -100,6 +102,9 @@ pub enum VmProcessError {
 
     #[error("Triton VM failed: {0}")]
     TritonVmFailed(InstructionError),
+
+    #[error(transparent)]
+    LegacyTritonVmFailed(#[from] LegacyProvingError),
 }
 
 enum ProverProcessCompletion {
@@ -193,6 +198,40 @@ impl ProverJob {
 
         assert_eq!(self.program.hash(), self.claim.program_digest);
 
+        // For v7 claims, the padded height of the whole trace, as the prover
+        // binary checks it; otherwise that of the processor table.
+        let padded_height_processor_table = if legacy_v7::is_v7_claim(&self.claim) {
+            self.padded_height_in_vm_v7().await?
+        } else {
+            self.run_in_vm().await?.next_power_of_two()
+        };
+
+        tracing::debug!(
+            "VM program execution finished: padded-height: {}",
+            padded_height_processor_table
+        );
+
+        match self.job_settings.max_log2_padded_height_for_proofs {
+            Some(limit) if 2u32.pow(limit.into()) < padded_height_processor_table => {
+                let ph_limit = 2u32.pow(limit.into());
+
+                tracing::warn!(
+                    "proof-complexity-limit-exceeded. ({} > {})  The proof will not be generated",
+                    padded_height_processor_table,
+                    ph_limit
+                );
+
+                Err(ProverJobError::ProofComplexityLimitExceeded {
+                    result: padded_height_processor_table,
+                    limit: ph_limit,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Run the program in the linked Triton VM, returning the cycle count.
+    async fn run_in_vm(&self) -> Result<u32, ProverJobError> {
         let mut vm_state = VMState::new(
             self.program.clone(),
             self.claim.input.clone().into(),
@@ -232,30 +271,37 @@ impl ProverJob {
         assert_eq!(self.claim.program_digest, self.program.hash());
         assert_eq!(self.claim.output, vm_state.public_output);
 
-        let padded_height_processor_table = vm_state.cycle_count.next_power_of_two();
+        Ok(vm_state.cycle_count)
+    }
 
-        tracing::debug!(
-            "VM program execution finished: padded-height (processor table): {}",
-            padded_height_processor_table
-        );
+    /// Trace the program in the linked triton-vm v7, the generation that
+    /// proves v7 claims, returning the padded height of the trace, which is
+    /// what the prover binary checks against the limit. Fails if the program
+    /// does not halt gracefully with the claimed output.
+    async fn padded_height_in_vm_v7(&self) -> Result<u32, ProverJobError> {
+        let program = self.program.clone();
+        let claim = self.claim.clone();
+        let nondeterminism = self.nondeterminism.clone();
+        let join_result = tokio::task::spawn_blocking(move || {
+            log_scope_duration!(fn_name!() + "::legacy_v7::LegacyProverPipeline::trace()");
+            legacy_v7::LegacyProverPipeline::trace(&program, &claim, &nondeterminism)
+                .map(|pipeline| pipeline.log2_padded_height())
+        })
+        .await;
 
-        match self.job_settings.max_log2_padded_height_for_proofs {
-            Some(limit) if 2u32.pow(limit.into()) < padded_height_processor_table => {
-                let ph_limit = 2u32.pow(limit.into());
-
-                tracing::warn!(
-                    "proof-complexity-limit-exceeded. ({} > {})  The proof will not be generated",
-                    padded_height_processor_table,
-                    ph_limit
-                );
-
-                Err(ProverJobError::ProofComplexityLimitExceeded {
-                    result: padded_height_processor_table,
-                    limit: ph_limit,
-                })
+        let log2_padded_height = match join_result {
+            Ok(result) => result.map_err(VmProcessError::from)?,
+            Err(e) => {
+                return Err(VmProcessError::from(LegacyProvingError::Execution(format!(
+                    "triton-vm v7 tracing did not complete: {e}"
+                )))
+                .into())
             }
-            _ => Ok(()),
-        }
+        };
+
+        Ok(1_u32
+            .checked_shl(u32::from(log2_padded_height))
+            .unwrap_or(u32::MAX))
     }
 
     /// Run the program and generate a proof for it, assuming the Triton VM run

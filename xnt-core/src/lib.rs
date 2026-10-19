@@ -125,6 +125,12 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
 
     info!("Starting xnt-core node on {}.", cli_args.network);
 
+    // The rule set of every height derives from the activation height of
+    // `UpgradeVMv8`, so it is set before any state is built.
+    cli_args
+        .apply_v8_activation_height()
+        .map_err(anyhow::Error::msg)?;
+
     // Get data directory (wallet, block database), create one if none exists
     let data_directory = DataDirectory::get(cli_args.data_dir.clone(), cli_args.network)?;
     DataDirectory::create_dir_if_not_exists(&data_directory.root_dir_path()).await?;
@@ -214,6 +220,13 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
         .restore_monitored_utxos_from_recovery_data()
         .await?;
     info!("UTXO restoration check complete");
+
+    // Check the destination of the dCTIDH migration against the wallet.
+    if let Some(settings) = global_state_lock.cli().dctidh_migration() {
+        settings
+            .prepare_wallet(&mut *global_state_lock.lock_guard_mut().await)
+            .await?;
+    }
 
     // Start the libp2p network stack, which runs next to the legacy TCP stack.
     #[cfg(feature = "libp2p")]

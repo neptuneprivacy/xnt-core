@@ -130,6 +130,11 @@ tasm-lib = { git = "https://github.com/neptuneprivacy/tasm-lib", rev = "4b630213
 # release before the UpgradeVMv8 fork verifies v7 blocks with it instead of
 # trusting them. Remove once the fork is well past, as neptune-core did.
 triton-vm-v7 = { package = "triton-vm", version = "=7.0.0" }
+# tasm-lib of the UpgradeVMv7 era (main net v0.2.5). Only its STARK verifier
+# snippet is used: the v7 SingleProof program embeds it, which is what makes
+# that program assemble to its pinned digest. Remove together with
+# `triton-vm-v7`.
+tasm-lib-v7 = { package = "tasm-lib", git = "https://github.com/neptuneprivacy/tasm-lib", rev = "803223357cc7d50ceba68ea1310911639b86f02f" }
 tiny-bip39 = "1.0"
 tokio = { version = "1.41", features = ["full", "tracing"] }
 tokio-serde = { version = "0.8", features = ["bincode", "json"] }

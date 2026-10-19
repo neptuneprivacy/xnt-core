@@ -4,6 +4,8 @@
 
 use std::ffi::c_char;
 
+use super::error::ffi_guard;
+
 /// Buffer for returning allocated byte arrays to C callers
 #[repr(C)]
 #[derive(Debug)]
@@ -41,7 +43,9 @@ impl ByteBuffer {
 /// - Calling twice on same buffer causes undefined behavior (double-free)
 #[no_mangle]
 pub extern "C" fn xnt_bytes_free(buf: ByteBuffer) {
-    free_vec!(buf.data, buf.len);
+    ffi_guard((), || {
+        free_vec!(buf.data, buf.len);
+    })
 }
 
 /// Free a string allocated by xnt-ffi
@@ -52,9 +56,11 @@ pub extern "C" fn xnt_bytes_free(buf: ByteBuffer) {
 /// - Calling twice on same pointer causes undefined behavior (double-free)
 #[no_mangle]
 pub extern "C" fn xnt_string_free(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        unsafe { drop(std::ffi::CString::from_raw(ptr)) }
-    }
+    ffi_guard((), || {
+        if !ptr.is_null() {
+            unsafe { drop(std::ffi::CString::from_raw(ptr)) }
+        }
+    })
 }
 
 /// XntDigest - 40 byte digest for FFI (TIP5 output)
@@ -152,10 +158,12 @@ impl std::ops::DerefMut for XntDigest {
 /// - Calling twice on same pointer causes undefined behavior (double-free)
 #[no_mangle]
 pub extern "C" fn xnt_buffer_free(buf: *mut ByteBuffer) {
-    if !buf.is_null() {
-        let b = unsafe { Box::from_raw(buf) };
-        free_vec!(b.data, b.len);
-    }
+    ffi_guard((), || {
+        if !buf.is_null() {
+            let b = unsafe { Box::from_raw(buf) };
+            free_vec!(b.data, b.len);
+        }
+    })
 }
 
 // Re-export xnt-core types for internal use

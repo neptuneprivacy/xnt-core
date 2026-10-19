@@ -19,6 +19,8 @@ use crate::api::tx_initiation::error::CreateProofError;
 use crate::application::config::network::Network;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
@@ -153,12 +155,14 @@ impl ProofCollection {
             .await?;
 
         debug!("proving lock scripts");
+        let claim_version = TritonProofVersion::V8.claim_version();
         let mut lock_scripts_halt = vec![];
         for lock_script_and_witness in &primitive_witness.lock_scripts_and_witnesses {
             lock_scripts_halt.push(
                 lock_script_and_witness
                     .prove(
                         txk_mast_hash_as_input.clone(),
+                        claim_version,
                         triton_vm_job_queue.clone(),
                         proof_job_options.clone(),
                     )
@@ -179,6 +183,7 @@ impl ProofCollection {
                     txk_mast_hash,
                     salted_inputs_hash,
                     salted_outputs_hash,
+                    claim_version,
                     triton_vm_job_queue.clone(),
                     proof_job_options.clone(),
                 )
@@ -226,16 +231,30 @@ impl ProofCollection {
     /// still tagged with the legacy hash are proved by `TimeLockV2`. The
     /// resulting `type_script_hashes` field reflects the post-remap set,
     /// matching what `CollectTypeScriptsV2` emits.
+    ///
+    /// Every claim carries the claim version
+    /// [`Self::claim_version_for`] the given rule set, which selects the Triton
+    /// VM generation that proves it: `UpgradeVMv8` claims are proven by the
+    /// linked triton-vm, `UpgradeVMv7` claims by the legacy triton-vm v7. The
+    /// programs are the same in both eras.
     pub async fn produce_v2(
         primitive_witness: &PrimitiveWitness,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Self, CreateProofError> {
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2Witness;
         use crate::protocol::consensus::type_scripts::known_type_scripts::match_type_script_and_generate_witness_v2;
         use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
         use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
+
+        // The nodes of the era before the fork take a v7 collection only of
+        // the programs they know.
+        if consensus_rule_set == ConsensusRuleSet::UpgradeVMv7 {
+            super::legacy_v7::check_v7_proof_collection_programs()
+                .map_err(CreateProofError::V7ProgramDigestMismatch)?;
+        }
 
         let (removal_records_integrity_witness, collect_lock_scripts_witness, kernel_to_outputs_witness, _) =
             Self::extract_specific_witnesses(primitive_witness);
@@ -245,11 +264,14 @@ impl ProofCollection {
         let txk_mast_hash_as_input = PublicInput::new(txk_mast_hash.reversed().values().to_vec());
         let salted_inputs_hash = Tip5::hash(&primitive_witness.input_utxos);
         let salted_outputs_hash = Tip5::hash(&primitive_witness.output_utxos);
+        let claim_version = Self::claim_version_for(consensus_rule_set);
 
         debug!("proving RemovalRecordsIntegrity (V2)");
         let removal_records_integrity = RemovalRecordsIntegrity
             .prove(
-                removal_records_integrity_witness.claim(),
+                removal_records_integrity_witness
+                    .claim()
+                    .about_version(claim_version),
                 removal_records_integrity_witness.nondeterminism(),
                 triton_vm_job_queue.clone(),
                 proof_job_options.clone(),
@@ -259,7 +281,9 @@ impl ProofCollection {
         debug!("proving CollectLockScripts (V2)");
         let collect_lock_scripts = CollectLockScripts
             .prove(
-                collect_lock_scripts_witness.claim(),
+                collect_lock_scripts_witness
+                    .claim()
+                    .about_version(claim_version),
                 collect_lock_scripts_witness.nondeterminism(),
                 triton_vm_job_queue.clone(),
                 proof_job_options.clone(),
@@ -269,7 +293,9 @@ impl ProofCollection {
         debug!("proving KernelToOutputs (V2)");
         let kernel_to_outputs = KernelToOutputs
             .prove(
-                kernel_to_outputs_witness.claim(),
+                kernel_to_outputs_witness
+                    .claim()
+                    .about_version(claim_version),
                 kernel_to_outputs_witness.nondeterminism(),
                 triton_vm_job_queue.clone(),
                 proof_job_options.clone(),
@@ -279,7 +305,9 @@ impl ProofCollection {
         debug!("proving CollectTypeScriptsV2");
         let collect_type_scripts = CollectTypeScriptsV2
             .prove(
-                collect_type_scripts_witness.claim(),
+                collect_type_scripts_witness
+                    .claim()
+                    .about_version(claim_version),
                 collect_type_scripts_witness.nondeterminism(),
                 triton_vm_job_queue.clone(),
                 proof_job_options.clone(),
@@ -293,6 +321,7 @@ impl ProofCollection {
                 lock_script_and_witness
                     .prove(
                         txk_mast_hash_as_input.clone(),
+                        claim_version,
                         triton_vm_job_queue.clone(),
                         proof_job_options.clone(),
                     )
@@ -337,6 +366,7 @@ impl ProofCollection {
                         txk_mast_hash,
                         salted_inputs_hash,
                         salted_outputs_hash,
+                        claim_version,
                         triton_vm_job_queue.clone(),
                         proof_job_options.clone(),
                     )
@@ -464,6 +494,40 @@ impl ProofCollection {
             authentication_structure: self.merge_bit_mast_path.clone(),
         }
         .verify(txk_mast_hash)
+    }
+
+    /// The claim version of a collection produced for the given rule set: that
+    /// of `UpgradeVMv7` for the legacy era, whose collections the legacy
+    /// triton-vm v7 proves, and that of `UpgradeVMv8` for every other rule set.
+    ///
+    /// The eras before `UpgradeVMv7` are checkpointed, and no verifier of this
+    /// version checks their collections. Stamping their own claim version (1,
+    /// 2 or 5) would make claims that verify nowhere, or, for 5, claims that
+    /// the legacy verifier takes for v7 claims. So a collection for such a rule
+    /// set, as only tests make, carries the claim version of the current era,
+    /// as all collections did before v7 collections were produced.
+    pub(crate) fn claim_version_for(consensus_rule_set: ConsensusRuleSet) -> u32 {
+        match consensus_rule_set {
+            ConsensusRuleSet::UpgradeVMv7 => TritonProofVersion::V7.claim_version(),
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv8 => TritonProofVersion::V8.claim_version(),
+        }
+    }
+
+    /// Whether the collection meets the checks that precede the proof
+    /// verifications of [`Self::verify_v2`]: it is about the kernel with this
+    /// MAST hash, it has one halting proof per script hash, and it proves an
+    /// unset merge bit.
+    pub(crate) fn meets_verification_preconditions(&self, txk_mast_hash: Digest) -> bool {
+        self.kernel_mast_hash == txk_mast_hash
+            && self.halt_proof_counts_match()
+            && self.proves_unset_merge_bit(txk_mast_hash)
     }
 
     pub(crate) async fn verify(&self, txk_mast_hash: Digest, network: Network) -> bool {
@@ -601,60 +665,96 @@ impl ProofCollection {
     /// collect_type_scripts claim is built against `CollectTypeScriptsV2`,
     /// matching what a V2 ProofCollection (created via [`produce_v2`])
     /// carries. Called from the transaction-validation path post-fork.
-    pub(crate) async fn verify_v2(&self, txk_mast_hash: Digest, network: Network) -> bool {
-        use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
+    ///
+    /// Every claim is stamped with the given claim version, which also selects
+    /// the verifier: the claim version of `UpgradeVMv7` is checked by the legacy
+    /// triton-vm v7, that of `UpgradeVMv8` by the linked triton-vm.
+    pub(crate) async fn verify_v2(
+        &self,
+        txk_mast_hash: Digest,
+        network: Network,
+        claim_version: u32,
+    ) -> bool {
         debug!("verifying (V2), txk hash: {}", txk_mast_hash);
-        if self.kernel_mast_hash != txk_mast_hash {
+        if !self.meets_verification_preconditions(txk_mast_hash) {
             return false;
         }
-
-        if !self.halt_proof_counts_match() {
-            return false;
-        }
-
-        if !self.proves_unset_merge_bit(txk_mast_hash) {
-            return false;
-        }
-
-        let removal_records_integrity_claim = self.removal_records_integrity_claim();
-        let kernel_to_outputs_claim = self.kernel_to_outputs_claim();
-        let collect_lock_scripts_claim = self.collect_lock_scripts_claim();
-        let collect_type_scripts_claim = self.collect_type_scripts_claim_v2();
-        let _ = &CollectTypeScriptsV2; // ensure import is used
-
-        let lock_script_claims = self.lock_script_claims();
-        let type_script_claims = self.type_script_claims();
 
         // Verify in the same order as `verify`, returning on the first proof
         // that fails: the script-hash lists, whose lengths decide how many
         // proofs the halting loops verify, are checked before those loops.
-        for (claim, proof) in [
-            (
-                removal_records_integrity_claim,
-                &self.removal_records_integrity,
-            ),
-            (kernel_to_outputs_claim, &self.kernel_to_outputs),
-            (collect_lock_scripts_claim, &self.collect_lock_scripts),
-            (collect_type_scripts_claim, &self.collect_type_scripts),
-        ] {
-            if !verify_transaction_proof(claim, proof.clone(), network).await {
-                return false;
-            }
-        }
-
-        for (claim, proof) in lock_script_claims.into_iter().zip(&self.lock_scripts_halt) {
-            if !verify_transaction_proof(claim, proof.clone(), network).await {
-                return false;
-            }
-        }
-
-        for (claim, proof) in type_script_claims.into_iter().zip(&self.type_scripts_halt) {
+        for (claim, proof) in self.claims_and_proofs(claim_version) {
             if !verify_transaction_proof(claim, proof.clone(), network).await {
                 return false;
             }
         }
 
         true
+    }
+
+    /// [`Self::verify_v2`] for the claim version of `UpgradeVMv7`, as the
+    /// previous release checks a collection: without the checks that it has
+    /// one halting proof per script hash and proves an unset merge bit, which
+    /// this version adds. Neither is covered by the proofs, so a third party
+    /// can make a collection that fails them from one that passes them, which
+    /// the nodes of the previous release still take and relay.
+    pub(crate) async fn verify_v2_as_previous_release(
+        &self,
+        txk_mast_hash: Digest,
+        network: Network,
+    ) -> bool {
+        if self.kernel_mast_hash != txk_mast_hash {
+            return false;
+        }
+
+        for (claim, proof) in self.claims_and_proofs(TritonProofVersion::V7.claim_version()) {
+            if !verify_transaction_proof(claim, proof.clone(), network).await {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Every (claim, proof) pair of a V2 collection, each claim stamped with
+    /// the given claim version, in the order in which both [`Self::verify_v2`]
+    /// and the in-VM verifier of `SingleProofV2` visit them: removal records
+    /// integrity, kernel to outputs, collect lock scripts, collect type scripts
+    /// (V2), then every lock script, then every type script.
+    ///
+    /// Pairs claims with proofs like `zip`; see
+    /// [`Self::halt_proof_counts_match`].
+    pub(crate) fn claims_and_proofs(&self, claim_version: u32) -> Vec<(Claim, &Proof)> {
+        let fixed = [
+            (
+                self.removal_records_integrity_claim(),
+                &self.removal_records_integrity,
+            ),
+            (self.kernel_to_outputs_claim(), &self.kernel_to_outputs),
+            (
+                self.collect_lock_scripts_claim(),
+                &self.collect_lock_scripts,
+            ),
+            (
+                self.collect_type_scripts_claim_v2(),
+                &self.collect_type_scripts,
+            ),
+        ];
+        let lock_scripts = self
+            .lock_script_claims()
+            .into_iter()
+            .zip(&self.lock_scripts_halt);
+        let type_scripts = self
+            .type_script_claims()
+            .into_iter()
+            .zip(&self.type_scripts_halt);
+
+        fixed
+            .into_iter()
+            .chain(lock_scripts)
+            .chain(type_scripts)
+            .map(|(claim, proof)| (claim.about_version(claim_version), proof))
+            .collect()
     }
 
     pub fn removal_records_integrity_claim(&self) -> Claim {
@@ -785,6 +885,25 @@ pub mod tests {
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
     use crate::tests::shared_tokio_runtime;
+
+    /// The claim versions of the rule sets that verify collections with
+    /// [`ProofCollection::verify_v2`] and that this version proves under.
+    const V2_CLAIM_VERSIONS: [u32; 2] = [5, tasm_lib::triton_vm::proof::CURRENT_VERSION];
+
+    #[test]
+    fn v2_claim_versions_are_those_of_the_v7_and_v8_eras() {
+        assert_eq!(
+            V2_CLAIM_VERSIONS,
+            [
+                ConsensusRuleSet::UpgradeVMv7
+                    .triton_proof_version()
+                    .claim_version(),
+                ConsensusRuleSet::UpgradeVMv8
+                    .triton_proof_version()
+                    .claim_version(),
+            ]
+        );
+    }
 
     impl ProofCollection {
         /// Return an invalid proof collection for testing purposes
@@ -919,10 +1038,14 @@ pub mod tests {
             merge_bit_false.verify(txk_unmerged, network).await,
             "sanity: an unmerged collection must verify"
         );
-        assert!(
-            merge_bit_false.verify_v2(txk_unmerged, network).await,
-            "sanity: an unmerged collection must verify under V2"
-        );
+        for claim_version in V2_CLAIM_VERSIONS {
+            assert!(
+                merge_bit_false
+                    .verify_v2(txk_unmerged, network, claim_version)
+                    .await,
+                "sanity: an unmerged collection must verify under V2"
+            );
+        }
 
         primitive_witness.kernel = TransactionKernelModifier::default()
             .merge_bit(true)
@@ -934,10 +1057,14 @@ pub mod tests {
             !merge_bit_true.verify(txk_merged, network).await,
             "a collection whose kernel has the merge bit set must be rejected"
         );
-        assert!(
-            !merge_bit_true.verify_v2(txk_merged, network).await,
-            "a collection whose kernel has the merge bit set must be rejected under V2"
-        );
+        for claim_version in V2_CLAIM_VERSIONS {
+            assert!(
+                !merge_bit_true
+                    .verify_v2(txk_merged, network, claim_version)
+                    .await,
+                "a collection whose kernel has the merge bit set must be rejected under V2"
+            );
+        }
     }
 
     /// The V2 verification path must reject the same mismatches as `verify`.
@@ -960,10 +1087,12 @@ pub mod tests {
         let valid = ProofCollection::produce_mock(&primitive_witness, true);
         assert!(!valid.lock_script_hashes.is_empty());
         assert!(!valid.type_script_hashes.is_empty());
-        assert!(
-            valid.verify_v2(txk, network).await,
-            "sanity: a well-formed valid-mock collection must verify under V2"
-        );
+        for claim_version in V2_CLAIM_VERSIONS {
+            assert!(
+                valid.verify_v2(txk, network, claim_version).await,
+                "sanity: a well-formed valid-mock collection must verify under V2"
+            );
+        }
 
         let mutations: [(&str, fn(ProofCollection) -> ProofCollection); 3] = [
             ("no lock-script proofs", |mut pc| {
@@ -981,11 +1110,72 @@ pub mod tests {
         ];
 
         for (description, mutate) in mutations {
-            assert!(
-                !mutate(valid.clone()).verify_v2(txk, network).await,
-                "verify_v2 must reject a collection with {description}"
-            );
+            for claim_version in V2_CLAIM_VERSIONS {
+                assert!(
+                    !mutate(valid.clone())
+                        .verify_v2(txk, network, claim_version)
+                        .await,
+                    "verify_v2 must reject a collection with {description}"
+                );
+            }
         }
+    }
+
+    /// `claims_and_proofs` stamps every claim with the requested version,
+    /// leaves the rest of each claim as the claim builders make it, and visits
+    /// the proofs in the order of the in-VM verifier.
+    #[test]
+    fn claims_and_proofs_carry_the_requested_claim_version() {
+        let mut test_runner = TestRunner::deterministic();
+        let primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
+            .new_tree(&mut test_runner)
+            .unwrap()
+            .current();
+        let pc = ProofCollection::produce_mock(&primitive_witness, true);
+        let num_proofs = pc.num_proofs();
+
+        let expected_claims = [
+            pc.removal_records_integrity_claim(),
+            pc.kernel_to_outputs_claim(),
+            pc.collect_lock_scripts_claim(),
+            pc.collect_type_scripts_claim_v2(),
+        ]
+        .into_iter()
+        .chain(pc.lock_script_claims())
+        .chain(pc.type_script_claims())
+        .collect_vec();
+        let expected_proofs = [
+            &pc.removal_records_integrity,
+            &pc.kernel_to_outputs,
+            &pc.collect_lock_scripts,
+            &pc.collect_type_scripts,
+        ]
+        .into_iter()
+        .chain(&pc.lock_scripts_halt)
+        .chain(&pc.type_scripts_halt)
+        .collect_vec();
+
+        for claim_version in V2_CLAIM_VERSIONS {
+            let (claims, proofs): (Vec<_>, Vec<_>) =
+                pc.claims_and_proofs(claim_version).into_iter().unzip();
+            assert_eq!(num_proofs, claims.len());
+            assert!(claims.iter().all(|claim| claim.version == claim_version));
+            for (claim, expected) in claims.iter().zip(&expected_claims) {
+                assert_eq!(expected.program_digest, claim.program_digest);
+                assert_eq!(expected.input, claim.input);
+                assert_eq!(expected.output, claim.output);
+            }
+            assert!(proofs
+                .iter()
+                .zip(&expected_proofs)
+                .all(|(proof, expected)| std::ptr::eq(*proof, *expected)));
+        }
+
+        // The claim builders stamp the linked triton-vm's version, which is the
+        // claim version of the current era.
+        assert!(expected_claims
+            .iter()
+            .all(|claim| claim.version == TritonProofVersion::V8.claim_version()));
     }
 
     #[proptest(cases = 5)]

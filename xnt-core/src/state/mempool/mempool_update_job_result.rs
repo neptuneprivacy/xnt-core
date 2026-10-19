@@ -1,6 +1,7 @@
 use crate::api::export::Transaction;
 use crate::api::export::TransactionKernelId;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::tasm_lib::prelude::Digest;
 
@@ -14,6 +15,10 @@ pub(crate) enum MempoolUpdateJobResult {
 
         /// The transaction, with updated mutator set data.
         new_transaction: Box<Transaction>,
+
+        /// The rule set the transaction was proven for: that of the block
+        /// following the tip when the update started.
+        consensus_rule_set: ConsensusRuleSet,
     },
     SuccessLink {
         /// The link transaction, with updated mutator set data.

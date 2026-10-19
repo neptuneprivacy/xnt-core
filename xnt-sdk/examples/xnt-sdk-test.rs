@@ -171,14 +171,14 @@ fn test_address() {
         xnt_string_free(rid);
     }
 
-    let b32 = xnt_address_to_bech32(ctx.addr, XntNetwork::Main);
+    let b32 = xnt_address_to_bech32(ctx.addr, XntNetwork::Main as u32);
     check!(b32, "encode");
     let b32s = unsafe { CStr::from_ptr(b32).to_str().unwrap() };
     ok!("bech32: {b32s}");
 
-    let dec = xnt_address_from_bech32(b32, XntNetwork::Main);
+    let dec = xnt_address_from_bech32(b32, XntNetwork::Main as u32);
     check!(dec, "decode");
-    let re = xnt_address_to_bech32(dec, XntNetwork::Main);
+    let re = xnt_address_to_bech32(dec, XntNetwork::Main as u32);
     if !re.is_null() {
         let res = unsafe { CStr::from_ptr(re).to_str().unwrap() };
         if res == b32s { ok!("roundtrip"); }
@@ -190,7 +190,7 @@ fn test_address() {
     let sub = xnt_subaddress_create(ctx.addr, 12345);
     check!(sub, "subaddress");
     if xnt_subaddress_payment_id(sub) == 12345 { ok!("payment_id=12345"); }
-    let sb = xnt_subaddress_to_bech32(sub, XntNetwork::Main);
+    let sb = xnt_subaddress_to_bech32(sub, XntNetwork::Main as u32);
     if !sb.is_null() {
         ok!("subaddr: {}", unsafe { CStr::from_ptr(sb).to_str().unwrap() });
         xnt_string_free(sb);
@@ -596,7 +596,7 @@ fn test_tx() {
     xnt_subaddress_free(subaddr);
 
     let ts = xnt_timestamp_now();
-    let built = xnt_tx_builder_build(builder, ms, ts, XntNetwork::Main);
+    let built = xnt_tx_builder_build(builder, ms, ts, XntNetwork::Main as u32);
     check!(built, "build");
 
     // Show built transaction summary (like TypeScript test)
@@ -627,9 +627,11 @@ fn test_tx() {
 
     ok!("built");
 
-    println!("Proving...");
+    // Prove for the block after the fetched tip: before main-net block 95000,
+    // a v7 proof collection.
+    println!("Proving for the block after tip {tip}...");
     let start = std::time::Instant::now();
-    let proven = xnt_built_transaction_prove(built);
+    let proven = xnt_built_transaction_prove_for_tip(built, tip as u64);
     let elapsed = start.elapsed();
     check!(proven, "prove");
 
@@ -882,7 +884,7 @@ fn test_tx_dctidh() {
 
     // Import CTIDH address into FFI layer as ReceivingAddress
     let dctidh_b32_c = cstr(&dctidh_b32);
-    let dctidh_addr_handle = xnt_address_from_bech32(dctidh_b32_c.as_ptr(), XntNetwork::Main);
+    let dctidh_addr_handle = xnt_address_from_bech32(dctidh_b32_c.as_ptr(), XntNetwork::Main as u32);
     check!(dctidh_addr_handle, "dctidh address from bech32");
     let recv = xnt_address_to_receiving(dctidh_addr_handle);
     check!(recv, "receiving address (dctidh)");
@@ -897,7 +899,7 @@ fn test_tx_dctidh() {
     xnt_address_free(dctidh_addr_handle);
 
     let ts = xnt_timestamp_now();
-    let built = xnt_tx_builder_build(builder, ms, ts, XntNetwork::Main);
+    let built = xnt_tx_builder_build(builder, ms, ts, XntNetwork::Main as u32);
     check!(built, "build");
 
     // Show built transaction summary
@@ -1112,8 +1114,8 @@ fn test_tx_dctidh_multi() {
 
     let mutator_set = get_mutator_set(&client).expect("mutator set");
     let ts = xnt_timestamp_now();
-    // Network drives the consensus-rule-set inference in prove()
-    // (mainnet TimelockExtension => produce_v2).
+    // Network and tip height drive the consensus-rule-set inference in
+    // prove_for_tip().
     let network = CoreNetwork::Main;
     let built = builder
         .build(&mutator_set, ts, network)
@@ -1143,11 +1145,11 @@ fn test_tx_dctidh_multi() {
     println!("  Fee: {}", NativeCurrencyAmount::from_nau(fee));
     ok!("built (multi Generation + CTIDH)");
 
-    // Prove (async) and submit
-    println!("Proving (multi-input tx)...");
+    // Prove (async) for the block after the fetched tip, and submit
+    println!("Proving (multi-input tx) for the block after tip {tip}...");
     let start = std::time::Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let proven = rt.block_on(built.prove()).expect("prove");
+    let proven = rt.block_on(built.prove_for_tip(tip)).expect("prove");
     let elapsed = start.elapsed();
     if proven.has_proof_collection() {
         ok!("proven in {:.1}s", elapsed.as_secs_f64());

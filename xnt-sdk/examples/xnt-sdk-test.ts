@@ -2,7 +2,7 @@
  * XNT-SDK TypeScript Test
  *
  * Usage: npx ts-node examples/xnt-sdk-test.ts [command] [arg]
- * Commands: version, seed, address [payment-id], shortaddress [payment-id], rpc, sync, utils, tx <recipient> <amount> <fee>
+ * Commands: version, seed, address [payment-id], shortaddress [payment-id], rpc, sync, utils, tx <recipient> <amount> <fee>, migrate [dry_run=yes|no]
  */
 
 import * as fs from "fs";
@@ -32,6 +32,7 @@ import {
   xntMempoolIncoming,
   xntComputeCommitmentForOutput,
 } from "../src/napi/output";
+import { migrateLegacyFunds } from "../src/ts/helpers";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -149,7 +150,10 @@ class WalletHelper {
     const genAddr = genKey.toAddress();
     const key = wallet.derivedCTIDHKey(index);
     const addr = key.toAddress();
-    return { wallet, genKey, genAddr, key, addr };
+    // The key the pre-v0.3 release derived for this index; its UTXOs sit at
+    // legacy-format locks and are only moved, never counted as balance.
+    const legacyKey = wallet.deriveLegacydCTIDHKey(index);
+    return { wallet, genKey, genAddr, key, addr, legacyKey };
   }
 
   sync(client: XntRpcClient, key: ReturnType<XntWalletEntropy["derivedCTIDHKey"]>): SyncResult | null {
@@ -211,10 +215,10 @@ class WalletHelper {
 class TestRunner {
   private log = new Logger();
   private wallet = new WalletHelper(this.log);
-  private tests: Map<string, (args: string[]) => boolean>;
+  private tests: Map<string, (args: string[]) => boolean | Promise<boolean>>;
 
   constructor() {
-    this.tests = new Map([
+    this.tests = new Map<string, (args: string[]) => boolean | Promise<boolean>>([
       ["version", (_) => this.testVersion()],
       ["seed", (_) => this.testSeed()],
       ["address", (a) => this.testAddress(a)],
@@ -223,6 +227,7 @@ class TestRunner {
       ["rpc", (_) => this.testRpc()],
       ["sync", (_) => this.testSync()],
       ["tx", (a) => this.testTx(a)],
+      ["migrate", (a) => this.testMigrate(a)],
     ]);
   }
 
@@ -234,6 +239,7 @@ class TestRunner {
         address: "[payment-id]",
         shortaddress: "[payment-id]",
         tx: "<recipient> <amount> <fee>",
+        migrate: "[dry_run=yes|no]",
       };
       for (const name of this.tests.keys()) {
         const hint = argHints[name];
@@ -325,7 +331,7 @@ class TestRunner {
     const client = this.wallet.connectRpc();
     if (!client) return false;
 
-    const { genKey, genAddr, key, addr } = this.wallet.loadTestWallet();
+    const { genKey, genAddr, key, addr, legacyKey } = this.wallet.loadTestWallet();
     // Funds can land on either the Generation or the dCTIDH address; scan both.
     const accounts = [
       { kind: "generation", key: genKey, addr: genAddr },
@@ -379,14 +385,71 @@ class TestRunner {
       }
     }
 
+    // Funds at legacy-format dCTIDH locks (sent to a pre-v0.3 address) are
+    // reported apart: they are only moved, see the migrate command.
+    let legacyTotal = 0n;
+    const legacy = this.wallet.sync(client, legacyKey);
+    for (const u of legacy?.unspent ?? []) {
+      legacyTotal += u.decrypted.amount;
+      this.log.info("utxo", {
+        kind: "legacy-dctidh",
+        aocl: u.aoclIndex, height: u.decrypted.blockHeight,
+        amount: AmountUtil.format(u.decrypted.amount),
+        ...(u.decrypted.paymentId ? { pid: u.decrypted.paymentId } : {}),
+        legacy: u.decrypted.isLegacy,
+      });
+    }
+
     const available = total - spendingTotal;
     const unconfirmed = available + incomingTotal;
     this.log.ok("balance", {
       unspent: unspentCount,
       confirmed: AmountUtil.format(total),
       ...(incomingTotal > 0n || spendingTotal > 0n ? { unconfirmed: AmountUtil.format(unconfirmed) } : {}),
+      ...(legacyTotal > 0n ? { legacyToMigrate: AmountUtil.format(legacyTotal) } : {}),
     });
     return true;
+  }
+
+  // Move the funds at legacy-format dCTIDH locks of index 0 to the wallet's
+  // current-format dCTIDH address 0. A dry run, which only builds and lists
+  // the transactions, unless "dry_run=no".
+  private async testMigrate(args: string[]): Promise<boolean> {
+    const dryRunArg = args[0] ?? "dry_run=yes";
+    if (dryRunArg !== "dry_run=yes" && dryRunArg !== "dry_run=no") {
+      return this.log.fail("migrate takes dry_run=yes or dry_run=no", { arg: dryRunArg });
+    }
+    const dryRun = dryRunArg === "dry_run=yes";
+    const client = this.wallet.connectRpc();
+    if (!client) return false;
+    const { wallet } = this.wallet.loadTestWallet();
+    try {
+      const report = await migrateLegacyFunds(client, wallet, {
+        indices: [0],
+        dryRun,
+        log: (message) => this.log.info("migrate", { message }),
+      });
+      this.log.ok("migrate", {
+        submitted: report.submitted,
+        moved: AmountUtil.format(report.moved),
+        fees: AmountUtil.format(report.fees),
+        dustInputs: report.dustInputs,
+        timeLocked: report.timeLocked,
+        remaining: report.remaining,
+        // Before fees; over the plan in a dry run, else over the submitted
+        // transactions. Record these per payment id before crediting.
+        byPaymentId: report.byPaymentId.map(total => ({
+          keyIndex: total.keyIndex,
+          paymentId: total.paymentId,
+          amount: AmountUtil.format(total.amount),
+          inputs: total.inputs,
+        })),
+        ...(dryRun ? { note: "dry run; pass dry_run=no to prove and submit" } : {}),
+      });
+      return true;
+    } catch (e) {
+      return this.log.fail("migrate failed", { error: String(e) });
+    }
   }
 
   private testTx(args: string[]): boolean {
@@ -526,7 +589,15 @@ class TestRunner {
 
     this.log.info("proving (this takes several minutes)");
     const start = Date.now();
-    const provenTx = builtTx.prove();
+    let provenTx: ReturnType<typeof builtTx.prove>;
+    try {
+      // Picks the rule set from the tip the mutator set belongs to; before the
+      // UpgradeVMv8 fork it refuses terms that nodes of that era do not relay
+      // (fee below 0.017 XNT, more than 10 inputs, within 10 blocks of the fork).
+      provenTx = builtTx.prove();
+    } catch (e) {
+      return { status: "rejected", error: `prove: ${e}` };
+    }
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     this.log.ok("proven", { seconds: elapsed, hasProofCollection: provenTx.hasProofCollection() });
 
@@ -560,7 +631,7 @@ class TestRunner {
 // ── Entry Point ────────────────────────────────────────────────────────────
 
 const command = process.argv[2] || "help";
-// Resolve the prover binary up-front for the only command that proves.
-if (command === "tx") ensureProverPath(new Logger());
+// Resolve the prover binary up-front for the commands that prove.
+if (command === "tx" || command === "migrate") ensureProverPath(new Logger());
 const runner = new TestRunner();
 runner.run(command, process.argv.slice(3));

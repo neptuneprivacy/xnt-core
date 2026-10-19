@@ -66,7 +66,7 @@ pub struct XntWalletEntropy {
 #[napi]
 impl XntWalletEntropy {
     /// Create from BIP39 mnemonic phrase (space-separated words)
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new(mnemonic: String) -> Result<Self> {
         let entropy = WalletEntropy::from_mnemonic(&mnemonic)
             .map_err(|e| Error::from_reason(format!("invalid mnemonic: {e}")))?;
@@ -74,7 +74,7 @@ impl XntWalletEntropy {
     }
 
     /// Generate new random mnemonic and wallet
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn generate() -> Result<Self> {
         let entropy =
             WalletEntropy::generate().map_err(|e| Error::from_reason(format!("{e}")))?;
@@ -82,7 +82,7 @@ impl XntWalletEntropy {
     }
 
     /// Get devnet test wallet
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn devnet() -> Self {
         Self {
             inner: WalletEntropy::devnet(),
@@ -90,13 +90,13 @@ impl XntWalletEntropy {
     }
 
     /// Export wallet to mnemonic phrase
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_mnemonic(&self) -> String {
         self.inner.to_mnemonic()
     }
 
     /// Derive spending key at index
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn derive_key(&self, index: u32) -> XntSpendingKey {
         XntSpendingKey {
             inner: self.inner.derive_spending_key(index as u64),
@@ -104,7 +104,7 @@ impl XntWalletEntropy {
     }
 
     /// Derive dCTIDH spending key at index (dCTIDH-512)
-    #[napi(js_name = "derivedCTIDHKey")]
+    #[napi(js_name = "derivedCTIDHKey", catch_unwind)]
     pub fn derive_dctidh_key(&self, index: u32) -> XntSpendingKey {
         XntSpendingKey {
             inner: self.inner.derive_dctidh_spending_key(index as u64),
@@ -113,7 +113,9 @@ impl XntWalletEntropy {
 
     /// Derive dCTIDH spending key at index using the legacy (pre-v0.3)
     /// derivation, for recognising and sweeping funds at legacy-format addresses.
-    #[napi(js_name = "deriveLegacydCTIDHKey")]
+    ///
+    /// UTXOs of such a key are sweep-only, see `isLegacy`.
+    #[napi(js_name = "deriveLegacydCTIDHKey", catch_unwind)]
     pub fn derive_legacy_dctidh_key(&self, index: u32) -> XntSpendingKey {
         XntSpendingKey {
             inner: self.inner.derive_legacy_dctidh_spending_key(index as u64),
@@ -131,7 +133,7 @@ pub struct XntSpendingKey {
 impl XntSpendingKey {
     /// Get receiving address from spending key. Throws for legacy-derivation
     /// dCTIDH keys, which have no receiving address.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_address(&self) -> Result<XntAddress> {
         let inner = self
             .inner
@@ -141,37 +143,68 @@ impl XntSpendingKey {
     }
 
     /// Get receiver identifier as u64
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn receiver_id(&self) -> i64 {
         self.inner.receiver_id() as i64
     }
 
     /// Get receiver identifier as hex string
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn receiver_id_hex(&self) -> String {
         self.inner.receiver_id_hex()
     }
 
     /// Get receiver_id_hash as hex string (for indexer lookups)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn receiver_id_hash_hex(&self) -> String {
         hex::encode(self.inner.receiver_id_hash().bytes)
     }
 
     /// Get receiver_preimage as hex string (for commitment computation)
-    #[napi]
+    ///
+    /// For dCTIDH keys this is also the unlock preimage of the key's lock
+    /// script: anyone who knows it can spend the key's UTXOs. Treat it as a
+    /// spending secret: keep it in the process that holds the seed, do not
+    /// log it, send it to a server or store it unencrypted.
+    #[napi(catch_unwind)]
     pub fn receiver_preimage_hex(&self) -> String {
         hex::encode(self.inner.receiver_preimage().bytes)
     }
 
+    /// Get the hash of the lock script this key can satisfy as hex string.
+    /// UTXOs with a different lock script hash cannot be spent by this key.
+    #[napi(catch_unwind)]
+    pub fn lock_script_hash_hex(&self) -> String {
+        hex::encode(self.inner.lock_script_hash().bytes)
+    }
+
+    /// True for dCTIDH keys derived with the legacy (pre-v0.3) lock
+    /// derivation (`deriveLegacydCTIDHKey`). UTXOs of such a key are
+    /// sweep-only: move them to a current-format key and never count them
+    /// towards the available balance.
+    #[napi(catch_unwind)]
+    pub fn is_legacy(&self) -> bool {
+        self.inner.is_legacy()
+    }
+
+    /// Whether UTXOs of this key confirmed in a block of height `block_height`
+    /// are recognized on `network`. Always true for keys that are not legacy;
+    /// for legacy keys true only below `xntLegacyDctidhCutoff(network)`.
+    #[napi(catch_unwind)]
+    pub fn recognizes_utxos_at(&self, network: XntNetwork, block_height: i64) -> Result<bool> {
+        let height = u64::try_from(block_height)
+            .map_err(|_| Error::from_reason("block_height must not be negative"))?;
+        Ok(self.inner.recognizes_utxos_at(network.into(), height))
+    }
+
     /// Check if this is a dCTIDH spending key
-    #[napi(js_name = "isDCTIDH")]
+    #[napi(js_name = "isDCTIDH", catch_unwind)]
     pub fn is_dctidh(&self) -> bool {
         self.inner.is_dctidh()
     }
 
     /// Check if this is a Generation spending key
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn is_generation(&self) -> bool {
         self.inner.is_generation()
     }
@@ -193,7 +226,7 @@ pub struct XntAddress {
 #[napi]
 impl XntAddress {
     /// Decode address from bech32m string
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn from_bech32(bech32: String, network: XntNetwork) -> Result<Self> {
         let addr = Address::from_bech32(&bech32, network.into())
             .map_err(|e| Error::from_reason(format!("invalid bech32m: {e}")))?;
@@ -201,7 +234,7 @@ impl XntAddress {
     }
 
     /// Encode address to bech32m string
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_bech32(&self, network: XntNetwork) -> Result<String> {
         self.inner
             .to_bech32(network.into())
@@ -209,25 +242,25 @@ impl XntAddress {
     }
 
     /// Get receiver identifier as hex string
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn receiver_id_hex(&self) -> String {
         self.inner.receiver_id_hex()
     }
 
     /// Get lock script hash as hex string (40 bytes)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn lock_script_hash_hex(&self) -> String {
         hex::encode(self.inner.lock_script_hash().bytes)
     }
 
     /// Get privacy_digest (receiver_postimage) as hex string for output commitments
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn privacy_digest_hex(&self) -> String {
         hex::encode(self.inner.privacy_digest().bytes)
     }
 
     /// Create subaddress with payment_id
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn with_payment_id(&self, payment_id: i64) -> Result<XntSubAddress> {
         let subaddr = self
             .inner
@@ -237,7 +270,7 @@ impl XntAddress {
     }
 
     /// Create dCTIDH subaddress with payment_id
-    #[napi(js_name = "dCTIDHSubaddress")]
+    #[napi(js_name = "dCTIDHSubaddress", catch_unwind)]
     pub fn dctidh_subaddress(&self, payment_id: i64) -> Result<XntReceivingAddress> {
         let subaddr = self
             .inner
@@ -247,7 +280,7 @@ impl XntAddress {
     }
 
     /// Convert to ReceivingAddress for addOutput
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_receiving_address(&self) -> XntReceivingAddress {
         XntReceivingAddress {
             inner: self.inner.to_receiving_address(),
@@ -264,7 +297,7 @@ pub struct XntSubAddress {
 #[napi]
 impl XntSubAddress {
     /// Encode subaddress to bech32m string
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_bech32(&self, network: XntNetwork) -> Result<String> {
         self.inner
             .to_bech32(network.into())
@@ -272,13 +305,13 @@ impl XntSubAddress {
     }
 
     /// Get payment_id
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn payment_id(&self) -> i64 {
         self.inner.payment_id() as i64
     }
 
     /// Convert to ReceivingAddress for addOutput
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_receiving_address(&self) -> XntReceivingAddress {
         XntReceivingAddress {
             inner: self.inner.to_receiving_address(),
@@ -295,20 +328,20 @@ pub struct XntReceivingAddress {
 #[napi]
 impl XntReceivingAddress {
     /// Encode address to bech32m string
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_bech32(&self, network: XntNetwork) -> Result<String> {
         self.inner
             .to_bech32(network.into())
             .map_err(|e| Error::from_reason(format!("bech32m encoding failed: {e}")))
     }
     /// Get payment_id if this is a subaddress, null otherwise
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn payment_id(&self) -> Option<i64> {
         self.inner.payment_id().map(|id| id as i64)
     }
 
     /// Check if this is a subaddress
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn is_subaddress(&self) -> bool {
         self.inner.is_subaddress()
     }
@@ -325,7 +358,7 @@ pub struct XntRpcClient {
 #[napi]
 impl XntRpcClient {
     /// Create new RPC client
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new(url: String) -> Result<Self> {
         let client =
             RpcClient::new(&url).map_err(|e| Error::from_reason(format!("RPC error: {e}")))?;
@@ -333,7 +366,7 @@ impl XntRpcClient {
     }
 
     /// Create RPC client with basic auth
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn with_auth(url: String, username: String, password: String) -> Result<Self> {
         let client = RpcClient::with_auth(&url, Some((username, password)))
             .map_err(|e| Error::from_reason(format!("RPC error: {e}")))?;
@@ -341,7 +374,7 @@ impl XntRpcClient {
     }
 
     /// Ping the node
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn ping(&self) -> Result<()> {
         self.inner
             .ping()
@@ -349,7 +382,7 @@ impl XntRpcClient {
     }
 
     /// Get current chain height
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn chain_height(&self) -> Result<i64> {
         self.inner
             .chain_height()
@@ -374,7 +407,7 @@ pub struct XntUtxo {
 #[napi]
 impl XntUtxo {
     /// Create UTXO for native currency output
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn new_native(address: &XntAddress, amount: BigInt) -> Result<Self> {
         let (amt_i128, lossless) = amount.get_i128();
         if !lossless {
@@ -386,7 +419,7 @@ impl XntUtxo {
     }
 
     /// Deserialize UTXO from bytes
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn from_bytes(data: Buffer) -> Result<Self> {
         let utxo =
             Utxo::from_bytes(&data).map_err(|e| Error::from_reason(format!("deserialize: {e}")))?;
@@ -394,7 +427,7 @@ impl XntUtxo {
     }
 
     /// Serialize UTXO to bytes
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_bytes(&self) -> Result<Buffer> {
         let bytes = self
             .inner
@@ -404,38 +437,44 @@ impl XntUtxo {
     }
 
     /// Get UTXO amount in nau (BigInt for i128 precision)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn amount(&self) -> BigInt {
         BigInt::from(self.inner.amount())
     }
 
     /// Get UTXO hash as hex string (for commitment calculation)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn hash_hex(&self) -> String {
         hex::encode(self.inner.hash().bytes)
     }
 
+    /// Get the hash of the lock script of this UTXO as hex string
+    #[napi(catch_unwind)]
+    pub fn lock_script_hash_hex(&self) -> String {
+        hex::encode(self.inner.lock_script_hash().bytes)
+    }
+
     /// Get release date if UTXO is timelocked (milliseconds since Unix epoch)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn release_date(&self) -> Option<BigInt> {
         self.inner.release_date().map(BigInt::from)
     }
 
     /// Check if UTXO is timelocked
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn is_timelocked(&self) -> bool {
         self.inner.is_timelocked()
     }
 
     /// Check if UTXO can be spent at given timestamp (milliseconds since Unix epoch)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn can_spend_at(&self, timestamp_ms: BigInt) -> bool {
         let (_, ts, _) = timestamp_ms.get_u64();
         self.inner.can_spend_at(ts)
     }
 
     /// Add timelock to UTXO, returns new timelocked UTXO
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn with_time_lock(&self, release_date_ms: BigInt) -> Self {
         let (_, rd, _) = release_date_ms.get_u64();
         Self {
@@ -460,7 +499,7 @@ pub struct XntMutatorSet {
 #[napi]
 impl XntMutatorSet {
     /// Deserialize from bytes
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn from_bytes(data: Buffer) -> Result<Self> {
         let ms = MutatorSet::from_bytes(&data)
             .map_err(|e| Error::from_reason(format!("deserialize: {e}")))?;
@@ -468,13 +507,36 @@ impl XntMutatorSet {
     }
 
     /// Serialize to bytes
-    #[napi]
+    ///
+    /// The tip height is not serialized, see withTipHeight.
+    #[napi(catch_unwind)]
     pub fn to_bytes(&self) -> Result<Buffer> {
         let bytes = self
             .inner
             .to_bytes()
             .map_err(|e| Error::from_reason(format!("serialize: {e}")))?;
         Ok(Buffer::from(bytes))
+    }
+
+    /// Height of the tip whose mutator set this is, or null if unknown, as
+    /// after fromBytes. A transaction built on it is proven for the block
+    /// after that tip, see prove.
+    #[napi(catch_unwind)]
+    pub fn tip_height(&self) -> Option<i64> {
+        self.inner
+            .tip_height()
+            .and_then(|height| i64::try_from(height).ok())
+    }
+
+    /// The same mutator set, as the one of the tip at `tipHeight`: for a
+    /// mutator set restored with fromBytes.
+    #[napi(catch_unwind)]
+    pub fn with_tip_height(&self, tip_height: i64) -> Result<XntMutatorSet> {
+        let tip_height = u64::try_from(tip_height)
+            .map_err(|_| Error::from_reason("tip height must not be negative"))?;
+        Ok(XntMutatorSet {
+            inner: self.inner.clone().with_tip_height(tip_height),
+        })
     }
 
     /// Get inner (for internal use)
@@ -492,7 +554,7 @@ pub struct XntMembershipProof {
 #[napi]
 impl XntMembershipProof {
     /// Deserialize from bytes
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn from_bytes(data: Buffer) -> Result<Self> {
         let mp = MembershipProof::from_bytes(&data)
             .map_err(|e| Error::from_reason(format!("deserialize: {e}")))?;
@@ -500,7 +562,7 @@ impl XntMembershipProof {
     }
 
     /// Serialize to bytes
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_bytes(&self) -> Result<Buffer> {
         let bytes = self
             .inner
@@ -516,13 +578,30 @@ impl XntMembershipProof {
 }
 
 /// Fetch UTXOs from indexer
-#[napi]
+///
+/// Entries without a block height, or whose ciphertext is oversized or not a
+/// list of field elements, are skipped, see `xntFetchUtxosWithSkipped`.
+#[napi(catch_unwind)]
 pub fn xnt_fetch_utxos(
     client: &XntRpcClient,
     receiver_id_hash_hex: String,
     from_height: i64,
     to_height: i64,
 ) -> Result<Vec<XntIndexedUtxo>> {
+    xnt_fetch_utxos_with_skipped(client, receiver_id_hash_hex, from_height, to_height)
+        .map(|fetched| fetched.utxos)
+}
+
+/// Fetch UTXOs from indexer, and count the entries skipped instead of failing
+/// the whole range: entries without a block height, or whose ciphertext is
+/// oversized or not a list of field elements.
+#[napi(catch_unwind)]
+pub fn xnt_fetch_utxos_with_skipped(
+    client: &XntRpcClient,
+    receiver_id_hash_hex: String,
+    from_height: i64,
+    to_height: i64,
+) -> Result<XntFetchedUtxos> {
     let hash_bytes = hex::decode(&receiver_id_hash_hex)
         .map_err(|e| Error::from_reason(format!("invalid hex: {e}")))?;
 
@@ -532,18 +611,39 @@ pub fn xnt_fetch_utxos(
 
     let hash = crate::core::Digest::from_bytes(hash_bytes.try_into().unwrap());
 
-    crate::core::fetch_utxos(client.inner(), &hash, from_height as u64, to_height as u64)
-        .map(|utxos| {
-            utxos
-                .into_iter()
-                .map(|u| XntIndexedUtxo {
-                    block_height: u.block_height as i64,
-                    block_digest_hex: hex::encode(u.block_digest.bytes),
-                    ciphertext: Buffer::from(u.ciphertext),
-                })
-                .collect()
-        })
-        .map_err(|e| Error::from_reason(format!("fetch_utxos: {e}")))
+    crate::core::fetch_utxos_with_skipped(
+        client.inner(),
+        &hash,
+        from_height as u64,
+        to_height as u64,
+    )
+    .map(|(utxos, skipped)| XntFetchedUtxos {
+        utxos: utxos
+            .into_iter()
+            .map(|u| XntIndexedUtxo {
+                block_height: u.block_height as i64,
+                block_digest_hex: hex::encode(u.block_digest.bytes),
+                ciphertext: Buffer::from(u.ciphertext),
+            })
+            .collect(),
+        skipped: skipped as i64,
+    })
+    .map_err(|e| Error::from_reason(format!("fetch_utxos: {e}")))
+}
+
+/// Indexed UTXOs of one range, see `xntFetchUtxosWithSkipped`
+#[napi(object)]
+pub struct XntFetchedUtxos {
+    pub utxos: Vec<XntIndexedUtxo>,
+    /// Number of malformed entries that were skipped
+    pub skipped: i64,
+}
+
+/// The block height from which UTXOs at legacy-format (pre-v0.3) dCTIDH locks
+/// are no longer recognized on `network`, or null if there is no cutoff.
+#[napi(catch_unwind)]
+pub fn xnt_legacy_dctidh_cutoff(network: XntNetwork) -> Option<i64> {
+    crate::core::legacy_dctidh_cutoff(network.into()).map(|height| height as i64)
 }
 
 /// Indexed UTXO from sync
@@ -555,7 +655,7 @@ pub struct XntIndexedUtxo {
 }
 
 /// Get mutator set from RPC
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_get_mutator_set(client: &XntRpcClient) -> Result<XntMutatorSet> {
     crate::core::get_mutator_set(client.inner())
         .map(|ms| XntMutatorSet { inner: ms })
@@ -564,7 +664,7 @@ pub fn xnt_get_mutator_set(client: &XntRpcClient) -> Result<XntMutatorSet> {
 
 /// Check if UTXOs are spent by absolute index set hashes
 /// Returns Vec<i64> where -1 = not spent, >= 0 = spent at that block height
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_check_spent(
     client: &XntRpcClient,
     absolute_index_set_hashes_hex: Vec<String>,
@@ -587,7 +687,7 @@ pub fn xnt_check_spent(
 }
 
 /// Get AOCL leaf indices for commitments
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_get_aocl_indices(
     client: &XntRpcClient,
     commitment_hashes_hex: Vec<String>,
@@ -617,44 +717,58 @@ pub struct XntDecryptedUtxo {
 
 #[napi]
 impl XntDecryptedUtxo {
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn utxo(&self) -> XntUtxo {
         XntUtxo { inner: self.inner.utxo.clone() }
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn sender_randomness_hex(&self) -> String {
         self.inner.sender_randomness.to_hex()
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn payment_id(&self) -> i64 {
         self.inner.payment_id as i64
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn amount(&self) -> BigInt {
         BigInt::from(self.inner.utxo.amount())
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn block_height(&self) -> i64 {
         self.inner.block_height as i64
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn block_digest_hex(&self) -> String {
         self.inner.block_digest.to_hex()
     }
 
+    /// Lock script hash of the UTXO as hex string
+    #[napi(getter, catch_unwind)]
+    pub fn lock_script_hash_hex(&self) -> String {
+        hex::encode(self.inner.utxo.lock_script_hash().bytes)
+    }
+
+    /// True if the UTXO is at a legacy-format (pre-v0.3) dCTIDH lock. Such
+    /// UTXOs are sweep-only: move them to a current-format key and never
+    /// count them towards the available balance.
+    #[napi(getter, catch_unwind)]
+    pub fn is_legacy(&self) -> bool {
+        self.inner.is_legacy
+    }
+
     /// Get release date if timelocked (milliseconds since Unix epoch)
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn release_date(&self) -> Option<BigInt> {
         self.inner.utxo.release_date().map(BigInt::from)
     }
 
     /// Check if UTXO is timelocked
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn is_timelocked(&self) -> bool {
         self.inner.utxo.is_timelocked()
     }
@@ -668,22 +782,22 @@ pub struct XntTxInputInfo {
 
 #[napi]
 impl XntTxInputInfo {
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn utxo(&self) -> XntUtxo {
         XntUtxo { inner: self.inner.utxo.clone() }
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn sender_randomness_hex(&self) -> String {
         self.inner.sender_randomness.to_hex()
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn commitment_hex(&self) -> String {
         self.inner.commitment.to_hex()
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn amount(&self) -> BigInt {
         BigInt::from(self.inner.utxo.amount())
     }
@@ -697,44 +811,47 @@ pub struct XntTxOutputInfo {
 
 #[napi]
 impl XntTxOutputInfo {
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn utxo(&self) -> XntUtxo {
         XntUtxo { inner: self.inner.utxo.clone() }
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn sender_randomness_hex(&self) -> String {
         self.inner.sender_randomness.to_hex()
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn receiver_digest_hex(&self) -> String {
         self.inner.receiver_digest.to_hex()
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn is_change(&self) -> bool {
         self.inner.is_change
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn payment_id(&self) -> Option<i64> {
         self.inner.payment_id.map(|id| id as i64)
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn commitment_hex(&self) -> String {
         self.inner.commitment.to_hex()
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn amount(&self) -> BigInt {
         BigInt::from(self.inner.utxo.amount())
     }
 }
 
 /// Decrypt indexed UTXO ciphertext
-#[napi]
+///
+/// Applies the main-net legacy cutoff, the strictest one; see
+/// `xntDecryptIndexedUtxoForNetwork`.
+#[napi(catch_unwind)]
 pub fn xnt_decrypt_indexed_utxo(
     spending_key: &XntSpendingKey,
     ciphertext: Buffer,
@@ -753,8 +870,37 @@ pub fn xnt_decrypt_indexed_utxo(
     Ok(XntDecryptedUtxo { inner })
 }
 
+/// Decrypt indexed UTXO ciphertext, applying the legacy cutoff of `network`.
+///
+/// Throws for a UTXO at a legacy-format dCTIDH lock confirmed at or above
+/// `xntLegacyDctidhCutoff(network)`. Legacy UTXOs below the cutoff have
+/// `isLegacy` set: they are sweep-only.
+#[napi(catch_unwind)]
+pub fn xnt_decrypt_indexed_utxo_for_network(
+    spending_key: &XntSpendingKey,
+    ciphertext: Buffer,
+    block_height: i64,
+    block_digest_hex: String,
+    network: XntNetwork,
+) -> Result<XntDecryptedUtxo> {
+    let block_digest = crate::core::Digest::from_hex(&block_digest_hex)
+        .ok_or_else(|| Error::from_reason("invalid block_digest_hex"))?;
+    let inner = crate::core::decrypt_indexed_utxo_for_network(
+        spending_key.inner(),
+        &ciphertext,
+        block_height as u64,
+        block_digest,
+        network.into(),
+    )
+    .map_err(|e| Error::from_reason(format!("decrypt: {e}")))?;
+    Ok(XntDecryptedUtxo { inner })
+}
+
 /// Compute commitment hash for UTXO
-#[napi]
+///
+/// `receiver_preimage_hex` is a spending secret for dCTIDH keys, see
+/// `XntSpendingKey.receiverPreimageHex`.
+#[napi(catch_unwind)]
 pub fn xnt_compute_commitment(
     utxo_hash_hex: String,
     sender_randomness_hex: String,
@@ -777,7 +923,7 @@ pub fn xnt_compute_commitment(
 }
 
 /// Compute commitment hash for output UTXO (using privacy_digest/receiver_postimage)
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_compute_commitment_for_output(
     utxo_hash_hex: String,
     sender_randomness_hex: String,
@@ -800,7 +946,10 @@ pub fn xnt_compute_commitment_for_output(
 }
 
 /// Compute absolute index set hash for spent checking
-#[napi]
+///
+/// `receiver_preimage_hex` is a spending secret for dCTIDH keys, see
+/// `XntSpendingKey.receiverPreimageHex`.
+#[napi(catch_unwind)]
 pub fn xnt_compute_absolute_index_set_hash(
     utxo_hash_hex: String,
     sender_randomness_hex: String,
@@ -825,7 +974,7 @@ pub fn xnt_compute_absolute_index_set_hash(
 
 /// Hash an AbsoluteIndexSet from JSON (from RPC mempool response)
 /// Used to check if a mempool tx input matches a known UTXO
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_hash_absolute_index_set(absolute_index_set_json: String) -> Result<String> {
     let hash = crate::core::hash_absolute_index_set_json(&absolute_index_set_json)
         .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -839,35 +988,43 @@ pub struct XntPendingUtxo {
     utxo: crate::core::Utxo,
     sender_randomness: crate::core::Digest,
     payment_id: u64,
+    is_legacy: bool,
 }
 
 #[napi]
 impl XntPendingUtxo {
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn utxo(&self) -> XntUtxo {
         XntUtxo { inner: self.utxo.clone() }
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn sender_randomness_hex(&self) -> String {
         hex::encode(self.sender_randomness.bytes)
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn payment_id(&self) -> i64 {
         self.payment_id as i64
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn amount(&self) -> BigInt {
         BigInt::from(self.utxo.amount())
+    }
+
+    /// True if the UTXO is at a legacy-format (pre-v0.3) dCTIDH lock, see
+    /// `XntDecryptedUtxo.isLegacy`
+    #[napi(getter, catch_unwind)]
+    pub fn is_legacy(&self) -> bool {
+        self.is_legacy
     }
 }
 
 /// Check mempool for pending spending (our UTXOs being spent)
 /// Takes array of absolute_index_set_hash hex strings (from sync)
 /// Returns indices of UTXOs with pending spends
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_mempool_spending(
     client: &XntRpcClient,
     abs_hashes_hex: Vec<String>,
@@ -891,7 +1048,10 @@ pub fn xnt_mempool_spending(
 }
 
 /// Check mempool for pending incoming UTXOs
-#[napi]
+///
+/// For a legacy key nothing is returned once the next block is at or above
+/// the main-net legacy cutoff.
+#[napi(catch_unwind)]
 pub fn xnt_mempool_incoming(
     client: &XntRpcClient,
     key: &XntSpendingKey,
@@ -905,12 +1065,17 @@ pub fn xnt_mempool_incoming(
             utxo,
             sender_randomness: sr,
             payment_id: pid,
+            is_legacy: key.inner.is_legacy(),
         })
         .collect())
 }
 
 /// Get membership proofs for UTXOs
-#[napi]
+///
+/// `receiver_preimage_hex` is a spending secret for dCTIDH keys (see
+/// `XntSpendingKey.receiverPreimageHex`); it is used locally and not sent to
+/// the node. Throws unless the node returns one proof per requested UTXO.
+#[napi(catch_unwind)]
 pub fn xnt_get_membership_proofs(
     client: &XntRpcClient,
     utxo_hashes_hex: Vec<String>,
@@ -973,7 +1138,7 @@ pub struct XntTransactionBuilder {
 #[napi]
 impl XntTransactionBuilder {
     /// Create new transaction builder
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new() -> Self {
         Self {
             inner: TransactionBuilder::new(),
@@ -981,7 +1146,7 @@ impl XntTransactionBuilder {
     }
 
     /// Add input UTXO to spend
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn add_input(
         &mut self,
         utxo: &XntUtxo,
@@ -996,7 +1161,7 @@ impl XntTransactionBuilder {
     }
 
     /// Add output recipient (takes XntReceivingAddress - use addr.toReceivingAddress() or subaddr.toReceivingAddress())
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn add_output(
         &mut self,
         receiving_address: &XntReceivingAddress,
@@ -1019,7 +1184,7 @@ impl XntTransactionBuilder {
     }
 
     /// Set change address
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn set_change(&mut self, address: &XntAddress, sender_randomness_hex: String) -> Result<()> {
         let sr_bytes = hex::decode(&sender_randomness_hex)
             .map_err(|e| Error::from_reason(format!("invalid hex: {e}")))?;
@@ -1032,7 +1197,10 @@ impl XntTransactionBuilder {
     }
 
     /// Set transaction fee
-    #[napi]
+    ///
+    /// `build()` throws for a fee below 0.0005 coins per input, including a
+    /// zero fee, unless `setAllowLowFee(true)` was called.
+    #[napi(catch_unwind)]
     pub fn set_fee(&mut self, fee: BigInt) -> Result<()> {
         let (fee_i128, lossless) = fee.get_i128();
         if !lossless {
@@ -1042,26 +1210,39 @@ impl XntTransactionBuilder {
         Ok(())
     }
 
+    /// Allow a fee below the default minimum relay fee (0.0005 coins per
+    /// input), including a zero fee. Nodes with the default
+    /// `--min-relay-pctx-fee-per-input` neither keep nor relay such a
+    /// transaction; use this only with a node configured to accept it.
+    #[napi(catch_unwind)]
+    pub fn set_allow_low_fee(&mut self, allow: bool) {
+        self.inner.set_allow_low_fee(allow);
+    }
+
     /// Get total input amount
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn input_total(&self) -> BigInt {
         BigInt::from(self.inner.input_total())
     }
 
     /// Get total output amount
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn output_total(&self) -> BigInt {
         BigInt::from(self.inner.output_total())
     }
 
     /// Get calculated change amount
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn change_amount(&self) -> BigInt {
         BigInt::from(self.inner.change_amount())
     }
 
     /// Build the transaction
-    #[napi]
+    ///
+    /// Throws for more than 200 inputs, for a fee below the minimum relay fee
+    /// (see `setFee`), and for a recipient that cannot receive a UTXO
+    /// notification (legacy-format dCTIDH lock or invalid dCTIDH public key).
+    #[napi(catch_unwind)]
     pub fn build(
         &self,
         mutator_set: &XntMutatorSet,
@@ -1084,7 +1265,10 @@ pub struct XntBuiltTransaction {
 #[napi]
 impl XntBuiltTransaction {
     /// Serialize to bytes
-    #[napi]
+    ///
+    /// Contains the primitive witness, see `witnessBytes`: keep it in the
+    /// process that holds the seed.
+    #[napi(catch_unwind)]
     pub fn to_bytes(&self) -> Result<Buffer> {
         self.inner
             .to_bytes()
@@ -1093,7 +1277,7 @@ impl XntBuiltTransaction {
     }
 
     /// Get transaction kernel bytes
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn kernel_bytes(&self) -> Result<Buffer> {
         self.inner
             .kernel_bytes()
@@ -1102,7 +1286,12 @@ impl XntBuiltTransaction {
     }
 
     /// Get witness bytes
-    #[napi]
+    ///
+    /// The witness holds the unlock data of every input, which for dCTIDH
+    /// inputs is the key's spending secret (see
+    /// `XntSpendingKey.receiverPreimageHex`). Keep it in the process that
+    /// holds the seed.
+    #[napi(catch_unwind)]
     pub fn witness_bytes(&self) -> Result<Buffer> {
         self.inner
             .witness_bytes()
@@ -1111,7 +1300,7 @@ impl XntBuiltTransaction {
     }
 
     /// Get all inputs
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn inputs(&self) -> Vec<XntTxInputInfo> {
         self.inner
             .inputs()
@@ -1121,7 +1310,7 @@ impl XntBuiltTransaction {
     }
 
     /// Get all outputs (including change)
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn outputs(&self) -> Vec<XntTxOutputInfo> {
         self.inner
             .outputs()
@@ -1133,14 +1322,19 @@ impl XntBuiltTransaction {
     /// Check the (unproven) transaction is still confirmable against `mutator_set`.
     /// Fetch the current tip via getMutatorSet and call this BEFORE prove() to
     /// avoid proving a stale snapshot.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn is_confirmable(&self, mutator_set: &XntMutatorSet) -> bool {
         self.inner.is_confirmable(mutator_set.inner())
     }
 
-    /// Prove the transaction (creates ProofCollection).
+    /// Prove the transaction (creates ProofCollection) for the consensus rule set
+    /// of the block that follows the tip whose mutator set it was built on, as
+    /// proveForTip does with that tip's height: before the UpgradeVMv8 hard fork
+    /// at main-net block 95000, a v7 proof collection. Fails if that height is
+    /// unknown (see XntMutatorSet.tipHeight); then use withTipHeight before
+    /// building, or proveForTip.
     /// WARNING: CPU-intensive, requires ~16 GB RAM.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn prove(&self) -> Result<XntTransaction> {
         let rt = global_tokio_runtime();
 
@@ -1152,6 +1346,311 @@ impl XntBuiltTransaction {
                 .map_err(|e| Error::from_reason(format!("prove: {e}")))
         })
     }
+
+    /// Prove the transaction (creates ProofCollection) for the consensus rule set
+    /// of the block that follows a tip at `tipHeight`: before the UpgradeVMv8
+    /// hard fork on main net, a v7 proof collection. Fails if the transaction
+    /// does not meet the terms of that era, or if the fork is too close.
+    /// WARNING: CPU-intensive, requires ~16 GB RAM.
+    #[napi(catch_unwind)]
+    pub fn prove_for_tip(&self, tip_height: i64) -> Result<XntTransaction> {
+        let tip_height = u64::try_from(tip_height)
+            .map_err(|_| Error::from_reason("prove: tip height must not be negative"))?;
+        let rt = global_tokio_runtime();
+
+        rt.block_on(async {
+            self.inner
+                .prove_for_tip(tip_height)
+                .await
+                .map(|tx| XntTransaction { inner: tx })
+                .map_err(|e| Error::from_reason(format!("prove: {e}")))
+        })
+    }
+}
+
+// Migration of legacy-format dCTIDH funds
+
+/// An input of a migration transaction, or one left out of the
+/// transactions, with the legacy key and the payment id it was received with.
+/// A migration transaction merges the UTXOs of many payment ids into one
+/// output; record what it moves per payment id from these.
+#[napi(object)]
+#[derive(Clone, Debug)]
+pub struct XntMigrationInput {
+    /// Index of the legacy key the UTXO is locked to
+    /// (wallet.deriveLegacydCTIDHKey)
+    pub key_index: i64,
+    /// Payment id the UTXO was received with, 0 for the base address, as
+    /// XntDecryptedUtxo.paymentId reports it
+    pub payment_id: i64,
+    /// Amount in nau, before fees
+    pub amount: BigInt,
+    /// Height of the block the UTXO was confirmed in
+    pub block_height: i64,
+    pub aocl_index: i64,
+    /// Absolute index set hash, for xntCheckSpent: the UTXO is spent once
+    /// the transaction spending it is confirmed
+    pub absolute_index_set_hash_hex: String,
+}
+
+impl XntMigrationInput {
+    fn from_core(input: &crate::core::MigrationInput) -> Self {
+        Self {
+            key_index: input.key_index as i64,
+            payment_id: input.payment_id as i64,
+            amount: BigInt::from(input.amount),
+            block_height: input.block_height as i64,
+            aocl_index: input.aocl_index as i64,
+            absolute_index_set_hash_hex: input.absolute_index_set_hash.to_hex(),
+        }
+    }
+}
+
+/// What the transactions of a migration spend for one legacy key index and
+/// payment id
+#[napi(object)]
+#[derive(Clone, Debug)]
+pub struct XntMigrationPaymentIdTotal {
+    pub key_index: i64,
+    /// As XntDecryptedUtxo.paymentId reports it, 0 for the base address
+    pub payment_id: i64,
+    /// In nau, before fees
+    pub amount: BigInt,
+}
+
+/// Transactions that move funds from legacy-format dCTIDH locks, see
+/// xntBuildMigration
+#[napi]
+pub struct XntMigrationPlan {
+    transactions: Vec<Option<crate::core::BuiltTransaction>>,
+    input_hashes: Vec<Vec<String>>,
+    swept_inputs: Vec<Vec<crate::core::MigrationInput>>,
+    dust_input_info: Vec<crate::core::MigrationInput>,
+    time_locked_info: Vec<crate::core::MigrationInput>,
+    totals_by_payment_id: Vec<(u64, u64, i128)>,
+    total: i128,
+    fees: i128,
+    dust_inputs: usize,
+    time_locked: usize,
+    skipped: usize,
+    tip_height: u64,
+}
+
+impl XntMigrationPlan {
+    fn from_core(plan: crate::core::MigrationPlan) -> Self {
+        let input_hashes = plan
+            .swept
+            .iter()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .map(|input| input.absolute_index_set_hash().to_hex())
+                    .collect()
+            })
+            .collect();
+        Self {
+            dust_inputs: plan.dust.iter().map(Vec::len).sum(),
+            time_locked: plan.time_locked.len(),
+            skipped: plan.skipped.total(),
+            total: plan.total,
+            fees: plan.fees,
+            tip_height: plan.tip_height,
+            input_hashes,
+            totals_by_payment_id: plan.totals_by_payment_id(),
+            swept_inputs: plan.swept_inputs,
+            dust_input_info: plan.dust_inputs.into_iter().flatten().collect(),
+            time_locked_info: plan.time_locked_inputs,
+            transactions: plan.transactions.into_iter().map(Some).collect(),
+        }
+    }
+}
+
+#[napi]
+impl XntMigrationPlan {
+    /// Number of transactions
+    #[napi(catch_unwind)]
+    pub fn num_transactions(&self) -> u32 {
+        self.transactions.len() as u32
+    }
+
+    /// Take all transactions not taken yet, the largest amounts first. Each
+    /// has one output, to the destination, and no change.
+    #[napi(catch_unwind)]
+    pub fn take_transactions(&mut self) -> Vec<XntBuiltTransaction> {
+        self.transactions
+            .iter_mut()
+            .filter_map(Option::take)
+            .map(|inner| XntBuiltTransaction { inner })
+            .collect()
+    }
+
+    /// Hex absolute index set hashes of the inputs of the transaction at
+    /// `index`, for xntCheckSpent: the transaction is confirmed once its inputs
+    /// are spent.
+    #[napi(catch_unwind)]
+    pub fn input_hashes(&self, index: u32) -> Result<Vec<String>> {
+        self.input_hashes
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| Error::from_reason("no transaction at this index"))
+    }
+
+    /// Inputs of the transaction at `index` with their legacy key index,
+    /// payment id, amount, block height, AOCL index and absolute index set
+    /// hash, in the order of inputHashes
+    #[napi(catch_unwind)]
+    pub fn inputs(&self, index: u32) -> Result<Vec<XntMigrationInput>> {
+        self.swept_inputs
+            .get(index as usize)
+            .map(|inputs| inputs.iter().map(XntMigrationInput::from_core).collect())
+            .ok_or_else(|| Error::from_reason("no transaction at this index"))
+    }
+
+    /// What the transactions spend per legacy key index and payment id, in
+    /// nau, before fees, sorted by key index and payment id. Covers the
+    /// inputs of the transactions, not those left out (dustInputInfo,
+    /// timeLockedInfo).
+    #[napi(catch_unwind)]
+    pub fn totals_by_payment_id(&self) -> Vec<XntMigrationPaymentIdTotal> {
+        self.totals_by_payment_id
+            .iter()
+            .map(|&(key_index, payment_id, amount)| XntMigrationPaymentIdTotal {
+                key_index: key_index as i64,
+                payment_id: payment_id as i64,
+                amount: BigInt::from(amount),
+            })
+            .collect()
+    }
+
+    /// The inputs left out because their batch holds no more than its fee,
+    /// see inputs()
+    #[napi(catch_unwind)]
+    pub fn dust_input_info(&self) -> Vec<XntMigrationInput> {
+        self.dust_input_info.iter().map(XntMigrationInput::from_core).collect()
+    }
+
+    /// The UTXOs at legacy-format locks left out because their time lock is
+    /// not released yet, see inputs()
+    #[napi(catch_unwind)]
+    pub fn time_locked_info(&self) -> Vec<XntMigrationInput> {
+        self.time_locked_info.iter().map(XntMigrationInput::from_core).collect()
+    }
+
+    /// Total moved to the destination, after fees, in nau
+    #[napi(catch_unwind)]
+    pub fn total(&self) -> BigInt {
+        BigInt::from(self.total)
+    }
+
+    /// Total of the fees in nau
+    #[napi(catch_unwind)]
+    pub fn fees(&self) -> BigInt {
+        BigInt::from(self.fees)
+    }
+
+    /// Height of the tip whose mutator set and membership proofs the
+    /// transactions were built on
+    #[napi(catch_unwind)]
+    pub fn tip_height(&self) -> i64 {
+        i64::try_from(self.tip_height).unwrap_or(i64::MAX)
+    }
+
+    /// Number of inputs left out because their batch holds no more than its
+    /// fee
+    #[napi(catch_unwind)]
+    pub fn dust_inputs(&self) -> u32 {
+        self.dust_inputs as u32
+    }
+
+    /// Number of UTXOs at legacy-format locks left out because their time
+    /// lock is not released yet
+    #[napi(catch_unwind)]
+    pub fn time_locked(&self) -> u32 {
+        self.time_locked as u32
+    }
+
+    /// Number of indexed entries the scans skipped
+    #[napi(catch_unwind)]
+    pub fn skipped(&self) -> u32 {
+        self.skipped as u32
+    }
+}
+
+/// Build the transactions that move every UTXO at the legacy-format dCTIDH
+/// locks of the given key indices of `wallet` that can be spent now to the
+/// bech32m address `destination` (a Generation or current-format dCTIDH
+/// address of `network`), ready for prove(). Nothing is proven or submitted.
+///
+/// At most 10 inputs per transaction, the largest first, and the fee the node
+/// uses for its own migration (0.1 coins for a proof collection); see
+/// xntBuildMigrationWith. A proof collection is valid only for the mutator set
+/// it was built on: prove, check and submit each transaction right away, and
+/// build the remaining ones again after a new block.
+#[napi(catch_unwind)]
+pub fn xnt_build_migration(
+    client: &XntRpcClient,
+    wallet: &XntWalletEntropy,
+    legacy_indices: Vec<i64>,
+    destination: String,
+    network: XntNetwork,
+) -> Result<XntMigrationPlan> {
+    xnt_build_migration_with(client, wallet, legacy_indices, destination, network, None, None, None, None)
+}
+
+/// xntBuildMigration with options: `fee` the fee of each transaction in nau,
+/// `maxInputs` the most inputs per transaction (default 10; before the
+/// UpgradeVMv8 fork capped at 10 with time locks, 11 without), and the heights
+/// scanned from `fromHeight` (default 0) to `toHeight` (default the tip).
+#[napi(catch_unwind)]
+#[allow(clippy::too_many_arguments)]
+pub fn xnt_build_migration_with(
+    client: &XntRpcClient,
+    wallet: &XntWalletEntropy,
+    legacy_indices: Vec<i64>,
+    destination: String,
+    network: XntNetwork,
+    fee: Option<BigInt>,
+    max_inputs: Option<u32>,
+    from_height: Option<i64>,
+    to_height: Option<i64>,
+) -> Result<XntMigrationPlan> {
+    let indices = legacy_indices
+        .iter()
+        .map(|&index| u64::try_from(index))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::from_reason("key indices must not be negative"))?;
+    let mut options = crate::core::MigrationOptions::default();
+    if let Some(fee) = fee {
+        let (fee, lossless) = fee.get_i128();
+        if !lossless {
+            return Err(Error::from_reason("fee overflow: value too large for i128"));
+        }
+        options.fee = Some(fee);
+    }
+    if let Some(max_inputs) = max_inputs {
+        options.max_inputs = max_inputs as usize;
+    }
+    if let Some(from_height) = from_height {
+        options.from_height = u64::try_from(from_height)
+            .map_err(|_| Error::from_reason("heights must not be negative"))?;
+    }
+    if let Some(to_height) = to_height {
+        options.to_height = Some(
+            u64::try_from(to_height)
+                .map_err(|_| Error::from_reason("heights must not be negative"))?,
+        );
+    }
+
+    crate::core::build_migration_with(
+        client.inner(),
+        &wallet.inner,
+        &indices,
+        &destination,
+        network.into(),
+        &options,
+    )
+    .map(XntMigrationPlan::from_core)
+    .map_err(|e| Error::from_reason(format!("build migration: {e}")))
 }
 
 /// Final transaction
@@ -1163,7 +1662,7 @@ pub struct XntTransaction {
 #[napi]
 impl XntTransaction {
     /// Deserialize from bytes
-    #[napi(factory)]
+    #[napi(factory, catch_unwind)]
     pub fn from_bytes(data: Buffer) -> Result<Self> {
         crate::core::Transaction::from_bytes(&data)
             .map(|tx| Self { inner: tx })
@@ -1171,7 +1670,7 @@ impl XntTransaction {
     }
 
     /// Serialize to bytes
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn to_bytes(&self) -> Result<Buffer> {
         self.inner
             .to_bytes()
@@ -1180,13 +1679,13 @@ impl XntTransaction {
     }
 
     /// Check if has ProofCollection
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn has_proof_collection(&self) -> bool {
         self.inner.has_proof_collection()
     }
 
     /// Check if has SingleProof
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn has_single_proof(&self) -> bool {
         self.inner.has_single_proof()
     }
@@ -1194,14 +1693,20 @@ impl XntTransaction {
     /// Check the transaction is confirmable against `mutator_set` (mirrors the
     /// node submit gate). Fetch the current tip via getMutatorSet and call this
     /// before submit() to detect a transaction that went stale while proving.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn is_confirmable(&self, mutator_set: &XntMutatorSet) -> bool {
         self.inner.is_confirmable(mutator_set.inner())
     }
 
-    /// Submit transaction to node. Returns the node's `success` field: `true`
-    /// if accepted + queued, `false` if rejected. Throws on RPC/transport error.
-    #[napi]
+    /// Submit transaction to node. Returns the node's `success` field. `true`
+    /// only means the node passed its validity and confirmability checks and
+    /// queued the transaction for its mempool: the node can still drop it,
+    /// for example if the fee is below its relay minimum. Confirm by looking
+    /// the transaction up in the mempool or waiting for its outputs on chain.
+    /// `false` means the node did not queue it. Throws for rejections the node
+    /// reports as errors (for example `NotConfirmable`) and on RPC/transport
+    /// errors.
+    #[napi(catch_unwind)]
     pub fn submit(&self, client: &XntRpcClient) -> Result<bool> {
         self.inner
             .submit(client.inner())
@@ -1212,13 +1717,13 @@ impl XntTransaction {
 // Utilities
 
 /// Library version
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_version() -> String {
     "0.1.0".to_string()
 }
 
 /// Get current timestamp in milliseconds
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_timestamp_now() -> i64 {
     crate::core::timestamp_now() as i64
 }
@@ -1226,7 +1731,7 @@ pub fn xnt_timestamp_now() -> i64 {
 /// Generate random sender randomness (40 bytes hex)
 ///
 /// Uses cryptographically secure OsRng for transaction privacy
-#[napi]
+#[napi(catch_unwind)]
 pub fn xnt_random_sender_randomness() -> String {
     use rand::RngExt;
     let mut bytes = [0u8; 40];
@@ -1235,7 +1740,9 @@ pub fn xnt_random_sender_randomness() -> String {
 }
 
 /// Select UTXOs to cover target amount (smallest-first)
-#[napi]
+///
+/// At most 200 inputs are selected, whatever `limit` is.
+#[napi(catch_unwind)]
 pub fn xnt_select_inputs(amounts: Vec<BigInt>, target: BigInt, limit: u32) -> Result<Vec<u32>> {
     let mut amts = Vec::with_capacity(amounts.len());
     for (i, b) in amounts.iter().enumerate() {

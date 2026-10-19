@@ -38,17 +38,13 @@ pub trait SubAddress: Sized {
     fn flag() -> BFieldElement;
 
     /// Encrypt a payload with payment_id included
-    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement>;
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Result<Vec<BFieldElement>>;
 
     /// Generate an announcement for this subaddress (default implementation)
-    fn generate_announcement(&self, payload: &UtxoNotificationPayload) -> Announcement {
-        let ciphertext = self.encrypt(payload);
-        let message = [
-            vec![Self::flag(), self.receiver_identifier()],
-            ciphertext,
-        ]
-        .concat();
-        Announcement::new(message)
+    fn generate_announcement(&self, payload: &UtxoNotificationPayload) -> Result<Announcement> {
+        let ciphertext = self.encrypt(payload)?;
+        let message = [vec![Self::flag(), self.receiver_identifier()], ciphertext].concat();
+        Ok(Announcement::new(message))
     }
 }
 

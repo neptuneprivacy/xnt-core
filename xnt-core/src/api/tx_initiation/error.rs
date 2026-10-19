@@ -49,6 +49,45 @@ pub enum CreateTxError {
 
     #[error("transparent transactions can only spend UTXOs held by Generation keys")]
     TransparentInputNotAllowed,
+
+    #[error("cannot send to this address: {0}")]
+    InvalidRecipient(String),
+
+    /// The fee of a transaction for the `UpgradeVMv7` era is below what nodes
+    /// of that era require to relay and upgrade its proof collection. See
+    /// [`legacy_era`](super::legacy_era).
+    #[error(
+        "fee {fee} is below {min_fee}, the least fee at which nodes of the current main-net \
+         release relay and upgrade a proof collection with {num_inputs} inputs before the \
+         next hard fork"
+    )]
+    LegacyEraFeeTooLow {
+        fee: NativeCurrencyAmount,
+        min_fee: NativeCurrencyAmount,
+        num_inputs: usize,
+    },
+
+    /// A transaction for the `UpgradeVMv7` era has more inputs than nodes of
+    /// that era upgrade the proof collection of. See
+    /// [`legacy_era`](super::legacy_era).
+    #[error(
+        "{num_inputs} inputs are more than the {max_num_inputs} that nodes of the current \
+         main-net release upgrade a proof collection with before the next hard fork; send \
+         the amount in several transactions"
+    )]
+    LegacyEraTooManyInputs {
+        num_inputs: usize,
+        max_num_inputs: usize,
+    },
+
+    /// An output of a transaction for the `UpgradeVMv7` era carries a type
+    /// script that is not known under its current hash in both eras. See
+    /// [`legacy_era`](super::legacy_era).
+    #[error(
+        "an output carries type script {0:x}; before the next hard fork, outputs carry only the \
+         native currency and time locks"
+    )]
+    LegacyEraTypeScript(Digest),
 }
 
 #[derive(Debug, Clone, thiserror::Error, strum::Display)]
@@ -92,14 +131,46 @@ pub enum CreateProofError {
     #[error("Could not forward job cancellation msg to proving job. {0}")]
     JobCancelSendError(#[from] tokio::sync::watch::error::SendError<()>),
 
+    /// No new transaction is created for this rule set, the one of the era
+    /// before the next hard fork: the fork is too close for the transaction to
+    /// be mined before it. See [`legacy_era`](super::legacy_era). Transactions
+    /// are created again once the next block belongs to the era after the
+    /// fork.
     #[error(
-        "this version verifies but cannot produce proofs for consensus rule set {0}; \
-         it produces proofs from the next hard fork on"
+        "no new transactions are created for consensus rule set {0}: the next hard fork is too \
+         close; new transactions are created again from the fork on"
     )]
     LegacyEra(crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet),
 
     #[error("link transaction cannot be fixed: {0}")]
     LinkTxNotFixable(&'static str),
+
+    #[error("this version cannot produce {proof} for consensus rule set {consensus_rule_set}")]
+    NotProducible {
+        proof: &'static str,
+        consensus_rule_set: crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet,
+    },
+
+    /// A freshly produced proof was rejected by the verifier of its era, so it
+    /// was not used.
+    #[error("the proof produced for program {0:x} does not verify")]
+    ProducedProofDoesNotVerify(Digest),
+
+    #[error(transparent)]
+    LegacyProving(#[from] crate::protocol::proof_abstractions::tasm::legacy_v7::LegacyProvingError),
+
+    #[error("no v7 single proof is made: {0}")]
+    V7SingleProofUnavailable(
+        #[from]
+        crate::protocol::consensus::transaction::validity::legacy_v7::V7SingleProofUnavailable,
+    ),
+
+    /// A program proven inside a v7 proof collection does not hash as the
+    /// nodes of the era before the fork compute it, so the collection would be
+    /// invalid there. See
+    /// `validity::legacy_v7::V7_PROOF_COLLECTION_PROGRAM_DIGESTS`.
+    #[error("no v7 proof collection is made: program {0} does not have its v7 digest")]
+    V7ProgramDigestMismatch(&'static str),
 }
 
 /// enumerates possible upgrade-proof errors
@@ -147,4 +218,15 @@ pub enum SendError {
 
     #[error("chained send failed: {0}")]
     Chained(String),
+
+    /// Before the next hard fork: the transaction comes within the cutoff
+    /// margin of the fork, or its proof collection pays too low a fee or has
+    /// too many proofs for the nodes of the era before the fork to relay and
+    /// upgrade it. See `legacy_era::submitted_transaction_meets_terms`.
+    #[error(
+        "transaction does not meet the terms of the era before the next hard fork: it comes \
+         within the cutoff margin of the fork, or its proof collection pays too low a fee or has \
+         too many proofs"
+    )]
+    BelowLegacyEraTerms,
 }

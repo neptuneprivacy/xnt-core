@@ -7,6 +7,10 @@ pub mod transfer_block;
 pub mod transfer_link_tx;
 pub mod transfer_transaction;
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod peer_wire_golden_tests;
+
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -34,6 +38,7 @@ use tracing::trace;
 use tracing::warn;
 use transaction_notification::TransactionNotification;
 use transfer_link_tx::TransferLinkTx;
+use transfer_transaction::TransactionProofQuality;
 use transfer_transaction::TransferTransaction;
 
 use super::consensus::block::block_header::BlockHeader;
@@ -781,9 +786,42 @@ pub struct MutablePeerState {
     /// Used on the receiver side to mirror the sender's cooldown so compliant
     /// peers (one challenge per `SYNC_CHALLENGE_COOLDOWN`) accrue no penalty.
     pub(crate) last_received_sync_challenge_time: Option<Timestamp>,
+
+    /// The transactions from this peer that were verified but not taken, see
+    /// [`UntakenTransaction`]. Such a transaction is verified once per tip,
+    /// and ignored when it comes again. Holds the latest
+    /// [`Self::MAX_UNTAKEN_TRANSACTIONS`].
+    untaken_transactions: Vec<UntakenTransaction>,
+}
+
+/// Why a transaction from a peer was verified but not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UntakenReason {
+    /// It is valid only on the other side of a hard fork next to the block
+    /// after the tip. Another proof of it, for the next block, may follow,
+    /// under the same id and of the same quality.
+    OtherEra,
+
+    /// It is valid only as the previous release checks it.
+    PreviousRelease,
+}
+
+/// A transaction from a peer that was verified but not taken, at the tip with
+/// the given digest: identified by its id, its proof quality and a fingerprint
+/// of its proof, so that another proof of the same transaction is verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UntakenTransaction {
+    pub(crate) tip: Digest,
+    pub(crate) txid: TransactionKernelId,
+    pub(crate) proof_quality: TransactionProofQuality,
+    pub(crate) proof_fingerprint: u64,
+    pub(crate) reason: UntakenReason,
 }
 
 impl MutablePeerState {
+    /// The largest number of untaken transactions remembered.
+    const MAX_UNTAKEN_TRANSACTIONS: usize = 64;
+
     pub fn new(block_height: BlockHeight) -> Self {
         Self {
             highest_shared_block_height: block_height,
@@ -791,7 +829,63 @@ impl MutablePeerState {
             sync_challenge: None,
             successful_sync_challenge_response_time: None,
             last_received_sync_challenge_time: None,
+            untaken_transactions: vec![],
         }
+    }
+
+    /// Whether this peer sent a transaction with this id that was verified but
+    /// not taken at the tip with this digest, whatever its proof.
+    pub(crate) fn has_untaken_transaction(&self, tip: Digest, txid: TransactionKernelId) -> bool {
+        self.untaken_transactions
+            .iter()
+            .any(|untaken| untaken.tip == tip && untaken.txid == txid)
+    }
+
+    /// Whether this peer sent this transaction, with this proof, that was
+    /// verified but not taken at the tip with this digest.
+    pub(crate) fn is_untaken_transaction(
+        &self,
+        tip: Digest,
+        txid: TransactionKernelId,
+        proof_quality: TransactionProofQuality,
+        proof_fingerprint: u64,
+    ) -> bool {
+        self.untaken_transactions.iter().any(|untaken| {
+            untaken.tip == tip
+                && untaken.txid == txid
+                && untaken.proof_quality == proof_quality
+                && untaken.proof_fingerprint == proof_fingerprint
+        })
+    }
+
+    /// Whether an announcement from this peer of a transaction with this id
+    /// and proof quality need not be followed up at the tip with this digest:
+    /// the peer sent such a transaction that is valid only as the previous
+    /// release checks it. One valid only on the other side of a hard fork is
+    /// requested again, as a proof for the next block may follow.
+    pub(crate) fn skips_announcement(
+        &self,
+        tip: Digest,
+        txid: TransactionKernelId,
+        proof_quality: TransactionProofQuality,
+    ) -> bool {
+        self.untaken_transactions.iter().any(|untaken| {
+            untaken.tip == tip
+                && untaken.txid == txid
+                && untaken.proof_quality == proof_quality
+                && untaken.reason == UntakenReason::PreviousRelease
+        })
+    }
+
+    /// Remember a transaction from this peer that was verified but not taken.
+    pub(crate) fn record_untaken_transaction(&mut self, untaken: UntakenTransaction) {
+        if self.untaken_transactions.contains(&untaken) {
+            return;
+        }
+        if self.untaken_transactions.len() >= Self::MAX_UNTAKEN_TRANSACTIONS {
+            self.untaken_transactions.remove(0);
+        }
+        self.untaken_transactions.push(untaken);
     }
 }
 

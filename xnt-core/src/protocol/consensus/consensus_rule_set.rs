@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use strum_macros::EnumIter;
 
 use crate::api::export::BlockHeight;
@@ -87,15 +89,122 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
 /// need no remap and remain spendable directly. Only `SingleProof`,
 /// `SingleProofV2` and `BlockProgram`, which embed the STARK verifier, re-hash.
 ///
-/// ROLLOUT: this binary verifies the v7 chain but cannot extend it, because a
-/// v7-era claim names the hardcoded v7 program digest and no v8 bytecode
-/// reproduces it. Before this height it therefore does not compose, nor hold
-/// or relay transactions (see `ConsensusRuleSet::is_legacy_era`), and the chain
-/// relies on composers still running the previous release to reach it.
+/// ROLLOUT: this binary verifies the v7 chain, and before this height it
+/// creates, relays and re-proves v7 transactions, but it does not compose v7
+/// blocks, nor update or merge v7 transactions: the chain relies on composers
+/// and proof upgraders still running the previous release to reach this
+/// height. See `ConsensusRuleSet::is_legacy_era`.
 ///
-/// Mainnet v8 activation height.
+/// Mainnet v8 activation height. Read it through
+/// [`upgrade_vm_v8_activation_height`], which also covers the other networks.
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET: BlockHeight =
     BlockHeight::new(BFieldElement::new(95_000u64));
+
+/// The height of the first block that follows the `UpgradeVMv8` consensus
+/// rule set on the given network: [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET`]
+/// on main net, and on the test networks the genesis block, so that they
+/// follow `UpgradeVMv8` from genesis on, unless the process has another
+/// activation height for the network (see [`set_v8_activation_height`]).
+///
+/// [`ConsensusRuleSet::infer_from`] switches to `UpgradeVMv8` at this height,
+/// and so does everything that derives from it: the rule set transactions are
+/// made for, the legacy relay pool, the peer version rule, and the legacy
+/// dCTIDH lock cutoff.
+pub(crate) fn upgrade_vm_v8_activation_height(network: Network) -> BlockHeight {
+    match network {
+        Network::Main => BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET,
+        Network::TestnetMock | Network::RegTest | Network::Testnet(_) => {
+            v8_activation_height_override(network).unwrap_or_else(BlockHeight::genesis)
+        }
+    }
+}
+
+/// The `UpgradeVMv8` activation height of one test network, for the whole
+/// process, set by [`set_v8_activation_height`].
+///
+/// The rule set of a height is a function of the network and the height
+/// alone, called from everywhere, also from code that holds no CLI
+/// arguments. So the setting lives here, set once at startup before any state
+/// is built, and read by [`upgrade_vm_v8_activation_height`] and nothing else.
+static V8_ACTIVATION_HEIGHT: OnceLock<(Network, BlockHeight)> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own activation height, see
+    /// [`tests::V8ActivationHeightForTests`]. It takes precedence over
+    /// [`V8_ACTIVATION_HEIGHT`], and is visible on the test's thread only, so
+    /// that tests running in parallel in one process do not see each other's.
+    static V8_ACTIVATION_HEIGHT_FOR_TESTS: std::cell::Cell<Option<(Network, BlockHeight)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn v8_activation_height_override(network: Network) -> Option<BlockHeight> {
+    #[cfg(test)]
+    if let Some((test_network, height)) = V8_ACTIVATION_HEIGHT_FOR_TESTS.get() {
+        return (test_network == network).then_some(height);
+    }
+
+    V8_ACTIVATION_HEIGHT
+        .get()
+        .filter(|(set_network, _)| *set_network == network)
+        .map(|(_, height)| *height)
+}
+
+/// Why an `UpgradeVMv8` activation height cannot be set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum V8ActivationHeightError {
+    #[error("the UpgradeVMv8 activation height of main net is fixed at block {BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET}")]
+    MainNet,
+
+    #[error("the UpgradeVMv8 activation height must be above the genesis block")]
+    Genesis,
+
+    #[error("the UpgradeVMv8 activation height is set already, to block {height} on {network}")]
+    AlreadySet {
+        network: Network,
+        height: BlockHeight,
+    },
+}
+
+/// Set the `UpgradeVMv8` activation height of a test network for this
+/// process, as `--v8-activation-height` does: blocks below it follow
+/// `UpgradeVMv7`, as main net does until its fork, the others `UpgradeVMv8`.
+/// The genesis block is the same either way: it has no proof, and is made
+/// without regard to rule sets.
+///
+/// Must be called before any state is built, as every rule set derived
+/// before would be that of the default. Can be called once only, but again
+/// with the same arguments. Refused on main net, whose activation height is
+/// fixed, and for the genesis block, which is the default.
+pub fn set_v8_activation_height(
+    network: Network,
+    height: BlockHeight,
+) -> Result<(), V8ActivationHeightError> {
+    set_v8_activation_height_in(&V8_ACTIVATION_HEIGHT, network, height)
+}
+
+fn set_v8_activation_height_in(
+    setting: &OnceLock<(Network, BlockHeight)>,
+    network: Network,
+    height: BlockHeight,
+) -> Result<(), V8ActivationHeightError> {
+    if network == Network::Main {
+        return Err(V8ActivationHeightError::MainNet);
+    }
+    if height.is_genesis() {
+        return Err(V8ActivationHeightError::Genesis);
+    }
+
+    let (set_network, set_height) = *setting.get_or_init(|| (network, height));
+    if (set_network, set_height) != (network, height) {
+        return Err(V8ActivationHeightError::AlreadySet {
+            network: set_network,
+            height: set_height,
+        });
+    }
+
+    Ok(())
+}
 
 /// Enumerates all possible sets of consensus rules.
 ///
@@ -116,11 +225,13 @@ pub enum ConsensusRuleSet {
     /// The +1 year timelock extension hard fork.
     ///
     /// Activated at [`BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET`] on
-    /// Main (mainnet-only). Under this ruleset, any coin still tagged with the
-    /// legacy `TimeLock` hash is governed by `TimeLockV2`, which enforces
+    /// Main (mainnet-only). Under this ruleset, a coin still tagged with the
+    /// legacy `TimeLock` hash is governed by `TimeLockV2`. For the four target
+    /// UTXOs of the extension (`TimeLockV2::target_utxo_digests`), it enforces
     /// `release_date + 1 year < timestamp` instead of the original
-    /// `release_date < timestamp`. New post-fork timelock UTXOs use
-    /// `TimeLockV2`'s own hash and follow normal release rules.
+    /// `release_date < timestamp`; for every other such coin, the original
+    /// release date holds. New post-fork timelock UTXOs use `TimeLockV2`'s own
+    /// hash and follow normal release rules.
     TimelockExtension,
     /// The triton-vm v3 / tasm-lib upgrade hard fork.
     ///
@@ -278,18 +389,23 @@ impl ConsensusRuleSet {
         }
     }
 
-    /// Whether this is the era immediately before the current one, which this
-    /// binary verifies with the legacy triton-vm v7 but cannot produce proofs
-    /// for.
+    /// Whether this is the era immediately before the current one, whose
+    /// proofs this binary verifies and produces with the legacy triton-vm v7.
     ///
     /// On main net the chain stays in this era until
     /// [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET`]. A node running this
-    /// binary before then verifies every block fully, but it must not compose
-    /// blocks or create, merge, upgrade or relay transactions: their proofs need
-    /// the v7 consensus programs, which this binary does not contain. Composing
-    /// a block of this era would fail at the first proof, and a v7 transaction
-    /// held in the mempool across the fork would make the first `UpgradeVMv8`
-    /// block impossible to compose.
+    /// binary before then verifies every block fully. While the next block
+    /// belongs to this era, it creates transactions with v7 proof collections,
+    /// and with v7 single proofs where the machine can hold them, verifies and
+    /// relays v7 transactions, and re-proves its own ones from their primitive
+    /// witnesses on every block. It keeps all of them in a pool of their own,
+    /// apart from the mempool (see `state::legacy_relay_pool`), so that the
+    /// composer and the proof upgrader never see them: it does not compose
+    /// blocks of this era, nor update or merge v7 transactions, and a v7
+    /// transaction held across the fork would make the first `UpgradeVMv8`
+    /// block impossible to compose. The pool is cleared when the next block
+    /// belongs to `UpgradeVMv8`, and new v7 transactions are refused a few
+    /// blocks before that (see `api::tx_initiation::legacy_era`).
     pub(crate) fn is_legacy_era(&self) -> bool {
         match self {
             ConsensusRuleSet::UpgradeVMv7 => true,
@@ -337,6 +453,13 @@ impl ConsensusRuleSet {
             .expect("Max block size cannot be less than that of a big proof")
     }
 
+    /// The rule set of the block that follows a tip at `tip_height`: the rule
+    /// set under which a transaction made now is mined, and so the one it must
+    /// be proven, verified and held for.
+    pub fn infer_for_next_block(network: Network, tip_height: BlockHeight) -> Self {
+        Self::infer_from(network, tip_height.next())
+    }
+
     /// Infer the [`ConsensusRuleSet`] from the [`Network`] and the
     /// [`BlockHeight`]. The second argument is necessary to take into account
     /// planned hard or soft forks that activate at a given height. The first
@@ -359,14 +482,18 @@ impl ConsensusRuleSet {
                     ConsensusRuleSet::UpgradeVMv4
                 } else if block_height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET {
                     ConsensusRuleSet::UpgradeVMv5
-                } else if block_height < BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET {
+                } else if block_height < upgrade_vm_v8_activation_height(network) {
                     ConsensusRuleSet::UpgradeVMv7
                 } else {
                     ConsensusRuleSet::UpgradeVMv8
                 }
             }
             Network::TestnetMock | Network::RegTest | Network::Testnet(_) => {
-                ConsensusRuleSet::UpgradeVMv8
+                if block_height < upgrade_vm_v8_activation_height(network) {
+                    ConsensusRuleSet::UpgradeVMv7
+                } else {
+                    ConsensusRuleSet::UpgradeVMv8
+                }
             }
         }
     }
@@ -608,6 +735,158 @@ pub(crate) mod tests {
     use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
     use crate::tests::tokio_runtime;
 
+    /// A test's own `UpgradeVMv8` activation height for a test network, until
+    /// dropped; see [`upgrade_vm_v8_activation_height`].
+    ///
+    /// The height is visible on the thread that set it only. A test sees it in
+    /// the code it runs directly, also in async code driven by `block_on` on
+    /// its thread, as `shared_tokio_runtime` does, but not in tasks spawned
+    /// onto the runtime's worker threads.
+    pub(crate) struct V8ActivationHeightForTests {
+        previous: Option<(Network, BlockHeight)>,
+    }
+
+    impl V8ActivationHeightForTests {
+        pub(crate) fn set(network: Network, height: BlockHeight) -> Self {
+            assert_ne!(
+                Network::Main,
+                network,
+                "main net's activation height is fixed"
+            );
+            let previous = V8_ACTIVATION_HEIGHT_FOR_TESTS.replace(Some((network, height)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for V8ActivationHeightForTests {
+        fn drop(&mut self) {
+            V8_ACTIVATION_HEIGHT_FOR_TESTS.set(self.previous);
+        }
+    }
+
+    /// The activation height can be set once, for a test network, above the
+    /// genesis block; again with the same arguments, but not with others.
+    #[test]
+    fn v8_activation_height_is_set_once_for_a_test_network() {
+        let setting = OnceLock::new();
+        let height = |h: u64| BlockHeight::new(BFieldElement::new(h));
+
+        assert_eq!(
+            Err(V8ActivationHeightError::MainNet),
+            set_v8_activation_height_in(&setting, Network::Main, height(100))
+        );
+        assert_eq!(
+            Err(V8ActivationHeightError::Genesis),
+            set_v8_activation_height_in(&setting, Network::RegTest, BlockHeight::genesis())
+        );
+        assert!(setting.get().is_none());
+
+        assert_eq!(
+            Ok(()),
+            set_v8_activation_height_in(&setting, Network::Testnet(3), height(100))
+        );
+        assert_eq!(
+            Ok(()),
+            set_v8_activation_height_in(&setting, Network::Testnet(3), height(100))
+        );
+        let already_set = Err(V8ActivationHeightError::AlreadySet {
+            network: Network::Testnet(3),
+            height: height(100),
+        });
+        assert_eq!(
+            already_set,
+            set_v8_activation_height_in(&setting, Network::Testnet(3), height(101))
+        );
+        assert_eq!(
+            already_set,
+            set_v8_activation_height_in(&setting, Network::RegTest, height(100))
+        );
+        assert_eq!(Some(&(Network::Testnet(3), height(100))), setting.get());
+    }
+
+    /// With an activation height, a test network follows `UpgradeVMv7` below
+    /// it and `UpgradeVMv8` from it on, as main net does around its fork, and
+    /// so do the rule set of the next block, the peer version rule and the
+    /// legacy dCTIDH lock cutoff. The genesis block is unchanged, and so are
+    /// main net and the other test networks.
+    #[test]
+    fn a_test_network_with_a_v8_activation_height_follows_v7_below_it() {
+        use crate::application::loops::connect_to_peers::version_follows_rule_set;
+        use crate::state::wallet::address::dctidh_address::legacy_dctidh_cutoff;
+
+        let height = |h: u64| BlockHeight::new(BFieldElement::new(h));
+        let network = Network::RegTest;
+        let genesis_without = Block::genesis(network);
+        let main_net_rule_sets = (0..10)
+            .map(|h| ConsensusRuleSet::infer_from(Network::Main, height(h)))
+            .collect_vec();
+
+        let activation = height(5);
+        let override_height = V8ActivationHeightForTests::set(network, activation);
+        assert_eq!(activation, upgrade_vm_v8_activation_height(network));
+        for h in 0..10 {
+            let expected = if h < 5 {
+                ConsensusRuleSet::UpgradeVMv7
+            } else {
+                ConsensusRuleSet::UpgradeVMv8
+            };
+            assert_eq!(
+                expected,
+                ConsensusRuleSet::infer_from(network, height(h)),
+                "{h}"
+            );
+            assert_eq!(
+                ConsensusRuleSet::infer_from(network, height(h + 1)),
+                ConsensusRuleSet::infer_for_next_block(network, height(h)),
+                "{h}"
+            );
+            assert_eq!(
+                h < 5,
+                version_follows_rule_set("0.2.5", ConsensusRuleSet::infer_from(network, height(h))),
+                "a peer of the previous release at tip {h}"
+            );
+            assert!(version_follows_rule_set(
+                "0.3.0",
+                ConsensusRuleSet::infer_from(network, height(h))
+            ));
+        }
+        assert!(ConsensusRuleSet::infer_for_next_block(network, height(3)).is_legacy_era());
+        assert!(!ConsensusRuleSet::infer_for_next_block(network, height(4)).is_legacy_era());
+        assert_eq!(Some(activation), legacy_dctidh_cutoff(network));
+
+        assert_eq!(genesis_without.hash(), Block::genesis(network).hash());
+        for other in [Network::TestnetMock, Network::Testnet(0)] {
+            assert!(
+                upgrade_vm_v8_activation_height(other).is_genesis(),
+                "{other}"
+            );
+            assert_eq!(None, legacy_dctidh_cutoff(other), "{other}");
+            assert_eq!(
+                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::infer_from(other, BlockHeight::genesis()),
+                "{other}"
+            );
+        }
+        assert_eq!(
+            main_net_rule_sets,
+            (0..10)
+                .map(|h| ConsensusRuleSet::infer_from(Network::Main, height(h)))
+                .collect_vec()
+        );
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET,
+            upgrade_vm_v8_activation_height(Network::Main)
+        );
+
+        drop(override_height);
+        assert!(upgrade_vm_v8_activation_height(network).is_genesis());
+        assert_eq!(None, legacy_dctidh_cutoff(network));
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            ConsensusRuleSet::infer_from(network, BlockHeight::genesis())
+        );
+    }
+
     /// The legacy era is exactly `UpgradeVMv7`, the era before the v8 fork. On
     /// main net it ends at the fork height: a composer whose tip is the last v7
     /// block composes the first v8 block, while one block earlier it waits.
@@ -649,6 +928,53 @@ pub(crate) mod tests {
                     "{network} height {h} is not in the legacy era"
                 );
             }
+        }
+    }
+
+    /// Transactions are made for the rule set of the next block. On main net,
+    /// a tip at 94,998 is followed by the last v7 block, a tip at 94,999 by the
+    /// fork block, so from that tip on transactions are made for v8. The test
+    /// networks follow v8 from genesis on.
+    #[test]
+    fn next_block_rule_set_switches_one_block_before_the_fork_height() {
+        let height = |h: u64| BlockHeight::new(BFieldElement::new(h));
+        let fork = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
+        assert_eq!(fork, upgrade_vm_v8_activation_height(Network::Main));
+        assert_eq!(95_000, fork.value());
+
+        for (tip, expected) in [
+            (94_998, ConsensusRuleSet::UpgradeVMv7),
+            (94_999, ConsensusRuleSet::UpgradeVMv8),
+            (95_000, ConsensusRuleSet::UpgradeVMv8),
+        ] {
+            assert_eq!(
+                expected,
+                ConsensusRuleSet::infer_for_next_block(Network::Main, height(tip)),
+                "tip at {tip}"
+            );
+            assert_eq!(
+                ConsensusRuleSet::infer_from(Network::Main, height(tip + 1)),
+                ConsensusRuleSet::infer_for_next_block(Network::Main, height(tip)),
+            );
+        }
+
+        // `infer_from` switches exactly at the activation height.
+        assert!(
+            ConsensusRuleSet::infer_from(Network::Main, fork.previous().unwrap()).is_legacy_era()
+        );
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            ConsensusRuleSet::infer_from(Network::Main, fork)
+        );
+
+        for network in [Network::Testnet(0), Network::RegTest, Network::TestnetMock] {
+            let activation = upgrade_vm_v8_activation_height(network);
+            assert!(activation.is_genesis(), "{network}");
+            assert_eq!(
+                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::infer_for_next_block(network, BlockHeight::genesis()),
+                "{network}"
+            );
         }
     }
 

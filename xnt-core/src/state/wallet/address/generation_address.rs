@@ -243,13 +243,13 @@ impl common::SubAddress for GenerationSubAddress {
         GENERATION_SUBADDR_FLAG
     }
 
-    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement> {
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Result<Vec<BFieldElement>> {
         let payload_with_id = UtxoNotificationPayload::with_payment_id(
             payload.utxo.clone(),
             payload.sender_randomness,
             self.payment_id,
         );
-        self.base.encrypt(&payload_with_id)
+        Ok(self.base.encrypt(&payload_with_id))
     }
 }
 

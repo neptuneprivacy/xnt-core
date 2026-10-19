@@ -18,6 +18,11 @@ pub struct WalletStatusElement {
     /// Payment ID from subaddress. Zero for base address UTXOs.
     #[serde(default)]
     pub payment_id: u64,
+    /// Whether the UTXO is held at a legacy-format dCTIDH lock. Such funds are
+    /// not part of the available balance. Not serialized, so the serialized
+    /// layout is unchanged; always `false` after deserialization.
+    #[serde(skip)]
+    pub is_legacy: bool,
 }
 
 impl WalletStatusElement {
@@ -26,6 +31,7 @@ impl WalletStatusElement {
             aocl_leaf_index,
             utxo,
             payment_id: payment_id.value(),
+            is_legacy: false,
         }
     }
 }
@@ -91,13 +97,26 @@ impl WalletStatus {
             .sum::<NativeCurrencyAmount>()
     }
 
-    /// synced, available balance (excludes timelocked utxos with active timelocks)
+    /// synced, available balance (excludes timelocked utxos with active
+    /// timelocks and funds at legacy-format dCTIDH locks)
     pub fn available_confirmed(&self, timestamp: Timestamp) -> NativeCurrencyAmount {
         self.synced_unspent
             .iter()
+            .filter(|(wse, _msmp)| !wse.is_legacy)
             .map(|(wse, _msmp)| &wse.utxo)
             .filter(|utxo| utxo.can_spend_at(timestamp))
             .map(|utxo| utxo.get_native_currency_amount())
+            .sum::<NativeCurrencyAmount>()
+    }
+
+    /// synced, unspent funds at legacy-format dCTIDH locks (only). These are
+    /// included in [Self::total_confirmed] but not in
+    /// [Self::available_confirmed].
+    pub fn legacy_confirmed(&self) -> NativeCurrencyAmount {
+        self.synced_unspent
+            .iter()
+            .filter(|(wse, _msmp)| wse.is_legacy)
+            .map(|(wse, _msmp)| wse.utxo.get_native_currency_amount())
             .sum::<NativeCurrencyAmount>()
     }
 

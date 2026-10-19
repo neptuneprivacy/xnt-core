@@ -32,6 +32,11 @@ pub fn main() -> Result<()> {
             anyhow::bail!(e);
         }
 
+        // Validate dCTIDH migration settings
+        if let Err(e) = args.validate_dctidh_migration() {
+            anyhow::bail!(e);
+        }
+
         #[cfg(not(feature = "tokio-console"))]
         {
             use std::io::Write;

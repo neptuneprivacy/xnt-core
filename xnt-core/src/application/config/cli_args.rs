@@ -25,10 +25,13 @@ use super::parser::multiaddr::parse_ip_or_multiaddr;
 use super::parser::peer_address::PeerAddress;
 use crate::application::config::auto_consolidation::AutoConsolidationSettings;
 use crate::application::config::auto_consolidation::ConsolidationTarget;
+use crate::application::config::dctidh_migration::DctidhMigrationSettings;
 use crate::application::config::triton_vm_env_vars::TritonVmEnvVars;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::application::json_rpc::core::api::ops::Namespace;
 use crate::application::triton_vm_job_queue::TritonVmJobPriority;
+use crate::protocol::consensus::block::block_height::BlockHeight;
+use crate::protocol::consensus::consensus_rule_set::set_v8_activation_height;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::peer::transfer_transaction::TransactionProofQuality;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
@@ -265,28 +268,80 @@ pub struct Args {
     #[clap(long, default_value = "0.0005", value_parser = NativeCurrencyAmount::coins_from_str)]
     pub(crate) min_relay_pctx_fee_per_input: NativeCurrencyAmount,
 
-    /// If set, periodically move funds received at legacy-format dCTIDH
-    /// addresses to a destination, one batch per new block. Current-format
-    /// dCTIDH funds are left untouched. Leave unset to disable.
+    /// The number of blocks before a hard fork from which this node creates no
+    /// new transactions for the era before the fork.
     ///
-    /// Accepts `generation` (move to a freshly derived Generation address of
-    /// this wallet), `dctidh` (a freshly derived current-format dCTIDH address
-    /// of this wallet), or an explicit bech32m address.
+    /// Such a transaction must be mined before the fork, and this version
+    /// cannot carry it over. Main net follows the `UpgradeVMv7` consensus rule
+    /// set until the `UpgradeVMv8` hard fork at block 95000; with the default,
+    /// the last such transactions are created on top of block 94989. The
+    /// transactions created before go on being relayed and re-proven until the
+    /// next block belongs to the new era.
+    #[clap(long, default_value = "10", value_name = "BLOCKS")]
+    pub(crate) fork_tx_cutoff_margin: u64,
+
+    /// On a test network, the height of the first block that follows the
+    /// `UpgradeVMv8` consensus rule set. The blocks below it follow
+    /// `UpgradeVMv7`, as main net does until its hard fork at block 95000, so
+    /// that the switch between the two eras can be exercised on a test
+    /// network, also together with nodes of the previous release, which follow
+    /// `UpgradeVMv7` there from genesis on. This node does not compose blocks
+    /// below it. The genesis block is the same with and without it.
+    ///
+    /// Only for testnet, testnet-mock and regtest, and above 0; refused on
+    /// main net, whose fork height is fixed. All nodes of a test network must
+    /// use the same value. Without it, test networks follow `UpgradeVMv8` from
+    /// genesis on.
+    #[clap(long, value_name = "HEIGHT")]
+    pub(crate) v8_activation_height: Option<u64>,
+
+    /// If set, move funds received at legacy-format dCTIDH addresses to a
+    /// destination, one batch per new block, also after startup and for
+    /// blocks this node finds. Current-format dCTIDH funds are left untouched.
+    /// Nothing happens while the node is syncing, nor within
+    /// --fork-tx-cutoff-margin blocks before the UpgradeVMv8 hard fork. Before
+    /// that, the transactions are made for the era before the fork, with at
+    /// most 10 inputs each. Leave unset to disable.
+    ///
+    /// Accepts `generation` (a Generation address of this wallet), `dctidh` (a
+    /// current-format dCTIDH address of this wallet), or an explicit bech32m
+    /// address. For `generation` and `dctidh`, each transaction goes to the
+    /// next unused address of that type, unless --migrate-dctidh-index is
+    /// given. An explicit address not owned by this wallet also requires
+    /// --migrate-dctidh-allow-foreign.
     #[clap(long, value_name = "generation|dctidh|ADDRESS")]
     pub(crate) migrate_dctidh: Option<String>,
 
-    /// Fee attached to each dCTIDH migration transaction.
-    #[clap(long, default_value = "0.01", value_parser = NativeCurrencyAmount::coins_from_str)]
-    pub(crate) migrate_dctidh_fee: NativeCurrencyAmount,
+    /// Fee attached to each dCTIDH migration transaction. Must be at least
+    /// --min-relay-pctx-fee-per-input times --migrate-dctidh-batch.
+    ///
+    /// If unset, the fee follows the proving capability like for
+    /// --auto-consolidate: 0.005 on nodes that can produce single proofs, 0.1
+    /// on nodes that can only produce proof collections, and never less than
+    /// --min-relay-pctx-fee-per-input per input.
+    #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+    pub(crate) migrate_dctidh_fee: Option<NativeCurrencyAmount>,
 
-    /// Maximum number of inputs consumed by each dCTIDH migration transaction.
+    /// Maximum number of inputs consumed by each dCTIDH migration transaction,
+    /// between 1 and 200. The largest UTXOs are moved first; UTXOs not worth
+    /// more than their share of the fee are not moved.
     #[clap(long, default_value = "10")]
     pub(crate) migrate_dctidh_batch: usize,
 
-    /// Wallet derivation index used as the destination when --migrate-dctidh is
-    /// `generation` or `dctidh`. Ignored for an explicit destination address.
-    #[clap(long, default_value = "0")]
-    pub(crate) migrate_dctidh_index: u64,
+    /// Derivation index of the destination when --migrate-dctidh is
+    /// `generation` or `dctidh`; all transactions then go to this one address.
+    /// If the wallet has not derived the index yet, its derivation counter is
+    /// raised at startup. Not allowed with an explicit destination address.
+    #[clap(long)]
+    pub(crate) migrate_dctidh_index: Option<u64>,
+
+    /// Allow --migrate-dctidh to send to an explicit address that is not owned
+    /// by this wallet.
+    #[clap(long)]
+    pub(crate) migrate_dctidh_allow_foreign: bool,
+
+    #[clap(skip)]
+    pub(crate) dctidh_migration_cache: OnceLock<Option<DctidhMigrationSettings>>,
 
     /// Enable automatic consolidation of UTXOs.
     ///
@@ -1023,6 +1078,59 @@ impl Args {
             .clone()
     }
 
+    /// Applies `--v8-activation-height` to this process, see
+    /// [`set_v8_activation_height`]. Returns an error if it is given for main
+    /// net or as 0, or if another activation height is set already.
+    ///
+    /// Must be called before any state is built.
+    pub fn apply_v8_activation_height(&self) -> Result<(), String> {
+        let Some(height) = self.v8_activation_height else {
+            return Ok(());
+        };
+        set_v8_activation_height(self.network, BlockHeight::from(height))
+            .map_err(|err| format!("--v8-activation-height {height}: {err}"))?;
+        tracing::info!(
+            "{}: the UpgradeVMv8 consensus rule set activates at block {height}",
+            self.network
+        );
+
+        Ok(())
+    }
+
+    /// Validates the dCTIDH migration settings, including the destination
+    /// address, and caches them. Returns an error if `--migrate-dctidh` or the
+    /// flags that go with it are invalid.
+    ///
+    /// The checks against the wallet happen at startup, see
+    /// [`DctidhMigrationSettings::prepare_wallet`].
+    pub fn validate_dctidh_migration(&self) -> Result<(), String> {
+        let settings = DctidhMigrationSettings::parse(self).map_err(|err| err.to_string())?;
+        if let Some(settings) = &settings {
+            settings
+                .validate_destination()
+                .map_err(|err| err.to_string())?;
+        }
+
+        let _ = self.dctidh_migration_cache.set(settings);
+        Ok(())
+    }
+
+    /// Get the dCTIDH migration settings, or `None` if the migration is off.
+    ///
+    /// Invalid settings are rejected at startup by
+    /// [`Self::validate_dctidh_migration`]. If that was skipped and the
+    /// settings are invalid, the migration is off.
+    pub(crate) fn dctidh_migration(&self) -> Option<DctidhMigrationSettings> {
+        self.dctidh_migration_cache
+            .get_or_init(|| {
+                DctidhMigrationSettings::parse(self).unwrap_or_else(|err| {
+                    tracing::warn!("dCTIDH migration disabled: {err}");
+                    None
+                })
+            })
+            .clone()
+    }
+
     pub(crate) fn proof_job_options(
         &self,
         job_priority: TritonVmJobPriority,
@@ -1642,5 +1750,40 @@ mod tests {
         assert_range_eq!(5u64..=u64::MAX, parse_range("5:").unwrap());
         assert_range_eq!(0u64..10, parse_range(":10").unwrap());
         assert_range_eq!(0u64..=u64::MAX, parse_range(":").unwrap());
+    }
+
+    /// `--v8-activation-height` is refused on main net and as 0, before
+    /// anything is set; without it, nothing is set.
+    #[test]
+    fn v8_activation_height_is_refused_on_main_net_and_at_genesis() {
+        assert_eq!(None, Args::default().v8_activation_height);
+        assert!(Args::default().apply_v8_activation_height().is_ok());
+
+        let main_net = Args::try_parse_from([
+            "xnt-core",
+            "--network",
+            "main",
+            "--v8-activation-height",
+            "100",
+        ])
+        .unwrap();
+        assert_eq!(Some(100), main_net.v8_activation_height);
+        assert!(main_net
+            .apply_v8_activation_height()
+            .unwrap_err()
+            .contains("main net"));
+
+        let at_genesis = Args::try_parse_from([
+            "xnt-core",
+            "--network",
+            "regtest",
+            "--v8-activation-height",
+            "0",
+        ])
+        .unwrap();
+        assert!(at_genesis
+            .apply_v8_activation_height()
+            .unwrap_err()
+            .contains("genesis"));
     }
 }

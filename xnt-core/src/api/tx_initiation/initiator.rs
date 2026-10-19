@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tasm_lib::prelude::Digest;
 
 use super::error;
+use super::legacy_era;
 use crate::api::export::Timestamp;
 use crate::api::tx_initiation::builder::transaction_builder::TransactionBuilder;
 use crate::api::tx_initiation::builder::transaction_details_builder::TransactionDetailsBuilder;
@@ -58,26 +59,12 @@ use num_traits::CheckedSub;
 use num_traits::Zero;
 
 use crate::state::wallet::address::KeyType;
-use crate::state::wallet::address::ReceivingAddress;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::transaction_input::TxInput;
 use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutput;
 use crate::state::wallet::transaction_output::TxOutputList;
-use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
 use crate::GlobalStateLock;
-
-/// Where [`TransactionInitiator::migrate_dctidh_utxos`] should send the moved
-/// funds.
-#[derive(Debug, Clone)]
-pub enum MigrationDestination {
-    /// An explicit destination address.
-    Address(ReceivingAddress),
-    /// This wallet's Generation address at the given derivation index.
-    NewGeneration { index: u64 },
-    /// This wallet's current-format dCTIDH address at the given derivation index.
-    NewDctidh { index: u64 },
-}
 
 /// A mempool transaction a chained transaction spends an unconfirmed output of.
 ///
@@ -284,6 +271,24 @@ impl TransactionInitiator {
                 kernel.outputs.len(),
                 kernel.announcements.len(),
             )?;
+        }
+
+        // Before the fork, the terms of that era apply, as for every
+        // submission, see `legacy_era::submitted_transaction_meets_terms`.
+        {
+            let cli = self.global_state_lock.cli();
+            let state = self.global_state_lock.lock_guard().await;
+            let tip_height = state.chain.light_state().header().height;
+            if state.next_block_consensus_rule_set().is_legacy_era()
+                && !legacy_era::submitted_transaction_meets_terms(
+                    &tx.transaction,
+                    cli.network,
+                    tip_height,
+                    cli.fork_tx_cutoff_margin,
+                )
+            {
+                return Err(error::SendError::BelowLegacyEraTerms);
+            }
         }
 
         // note: acquires write-lock.
@@ -798,6 +803,24 @@ impl TransactionInitiator {
 
         tracing::debug!("tx send initiated.");
 
+        // The transaction is made for the rule set of the next block. Before
+        // the fork, that may be the legacy era's, see `legacy_era`.
+        let cli_args = self.global_state_lock.cli();
+        let network = cli_args.network;
+        let tip_height = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        let consensus_rule_set = legacy_era::rule_set_for_new_transaction(
+            network,
+            tip_height,
+            cli_args.fork_tx_cutoff_margin,
+        )?;
+
         // The target proof-type is set to the lowest possible value here,
         // since we don't want the client (CLI or dashboard) to hang while
         // producing proofs. Instead, we let (a task started by) main loop
@@ -807,9 +830,16 @@ impl TransactionInitiator {
         // generate outputs
         let tx_outputs = self.generate_tx_outputs(outputs).await;
 
-        // select inputs
+        // select inputs: the smallest first, but before the fork, where a
+        // transaction may have only a few inputs (see
+        // `legacy_era::check_proof_collection_terms`), the largest first
         let spend_amount = tx_outputs.total_native_coins() + fee;
-        let policy = InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending);
+        let sort_order = if consensus_rule_set.is_legacy_era() {
+            SortOrder::Descending
+        } else {
+            SortOrder::Ascending
+        };
+        let policy = InputSelectionPolicy::ByNativeCoinAmount(sort_order);
         let mut spendable_inputs: Vec<TxInput> = self
             .spendable_inputs(timestamp, exclude_recent_blocks)
             .await
@@ -845,18 +875,12 @@ impl TransactionInitiator {
             .build(&mut self.global_state_lock.clone().into())
             .await?;
 
-        let block_height = self
-            .global_state_lock
-            .lock_guard()
-            .await
-            .chain
-            .light_state()
-            .header()
-            .height;
-        let cli_args = self.global_state_lock.cli();
-        let network = cli_args.network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
-        // drop(state_lock); // release lock asap.
+        // A transaction for the legacy era may end up with its proof
+        // collection, so it must meet the terms on which that era's nodes
+        // relay and upgrade one.
+        if consensus_rule_set.is_legacy_era() {
+            legacy_era::check_proof_collection_terms(&tx_details.primitive_witness())?;
+        }
 
         tracing::info!("send: proving tx:\n{}", tx_details);
 
@@ -896,148 +920,6 @@ impl TransactionInitiator {
         Ok(tx_creation_artifacts)
     }
 
-    /// Move funds held at legacy-format dCTIDH keys to a destination,
-    /// consolidating a batch of such UTXOs into a single output.
-    ///
-    /// Only UTXOs locked by legacy-format dCTIDH keys are spent; current-format
-    /// dCTIDH UTXOs and everything else in the wallet are left untouched. The
-    /// selected inputs, minus `fee`, are sent to `destination` as one on-chain
-    /// output. Because the destination is never a legacy-format lock, the moved
-    /// funds are not re-selected on a later call. The destination may be an
-    /// explicit address or this wallet's Generation / current-format dCTIDH
-    /// address at a fixed derivation index (no wallet counter is advanced). The
-    /// output is always announced on-chain, also when it is owned by this
-    /// wallet, so the moved funds can be found again from the seed alone.
-    ///
-    /// Returns `Ok(None)` when there is nothing to move (no matching UTXOs, or
-    /// the available amount does not cover the fee). Otherwise returns the
-    /// created transaction artifacts. Bound the batch with `max_inputs` and call
-    /// repeatedly across blocks to drain a large set.
-    pub async fn migrate_dctidh_utxos(
-        &mut self,
-        destination: MigrationDestination,
-        fee: NativeCurrencyAmount,
-        timestamp: Timestamp,
-        exclude_recent_blocks: usize,
-        max_inputs: Option<usize>,
-    ) -> Result<Option<TxCreationArtifacts>, error::SendError> {
-        self.private().check_proceed_with_send(fee).await?;
-
-        // Lock-script hashes controlled by legacy-format dCTIDH keys.
-        let dctidh_locks: HashSet<Digest> = self
-            .global_state_lock
-            .lock_guard()
-            .await
-            .wallet_state
-            .get_known_legacy_dctidh_keys()
-            .map(|key| key.lock_script_hash())
-            .collect();
-
-        // Restrict spendable inputs to those locked by legacy-format dCTIDH keys.
-        let mut inputs: Vec<TxInput> = self
-            .spendable_inputs(timestamp, exclude_recent_blocks)
-            .await
-            .into();
-        inputs.retain(|input| dctidh_locks.contains(&input.utxo.lock_script_hash()));
-        if let Some(limit) = max_inputs {
-            inputs.truncate(limit);
-        }
-        if inputs.is_empty() {
-            return Ok(None);
-        }
-
-        let total: NativeCurrencyAmount = inputs
-            .iter()
-            .map(|input| input.utxo.get_native_currency_amount())
-            .sum();
-        let Some(output_amount) = total.checked_sub(&fee) else {
-            return Ok(None);
-        };
-        if output_amount == NativeCurrencyAmount::coins(0) {
-            return Ok(None);
-        }
-
-        // Resolve the destination. Self-derived destinations use a fixed
-        // derivation index, so no wallet counter is advanced and the address is
-        // always recoverable from the seed.
-        let destination = match destination {
-            MigrationDestination::Address(address) => address,
-            MigrationDestination::NewGeneration { index } => self
-                .global_state_lock
-                .lock_guard()
-                .await
-                .wallet_state
-                .nth_spending_key(KeyType::Generation, index)
-                .to_address(),
-            MigrationDestination::NewDctidh { index } => self
-                .global_state_lock
-                .lock_guard()
-                .await
-                .wallet_state
-                .nth_spending_key(KeyType::dCTIDH, index)
-                .to_address(),
-        };
-
-        // Announce the output on-chain even when it is owned by this wallet.
-        // An off-chain notification would only live in the local wallet
-        // database, and the funds could not be found when restoring from seed.
-        let tx_outputs = self
-            .generate_tx_outputs(vec![OutputFormat::AddressAndAmountAndMedium(
-                destination,
-                output_amount,
-                UtxoNotificationMedium::OnChain,
-            )])
-            .await;
-
-        let target_proof_type = TransactionProofType::PrimitiveWitness;
-
-        let tx_details = TransactionDetailsBuilder::new()
-            .timestamp(timestamp)
-            .inputs(inputs.into())
-            .outputs(tx_outputs)
-            .fee(fee)
-            .change_policy(ChangePolicy::ExactChange)
-            .build(&mut self.global_state_lock.clone().into())
-            .await?;
-
-        let block_height = self
-            .global_state_lock
-            .lock_guard()
-            .await
-            .chain
-            .light_state()
-            .header()
-            .height;
-        let cli_args = self.global_state_lock.cli();
-        let network = cli_args.network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
-
-        let options = TritonVmProofJobOptionsBuilder::new()
-            .template(&cli_args.as_proof_job_options())
-            .proof_type(target_proof_type)
-            .build();
-
-        let proof = TransactionProofBuilder::new()
-            .consensus_rule_set(consensus_rule_set)
-            .transaction_details(&tx_details)
-            .job_queue(vm_job_queue())
-            .proof_job_options(options)
-            .build()
-            .await?;
-
-        let transaction = self.assemble_transaction(&tx_details, proof)?;
-
-        let tx_creation_artifacts = TxCreationArtifactsBuilder::new()
-            .transaction_details(tx_details)
-            .transaction(transaction)
-            .build()?;
-
-        self.record_and_broadcast_transaction(&tx_creation_artifacts)
-            .await?;
-
-        Ok(Some(tx_creation_artifacts))
-    }
-
     pub(super) fn private(&self) -> super::private::TransactionInitiatorPrivate {
         super::private::TransactionInitiatorPrivate::new(self.global_state_lock.clone())
     }
@@ -1059,6 +941,7 @@ mod tests {
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::transaction::tx_proving_capability::TxProvingCapability;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
+    use crate::state::wallet::address::ReceivingAddress;
     use crate::state::wallet::wallet_entropy::WalletEntropy;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
     use crate::tests::shared::globalstate::single_proof_payment;

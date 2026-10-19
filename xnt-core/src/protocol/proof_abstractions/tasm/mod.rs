@@ -1,5 +1,6 @@
 pub mod builtins;
 mod environment;
+pub mod legacy_v7;
 pub mod program;
 pub mod prover_job;
 

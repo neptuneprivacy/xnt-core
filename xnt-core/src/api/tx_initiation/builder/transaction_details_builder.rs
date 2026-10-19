@@ -172,6 +172,12 @@ impl TransactionDetailsBuilder {
             ..
         } = self;
 
+        // Refuse outputs whose UTXO notification cannot be encrypted to their
+        // receiving address, before any change key is derived.
+        tx_outputs
+            .validate_recipients()
+            .map_err(|e| CreateTxError::InvalidRecipient(e.to_string()))?;
+
         // A transparent transaction publishes each input's receiver preimage,
         // so only inputs whose lock does not open with that preimage can be
         // spent transparently.

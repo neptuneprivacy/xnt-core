@@ -11,6 +11,7 @@ use crate::api::export::Timestamp;
 use crate::api::export::Transaction;
 use crate::api::export::TransactionProof;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use crate::api::tx_initiation::legacy_era;
 use crate::api::tx_initiation::send::TransactionSender;
 use crate::api::wallet::Wallet;
 use crate::application::json_rpc::core::api::rpc::*;
@@ -31,6 +32,7 @@ use crate::application::rpc::server::network_overview_data::request_network_over
 use crate::protocol::consensus::block::block_selector::BlockSelector;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 
 use crate::application::database::storage::storage_vec::traits::StorageVecStream;
 use crate::state::wallet::address::KeyType;
@@ -362,14 +364,17 @@ impl RpcApi for RpcServer {
         let state = self.state.lock_guard().await;
 
         // Check if utxo_digest is in mempool first
-        let in_mempool = state.mempool.fee_density_iter().any(|(txid, _)| {
-            state.mempool.get(txid).is_some_and(|tx| {
+        let in_mempool = state
+            .mempool
+            .fee_density_iter()
+            .filter_map(|(txid, _)| state.mempool.get(txid))
+            .chain(state.legacy_relay_pool.transactions())
+            .any(|tx| {
                 tx.kernel
                     .outputs
                     .iter()
                     .any(|o| o.canonical_commitment == request.utxo_digest)
-            })
-        });
+            });
 
         if in_mempool {
             return Ok(FindUtxoLeafIndexResponse {
@@ -496,7 +501,7 @@ impl RpcApi for RpcServer {
         // Collect known outputs from wallet
         let known_outputs: std::collections::HashMap<Digest, _> = state
             .wallet_state
-            .scan_for_utxos_announced_to_known_keys(&tx_kernel)
+            .scan_for_utxos_announced_to_known_keys(&tx_kernel, header.height)
             .map(|incoming| (incoming.addition_record().canonical_commitment, incoming))
             .collect();
 
@@ -685,11 +690,52 @@ impl RpcApi for RpcServer {
     ) -> RpcResult<SubmitTransactionResponse> {
         let transaction: Transaction = request.transaction.into();
         let network = self.state.cli().network;
-        let consensus_rule_set = self.state.lock_guard().await.consensus_rule_set();
 
+        // The transaction must be valid under the rule set of the next block,
+        // in which it is mined. Next to a hard fork, one valid on the other
+        // side of it is reported as such.
+        let tip_height = self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
         if !transaction.is_valid(network, consensus_rule_set).await {
+            let neighboring_rule_sets = [
+                ConsensusRuleSet::infer_from(network, tip_height),
+                ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
+            ];
+            for neighboring_rule_set in neighboring_rule_sets {
+                if neighboring_rule_set != consensus_rule_set
+                    && transaction.is_valid(network, neighboring_rule_set).await
+                {
+                    return Err(RpcError::SubmitTransaction(
+                        SubmitTransactionError::OtherEra,
+                    ));
+                }
+            }
+
             return Err(RpcError::SubmitTransaction(
                 SubmitTransactionError::InvalidTransaction,
+            ));
+        }
+
+        // Before the fork, a transaction must meet the terms on which the
+        // nodes of that era relay and upgrade it, and not come too close to
+        // the fork.
+        if consensus_rule_set.is_legacy_era()
+            && !legacy_era::submitted_transaction_meets_terms(
+                &transaction,
+                network,
+                tip_height,
+                self.state.cli().fork_tx_cutoff_margin,
+            )
+        {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::BelowLegacyEraTerms,
             ));
         }
 
@@ -729,7 +775,10 @@ impl RpcApi for RpcServer {
 
         let response = self
             .to_main_tx
-            .send(RPCServerToMain::SubmitTx(Box::new(transaction)))
+            .send(RPCServerToMain::SubmitTx(
+                Box::new(transaction),
+                consensus_rule_set,
+            ))
             .await;
 
         Ok(SubmitTransactionResponse {
@@ -827,16 +876,18 @@ impl RpcApi for RpcServer {
     }
 
     async fn transactions_call(&self, _: TransactionsRequest) -> RpcResult<TransactionsResponse> {
-        let transactions = self
-            .state
-            .lock_guard()
-            .await
+        let state = self.state.lock_guard().await;
+        let transactions = state
             .mempool
             .fee_density_iter()
             .map(|(txkid, _)| txkid)
             .collect();
+        let legacy_transactions = state.legacy_relay_pool.txids_by_fee_density();
 
-        Ok(TransactionsResponse { transactions })
+        Ok(TransactionsResponse {
+            transactions,
+            legacy_transactions,
+        })
     }
 
     async fn get_transaction_kernel_call(
@@ -847,8 +898,7 @@ impl RpcApi for RpcServer {
             .state
             .lock_guard()
             .await
-            .mempool
-            .get(request.id)
+            .mempool_or_legacy_pool_get(request.id)
             .cloned();
 
         Ok(GetTransactionKernelResponse {
@@ -864,8 +914,7 @@ impl RpcApi for RpcServer {
             .state
             .lock_guard()
             .await
-            .mempool
-            .get(request.id)
+            .mempool_or_legacy_pool_get(request.id)
             .cloned();
 
         Ok(GetTransactionProofResponse {
@@ -931,9 +980,11 @@ impl RpcApi for RpcServer {
         let wallet_status = state.get_wallet_status_for_tip().await;
 
         let confirmed_available = wallet_status.available_confirmed(Timestamp::now());
+        let legacy = wallet_status.legacy_confirmed();
 
         Ok(GetBalanceResponse {
             balance: confirmed_available.to_string(),
+            legacy_balance: legacy.is_positive().then(|| legacy.to_string()),
         })
     }
 
@@ -956,6 +1007,7 @@ impl RpcApi for RpcServer {
             .mutator_set_accumulator_after()
             .expect("block from state must have mutator set after");
 
+        let legacy_dctidh_locks = state.wallet_state.legacy_dctidh_lock_hashes();
         let monitored_utxos = state.wallet_state.wallet_db.monitored_utxos();
         let stream = monitored_utxos.stream_values().await;
         futures::pin_mut!(stream);
@@ -1013,6 +1065,7 @@ impl RpcApi for RpcServer {
                 timestamp,
                 receiving_address,
                 utxo: ApiUtxo::new(&mutxo.utxo),
+                is_legacy: legacy_dctidh_locks.contains(&lock_script_hash),
             });
         }
 
@@ -1130,7 +1183,11 @@ impl RpcApi for RpcServer {
         use crate::state::wallet::address::SubAddress;
         let network = self.state.cli().network;
 
-        let parsed = ReceivingAddress::from_bech32m(&request.address_string, network).ok();
+        // A symmetric key also parses, but it is a secret, not an address.
+        let parsed = ReceivingAddress::from_bech32m(&request.address_string, network)
+            .ok()
+            .filter(|address| !matches!(address, ReceivingAddress::Symmetric(_)))
+            .filter(|address| address.validate_as_recipient().is_ok());
 
         match parsed {
             Some(addr) => {
@@ -1295,6 +1352,12 @@ impl RpcApi for RpcServer {
         let spendable_inputs = tx_initiator
             .spendable_inputs(Timestamp::now(), request.exclude_recent_blocks)
             .await;
+        let legacy_dctidh_locks = self
+            .state
+            .lock_guard()
+            .await
+            .wallet_state
+            .legacy_dctidh_lock_hashes();
 
         let utxos: Vec<UnspentUtxo> = spendable_inputs
             .iter()
@@ -1302,6 +1365,7 @@ impl RpcApi for RpcServer {
                 leaf_index: input.mutator_set_mp().aocl_leaf_index,
                 lock_script_hash: input.utxo.lock_script_hash(),
                 amount: input.native_currency_amount().to_string(),
+                is_legacy: legacy_dctidh_locks.contains(&input.utxo.lock_script_hash()),
             })
             .collect();
 
@@ -1522,6 +1586,32 @@ pub mod tests {
             mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
 
         RpcServer::new(global_state_lock, None)
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn validate_address_refuses_symmetric_keys() {
+        use crate::application::json_rpc::core::model::message::ValidateAddressRequest;
+        use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
+        use crate::state::wallet::address::symmetric_key::SymmetricKey;
+        use crate::state::wallet::address::ReceivingAddress;
+
+        let rpc_server = test_rpc_server().await;
+        let validate = |address_string: String| {
+            rpc_server.validate_address(ValidateAddressRequest { address_string })
+        };
+
+        let generation =
+            ReceivingAddress::from(GenerationReceivingAddress::derive_from_seed(rand::random()));
+        let generation = generation.to_bech32m(Network::Main).unwrap();
+        let generation_response = validate(generation.clone()).await.unwrap();
+        assert_eq!(Some(generation), generation_response.address);
+
+        let symmetric = ReceivingAddress::from(SymmetricKey::from_seed(rand::random()));
+        let symmetric_response = validate(symmetric.to_bech32m(Network::Main).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(None, symmetric_response.address);
+        assert_eq!(None, symmetric_response.address_type);
     }
 
     #[apply(shared_tokio_runtime)]
@@ -2106,6 +2196,59 @@ pub mod tests {
                     assert_eq!(proof.unwrap(), tx.proof.into());
                 }
             }
+        }
+    }
+
+    /// Before the fork, a submitted transaction is verified under the rule set
+    /// of the next block, `UpgradeVMv7`, and the transactions of that era are
+    /// held in the legacy relay pool, listed apart from the mempool's and
+    /// looked up like them.
+    #[apply(shared_tokio_runtime)]
+    async fn legacy_era_transactions_are_verified_and_listed_apart() {
+        use crate::api::tx_initiation::migrate_dctidh::tests::main_net_placeholder_block;
+        use crate::application::json_rpc::core::api::rpc::SubmitTransactionError;
+
+        let mut rpc_server = test_rpc_server().await;
+        let tip = rpc_server
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .clone();
+        let pre_fork = main_net_placeholder_block(&tip, 94_000u64.into());
+        rpc_server.state.set_new_tip(pre_fork).await.unwrap();
+
+        let mut txs = make_plenty_mock_transaction_supported_by_primitive_witness(3);
+        for tx in &mut txs {
+            tx.proof = TransactionProof::invalid();
+        }
+
+        // Not valid in any era.
+        let refused = rpc_server
+            .submit_transaction(txs[0].clone().into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            RpcError::SubmitTransaction(SubmitTransactionError::InvalidTransaction),
+            refused
+        );
+
+        for tx in &txs {
+            rpc_server
+                .state
+                .lock_guard_mut()
+                .await
+                .mempool_insert(tx.clone(), UpgradePriority::Irrelevant, AddReason::FromPeer)
+                .await;
+        }
+        let listed = rpc_server.transactions().await.unwrap();
+        assert!(listed.transactions.is_empty());
+        assert_eq!(3, listed.legacy_transactions.len());
+        for tx in &txs {
+            assert!(listed.legacy_transactions.contains(&tx.txid()));
+            let kernel = rpc_server.get_transaction_kernel(tx.txid()).await.unwrap();
+            assert_eq!(Some(tx.kernel.clone()), kernel.kernel.map(Into::into));
         }
     }
 }

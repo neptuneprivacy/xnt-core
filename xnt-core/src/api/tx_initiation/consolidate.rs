@@ -11,9 +11,13 @@ use crate::api::tx_initiation::builder::transaction_proof_builder::TransactionPr
 use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
 use crate::api::tx_initiation::builder::tx_artifacts_builder::TxCreationArtifactsBuilder;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use crate::api::tx_initiation::error::CreateProofError;
 use crate::api::tx_initiation::error::CreateTxError;
 use crate::api::tx_initiation::error::SendError;
 use crate::api::tx_initiation::initiator::TransactionInitiator;
+use crate::api::tx_initiation::legacy_era::check_proof_collection_terms;
+use crate::api::tx_initiation::legacy_era::legacy_era_max_num_inputs;
+use crate::api::tx_initiation::legacy_era::rule_set_for_new_transaction;
 use crate::application::config::auto_consolidation::MAX_NUM_CONSOLIDATION_INPUTS;
 use crate::application::config::auto_consolidation::MIN_NUM_CONSOLIDATION_INPUTS;
 use crate::application::triton_vm_job_queue::vm_job_queue;
@@ -50,7 +54,7 @@ pub const CONSOLIDATION_KEY_INDEX: u64 = 0;
 
 /// Inputs of transactions this wallet sent within this many recent blocks are
 /// not selected, also when those transactions are no longer in the mempool.
-const NUM_RECENT_BLOCKS_EXCLUDED: usize = 3;
+pub(crate) const NUM_RECENT_BLOCKS_EXCLUDED: usize = 3;
 
 impl TransactionInitiator {
     /// Initiate a transaction that spends a batch of UTXOs to the node's own
@@ -60,7 +64,12 @@ impl TransactionInitiator {
     /// least [`NUM_CONFIRMATIONS_REQUIRED_FOR_CONSOLIDATION`] confirmations,
     /// and fails if fewer qualify. The fee is fixed per transaction and
     /// depends on the node's proving capability, see [`CONSOLIDATION_FEE_SP`]
-    /// and [`CONSOLIDATION_FEE_PC`]. The single output goes to
+    /// and [`CONSOLIDATION_FEE_PC`]. Before the `UpgradeVMv8` fork, the
+    /// transaction is made for the legacy era (see
+    /// [`legacy_era`](super::legacy_era)): it pays [`CONSOLIDATION_FEE_PC`],
+    /// spends at most [`legacy_era_max_num_inputs`] inputs instead of
+    /// `num_inputs`, and is refused with [`ConsolidationError::LegacyEra`]
+    /// once the fork is too close. The single output goes to
     /// `consolidation_address` if set, else to this wallet's Generation key at
     /// [`CONSOLIDATION_KEY_INDEX`], and is always announced on-chain so that it
     /// can be recovered from the seed.
@@ -82,20 +91,6 @@ impl TransactionInitiator {
             });
         }
 
-        let capability = self.global_state_lock.cli().proving_capability();
-        let fee = match capability {
-            TxProvingCapability::LockScript | TxProvingCapability::PrimitiveWitness => {
-                return Err(ConsolidationError::NoTransactionInitiation);
-            }
-            TxProvingCapability::ProofCollection => CONSOLIDATION_FEE_PC,
-            TxProvingCapability::SingleProof => CONSOLIDATION_FEE_SP,
-        };
-
-        self.private()
-            .check_proceed_with_send(fee)
-            .await
-            .map_err(ConsolidationError::from_send_error)?;
-
         let tip_height = self
             .global_state_lock
             .lock_guard()
@@ -104,11 +99,41 @@ impl TransactionInitiator {
             .light_state()
             .header()
             .height;
-        let network = self.global_state_lock.cli().network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, tip_height);
-        if consensus_rule_set.is_legacy_era() {
-            return Err(ConsolidationError::LegacyEra(consensus_rule_set));
-        }
+        let cli = self.global_state_lock.cli();
+        let consensus_rule_set = match rule_set_for_new_transaction(
+            cli.network,
+            tip_height,
+            cli.fork_tx_cutoff_margin,
+        ) {
+            Ok(consensus_rule_set) => consensus_rule_set,
+            Err(CreateProofError::LegacyEra(consensus_rule_set)) => {
+                return Err(ConsolidationError::LegacyEra(consensus_rule_set));
+            }
+            Err(other) => return Err(ConsolidationError::CreateProofError(other.to_string())),
+        };
+
+        // A consolidation for the legacy era may end up with its proof
+        // collection: it pays the proof collection fee, and has no more inputs
+        // than that era's proof upgraders take, also with a time lock.
+        let capability = cli.proving_capability();
+        let fee = match capability {
+            TxProvingCapability::LockScript | TxProvingCapability::PrimitiveWitness => {
+                return Err(ConsolidationError::NoTransactionInitiation);
+            }
+            _ if consensus_rule_set.is_legacy_era() => CONSOLIDATION_FEE_PC,
+            TxProvingCapability::ProofCollection => CONSOLIDATION_FEE_PC,
+            TxProvingCapability::SingleProof => CONSOLIDATION_FEE_SP,
+        };
+        let num_inputs = if consensus_rule_set.is_legacy_era() {
+            num_inputs.min(legacy_era_max_num_inputs(2))
+        } else {
+            num_inputs
+        };
+
+        self.private()
+            .check_proceed_with_send(fee)
+            .await
+            .map_err(ConsolidationError::from_send_error)?;
 
         let selected_inputs = self.consolidation_inputs(num_inputs, timestamp).await;
 
@@ -170,6 +195,9 @@ impl TransactionInitiator {
             .change_policy(ChangePolicy::ExactChange)
             .build(&mut self.global_state_lock.clone().into())
             .await?;
+        if consensus_rule_set.is_legacy_era() {
+            check_proof_collection_terms(&tx_details.primitive_witness())?;
+        }
 
         // The proof is upgraded by the main loop, like for any other
         // transaction this node initiates.
@@ -271,7 +299,12 @@ pub enum ConsolidationError {
     )]
     NoTransactionInitiation,
 
-    #[error("Cannot initiate consolidation transaction in the {0} era.")]
+    /// The next hard fork is too close for a new transaction of this rule
+    /// set, see [`CreateProofError::LegacyEra`].
+    #[error(
+        "Cannot initiate consolidation transaction in the {0} era: the next hard fork is too \
+         close."
+    )]
     LegacyEra(ConsensusRuleSet),
 
     #[error(
@@ -329,7 +362,6 @@ mod tests {
     use crate::application::loops::mine_loop::compose_block_helper;
     use crate::protocol::consensus::block::block_height::BlockHeight;
     use crate::protocol::consensus::block::Block;
-    use crate::protocol::consensus::block::BlockProof;
     use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
     use crate::protocol::consensus::transaction::transaction_proof::TransactionProof;
     use crate::protocol::consensus::transaction::Transaction;
@@ -339,7 +371,6 @@ mod tests {
     use crate::state::mempool::upgrade_priority::UpgradePriority;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
     use crate::state::wallet::wallet_entropy::WalletEntropy;
-    use crate::tests::shared::blocks::invalid_empty_block;
     use crate::tests::shared::blocks::make_mock_block;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
     use crate::tests::shared_tokio_runtime;
@@ -629,50 +660,68 @@ mod tests {
         );
     }
 
-    /// On main net, consolidation waits for the v8 fork. While the tip is in
-    /// the legacy era it is refused, which auto-consolidation takes as nothing
-    /// to do; from the fork block on, it spends UTXOs confirmed before the
-    /// fork.
+    /// On main net, consolidation before the v8 fork makes transactions for
+    /// the legacy era: at most 10 inputs and the proof collection fee, held in
+    /// the legacy relay pool. Within `--fork-tx-cutoff-margin` blocks of the
+    /// fork it is refused, which auto-consolidation takes as nothing to do.
+    /// When the next block belongs to the v8 era, the legacy consolidation is
+    /// dropped, its inputs are free again, and a new one goes to the mempool.
     #[traced_test]
     #[apply(shared_tokio_runtime)]
-    async fn consolidation_starts_at_the_v8_fork() {
+    async fn consolidation_follows_the_era_of_the_next_block() {
+        use crate::api::tx_initiation::migrate_dctidh::tests::main_net_placeholder_block;
+
         let network = Network::Main;
         let mut alice = alice_with_mined_blocks(3, TxProvingCapability::SingleProof).await;
         let old_enough = spendable_aocl_indices(&alice).await;
         assert!(old_enough.len() >= 2, "need at least two old UTXOs");
 
-        // The chain then reaches the last pre-fork block. It is a placeholder:
-        // its body extends the mutator set of block 3, and its height is that
-        // of the last pre-fork block. This version cannot make blocks of the
-        // legacy era, not even mock ones.
+        // The legacy era, before the cutoff.
         let fork_height = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
-        let successor = invalid_empty_block(&tip(&alice).await, network);
-        let mut header = *successor.header();
-        header.height = fork_height.previous().unwrap();
-        let last_pre_fork_block = Block::new(
-            header,
-            successor.body().clone(),
-            successor.appendix().clone(),
-            BlockProof::Invalid,
-        );
-        alice
-            .set_new_tip(last_pre_fork_block.clone())
-            .await
-            .unwrap();
-        assert!(ConsensusRuleSet::infer_from(network, header.height).is_legacy_era());
+        let margin = alice.cli().fork_tx_cutoff_margin;
+        let early = main_net_placeholder_block(&tip(&alice).await, 90_000u64.into());
+        alice.set_new_tip(early.clone()).await.unwrap();
+        assert_eq!(2, run_consolidation(&alice, 2, None).await.unwrap());
+        {
+            let state = alice.lock_guard().await;
+            assert!(state.mempool.is_empty());
+            assert_eq!(1, state.legacy_relay_pool.len());
+            let txid = state.legacy_relay_pool.txids_by_fee_density()[0];
+            let transaction = state.legacy_relay_pool.get(txid).unwrap();
+            assert_eq!(CONSOLIDATION_FEE_PC, transaction.kernel.fee);
+            assert_eq!(2, transaction.kernel.inputs.len());
+        }
 
+        // Within the margin of the fork, refused.
+        let close = main_net_placeholder_block(&early, (fork_height.value() - margin).into());
+        alice.set_new_tip(close.clone()).await.unwrap();
+        assert!(
+            ConsensusRuleSet::infer_for_next_block(network, close.header().height).is_legacy_era()
+        );
         let refused = run_consolidation(&alice, 2, None).await.unwrap_err();
         assert!(matches!(
             refused,
             ConsolidationError::LegacyEra(ConsensusRuleSet::UpgradeVMv7)
         ));
         assert!(refused.is_nothing_to_do());
-        assert!(alice.lock_guard().await.mempool.is_empty());
 
-        // The fork block arrives.
-        let fork_block = invalid_empty_block(&last_pre_fork_block, network);
-        assert_eq!(fork_height, fork_block.header().height);
-        alice.set_new_tip(fork_block).await.unwrap();
+        // Two more blocks, after which the inputs of the legacy consolidation
+        // are no longer among those of recently sent transactions. (Its
+        // timestamp follows the mock chain, days before now, so the legacy
+        // relay pool has dropped it as stale already.)
+        let mut tip = close;
+        for height in [fork_height.value() - 3, fork_height.value() - 2] {
+            tip = main_net_placeholder_block(&tip, height.into());
+            alice.set_new_tip(tip.clone()).await.unwrap();
+        }
+
+        // The last pre-fork block: the next one is the fork block.
+        let last_pre_fork_block = main_net_placeholder_block(&tip, fork_height.previous().unwrap());
+        alice
+            .set_new_tip(last_pre_fork_block.clone())
+            .await
+            .unwrap();
+        assert!(alice.lock_guard().await.legacy_relay_pool.is_empty());
 
         assert_eq!(2, run_consolidation(&alice, 2, None).await.unwrap());
         let tx = only_mempool_transaction(&alice).await;
@@ -684,13 +733,15 @@ mod tests {
         };
         primitive_witness.validate().await.unwrap();
 
+        // Only the new consolidation's inputs are spent: those of the legacy
+        // one were freed when it was dropped.
         let spendable_after = spendable_aocl_indices(&alice).await;
         let spent = old_enough
             .iter()
             .filter(|index| !spendable_after.contains(index))
             .copied()
             .collect_vec();
-        assert_eq!(old_enough[..2].to_vec(), spent);
+        assert_eq!(2, spent.len());
     }
 
     /// A consolidation, proven for real and mined under the v8 rule set, that

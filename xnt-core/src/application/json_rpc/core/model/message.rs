@@ -424,6 +424,11 @@ pub struct TransactionsRequest {}
 #[serde(rename_all = "camelCase")]
 pub struct TransactionsResponse {
     pub transactions: Vec<RpcTransactionKernelId>,
+
+    /// The transactions of the era before the next hard fork, which the node
+    /// holds apart from its mempool. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_transactions: Vec<RpcTransactionKernelId>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
@@ -548,7 +553,13 @@ pub struct GetBalanceRequest {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetBalanceResponse {
+    /// Confirmed, available balance. Excludes funds at legacy-format dCTIDH
+    /// locks.
     pub balance: String,
+    /// Confirmed funds at legacy-format dCTIDH locks, if any. These should be
+    /// moved to a current-format address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_balance: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -574,6 +585,9 @@ pub struct History {
     pub timestamp: Timestamp,
     pub receiving_address: Option<String>,
     pub utxo: ApiUtxo,
+    /// Whether the UTXO is held at a legacy-format dCTIDH lock.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_legacy: bool,
 }
 
 pub type HistoryResponse = Vec<History>;
@@ -666,6 +680,10 @@ pub struct UnspentUtxo {
     pub leaf_index: u64,
     pub lock_script_hash: Digest,
     pub amount: String,
+    /// Whether the UTXO is held at a legacy-format dCTIDH lock. Such funds are
+    /// not part of the available balance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_legacy: bool,
 }
 
 pub type UnspentUtxosResponse = Vec<UnspentUtxo>;

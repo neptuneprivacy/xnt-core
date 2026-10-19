@@ -9,37 +9,86 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+/*
+ * Conventions
+ *
+ * - Handles are freed with the matching *_free function; every *_free
+ *   function ignores NULL.
+ * - On failure a function returns an error code or its documented failure
+ *   value (NULL, false, 0, -1 or an empty result) and sets a thread-local
+ *   message, see xnt_get_last_error. A Rust panic inside the library is
+ *   reported the same way: XNT_ERROR_CODE_INTERNAL_ERROR or the failure
+ *   value, and a message starting with "internal error". This needs a
+ *   library built with panic = "unwind", the default for release builds.
+ * - Network arguments are a uint32_t holding one of the XntNetwork values.
+ * - Amounts are in nau. Functions ending in _le pass them as 16 bytes,
+ *   little-endian two's complement. The other amount functions and the
+ *   amount fields use __int128 (GCC and Clang on 64-bit targets), which has
+ *   the same size and alignment as Rust's i128 there.
+ * - Spending secrets: for dCTIDH keys the receiver preimage
+ *   (xnt_spending_key_receiver_preimage, _hex) is the unlock preimage of the
+ *   key's lock script, and the witness of a built transaction
+ *   (xnt_built_transaction_witness, xnt_built_transaction_serialize) holds
+ *   the unlock data of its inputs. Anyone who has them can spend the
+ *   corresponding UTXOs: keep them on the device that holds the seed, do not
+ *   log them, send them to a server or store them unencrypted.
+ * - Keys from xnt_wallet_derive_legacy_dctidh_key are sweep-only: move their
+ *   UTXOs to a current-format key and never count them towards the
+ *   available balance, see xnt_spending_key_is_legacy.
+ */
+
+
+// Most inputs of a migration transaction, unless configured otherwise: the
+// limit of the era before the UpgradeVMv8 fork for transactions with time
+// locks, see [MigrationOptions::max_inputs].
+#define XntDEFAULT_MIGRATION_MAX_INPUTS 10
+
+// Most inputs a transaction built by [TransactionBuilder] may have.
+//
+// [BuiltTransaction::prove] produces a ProofCollection, and nodes relay
+// ProofCollection-backed transactions only up to this many inputs.
+#define XNT_MAX_INPUTS 200
 
 // Error codes returned by FFI functions
-typedef enum XntXntErrorCode {
-    XNT_XNT_ERROR_CODE_OK = 0,
-    XNT_XNT_ERROR_CODE_INVALID_INPUT = 1,
-    XNT_XNT_ERROR_CODE_NULL_POINTER = 2,
-    XNT_XNT_ERROR_CODE_INVALID_MNEMONIC = 3,
-    XNT_XNT_ERROR_CODE_INVALID_ADDRESS = 4,
-    XNT_XNT_ERROR_CODE_DECRYPTION_FAILED = 5,
-    XNT_XNT_ERROR_CODE_ENCODING_FAILED = 6,
-    XNT_XNT_ERROR_CODE_NETWORK_ERROR = 7,
-    XNT_XNT_ERROR_CODE_INSUFFICIENT_FUNDS = 8,
-    XNT_XNT_ERROR_CODE_PROOF_GENERATION_FAILED = 9,
-    XNT_XNT_ERROR_CODE_DESERIALIZE_FAILED = 10,
-    XNT_XNT_ERROR_CODE_RPC_ERROR = 11,
-    XNT_XNT_ERROR_CODE_INTERNAL_ERROR = 99,
-} XntXntErrorCode;
+//
+// `InternalError` is also returned when the library hit an internal error
+// (a Rust panic); the last error message then starts with "internal error".
+typedef enum XntErrorCode {
+    XNT_ERROR_CODE_OK = 0,
+    XNT_ERROR_CODE_INVALID_INPUT = 1,
+    XNT_ERROR_CODE_NULL_POINTER = 2,
+    XNT_ERROR_CODE_INVALID_MNEMONIC = 3,
+    XNT_ERROR_CODE_INVALID_ADDRESS = 4,
+    XNT_ERROR_CODE_DECRYPTION_FAILED = 5,
+    XNT_ERROR_CODE_ENCODING_FAILED = 6,
+    XNT_ERROR_CODE_NETWORK_ERROR = 7,
+    XNT_ERROR_CODE_INSUFFICIENT_FUNDS = 8,
+    XNT_ERROR_CODE_PROOF_GENERATION_FAILED = 9,
+    XNT_ERROR_CODE_DESERIALIZE_FAILED = 10,
+    XNT_ERROR_CODE_RPC_ERROR = 11,
+    XNT_ERROR_CODE_INTERNAL_ERROR = 99,
+} XntErrorCode;
 
 // Network type for address encoding (C-compatible)
-typedef enum XntXntNetwork {
-    XNT_XNT_NETWORK_MAIN = 0,
-    XNT_XNT_NETWORK_TESTNET_MOCK = 1,
-    XNT_XNT_NETWORK_REG_TEST = 2,
-    XNT_XNT_NETWORK_TESTNET = 3,
-} XntXntNetwork;
+//
+// Functions take the network as a `uint32_t` holding one of these values
+// and fail for any other value.
+typedef enum XntNetwork {
+    XNT_NETWORK_MAIN = 0,
+    XNT_NETWORK_TESTNET_MOCK = 1,
+    XNT_NETWORK_REG_TEST = 2,
+    XNT_NETWORK_TESTNET = 3,
+} XntNetwork;
 
 // Opaque handle to receiving address
 typedef struct XntAddressHandle XntAddressHandle;
 
 // Opaque handle to built transaction
 typedef struct XntBuiltTransactionHandle XntBuiltTransactionHandle;
+
+// Opaque handle to the transactions that move funds from legacy-format
+// dCTIDH locks, see xnt_build_migration
+typedef struct XntMigrationPlanHandle XntMigrationPlanHandle;
 
 // Opaque handle to MembershipProof
 typedef struct XntMsMembershipProofHandle XntMsMembershipProofHandle;
@@ -72,9 +121,9 @@ typedef struct XntUtxoHandle XntUtxoHandle;
 typedef struct XntWalletEntropyHandle XntWalletEntropyHandle;
 
 // XntDigest - 40 byte digest for FFI (TIP5 output)
-typedef struct XntXntDigest {
+typedef struct XntDigest {
     uint8_t bytes[40];
-} XntXntDigest;
+} XntDigest;
 
 // Buffer for returning allocated byte arrays to C callers
 typedef struct XntByteBuffer {
@@ -82,154 +131,179 @@ typedef struct XntByteBuffer {
     uintptr_t len;
 } XntByteBuffer;
 
-// Indexed UTXO from sync (FFI-compatible)
-typedef struct XntXntIndexedUtxo {
+// An input of a migration transaction, or one left out of the transactions,
+// with the legacy key and the payment id it was received with
+// (C-compatible), see xnt_migration_input_info
+//
+// A migration transaction merges the UTXOs of many payment ids into one
+// output; record what it moves per payment id from these. `amount` is in
+// nau, before fees, a 128-bit integer, see XntTxInputInfo.
+typedef struct XntMigrationInputInfo {
+    // Index of the legacy key the UTXO is locked to, see
+    // xnt_wallet_derive_legacy_dctidh_key
+    uint64_t key_index;
+    // Payment id the UTXO was received with, 0 for the base address
+    uint64_t payment_id;
+    __int128 amount;
+    // Height of the block the UTXO was confirmed in
     uint64_t block_height;
-    struct XntXntDigest block_digest;
+    uint64_t aocl_index;
+    // For xnt_sync_check_spent: the UTXO is spent once the transaction
+    // spending it is confirmed
+    struct XntDigest absolute_index_set_hash;
+} XntMigrationInputInfo;
+
+// Indexed UTXO from sync (FFI-compatible)
+typedef struct XntIndexedUtxo {
+    uint64_t block_height;
+    struct XntDigest block_digest;
     uint8_t *ciphertext_data;
     uintptr_t ciphertext_len;
-} XntXntIndexedUtxo;
+} XntIndexedUtxo;
 
 // Array of indexed UTXOs
-typedef struct XntXntIndexedUtxoArray {
-    struct XntXntIndexedUtxo *data;
+typedef struct XntIndexedUtxoArray {
+    struct XntIndexedUtxo *data;
     uintptr_t len;
-} XntXntIndexedUtxoArray;
+} XntIndexedUtxoArray;
 
 // Decrypted UTXO notification result
-typedef struct XntXntDecryptedUtxo {
+typedef struct XntDecryptedUtxo {
     struct XntUtxoHandle *utxo;
-    struct XntXntDigest sender_randomness;
+    struct XntDigest sender_randomness;
     uint64_t payment_id;
     uint64_t block_height;
-    struct XntXntDigest block_digest;
-} XntXntDecryptedUtxo;
+    struct XntDigest block_digest;
+} XntDecryptedUtxo;
 
 // Spent status result
-typedef struct XntXntSpentStatus {
+typedef struct XntSpentStatus {
     int64_t *heights;
     uintptr_t len;
-} XntXntSpentStatus;
+} XntSpentStatus;
 
 // AOCL indices result
-typedef struct XntXntAoclIndices {
+typedef struct XntAoclIndices {
     int64_t *indices;
     uintptr_t len;
-} XntXntAoclIndices;
+} XntAoclIndices;
 
 // Transaction input info (C-compatible)
-typedef struct XntXntTxInputInfo {
+//
+// `amount` is a 128-bit integer aligned to 16 bytes. Callers without one can
+// read it as two 64-bit halves (low half first on little-endian targets) or
+// call xnt_utxo_get_amount_le on `utxo`.
+typedef struct XntTxInputInfo {
     struct XntUtxoHandle *utxo;
-    struct XntXntDigest sender_randomness;
-    struct XntXntDigest commitment;
-    Xnti128 amount;
-} XntXntTxInputInfo;
+    struct XntDigest sender_randomness;
+    struct XntDigest commitment;
+    __int128 amount;
+} XntTxInputInfo;
 
 // Array of input info
-typedef struct XntXntTxInputInfoArray {
-    struct XntXntTxInputInfo *data;
+typedef struct XntTxInputInfoArray {
+    struct XntTxInputInfo *data;
     uintptr_t len;
-} XntXntTxInputInfoArray;
+} XntTxInputInfoArray;
 
 // Transaction output info (C-compatible)
-typedef struct XntXntTxOutputInfo {
+//
+// `amount` is a 128-bit integer, see XntTxInputInfo.
+typedef struct XntTxOutputInfo {
     struct XntUtxoHandle *utxo;
-    struct XntXntDigest sender_randomness;
-    struct XntXntDigest receiver_digest;
-    struct XntXntDigest commitment;
-    Xnti128 amount;
+    struct XntDigest sender_randomness;
+    struct XntDigest receiver_digest;
+    struct XntDigest commitment;
+    __int128 amount;
     bool is_change;
     uint64_t payment_id;
-} XntXntTxOutputInfo;
+} XntTxOutputInfo;
 
 // Array of output info
-typedef struct XntXntTxOutputInfoArray {
-    struct XntXntTxOutputInfo *data;
+typedef struct XntTxOutputInfoArray {
+    struct XntTxOutputInfo *data;
     uintptr_t len;
-} XntXntTxOutputInfoArray;
+} XntTxOutputInfoArray;
 
 // Get receiving address from spending key. Returns NULL and sets the last
 // error for legacy-derivation dCTIDH keys, which have no receiving address.
-xnt_
 struct XntAddressHandle *xnt_spending_key_to_address(const struct XntSpendingKeyHandle *handle);
 
+// Free an address handle. NULL is ignored.
+void xnt_address_free(struct XntAddressHandle *handle);
+
 // Encode address to bech32m string
-xnt_ char *xnt_address_to_bech32(const struct XntAddressHandle *handle, enum XntXntNetwork network);
+//
+// `network` is one of the [XntNetwork] values.
+char *xnt_address_to_bech32(const struct XntAddressHandle *handle, uint32_t network);
 
 // Decode address from bech32m string
-xnt_
-struct XntAddressHandle *xnt_address_from_bech32(const char *bech32,
-                                                 enum XntXntNetwork network);
+//
+// `network` is one of the [XntNetwork] values. Refuses legacy-format dCTIDH
+// addresses and symmetric keys.
+struct XntAddressHandle *xnt_address_from_bech32(const char *bech32, uint32_t network);
 
 // Get lock_script_hash from address (40 bytes)
-xnt_
-enum XntXntErrorCode xnt_address_lock_script_hash(const struct XntAddressHandle *handle,
-                                                  uint8_t *out);
+enum XntErrorCode xnt_address_lock_script_hash(const struct XntAddressHandle *handle, uint8_t *out);
 
 // Get receiver_identifier from address (8 bytes)
-xnt_
-enum XntXntErrorCode xnt_address_receiver_id(const struct XntAddressHandle *handle,
-                                             uint8_t *out);
+enum XntErrorCode xnt_address_receiver_id(const struct XntAddressHandle *handle, uint8_t *out);
 
 // Get receiver_identifier as hex string
-xnt_ char *xnt_address_receiver_id_hex(const struct XntAddressHandle *handle);
+char *xnt_address_receiver_id_hex(const struct XntAddressHandle *handle);
 
 // Get privacy_digest from address (40 bytes)
-xnt_
-enum XntXntErrorCode xnt_address_privacy_digest(const struct XntAddressHandle *handle,
-                                                uint8_t *out);
+enum XntErrorCode xnt_address_privacy_digest(const struct XntAddressHandle *handle, uint8_t *out);
 
 // Create subaddress from address with payment_id
-xnt_
 struct XntSubAddressHandle *xnt_subaddress_create(const struct XntAddressHandle *address,
                                                   uint64_t payment_id);
 
+// Free a subaddress handle. NULL is ignored.
+void xnt_subaddress_free(struct XntSubAddressHandle *handle);
+
 // Encode subaddress to bech32m string
-xnt_
-char *xnt_subaddress_to_bech32(const struct XntSubAddressHandle *handle,
-                               enum XntXntNetwork network);
+//
+// `network` is one of the [XntNetwork] values.
+char *xnt_subaddress_to_bech32(const struct XntSubAddressHandle *handle, uint32_t network);
 
 // Get payment_id from subaddress
-xnt_ uint64_t xnt_subaddress_payment_id(const struct XntSubAddressHandle *handle);
+uint64_t xnt_subaddress_payment_id(const struct XntSubAddressHandle *handle);
 
 // Convert Address to ReceivingAddress
-xnt_
 struct XntReceivingAddressHandle *xnt_address_to_receiving(const struct XntAddressHandle *handle);
 
 // Convert SubAddress to ReceivingAddress
-xnt_
 struct XntReceivingAddressHandle *xnt_subaddress_to_receiving(const struct XntSubAddressHandle *handle);
 
+// Free a receiving address handle. NULL is ignored.
+void xnt_receiving_address_free(struct XntReceivingAddressHandle *handle);
+
 // Get payment_id (0 = main, non-zero = subaddress)
-xnt_ uint64_t xnt_receiving_address_payment_id(const struct XntReceivingAddressHandle *handle);
+uint64_t xnt_receiving_address_payment_id(const struct XntReceivingAddressHandle *handle);
 
 // Hash arbitrary bytes with TIP5, output = 40 bytes (Digest)
 // out: Buffer to write 40 bytes
-xnt_ enum XntXntErrorCode xnt_tip5_hash(const uint8_t *data, uintptr_t data_len, uint8_t *out);
+enum XntErrorCode xnt_tip5_hash(const uint8_t *data, uintptr_t data_len, uint8_t *out);
 
 // Hash two digests with TIP5 (Merkle tree style), output = 40 bytes
-xnt_
-enum XntXntErrorCode xnt_tip5_hash_pair(const struct XntXntDigest *left,
-                                        const struct XntXntDigest *right,
-                                        uint8_t *out);
+enum XntErrorCode xnt_tip5_hash_pair(const struct XntDigest *left,
+                                     const struct XntDigest *right,
+                                     uint8_t *out);
 
 // Hash a single digest (self-hash), output = 40 bytes
-xnt_ enum XntXntErrorCode xnt_tip5_hash_digest(const struct XntXntDigest *digest, uint8_t *out);
+enum XntErrorCode xnt_tip5_hash_digest(const struct XntDigest *digest, uint8_t *out);
 
 // SHAKE256 XOF - variable output length
 // Returns allocated buffer, caller must free with xnt_buffer_free()
-xnt_
-struct XntByteBuffer *xnt_shake256(const uint8_t *data,
-                                   uintptr_t data_len,
-                                   uintptr_t output_len);
+struct XntByteBuffer *xnt_shake256(const uint8_t *data, uintptr_t data_len, uintptr_t output_len);
 
 // SHAKE256 with fixed 32-byte output (common case for AES keys)
-xnt_ enum XntXntErrorCode xnt_shake256_32(const uint8_t *data, uintptr_t data_len, uint8_t *out);
+enum XntErrorCode xnt_shake256_32(const uint8_t *data, uintptr_t data_len, uint8_t *out);
 
 // AES-256-GCM encrypt
 // key: 32 bytes, nonce: 12 bytes
 // Returns encrypted ciphertext with auth tag, caller must free with xnt_buffer_free()
-xnt_
 struct XntByteBuffer *xnt_aes256gcm_encrypt(const uint8_t *key,
                                             const uint8_t *nonce,
                                             const uint8_t *plaintext,
@@ -238,7 +312,6 @@ struct XntByteBuffer *xnt_aes256gcm_encrypt(const uint8_t *key,
 // AES-256-GCM decrypt
 // key: 32 bytes, nonce: 12 bytes
 // Returns decrypted plaintext, caller must free with xnt_buffer_free()
-xnt_
 struct XntByteBuffer *xnt_aes256gcm_decrypt(const uint8_t *key,
                                             const uint8_t *nonce,
                                             const uint8_t *ciphertext,
@@ -246,322 +319,587 @@ struct XntByteBuffer *xnt_aes256gcm_decrypt(const uint8_t *key,
 
 // Get last error message. Returns NULL if no error.
 // Caller must NOT free this pointer.
-xnt_ const char *xnt_get_last_error(void);
+const char *xnt_get_last_error(void);
 
 // Clear the last error message
-xnt_ void xnt_clear_error(void);
+void xnt_clear_error(void);
 
 // Get library version
-xnt_ const char *xnt_version(void);
+const char *xnt_version(void);
 
 // Create RPC client
-xnt_ struct XntRpcClientHandle *xnt_rpc_client_create(const char *url);
+struct XntRpcClientHandle *xnt_rpc_client_create(const char *url);
 
 // Create RPC client with optional basic auth
-xnt_
 struct XntRpcClientHandle *xnt_rpc_client_create_with_auth(const char *url,
                                                            const char *username,
                                                            const char *password);
 
+// Free an RPC client handle. NULL is ignored.
+void xnt_rpc_client_free(struct XntRpcClientHandle *handle);
+
 // Make a JSON-RPC call
 // Returns result as JSON string, caller must free with xnt_string_free()
-xnt_
 char *xnt_rpc_call(const struct XntRpcClientHandle *client,
                    const char *method,
                    const char *params_json);
 
 // Check if RPC client is connected (simple ping)
-xnt_ enum XntXntErrorCode xnt_rpc_client_ping(const struct XntRpcClientHandle *client);
+enum XntErrorCode xnt_rpc_client_ping(const struct XntRpcClientHandle *client);
 
 // Get current chain height
-xnt_ int64_t xnt_rpc_chain_height(const struct XntRpcClientHandle *client);
+int64_t xnt_rpc_chain_height(const struct XntRpcClientHandle *client);
+
+// Build the transactions that move every UTXO at the legacy-format dCTIDH
+// locks of the given key indices of `wallet` that can be spent now to the
+// bech32m address `destination` (a Generation or current-format dCTIDH
+// address of `network`), each with one output and no change, ready for
+// xnt_built_transaction_prove. Nothing is proven or submitted.
+//
+// At most 10 inputs per transaction, the largest first, and the fee the node
+// uses for its own migration (0.1 coins for a proof collection); see
+// xnt_build_migration_with. A proof collection is valid only for the mutator
+// set it was built on: prove, check and submit each transaction right away,
+// and build the remaining ones again after a new block.
+struct XntMigrationPlanHandle *xnt_build_migration(const struct XntRpcClientHandle *client,
+                                                   const struct XntWalletEntropyHandle *wallet,
+                                                   const uint64_t *legacy_indices,
+                                                   uintptr_t num_indices,
+                                                   const char *destination,
+                                                   uint32_t network);
+
+// xnt_build_migration with options: `fee_le` the fee of each transaction in
+// nau as 16 bytes, little-endian two's complement, or NULL for the default;
+// `max_inputs` the most inputs per transaction, or 0 for the default of 10
+// (before the UpgradeVMv8 fork capped at 10 with time locks, 11 without);
+// the heights scanned from `from_height` to `to_height`, or to the tip for
+// UINT64_MAX.
+struct XntMigrationPlanHandle *xnt_build_migration_with(const struct XntRpcClientHandle *client,
+                                                        const struct XntWalletEntropyHandle *wallet,
+                                                        const uint64_t *legacy_indices,
+                                                        uintptr_t num_indices,
+                                                        const char *destination,
+                                                        uint32_t network,
+                                                        const uint8_t *fee_le,
+                                                        uintptr_t max_inputs,
+                                                        uint64_t from_height,
+                                                        uint64_t to_height);
+
+// Free a migration handle, with the transactions not taken. NULL is ignored.
+void xnt_migration_free(struct XntMigrationPlanHandle *handle);
+
+// Number of transactions of the migration
+uintptr_t xnt_migration_num_transactions(const struct XntMigrationPlanHandle *handle);
+
+// Take the built transaction at `index`, the largest amounts first. Each can
+// be taken once; free it with xnt_built_transaction_free. Returns NULL for an
+// index out of range or a transaction taken already.
+struct XntBuiltTransactionHandle *xnt_migration_take_transaction(struct XntMigrationPlanHandle *handle,
+                                                                 uintptr_t index);
+
+// Number of inputs the transaction at `index` spends
+uintptr_t xnt_migration_num_inputs(const struct XntMigrationPlanHandle *handle, uintptr_t index);
+
+// Write the absolute index set hash (40 bytes) of input `input_index` of the
+// transaction at `index` to `out`, for xnt_sync_check_spent: the transaction
+// is confirmed once its inputs are spent.
+enum XntErrorCode xnt_migration_input_hash(const struct XntMigrationPlanHandle *handle,
+                                           uintptr_t index,
+                                           uintptr_t input_index,
+                                           uint8_t *out);
+
+// Write the details of input `input_index` of the transaction at `index`
+// to `out`: legacy key index, payment id, amount, block height, AOCL index
+// and absolute index set hash. Inputs are in the order of
+// xnt_migration_input_hash, from 0 to xnt_migration_num_inputs.
+enum XntErrorCode xnt_migration_input_info(const struct XntMigrationPlanHandle *handle,
+                                           uintptr_t index,
+                                           uintptr_t input_index,
+                                           struct XntMigrationInputInfo *out);
+
+// Write the details of dust input `input_index` (from 0 to
+// xnt_migration_num_dust_inputs) to `out`, see xnt_migration_input_info:
+// an input left out because its batch holds no more than its fee.
+enum XntErrorCode xnt_migration_dust_input_info(const struct XntMigrationPlanHandle *handle,
+                                                uintptr_t input_index,
+                                                struct XntMigrationInputInfo *out);
+
+// Write the details of time-locked UTXO `index` (from 0 to
+// xnt_migration_num_time_locked) to `out`, see xnt_migration_input_info: a
+// UTXO left out because its time lock is not released yet.
+enum XntErrorCode xnt_migration_time_locked_info(const struct XntMigrationPlanHandle *handle,
+                                                 uintptr_t index,
+                                                 struct XntMigrationInputInfo *out);
+
+// Write the total moved to the destination, after fees, in nau to `out` as
+// 16 bytes, little-endian two's complement
+enum XntErrorCode xnt_migration_total_le(const struct XntMigrationPlanHandle *handle, uint8_t *out);
+
+// Write the total of the fees in nau to `out` as 16 bytes, little-endian
+// two's complement
+enum XntErrorCode xnt_migration_fees_le(const struct XntMigrationPlanHandle *handle, uint8_t *out);
+
+// Height of the tip whose mutator set and membership proofs the transactions
+// were built on
+uint64_t xnt_migration_tip_height(const struct XntMigrationPlanHandle *handle);
+
+// Number of inputs left out because their batch holds no more than its fee
+uintptr_t xnt_migration_num_dust_inputs(const struct XntMigrationPlanHandle *handle);
+
+// Number of UTXOs at legacy-format locks left out because their time lock is
+// not released yet
+uintptr_t xnt_migration_num_time_locked(const struct XntMigrationPlanHandle *handle);
+
+// Number of indexed entries the scans skipped, see
+// xnt_sync_fetch_utxos_with_skipped
+uintptr_t xnt_migration_num_skipped(const struct XntMigrationPlanHandle *handle);
 
 // Generate new wallet with random 18-word mnemonic
-xnt_ struct XntWalletEntropyHandle *xnt_wallet_generate(void);
+struct XntWalletEntropyHandle *xnt_wallet_generate(void);
 
 // Create wallet from mnemonic phrase (space-separated words)
-xnt_ struct XntWalletEntropyHandle *xnt_wallet_from_mnemonic(const char *mnemonic);
+struct XntWalletEntropyHandle *xnt_wallet_from_mnemonic(const char *mnemonic);
 
 // Get devnet test wallet
-xnt_ struct XntWalletEntropyHandle *xnt_wallet_devnet(void);
+struct XntWalletEntropyHandle *xnt_wallet_devnet(void);
+
+// Free a wallet handle. NULL is ignored.
+void xnt_wallet_free(struct XntWalletEntropyHandle *handle);
 
 // Export wallet to mnemonic phrase
-xnt_ char *xnt_wallet_to_mnemonic(const struct XntWalletEntropyHandle *handle);
+char *xnt_wallet_to_mnemonic(const struct XntWalletEntropyHandle *handle);
 
 // Derive Nth generation spending key
-xnt_
 struct XntSpendingKeyHandle *xnt_wallet_derive_key(const struct XntWalletEntropyHandle *handle,
                                                    uint64_t index);
 
 // Derive Nth CTIDH spending key (CTIDH-512)
-xnt_
 struct XntSpendingKeyHandle *xnt_wallet_derive_dctidh_key(const struct XntWalletEntropyHandle *handle,
                                                           uint64_t index);
 
 // Derive Nth CTIDH spending key using the legacy (pre-v0.3) derivation, for
 // recognising and sweeping funds at legacy-format dCTIDH addresses.
-xnt_
+//
+// UTXOs of such a key are sweep-only, see xnt_spending_key_is_legacy.
 struct XntSpendingKeyHandle *xnt_wallet_derive_legacy_dctidh_key(const struct XntWalletEntropyHandle *handle,
                                                                  uint64_t index);
 
+// Free a spending key handle. NULL is ignored.
+void xnt_spending_key_free(struct XntSpendingKeyHandle *handle);
+
 // Get receiver_id from spending key
-xnt_ uint64_t xnt_spending_key_receiver_id(const struct XntSpendingKeyHandle *handle);
+uint64_t xnt_spending_key_receiver_id(const struct XntSpendingKeyHandle *handle);
 
 // Get receiver_id as hex string
-xnt_ char *xnt_spending_key_receiver_id_hex(const struct XntSpendingKeyHandle *handle);
+char *xnt_spending_key_receiver_id_hex(const struct XntSpendingKeyHandle *handle);
 
 // Get receiver_id_hash for indexer lookups (40 bytes)
-xnt_
-enum XntXntErrorCode xnt_spending_key_receiver_id_hash(const struct XntSpendingKeyHandle *handle,
-                                                       uint8_t *out);
+enum XntErrorCode xnt_spending_key_receiver_id_hash(const struct XntSpendingKeyHandle *handle,
+                                                    uint8_t *out);
 
 // Get receiver_id_hash as XntDigest
-xnt_
-struct XntXntDigest xnt_spending_key_receiver_id_hash_digest(const struct XntSpendingKeyHandle *handle);
+struct XntDigest xnt_spending_key_receiver_id_hash_digest(const struct XntSpendingKeyHandle *handle);
 
 // Get receiver preimage (privacy_preimage) for commitment computation (40 bytes)
-xnt_
-enum XntXntErrorCode xnt_spending_key_receiver_preimage(const struct XntSpendingKeyHandle *handle,
-                                                        uint8_t *out);
+//
+// For dCTIDH keys this is also the unlock preimage of the key's lock script:
+// anyone who knows it can spend the key's UTXOs. Treat it as a spending
+// secret: keep it on the device that holds the seed, do not log it, send it
+// to a server or store it unencrypted.
+enum XntErrorCode xnt_spending_key_receiver_preimage(const struct XntSpendingKeyHandle *handle,
+                                                     uint8_t *out);
 
 // Get receiver preimage as hex string
-xnt_ char *xnt_spending_key_receiver_preimage_hex(const struct XntSpendingKeyHandle *handle);
+//
+// A spending secret for dCTIDH keys, see xnt_spending_key_receiver_preimage.
+char *xnt_spending_key_receiver_preimage_hex(const struct XntSpendingKeyHandle *handle);
 
 // Get receiver_id_hash as hex string
-xnt_ char *xnt_spending_key_receiver_id_hash_hex(const struct XntSpendingKeyHandle *handle);
+char *xnt_spending_key_receiver_id_hash_hex(const struct XntSpendingKeyHandle *handle);
+
+// Get the hash of the lock script this key can satisfy (40 bytes)
+//
+// UTXOs whose lock script hash (xnt_utxo_lock_script_hash) differs cannot be
+// spent by this key.
+enum XntErrorCode xnt_spending_key_lock_script_hash(const struct XntSpendingKeyHandle *handle,
+                                                    uint8_t *out);
+
+// True for dCTIDH keys derived with the legacy (pre-v0.3) lock derivation
+// (xnt_wallet_derive_legacy_dctidh_key). False for other keys and for NULL.
+//
+// UTXOs of such a key are sweep-only: move them to a current-format key and
+// never count them towards the available balance.
+bool xnt_spending_key_is_legacy(const struct XntSpendingKeyHandle *handle);
+
+// Whether UTXOs of this key confirmed in a block of height `block_height`
+// are recognized on `network` (one of the XntNetwork values).
+//
+// Always true for keys that are not legacy; for legacy keys true only below
+// xnt_legacy_dctidh_cutoff. False for NULL or an invalid network.
+bool xnt_spending_key_recognizes_utxos_at(const struct XntSpendingKeyHandle *handle,
+                                          uint32_t network,
+                                          uint64_t block_height);
+
+// The block height from which UTXOs at legacy-format (pre-v0.3) dCTIDH locks
+// are no longer recognized on `network` (one of the XntNetwork values).
+//
+// Returns UINT64_MAX if there is no cutoff (every height is below it), and 0
+// with the last error set for an invalid network.
+uint64_t xnt_legacy_dctidh_cutoff(uint32_t network);
 
 // Alias for xnt_wallet_derive_key (backwards compatibility)
-xnt_
 struct XntSpendingKeyHandle *xnt_wallet_derive_spending_key(const struct XntWalletEntropyHandle *handle,
                                                             uint64_t index);
 
 // Fetch UTXOs by receiver_id_hash from indexer
-xnt_
-struct XntXntIndexedUtxoArray xnt_sync_fetch_utxos(const struct XntRpcClientHandle *client,
-                                                   const struct XntXntDigest *receiver_id_hash,
-                                                   uint64_t from_height,
-                                                   uint64_t to_height);
+//
+// Entries without a block height, or whose ciphertext is oversized or not a
+// list of field elements, are skipped, see
+// xnt_sync_fetch_utxos_with_skipped.
+struct XntIndexedUtxoArray xnt_sync_fetch_utxos(const struct XntRpcClientHandle *client,
+                                                const struct XntDigest *receiver_id_hash,
+                                                uint64_t from_height,
+                                                uint64_t to_height);
+
+// Fetch UTXOs by receiver_id_hash from indexer, and write the number of
+// entries skipped instead of failing the whole range to `out_skipped` (may be
+// NULL): entries without a block height, or whose ciphertext is oversized or
+// not a list of field elements.
+struct XntIndexedUtxoArray xnt_sync_fetch_utxos_with_skipped(const struct XntRpcClientHandle *client,
+                                                             const struct XntDigest *receiver_id_hash,
+                                                             uint64_t from_height,
+                                                             uint64_t to_height,
+                                                             uintptr_t *out_skipped);
 
 // Free indexed UTXO array
-xnt_ void xnt_sync_indexed_utxos_free(struct XntXntIndexedUtxoArray *arr);
+void xnt_sync_indexed_utxos_free(struct XntIndexedUtxoArray *arr);
 
 // Decrypt indexed UTXO ciphertext with spending key
-xnt_
-struct XntXntDecryptedUtxo xnt_sync_decrypt_indexed_utxo(const struct XntSpendingKeyHandle *spending_key,
-                                                         const struct XntXntIndexedUtxo *indexed_utxo);
+//
+// Applies the main-net legacy cutoff, the strictest one; see
+// xnt_sync_decrypt_indexed_utxo_for_network.
+struct XntDecryptedUtxo xnt_sync_decrypt_indexed_utxo(const struct XntSpendingKeyHandle *spending_key,
+                                                      const struct XntIndexedUtxo *indexed_utxo);
+
+// Decrypt indexed UTXO ciphertext with spending key, applying the legacy
+// cutoff of `network` (one of the XntNetwork values).
+//
+// Fails for a UTXO at a legacy-format dCTIDH lock confirmed at or above
+// xnt_legacy_dctidh_cutoff. Writes whether the UTXO is at a legacy-format
+// lock, and so sweep-only, to `out_is_legacy` (may be NULL).
+struct XntDecryptedUtxo xnt_sync_decrypt_indexed_utxo_for_network(const struct XntSpendingKeyHandle *spending_key,
+                                                                  const struct XntIndexedUtxo *indexed_utxo,
+                                                                  uint32_t network,
+                                                                  bool *out_is_legacy);
 
 // Check spent status of UTXOs by their absolute_index_set_hash
-xnt_
-struct XntXntSpentStatus xnt_sync_check_spent(const struct XntRpcClientHandle *client,
-                                              const struct XntXntDigest *hashes,
-                                              uintptr_t count);
+struct XntSpentStatus xnt_sync_check_spent(const struct XntRpcClientHandle *client,
+                                           const struct XntDigest *hashes,
+                                           uintptr_t count);
 
 // Free spent status result
-xnt_ void xnt_sync_spent_status_free(struct XntXntSpentStatus *status);
+void xnt_sync_spent_status_free(struct XntSpentStatus *status);
 
 // Get AOCL leaf indices for commitments
-xnt_
-struct XntXntAoclIndices xnt_sync_get_aocl_indices(const struct XntRpcClientHandle *client,
-                                                   const struct XntXntDigest *commitments,
-                                                   uintptr_t count);
+struct XntAoclIndices xnt_sync_get_aocl_indices(const struct XntRpcClientHandle *client,
+                                                const struct XntDigest *commitments,
+                                                uintptr_t count);
 
 // Free AOCL indices result
-xnt_ void xnt_sync_aocl_indices_free(struct XntXntAoclIndices *result);
+void xnt_sync_aocl_indices_free(struct XntAoclIndices *result);
 
 // Get current block height from node
-xnt_ int64_t xnt_sync_get_height(const struct XntRpcClientHandle *client);
+int64_t xnt_sync_get_height(const struct XntRpcClientHandle *client);
 
 // Compute canonical commitment for UTXO (using receiver_preimage)
-xnt_
-enum XntXntErrorCode xnt_compute_commitment(const struct XntXntDigest *utxo_hash,
-                                            const struct XntXntDigest *sender_randomness,
-                                            const struct XntXntDigest *receiver_preimage,
-                                            uint8_t *out_commitment);
+enum XntErrorCode xnt_compute_commitment(const struct XntDigest *utxo_hash,
+                                         const struct XntDigest *sender_randomness,
+                                         const struct XntDigest *receiver_preimage,
+                                         uint8_t *out_commitment);
 
 // Compute canonical commitment for output (using receiver_postimage)
-xnt_
-enum XntXntErrorCode xnt_compute_commitment_for_output(const struct XntXntDigest *utxo_hash,
-                                                       const struct XntXntDigest *sender_randomness,
-                                                       const struct XntXntDigest *receiver_postimage,
-                                                       uint8_t *out_commitment);
+enum XntErrorCode xnt_compute_commitment_for_output(const struct XntDigest *utxo_hash,
+                                                    const struct XntDigest *sender_randomness,
+                                                    const struct XntDigest *receiver_postimage,
+                                                    uint8_t *out_commitment);
 
 // Compute absolute_index_set_hash for spent checking
-xnt_
-enum XntXntErrorCode xnt_compute_absolute_index_set_hash(const struct XntXntDigest *utxo_hash,
-                                                         const struct XntXntDigest *sender_randomness,
-                                                         const struct XntXntDigest *receiver_preimage,
-                                                         uint64_t aocl_leaf_index,
-                                                         uint8_t *out_hash);
+enum XntErrorCode xnt_compute_absolute_index_set_hash(const struct XntDigest *utxo_hash,
+                                                      const struct XntDigest *sender_randomness,
+                                                      const struct XntDigest *receiver_preimage,
+                                                      uint64_t aocl_leaf_index,
+                                                      uint8_t *out_hash);
 
 // Hash an AbsoluteIndexSet from JSON (from RPC mempool response)
 // Used to check if a mempool tx input matches a known UTXO
-xnt_ enum XntXntErrorCode xnt_hash_absolute_index_set(const char *json_str, uint8_t *out_hash);
+enum XntErrorCode xnt_hash_absolute_index_set(const char *json_str, uint8_t *out_hash);
 
-// Get current mutator set accumulator from archival node
-xnt_ struct XntMutatorSetHandle *xnt_sync_get_mutator_set(const struct XntRpcClientHandle *client);
+// Get current mutator set accumulator from archival node, with the height of
+// the tip it belongs to (see xnt_mutator_set_tip_height)
+struct XntMutatorSetHandle *xnt_sync_get_mutator_set(const struct XntRpcClientHandle *client);
+
+// Free a mutator set handle. NULL is ignored.
+void xnt_mutator_set_free(struct XntMutatorSetHandle *handle);
 
 // Serialize mutator set to bytes for caching
-xnt_ struct XntByteBuffer *xnt_mutator_set_serialize(const struct XntMutatorSetHandle *handle);
+struct XntByteBuffer *xnt_mutator_set_serialize(const struct XntMutatorSetHandle *handle);
+
+// Height of the tip whose mutator set this is, or -1 if unknown, as after
+// xnt_mutator_set_deserialize: the height is not serialized. A transaction
+// built on the mutator set is proven for the block after that tip, see
+// xnt_built_transaction_prove.
+int64_t xnt_mutator_set_tip_height(const struct XntMutatorSetHandle *handle);
+
+// Record the height of the tip whose mutator set this is, as for a mutator
+// set restored with xnt_mutator_set_deserialize
+enum XntErrorCode xnt_mutator_set_set_tip_height(struct XntMutatorSetHandle *handle,
+                                                 uint64_t tip_height);
 
 // Deserialize mutator set from bytes
-xnt_ struct XntMutatorSetHandle *xnt_mutator_set_deserialize(const uint8_t *data, uintptr_t len);
+//
+// The tip height is unknown, see xnt_mutator_set_set_tip_height.
+struct XntMutatorSetHandle *xnt_mutator_set_deserialize(const uint8_t *data, uintptr_t len);
+
+// Free a membership proof handle. NULL is ignored.
+void xnt_ms_membership_proof_free(struct XntMsMembershipProofHandle *handle);
 
 // Serialize membership proof to bytes
-xnt_
 struct XntByteBuffer *xnt_ms_membership_proof_serialize(const struct XntMsMembershipProofHandle *handle);
 
 // Deserialize membership proof from bytes
-xnt_
 struct XntMsMembershipProofHandle *xnt_ms_membership_proof_deserialize(const uint8_t *data,
                                                                        uintptr_t len);
 
 // Verify membership proof against mutator set
-xnt_
 bool xnt_verify_membership(const struct XntMutatorSetHandle *mutator_set,
-                           const struct XntXntDigest *utxo_hash,
+                           const struct XntDigest *utxo_hash,
                            const struct XntMsMembershipProofHandle *membership_proof);
 
 // Get the AOCL leaf index from a membership proof
-xnt_ uint64_t xnt_ms_membership_proof_aocl_index(const struct XntMsMembershipProofHandle *handle);
+uint64_t xnt_ms_membership_proof_aocl_index(const struct XntMsMembershipProofHandle *handle);
 
 // Get membership proofs for UTXOs via wallet RPC
-xnt_
-enum XntXntErrorCode xnt_sync_get_membership_proofs(const struct XntRpcClientHandle *client,
-                                                    const struct XntXntDigest *utxo_hashes,
-                                                    const struct XntXntDigest *sender_randomnesses,
-                                                    const struct XntXntDigest *receiver_preimage,
-                                                    const uint64_t *aocl_indices,
-                                                    uintptr_t count,
-                                                    struct XntMsMembershipProofHandle **out_proofs);
+//
+// `receiver_preimage` is a spending secret for dCTIDH keys (see
+// xnt_spending_key_receiver_preimage); it is used locally and not sent to
+// the node. On success writes `count` proof handles to `out_proofs`, each to
+// be freed with xnt_ms_membership_proof_free.
+enum XntErrorCode xnt_sync_get_membership_proofs(const struct XntRpcClientHandle *client,
+                                                 const struct XntDigest *utxo_hashes,
+                                                 const struct XntDigest *sender_randomnesses,
+                                                 const struct XntDigest *receiver_preimage,
+                                                 const uint64_t *aocl_indices,
+                                                 uintptr_t count,
+                                                 struct XntMsMembershipProofHandle **out_proofs);
 
 // Create new transaction builder
-xnt_ struct XntTransactionBuilderHandle *xnt_tx_builder_create(void);
+struct XntTransactionBuilderHandle *xnt_tx_builder_create(void);
 
 // Add input UTXO to spend
-xnt_
-enum XntXntErrorCode xnt_tx_builder_add_input(struct XntTransactionBuilderHandle *builder,
-                                              const struct XntUtxoHandle *utxo,
-                                              const struct XntSpendingKeyHandle *spending_key,
-                                              const struct XntMsMembershipProofHandle *membership_proof);
+enum XntErrorCode xnt_tx_builder_add_input(struct XntTransactionBuilderHandle *builder,
+                                           const struct XntUtxoHandle *utxo,
+                                           const struct XntSpendingKeyHandle *spending_key,
+                                           const struct XntMsMembershipProofHandle *membership_proof);
 
 // Add output (takes ReceivingAddress - works for both main and subaddresses)
-xnt_
-enum XntXntErrorCode xnt_tx_builder_add_output(struct XntTransactionBuilderHandle *builder,
+//
+// `amount` is passed as a 128-bit integer; see xnt_tx_builder_add_output_le
+// for callers without one.
+enum XntErrorCode xnt_tx_builder_add_output(struct XntTransactionBuilderHandle *builder,
+                                            const struct XntReceivingAddressHandle *receiving_address,
+                                            __int128 amount,
+                                            const struct XntDigest *sender_randomness);
+
+// Add output, with `amount_le` pointing to the amount in nau as 16 bytes,
+// little-endian two's complement
+enum XntErrorCode xnt_tx_builder_add_output_le(struct XntTransactionBuilderHandle *builder,
                                                const struct XntReceivingAddressHandle *receiving_address,
-                                               Xnti128 amount,
-                                               const struct XntXntDigest *sender_randomness);
+                                               const uint8_t *amount_le,
+                                               const struct XntDigest *sender_randomness);
 
 // Set change address
-xnt_
-enum XntXntErrorCode xnt_tx_builder_set_change(struct XntTransactionBuilderHandle *builder,
-                                               const struct XntAddressHandle *change_address,
-                                               const struct XntXntDigest *sender_randomness);
+enum XntErrorCode xnt_tx_builder_set_change(struct XntTransactionBuilderHandle *builder,
+                                            const struct XntAddressHandle *change_address,
+                                            const struct XntDigest *sender_randomness);
 
 // Set transaction fee
-xnt_
-enum XntXntErrorCode xnt_tx_builder_set_fee(struct XntTransactionBuilderHandle *builder,
-                                            Xnti128 fee);
+//
+// Building fails for a fee below 0.0005 coins per input, including a zero
+// fee, unless xnt_tx_builder_set_allow_low_fee is set. See
+// xnt_tx_builder_set_fee_le for callers without a 128-bit integer.
+enum XntErrorCode xnt_tx_builder_set_fee(struct XntTransactionBuilderHandle *builder, __int128 fee);
+
+// Set transaction fee, with `fee_le` pointing to the fee in nau as 16 bytes,
+// little-endian two's complement
+enum XntErrorCode xnt_tx_builder_set_fee_le(struct XntTransactionBuilderHandle *builder,
+                                            const uint8_t *fee_le);
+
+// Allow a fee below the default minimum relay fee (0.0005 coins per input),
+// including a zero fee.
+//
+// Nodes with the default --min-relay-pctx-fee-per-input neither keep nor
+// relay such a transaction; use this only with a node configured to accept
+// it.
+enum XntErrorCode xnt_tx_builder_set_allow_low_fee(struct XntTransactionBuilderHandle *builder,
+                                                   bool allow);
 
 // Get total input amount
-xnt_ Xnti128 xnt_tx_builder_input_total(const struct XntTransactionBuilderHandle *builder);
+__int128 xnt_tx_builder_input_total(const struct XntTransactionBuilderHandle *builder);
 
 // Get total output amount
-xnt_ Xnti128 xnt_tx_builder_output_total(const struct XntTransactionBuilderHandle *builder);
+__int128 xnt_tx_builder_output_total(const struct XntTransactionBuilderHandle *builder);
 
 // Get calculated change amount
-xnt_ Xnti128 xnt_tx_builder_change_amount(const struct XntTransactionBuilderHandle *builder);
+__int128 xnt_tx_builder_change_amount(const struct XntTransactionBuilderHandle *builder);
+
+// Write the total input amount in nau to `out` as 16 bytes, little-endian
+// two's complement
+enum XntErrorCode xnt_tx_builder_input_total_le(const struct XntTransactionBuilderHandle *builder,
+                                                uint8_t *out);
+
+// Write the total output amount in nau to `out` as 16 bytes, little-endian
+// two's complement
+enum XntErrorCode xnt_tx_builder_output_total_le(const struct XntTransactionBuilderHandle *builder,
+                                                 uint8_t *out);
+
+// Write the calculated change amount in nau to `out` as 16 bytes,
+// little-endian two's complement
+enum XntErrorCode xnt_tx_builder_change_amount_le(const struct XntTransactionBuilderHandle *builder,
+                                                  uint8_t *out);
+
+// Free a transaction builder handle. NULL is ignored.
+void xnt_tx_builder_free(struct XntTransactionBuilderHandle *handle);
 
 // Build the transaction
-xnt_
+//
+// `network` is one of the XntNetwork values. Fails for more than 200 inputs,
+// for a fee below the minimum relay fee (see xnt_tx_builder_set_fee), and
+// for a recipient that cannot receive a UTXO notification (legacy-format
+// dCTIDH lock or invalid dCTIDH public key).
 struct XntBuiltTransactionHandle *xnt_tx_builder_build(const struct XntTransactionBuilderHandle *builder,
                                                        const struct XntMutatorSetHandle *mutator_set,
                                                        uint64_t timestamp_ms,
-                                                       enum XntXntNetwork network);
+                                                       uint32_t network);
 
-// Prove the built transaction (creates ProofCollection)
+// Free a built transaction handle. NULL is ignored.
+void xnt_built_transaction_free(struct XntBuiltTransactionHandle *handle);
+
+// Prove the built transaction (creates ProofCollection) for the consensus rule
+// set of the block that follows the tip whose mutator set it was built on, as
+// xnt_built_transaction_prove_for_tip does with that tip's height: before the
+// UpgradeVMv8 hard fork at main-net block 95000, a v7 proof collection.
+// Fails if that height is unknown (see xnt_mutator_set_tip_height); then
+// record it with xnt_mutator_set_set_tip_height before building, or use
+// xnt_built_transaction_prove_for_tip.
 // This is a blocking operation that can take significant time and memory
-xnt_
 struct XntTransactionHandle *xnt_built_transaction_prove(const struct XntBuiltTransactionHandle *handle);
 
+// Prove the built transaction (creates ProofCollection) for the consensus rule
+// set of the block that follows a tip at `tip_height`: before the UpgradeVMv8
+// hard fork on main net, a v7 proof collection. Fails if the transaction does
+// not meet the terms of that era, or if the fork is too close.
+// This is a blocking operation that can take significant time and memory
+struct XntTransactionHandle *xnt_built_transaction_prove_for_tip(const struct XntBuiltTransactionHandle *handle,
+                                                                 uint64_t tip_height);
+
 // Get transaction kernel bytes
-xnt_
 struct XntByteBuffer *xnt_built_transaction_kernel(const struct XntBuiltTransactionHandle *handle);
 
 // Get primitive witness bytes
-xnt_
+//
+// The witness holds the unlock data of every input, which for dCTIDH inputs
+// is the key's spending secret (see xnt_spending_key_receiver_preimage).
+// Keep it on the device that holds the seed.
 struct XntByteBuffer *xnt_built_transaction_witness(const struct XntBuiltTransactionHandle *handle);
 
 // Serialize full transaction with Witness proof
-xnt_
+//
+// Contains the primitive witness, a spending secret for dCTIDH inputs (see
+// xnt_built_transaction_witness). Keep it on the device that holds the seed.
 struct XntByteBuffer *xnt_built_transaction_serialize(const struct XntBuiltTransactionHandle *handle);
 
 // Check the (unproven) transaction is still confirmable against a mutator set.
 // Returns true if it can still be proven & submitted. Call BEFORE prove() with
 // the current tip mutator set (xnt_sync_get_mutator_set) to avoid proving a
 // stale snapshot.
-xnt_
 bool xnt_built_transaction_is_confirmable(const struct XntBuiltTransactionHandle *handle,
                                           const struct XntMutatorSetHandle *mutator_set);
 
 // Deserialize Transaction
-xnt_ struct XntTransactionHandle *xnt_transaction_deserialize(const uint8_t *data, uintptr_t len);
+struct XntTransactionHandle *xnt_transaction_deserialize(const uint8_t *data, uintptr_t len);
 
 // Serialize Transaction for broadcast
-xnt_ struct XntByteBuffer *xnt_transaction_serialize(const struct XntTransactionHandle *handle);
+struct XntByteBuffer *xnt_transaction_serialize(const struct XntTransactionHandle *handle);
 
 // Check if transaction has ProofCollection
-xnt_ bool xnt_transaction_has_proof_collection(const struct XntTransactionHandle *handle);
+bool xnt_transaction_has_proof_collection(const struct XntTransactionHandle *handle);
 
 // Check if transaction has SingleProof
-xnt_ bool xnt_transaction_has_single_proof(const struct XntTransactionHandle *handle);
+bool xnt_transaction_has_single_proof(const struct XntTransactionHandle *handle);
 
 // Check the transaction is confirmable against a mutator set (mirrors the node
 // submit gate). Call with the current tip mutator set (xnt_sync_get_mutator_set)
 // before submit() to detect a transaction that went stale while proving.
-xnt_
 bool xnt_transaction_is_confirmable(const struct XntTransactionHandle *handle,
                                     const struct XntMutatorSetHandle *mutator_set);
 
 // Submit transaction to node via RPC
-xnt_
-enum XntXntErrorCode xnt_transaction_submit(const struct XntTransactionHandle *handle,
-                                            const struct XntRpcClientHandle *client);
+//
+// Ok only means the node passed its validity and confirmability checks and
+// queued the transaction for its mempool; the node can still drop it, for
+// example if the fee is below its relay minimum. Confirm by looking the
+// transaction up in the mempool or waiting for its outputs on chain.
+enum XntErrorCode xnt_transaction_submit(const struct XntTransactionHandle *handle,
+                                         const struct XntRpcClientHandle *client);
+
+// Free a transaction handle. NULL is ignored.
+void xnt_transaction_free(struct XntTransactionHandle *handle);
 
 // Get current timestamp in milliseconds
-xnt_ uint64_t xnt_timestamp_now(void);
+uint64_t xnt_timestamp_now(void);
 
 // Select UTXOs to cover target amount (smallest-first)
 // out_indices: buffer to write selected indices, must have capacity >= limit
 // out_capacity: capacity of out_indices buffer (must be >= limit)
 // Returns count of selected indices, writes indices to out_indices
 // Returns -1 on error
-xnt_
-int32_t xnt_select_inputs(const Xnti128 *amounts,
+// At most 200 inputs are selected, whatever `limit` is. See
+// xnt_select_inputs_le for callers without a 128-bit integer.
+int32_t xnt_select_inputs(const __int128 *amounts,
                           uintptr_t amounts_len,
-                          Xnti128 target,
+                          __int128 target,
                           uintptr_t limit,
                           uintptr_t *out_indices,
                           uintptr_t out_capacity);
 
 // Generate random sender_randomness as XntDigest
-xnt_ struct XntXntDigest xnt_random_sender_randomness(void);
+struct XntDigest xnt_random_sender_randomness(void);
 
 // Generate random sender_randomness as hex string
-xnt_ char *xnt_random_sender_randomness_hex(void);
+char *xnt_random_sender_randomness_hex(void);
+
+// Select UTXOs to cover target amount (smallest-first), like
+// xnt_select_inputs, with amounts in nau passed as 16 bytes each,
+// little-endian two's complement: `amounts_le` holds `amounts_len` such
+// amounts back to back and `target_le` points to one.
+int32_t xnt_select_inputs_le(const uint8_t *amounts_le,
+                             uintptr_t amounts_len,
+                             const uint8_t *target_le,
+                             uintptr_t limit,
+                             uintptr_t *out_indices,
+                             uintptr_t out_capacity);
 
 // Get all inputs from built transaction
-xnt_
-struct XntXntTxInputInfoArray *xnt_built_transaction_inputs(const struct XntBuiltTransactionHandle *handle);
+struct XntTxInputInfoArray *xnt_built_transaction_inputs(const struct XntBuiltTransactionHandle *handle);
 
 // Get all outputs from built transaction
-xnt_
-struct XntXntTxOutputInfoArray *xnt_built_transaction_outputs(const struct XntBuiltTransactionHandle *handle);
+struct XntTxOutputInfoArray *xnt_built_transaction_outputs(const struct XntBuiltTransactionHandle *handle);
 
 // Free input info array
-xnt_ void xnt_tx_input_info_array_free(struct XntXntTxInputInfoArray *arr);
+void xnt_tx_input_info_array_free(struct XntTxInputInfoArray *arr);
 
 // Free output info array
-xnt_ void xnt_tx_output_info_array_free(struct XntXntTxOutputInfoArray *arr);
+void xnt_tx_output_info_array_free(struct XntTxOutputInfoArray *arr);
 
 // Free a byte buffer allocated by xnt-ffi
 //
@@ -569,7 +907,7 @@ xnt_ void xnt_tx_output_info_array_free(struct XntXntTxOutputInfoArray *arr);
 // - Must only be called once per buffer
 // - Caller must NOT use the buffer after calling this function
 // - Calling twice on same buffer causes undefined behavior (double-free)
-xnt_ void xnt_bytes_free(struct XntByteBuffer buf);
+void xnt_bytes_free(struct XntByteBuffer buf);
 
 // Free a string allocated by xnt-ffi
 //
@@ -577,7 +915,7 @@ xnt_ void xnt_bytes_free(struct XntByteBuffer buf);
 // - Must only be called once per string
 // - Caller must NOT use the string after calling this function
 // - Calling twice on same pointer causes undefined behavior (double-free)
-xnt_ void xnt_string_free(char *ptr);
+void xnt_string_free(char *ptr);
 
 // Free ByteBuffer pointer allocated by xnt-ffi
 //
@@ -585,53 +923,69 @@ xnt_ void xnt_string_free(char *ptr);
 // - Must only be called once per buffer
 // - Caller must NOT use the buffer after calling this function
 // - Calling twice on same pointer causes undefined behavior (double-free)
-xnt_ void xnt_buffer_free(struct XntByteBuffer *buf);
+void xnt_buffer_free(struct XntByteBuffer *buf);
 
 // Create UTXO for native currency
-xnt_
+//
+// See xnt_utxo_create_native_le for callers without a 128-bit integer.
 struct XntUtxoHandle *xnt_utxo_create_native(const struct XntAddressHandle *address,
-                                             Xnti128 amount);
+                                             __int128 amount);
+
+// Create UTXO for native currency, with `amount_le` pointing to the amount in
+// nau as 16 bytes, little-endian two's complement
+struct XntUtxoHandle *xnt_utxo_create_native_le(const struct XntAddressHandle *address,
+                                                const uint8_t *amount_le);
+
+// Free a UTXO handle. NULL is ignored.
+void xnt_utxo_free(struct XntUtxoHandle *handle);
 
 // Get native currency amount from UTXO (in nau)
-xnt_ Xnti128 xnt_utxo_get_amount(const struct XntUtxoHandle *handle);
+//
+// See xnt_utxo_get_amount_le for callers without a 128-bit integer.
+__int128 xnt_utxo_get_amount(const struct XntUtxoHandle *handle);
+
+// Write the native currency amount of the UTXO in nau to `out` as 16 bytes,
+// little-endian two's complement
+enum XntErrorCode xnt_utxo_get_amount_le(const struct XntUtxoHandle *handle, uint8_t *out);
 
 // Get lock_script_hash from UTXO (40 bytes)
-xnt_
-enum XntXntErrorCode xnt_utxo_lock_script_hash(const struct XntUtxoHandle *handle,
-                                               uint8_t *out);
+enum XntErrorCode xnt_utxo_lock_script_hash(const struct XntUtxoHandle *handle, uint8_t *out);
 
 // Get UTXO hash (40 bytes)
-xnt_ enum XntXntErrorCode xnt_utxo_hash(const struct XntUtxoHandle *handle, uint8_t *out);
+enum XntErrorCode xnt_utxo_hash(const struct XntUtxoHandle *handle, uint8_t *out);
 
 // Serialize UTXO to bytes
-xnt_ struct XntByteBuffer *xnt_utxo_serialize(const struct XntUtxoHandle *handle);
+struct XntByteBuffer *xnt_utxo_serialize(const struct XntUtxoHandle *handle);
 
 // Deserialize UTXO from bytes
-xnt_ struct XntUtxoHandle *xnt_utxo_deserialize(const uint8_t *data, uintptr_t len);
+struct XntUtxoHandle *xnt_utxo_deserialize(const uint8_t *data, uintptr_t len);
 
 // Get release date if UTXO is timelocked (milliseconds since Unix epoch)
 // Returns 0 if not timelocked
-xnt_ uint64_t xnt_utxo_release_date(const struct XntUtxoHandle *handle);
+uint64_t xnt_utxo_release_date(const struct XntUtxoHandle *handle);
 
 // Check if UTXO is timelocked (returns 1 if timelocked, 0 if not)
-xnt_ int32_t xnt_utxo_is_timelocked(const struct XntUtxoHandle *handle);
+int32_t xnt_utxo_is_timelocked(const struct XntUtxoHandle *handle);
 
 // Check if UTXO can be spent at given timestamp (milliseconds since Unix epoch)
 // Returns 1 if can spend, 0 if not
-xnt_ int32_t xnt_utxo_can_spend_at(const struct XntUtxoHandle *handle, uint64_t timestamp_ms);
+int32_t xnt_utxo_can_spend_at(const struct XntUtxoHandle *handle, uint64_t timestamp_ms);
 
 // Add timelock to UTXO, returns new timelocked UTXO handle
-xnt_
 struct XntUtxoHandle *xnt_utxo_with_time_lock(const struct XntUtxoHandle *handle,
                                               uint64_t release_date_ms);
 
 // Decrypt announcement with spending key
-xnt_
-struct XntXntDecryptedUtxo xnt_announcement_decrypt(const struct XntSpendingKeyHandle *spending_key,
-                                                    const uint8_t *announcement_data,
-                                                    uintptr_t announcement_count);
+//
+// The announcement carries no block height, so the legacy cutoff is not
+// applied: for a legacy key (xnt_spending_key_is_legacy) check
+// xnt_spending_key_recognizes_utxos_at with the height of the block that
+// confirmed the announcement before crediting the result.
+struct XntDecryptedUtxo xnt_announcement_decrypt(const struct XntSpendingKeyHandle *spending_key,
+                                                 const uint8_t *announcement_data,
+                                                 uintptr_t announcement_count);
 
 // Free decrypted UTXO result
-xnt_ void xnt_decrypted_utxo_free(struct XntXntDecryptedUtxo *result);
+void xnt_decrypted_utxo_free(struct XntDecryptedUtxo *result);
 
 #endif  /* XNT_SDK_H */

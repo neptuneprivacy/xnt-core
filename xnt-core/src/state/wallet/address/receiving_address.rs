@@ -139,16 +139,19 @@ impl ReceivingAddress {
     ///
     /// Fields |0,1| enable the receiver to determine the ciphertext
     /// is intended for them and decryption should be attempted.
+    ///
+    /// Fails if the notification cannot be encrypted to this address, see
+    /// [Self::validate_as_recipient].
     pub(crate) fn generate_announcement(
         &self,
         utxo_notification_payload: UtxoNotificationPayload,
-    ) -> Announcement {
+    ) -> Result<Announcement> {
         match self {
             ReceivingAddress::Generation(generation_receiving_address) => {
-                generation_receiving_address.generate_announcement(&utxo_notification_payload)
+                Ok(generation_receiving_address.generate_announcement(&utxo_notification_payload))
             }
             ReceivingAddress::Symmetric(symmetric_key) => {
-                symmetric_key.generate_announcement(&utxo_notification_payload)
+                Ok(symmetric_key.generate_announcement(&utxo_notification_payload))
             }
             ReceivingAddress::GenerationSubAddr(subaddr) => {
                 subaddr.generate_announcement(&utxo_notification_payload)
@@ -162,24 +165,26 @@ impl ReceivingAddress {
         }
     }
 
+    /// Fails if the notification cannot be encrypted to this address, see
+    /// [Self::validate_as_recipient].
     pub(crate) fn private_notification(
         &self,
         utxo_notification_payload: UtxoNotificationPayload,
         network: Network,
-    ) -> String {
+    ) -> Result<String> {
         match self {
             ReceivingAddress::Generation(generation_receiving_address) => {
-                generation_receiving_address
-                    .private_utxo_notification(&utxo_notification_payload, network)
+                Ok(generation_receiving_address
+                    .private_utxo_notification(&utxo_notification_payload, network))
             }
             ReceivingAddress::Symmetric(symmetric_key) => {
-                symmetric_key.private_utxo_notification(&utxo_notification_payload, network)
+                Ok(symmetric_key.private_utxo_notification(&utxo_notification_payload, network))
             }
             ReceivingAddress::GenerationSubAddr(subaddr) => {
                 // Use the base address's private notification for now
-                subaddr
+                Ok(subaddr
                     .base()
-                    .private_utxo_notification(&utxo_notification_payload, network)
+                    .private_utxo_notification(&utxo_notification_payload, network))
             }
             ReceivingAddress::dCTIDH(dctidh) => {
                 dctidh.private_utxo_notification(&utxo_notification_payload, network)
@@ -190,6 +195,50 @@ impl ReceivingAddress {
                     .private_utxo_notification(&utxo_notification_payload, network)
             }
         }
+    }
+
+    /// Check that funds can be sent to this address and that UTXO
+    /// notifications can be encrypted to it.
+    ///
+    /// For dCTIDH addresses this refuses legacy-format locks and invalid public
+    /// keys, see [dctidh_address::dCTIDHReceivingAddress::validate_encryption_key]
+    /// for the cost. Other address types always pass.
+    pub fn validate_as_recipient(&self) -> Result<()> {
+        match self {
+            Self::dCTIDH(a) => a.validate_encryption_key(),
+            Self::dCTIDHSubAddr(a) => a.base().validate_encryption_key(),
+            Self::Generation(_) | Self::Symmetric(_) | Self::GenerationSubAddr(_) => Ok(()),
+        }
+    }
+
+    /// Deserialize a [ReceivingAddress] without the checks that the
+    /// `Deserialize` implementation of a dCTIDH address applies.
+    ///
+    /// Only for records the wallet wrote itself, such as the notification
+    /// targets of past transactions, which may name legacy-format dCTIDH
+    /// addresses. Same serialized layout as the derived implementation.
+    pub(crate) fn deserialize_unchecked<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename = "ReceivingAddress")]
+        #[allow(non_camel_case_types)]
+        enum Unchecked {
+            Generation(Box<generation_address::GenerationReceivingAddress>),
+            Symmetric(symmetric_key::SymmetricKey),
+            GenerationSubAddr(Box<generation_address::GenerationSubAddress>),
+            dCTIDH(dctidh_address::UncheckedReceivingAddress),
+            dCTIDHSubAddr(dctidh_address::UncheckedSubAddress),
+        }
+
+        Ok(match Unchecked::deserialize(deserializer)? {
+            Unchecked::Generation(a) => Self::Generation(a),
+            Unchecked::Symmetric(k) => Self::Symmetric(k),
+            Unchecked::GenerationSubAddr(a) => Self::GenerationSubAddr(*a),
+            Unchecked::dCTIDH(a) => Self::dCTIDH(Box::new(a.into())),
+            Unchecked::dCTIDHSubAddr(a) => Self::dCTIDHSubAddr(a.into()),
+        })
     }
 
     /// returns the `spending_lock`
@@ -220,10 +269,10 @@ impl ReceivingAddress {
     pub(crate) fn encrypt(
         &self,
         utxo_notification_payload: &UtxoNotificationPayload,
-    ) -> Vec<BFieldElement> {
+    ) -> Result<Vec<BFieldElement>> {
         match self {
-            Self::Generation(a) => a.encrypt(utxo_notification_payload),
-            Self::Symmetric(a) => a.encrypt(utxo_notification_payload),
+            Self::Generation(a) => Ok(a.encrypt(utxo_notification_payload)),
+            Self::Symmetric(a) => Ok(a.encrypt(utxo_notification_payload)),
             Self::GenerationSubAddr(a) => a.encrypt(utxo_notification_payload),
             Self::dCTIDH(a) => a.encrypt(utxo_notification_payload),
             Self::dCTIDHSubAddr(a) => a.encrypt(utxo_notification_payload),

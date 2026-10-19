@@ -3801,7 +3801,8 @@ dependencies = [
  "sysinfo",
  "systemstat",
  "tarpc",
- "tasm-lib",
+ "tasm-lib 7.0.0",
+ "tasm-lib 9.0.0",
  "test-strategy 0.3.1",
  "thiserror 1.0.69",
  "thread-priority",
@@ -5778,6 +5779,28 @@ dependencies = [
 
 [[package]]
 name = "tasm-lib"
+version = "7.0.0"
+source = "git+https://github.com/neptuneprivacy/tasm-lib?rev=803223357cc7d50ceba68ea1310911639b86f02f#803223357cc7d50ceba68ea1310911639b86f02f"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "const_format",
+ "hex",
+ "itertools 0.14.0",
+ "ndarray",
+ "num",
+ "num-traits",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "tasm-object-derive 7.0.0",
+ "triton-vm 7.0.0",
+ "web-time",
+]
+
+[[package]]
+name = "tasm-lib"
 version = "9.0.0"
 source = "git+https://github.com/neptuneprivacy/tasm-lib?rev=4b630213f6669f2e85be69808fb8c890b8735be8#4b630213f6669f2e85be69808fb8c890b8735be8"
 dependencies = [
@@ -5793,9 +5816,19 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
- "tasm-object-derive",
+ "tasm-object-derive 9.0.0",
  "triton-vm 9.0.0",
  "web-time",
+]
+
+[[package]]
+name = "tasm-object-derive"
+version = "7.0.0"
+source = "git+https://github.com/neptuneprivacy/tasm-lib?rev=803223357cc7d50ceba68ea1310911639b86f02f#803223357cc7d50ceba68ea1310911639b86f02f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -7371,7 +7404,7 @@ dependencies = [
  "ratatui",
  "strum 0.27.2",
  "tarpc",
- "tasm-lib",
+ "tasm-lib 9.0.0",
  "tokio",
  "unicode-width 0.1.14",
 ]

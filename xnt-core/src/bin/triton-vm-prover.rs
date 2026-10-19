@@ -4,6 +4,8 @@ use std::io::BufRead;
 use std::io::Write;
 
 use neptune_privacy::application::config::triton_vm_env_vars::TritonVmEnvVars;
+use neptune_privacy::protocol::proof_abstractions::tasm::legacy_v7;
+use neptune_privacy::protocol::proof_abstractions::tasm::legacy_v7::LegacyProverPipeline;
 use neptune_privacy::protocol::proof_abstractions::tasm::prover_job::PROOF_PADDED_HEIGHT_TOO_BIG_PROCESS_OFFSET_ERROR_CODE;
 use tasm_lib::triton_vm::config::overwrite_lde_trace_caching_to;
 use tasm_lib::triton_vm::config::CacheDecision;
@@ -57,11 +59,15 @@ fn set_environment_variables(env_vars: &[(String, String)]) {
             if let Some(cache_lde_trace_overwrite) = cache_lde_trace_overwrite {
                 eprintln!("overwriting cache lde trace to: {cache_lde_trace_overwrite:?}");
                 overwrite_lde_trace_caching_to(cache_lde_trace_overwrite);
+                legacy_v7::overwrite_lde_trace_caching_to(cache_lde_trace_overwrite);
             }
         }
     }
 }
 
+/// Trace and prove with the triton-vm generation that the claim's version
+/// names: claims of the `UpgradeVMv7` era go through the linked triton-vm v7,
+/// all others through the current triton-vm.
 fn execute(
     claim: Claim,
     program: Program,
@@ -69,11 +75,35 @@ fn execute(
     max_log2_padded_height: Option<u8>,
     env_vars: TritonVmEnvVars,
 ) -> Proof {
+    if legacy_v7::is_v7_claim(&claim) {
+        let pipeline = LegacyProverPipeline::trace(&program, &claim, &non_determinism).unwrap();
+        prepare_proving(
+            pipeline.log2_padded_height(),
+            max_log2_padded_height,
+            env_vars,
+        );
+        return pipeline.prove().unwrap();
+    }
+
     let stark: Stark = Stark::default();
 
     let (aet, _) = VM::trace_execution(program, (&claim.input).into(), non_determinism).unwrap();
-    let log2_padded_height = aet.padded_height().ilog2() as u8;
+    prepare_proving(
+        aet.padded_height().ilog2() as u8,
+        max_log2_padded_height,
+        env_vars,
+    );
 
+    stark.prove(&claim, &aet).unwrap()
+}
+
+/// Exit if the padded height exceeds the limit, otherwise set the environment
+/// variables configured for the padded height.
+fn prepare_proving(
+    log2_padded_height: u8,
+    max_log2_padded_height: Option<u8>,
+    env_vars: TritonVmEnvVars,
+) {
     // Use std-err for logging purposes since spawner (caller) doesn't get the
     // log outputs but can capture std-err.
     eprintln!("actual log2 padded height for proof: {log2_padded_height}");
@@ -96,8 +126,6 @@ fn execute(
         .unwrap_or_default();
 
     set_environment_variables(&env_vars);
-
-    stark.prove(&claim, &aet).unwrap()
 }
 
 fn main() {
@@ -195,6 +223,26 @@ mod tests {
         );
 
         assert!(triton_vm::verify(Stark::default(), &claim, &proof));
+    }
+
+    #[test]
+    fn make_v7_halt_proof() {
+        let program = triton_asm!(halt);
+        let program = Program::new(&program);
+        let claim = Claim::about_program(&program).about_version(legacy_v7::v7_claim_version());
+        let non_determinism = NonDeterminism::default();
+        let max_log2_padded_height = None;
+        let env_vars = TritonVmEnvVars::default();
+        let proof = execute(
+            claim.clone(),
+            program,
+            non_determinism,
+            max_log2_padded_height,
+            env_vars,
+        );
+
+        assert!(legacy_v7::verify(&claim, &proof));
+        assert!(!triton_vm::verify(Stark::default(), &claim, &proof));
     }
 
     #[test]

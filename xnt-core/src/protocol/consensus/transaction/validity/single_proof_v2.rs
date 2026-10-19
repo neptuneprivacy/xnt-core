@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 
 use crate::api::tx_initiation::builder::proof_builder::ProofBuilder;
 use crate::api::tx_initiation::error::CreateProofError;
+use crate::application::config::network::Network;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::transaction::validity::legacy_v7;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::triton_vm::prelude::*;
 use itertools::Itertools;
@@ -105,23 +107,69 @@ impl SingleProofV2Witness {
         Self::Weld(Box::new(witness))
     }
 
-    /// Prove this witness, yielding a [`SingleProofV2`]-backed [`Proof`].
+    /// Prove this witness under the given rule set's [`SingleProofV2`]
+    /// program, yielding a [`SingleProofV2`]-backed [`Proof`].
+    ///
+    /// Under `UpgradeVMv7` only a [`ProofCollection`] can be raised, and the
+    /// padded-height limit of the job is lowered to what the available memory
+    /// holds; see `nondeterminism_for` and `SingleProofV2::job_options_for`.
     pub async fn produce(
         self,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Proof, CreateProofError> {
-        // Through the versioned builder, like `SingleProofV2::produce`.
-        let claim = single_proof_claim(self.kernel_mast_hash(), ConsensusRuleSet::UpgradeVMv8);
-        let nondeterminism = self.nondeterminism();
+        // Through the versioned builder, like the verifier.
+        let claim = single_proof_claim(self.kernel_mast_hash(), consensus_rule_set);
+        let program = SingleProofV2::program_for(consensus_rule_set)?;
+        let nondeterminism = self
+            .nondeterminism_for(consensus_rule_set, proof_job_options.job_settings.network)
+            .await?;
+        let proof_job_options =
+            SingleProofV2::job_options_for(consensus_rule_set, proof_job_options);
         ProofBuilder::new()
-            .program(SingleProofV2.program())
+            .program(program)
             .claim(claim)
             .nondeterminism(|| nondeterminism)
             .job_queue(triton_vm_job_queue)
             .proof_job_options(proof_job_options)
             .build()
             .await
+    }
+
+    /// The nondeterminism for proving this witness under the given rule set's
+    /// [`SingleProofV2`] program; see [`SingleProofV2::program_for`].
+    ///
+    /// The `UpgradeVMv7` program verifies triton-vm v7 proofs, so its
+    /// nondeterminism comes from the tasm-lib v7 verifier, which verifies every
+    /// sub-proof first; that runs in a blocking task. This version raises only
+    /// proof collections to v7 single proofs; updating and merging v7 single
+    /// proofs is left to nodes of that era. On networks with mock proofs the
+    /// prover reads no nondeterminism, and the sub-proofs are mock proofs that
+    /// the v7 verifier rejects, so none is derived.
+    pub(crate) async fn nondeterminism_for(
+        &self,
+        consensus_rule_set: ConsensusRuleSet,
+        network: Network,
+    ) -> Result<NonDeterminism, CreateProofError> {
+        match (consensus_rule_set, self) {
+            (ConsensusRuleSet::UpgradeVMv8, _) => Ok(self.nondeterminism()),
+            (ConsensusRuleSet::UpgradeVMv7, Self::Collection(_)) if network.use_mock_proof() => {
+                Ok(NonDeterminism::default())
+            }
+            (ConsensusRuleSet::UpgradeVMv7, Self::Collection(proof_collection)) => Ok(
+                legacy_v7::v7_single_proof_nondeterminism_blocking((**proof_collection).clone())
+                    .await?,
+            ),
+            (ConsensusRuleSet::UpgradeVMv7, _) => Err(CreateProofError::NotProducible {
+                proof: "a single proof other than from a proof collection",
+                consensus_rule_set,
+            }),
+            _ => Err(CreateProofError::NotProducible {
+                proof: "a single proof",
+                consensus_rule_set,
+            }),
+        }
     }
 
     /// MAST hash of the transaction kernel this witness attests to -- the public
@@ -298,6 +346,59 @@ impl SingleProofV2 {
             .with_input(tx_kernel_mast_hash.reversed().values())
     }
 
+    /// The `SingleProofV2` program of the given rule set, for the rule sets
+    /// this version proves under: the linked program for `UpgradeVMv8`, and
+    /// the program reassembled with the tasm-lib v7 verifier for `UpgradeVMv7`
+    /// (see [`legacy_v7::single_proof_v2_v7_program`]). Both hash to the program
+    /// digest of [`single_proof_claim`] for their rule set.
+    pub(crate) fn program_for(
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> Result<Program, CreateProofError> {
+        match consensus_rule_set {
+            ConsensusRuleSet::UpgradeVMv8 => Ok(SingleProofV2.program()),
+            ConsensusRuleSet::UpgradeVMv7 => {
+                // Refuse to prove if the reassembled program drifted from the
+                // pinned digest: no node of that era would accept the proof.
+                let program = legacy_v7::single_proof_v2_v7_program();
+                if program.hash() != single_proof_program_digest(consensus_rule_set) {
+                    return Err(CreateProofError::NotProducible {
+                        proof: "a single proof: the assembled program does not hash to the pinned \
+                                digest",
+                        consensus_rule_set,
+                    });
+                }
+
+                Ok(program)
+            }
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5 => Err(CreateProofError::NotProducible {
+                proof: "a single proof",
+                consensus_rule_set,
+            }),
+        }
+    }
+
+    /// The job options for proving the given rule set's program on this
+    /// machine: for `UpgradeVMv7`, with the padded-height limit lowered to
+    /// what the available memory holds; see
+    /// [`legacy_v7::v7_single_proof_job_options`].
+    pub(crate) fn job_options_for(
+        consensus_rule_set: ConsensusRuleSet,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> TritonVmProofJobOptions {
+        match consensus_rule_set {
+            ConsensusRuleSet::UpgradeVMv7 => {
+                legacy_v7::v7_single_proof_job_options(proof_job_options)
+            }
+            _ => proof_job_options,
+        }
+    }
+
     /// Generate a [SingleProofV2] for the transaction, given its primitive
     /// witness.
     ///
@@ -311,36 +412,30 @@ impl SingleProofV2 {
         proof_job_options: TritonVmProofJobOptions,
         consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Proof, CreateProofError> {
+        // Fail before proving the collection if the rule set's program is not
+        // available.
+        SingleProofV2::program_for(consensus_rule_set)?;
+
         let proof_collection = ProofCollection::produce_v2(
             primitive_witness,
             triton_vm_job_queue.clone(),
             proof_job_options.clone(),
+            consensus_rule_set,
         )
         .await?;
         let single_proof_witness = SingleProofV2Witness::from_collection(proof_collection);
-        // Build the claim through the versioned builder rather than the
-        // witness's default `claim()`, which stamps the LINKED triton-vm's
+
+        // The witness builds the claim through the versioned builder rather
+        // than its default `claim()`, which stamps the LINKED triton-vm's
         // `CURRENT_VERSION`. Those two agree only while the era being produced
         // for is the current one; for any other era they disagree, and because
         // the claim's version is part of the Fiat-Shamir transcript the proof
         // then answers a different question than the verifier asks. Going
         // through the same builder the verifier uses makes them agree by
         // construction. Upstream: d4742c65.
-        let claim = single_proof_claim(
-            primitive_witness.kernel.mast_hash(),
-            consensus_rule_set,
-        );
-
-        let nondeterminism = single_proof_witness.nondeterminism();
         info!("Start: generate single proof from proof collection");
-
-        let proof = ProofBuilder::new()
-            .program(SingleProofV2.program())
-            .claim(claim)
-            .nondeterminism(|| nondeterminism)
-            .job_queue(triton_vm_job_queue)
-            .proof_job_options(proof_job_options)
-            .build()
+        let proof = single_proof_witness
+            .produce(triton_vm_job_queue, proof_job_options, consensus_rule_set)
             .await?;
         info!("Done");
 
@@ -528,7 +623,7 @@ pub(crate) async fn fix_link_tx(
         }
 
         SingleProofV2Witness::from_fix(witness)
-            .produce(triton_vm_job_queue, proof_job_options)
+            .produce(triton_vm_job_queue, proof_job_options, consensus_rule_set)
             .await?
     };
 
@@ -556,8 +651,21 @@ impl SingleProofV2 {
     /// reproduces the program as it was before they were added, which is what
     /// shows that adding them changed nothing else.
     fn assemble(&self, with_chain_branches: bool) -> (Library, Vec<LabelledInstruction>) {
-        let mut library = Library::new();
+        self.assemble_into(Library::new(), with_chain_branches)
+    }
 
+    /// Like [`Self::assemble`], into a library that may already hold imports.
+    ///
+    /// Imports deduplicate by entrypoint label, so a snippet imported up front
+    /// replaces every later import of the same label. The `UpgradeVMv7`
+    /// program uses this to substitute the tasm-lib v7 STARK verifier and the
+    /// claim builder for claim version 5; see
+    /// [`legacy_v7::single_proof_v2_v7_code`].
+    pub(crate) fn assemble_into(
+        &self,
+        mut library: Library,
+        with_chain_branches: bool,
+    ) -> (Library, Vec<LabelledInstruction>) {
         // imports
         let stark_verify = library.import(Box::new(StarkVerify::new_with_dynamic_layout(
             Stark::default(),
@@ -1053,6 +1161,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::application::config::network::Network;
     use crate::application::triton_vm_job_queue::TritonVmJobPriority;
+    use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
     use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
     use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
     use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
@@ -1198,6 +1307,7 @@ pub(crate) mod tests {
                 &good_primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
@@ -1216,6 +1326,7 @@ pub(crate) mod tests {
                 &bad_primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
@@ -1249,10 +1360,16 @@ pub(crate) mod tests {
                 &primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
-            assert!(proof_collection.verify_v2(txk_mast_hash, network).await);
+            let claim_version = TritonProofVersion::V8.claim_version();
+            assert!(
+                proof_collection
+                    .verify_v2(txk_mast_hash, network, claim_version)
+                    .await
+            );
 
             let witness = SingleProofV2Witness::from_collection(proof_collection.clone());
             let claim = witness.claim();
@@ -1299,10 +1416,16 @@ pub(crate) mod tests {
                 &primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
-            assert!(proof_collection.verify_v2(txk_mast_hash, network).await);
+            let claim_version = TritonProofVersion::V8.claim_version();
+            assert!(
+                proof_collection
+                    .verify_v2(txk_mast_hash, network, claim_version)
+                    .await
+            );
 
             let witness = SingleProofV2Witness::from_collection(proof_collection.clone());
             let claim = witness.claim();

@@ -69,6 +69,8 @@ pub mod builder;
 pub mod consolidate;
 pub mod error;
 pub mod initiator;
+pub mod legacy_era;
+pub mod migrate_dctidh;
 pub mod send;
 
 #[cfg(test)]

@@ -102,12 +102,14 @@ impl TypeScriptAndWitness {
             .with_ram(self.nd_memory.iter().copied().collect::<HashMap<_, _>>())
     }
 
-    /// Assuming the type script halts gracefully, prove it.
+    /// Assuming the type script halts gracefully, prove it, for a claim of
+    /// the given version.
     pub(crate) async fn prove(
         &self,
         txk_mast_hash: Digest,
         salted_inputs_hash: Digest,
         salted_outputs_hash: Digest,
+        claim_version: u32,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
     ) -> Result<Proof, CreateProofError> {
@@ -115,7 +117,9 @@ impl TypeScriptAndWitness {
             .into_iter()
             .flat_map(|d| d.reversed().values())
             .collect_vec();
-        let claim = Claim::new(self.program.hash()).with_input(input);
+        let claim = Claim::new(self.program.hash())
+            .about_version(claim_version)
+            .with_input(input);
 
         ProofBuilder::new()
             .program(self.program.clone())

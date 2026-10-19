@@ -48,8 +48,8 @@ use crate::protocol::consensus::block::pow::GuesserBuffer;
 use crate::protocol::consensus::block::pow::Pow;
 use crate::protocol::consensus::block::pow::PowMastPaths;
 use crate::protocol::consensus::block::*;
+use crate::protocol::consensus::consensus_rule_set::upgrade_vm_v8_activation_height;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
-use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
 use crate::protocol::consensus::transaction::*;
@@ -913,8 +913,8 @@ pub(crate) async fn mine(
             if legacy_era_notice_height != Some(next_block_height) {
                 info!(
                     "Not composing block {next_block_height}: this version cannot prove blocks \
-                     before the hard fork at block {BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET}. \
-                     Composing starts automatically at the fork."
+                     before the hard fork at block {}. Composing starts automatically at the fork.",
+                    upgrade_vm_v8_activation_height(network)
                 );
                 legacy_era_notice_height = Some(next_block_height);
             }
@@ -1163,6 +1163,7 @@ pub(crate) mod tests {
     use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseOutput;
     use crate::application::triton_vm_job_queue::TritonVmJobQueue;
     use crate::protocol::consensus::block::mock_block_generator::MockBlockGenerator;
+    use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
     use crate::protocol::consensus::transaction::validity::single_proof::single_proof_claim;
     use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -2721,7 +2722,10 @@ pub(crate) mod tests {
                     .lock_guard()
                     .await
                     .wallet_state
-                    .scan_for_utxos_announced_to_known_keys(&transaction.kernel)
+                    .scan_for_utxos_announced_to_known_keys(
+                        &transaction.kernel,
+                        BlockHeight::genesis(),
+                    )
                     .collect_vec();
                 assert_eq!(1, announced_outputs.len());
                 assert_eq!(

@@ -186,14 +186,18 @@ impl LockScriptAndWitness {
         VM::run(self.program.clone(), public_input, self.nondeterminism()).is_ok()
     }
 
-    /// Assuming the lock script halts gracefully, prove it.
+    /// Assuming the lock script halts gracefully, prove it, for a claim of
+    /// the given version.
     pub(crate) async fn prove(
         &self,
         public_input: PublicInput,
+        claim_version: u32,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
     ) -> Result<Proof, CreateProofError> {
-        let claim = Claim::new(self.program.hash()).with_input(public_input.individual_tokens);
+        let claim = Claim::new(self.program.hash())
+            .about_version(claim_version)
+            .with_input(public_input.individual_tokens);
         ProofBuilder::new()
             .program(self.program.clone())
             .claim(claim)

@@ -616,7 +616,11 @@ pub(crate) mod tests {
     async fn produce_and_verify_single_proof(witness: FixWitness) -> Claim {
         let claim = single_proof_claim(witness.kernel_mast_hash(), CONSENSUS_RULE_SET);
         let single_proof = SingleProofV2Witness::from_fix(witness)
-            .produce(vm_job_queue(), TritonVmProofJobOptions::default())
+            .produce(
+                vm_job_queue(),
+                TritonVmProofJobOptions::default(),
+                CONSENSUS_RULE_SET,
+            )
             .await
             .unwrap();
 

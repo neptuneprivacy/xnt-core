@@ -1,6 +1,7 @@
 pub(crate) mod auto_consolidation;
 pub mod cli_args;
 pub mod data_directory;
+pub(crate) mod dctidh_migration;
 pub(crate) mod fee_notification_policy;
 #[cfg(feature = "libp2p")]
 pub(crate) mod identity;

@@ -2,6 +2,11 @@ pub(crate) mod network_actor_link;
 mod network_event_handler;
 pub mod proof_upgrader;
 pub(crate) mod upgrade_incentive;
+mod wallet_maintenance;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod fork_switch_tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -37,8 +42,8 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use wallet_maintenance::WalletMaintenance;
 
-use crate::api::tx_initiation::initiator::MigrationDestination;
 use crate::application::config::auto_consolidation::ConsolidationTarget;
 use crate::application::config::parser::multiaddr::canonical_socket_addr;
 use crate::application::loops::channel::MainToMiner;
@@ -71,6 +76,7 @@ use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::peer::PeerSynchronizationState;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
+use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::mempool_update_job_result::MempoolUpdateJobResult;
@@ -78,7 +84,6 @@ use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposal;
 use crate::state::networking_state::SyncAnchor;
 use crate::state::transaction::tx_proving_capability::TxProvingCapability;
-use crate::state::wallet::address::ReceivingAddress;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
 use crate::SUCCESS_EXIT_CODE;
@@ -89,6 +94,14 @@ const MEMPOOL_PRUNE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const MP_RESYNC_INTERVAL: Duration = Duration::from_secs(59);
 const PROOF_UPGRADE_INTERVAL: Duration = Duration::from_secs(10);
 const EXPECTED_UTXOS_PRUNE_INTERVAL: Duration = Duration::from_secs(19 * 60);
+
+/// Time after startup at which the wallet maintenance runs once, if the tip is
+/// recent by then. See [`MainLoopHandler::spawn_wallet_maintenance`].
+const STARTUP_WALLET_MAINTENANCE_DELAY: Duration = Duration::from_secs(60);
+
+/// A tip at most this many target block intervals old counts as recent for
+/// the wallet maintenance after startup.
+const STARTUP_WALLET_MAINTENANCE_MAX_TIP_AGE: usize = 6;
 
 const SANCTION_PEER_TIMEOUT_FACTOR: u64 = 40;
 
@@ -155,7 +168,7 @@ pub struct MainLoopHandler {
 
     /// Held by the task that migrates and consolidates wallet funds after a
     /// new block, so that two such tasks never select the same inputs.
-    wallet_maintenance: Arc<tokio::sync::Mutex<()>>,
+    wallet_maintenance: Arc<tokio::sync::Mutex<WalletMaintenance>>,
 
     #[cfg(test)]
     mock_now: Option<SystemTime>,
@@ -453,7 +466,7 @@ impl MainLoopHandler {
             rpc_server_to_main_rx,
             task_handles,
             network_actor,
-            wallet_maintenance: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_maintenance: Arc::new(tokio::sync::Mutex::new(WalletMaintenance::default())),
 
             #[cfg(test)]
             mock_now: None,
@@ -512,17 +525,20 @@ impl MainLoopHandler {
                 | MempoolUpdateJob::ProofCollection(pw_update) => {
                     let old_msa = &pw_update.old_primitive_witness.mutator_set_accumulator;
 
-                    // Acquire lock, and drop it immediately.
-                    let msa_update = global_state_lock
-                        .lock_guard()
-                        .await
-                        .chain
-                        .archival_state()
-                        .get_mutator_set_update_to_tip(
-                            old_msa,
-                            SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
-                        )
-                        .await;
+                    // Acquire lock, and drop it immediately. The transaction
+                    // is proven for the rule set of the next block.
+                    let (msa_update, consensus_rule_set) = {
+                        let state = global_state_lock.lock_guard().await;
+                        let msa_update = state
+                            .chain
+                            .archival_state()
+                            .get_mutator_set_update_to_tip(
+                                old_msa,
+                                SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
+                            )
+                            .await;
+                        (msa_update, state.next_block_consensus_rule_set())
+                    };
                     let Some(msa_update) = msa_update else {
                         result.push(MempoolUpdateJobResult::Failure(txid));
                         continue;
@@ -537,13 +553,17 @@ impl MainLoopHandler {
                             proof: TransactionProof::Witness(new_pw.clone()),
                         },
                         MempoolUpdateJob::ProofCollection(_) => {
-                            let pc_job = PrimitiveWitnessToProofCollection {
-                                primitive_witness: new_pw.clone(),
-                            };
-
+                            // Also a transaction of the legacy era, which this
+                            // version cannot update, is proven again as a proof
+                            // collection: a v7 single proof takes minutes and a
+                            // large machine, and would hold up every other job
+                            // of the block.
                             // No locks may be held here!
-                            let upgrade_result =
-                                pc_job.upgrade(job_queue.clone(), &proof_job_options).await;
+                            let upgrade_result = PrimitiveWitnessToProofCollection {
+                                primitive_witness: new_pw.clone(),
+                            }
+                            .upgrade(job_queue.clone(), &proof_job_options, consensus_rule_set)
+                            .await;
                             match upgrade_result {
                                 Ok(upgraded) => upgraded,
                                 Err(_) => {
@@ -560,6 +580,7 @@ impl MainLoopHandler {
                     result.push(MempoolUpdateJobResult::Success {
                         new_primitive_witness: Some(Box::new(new_pw)),
                         new_transaction: Box::new(upgraded_tx),
+                        consensus_rule_set,
                     });
                 }
                 MempoolUpdateJob::Link { old_link_tx } => {
@@ -609,16 +630,18 @@ impl MainLoopHandler {
                     old_single_proof,
                 } => {
                     let upgrade_incentive = UpgradeIncentive::Critical;
-                    let Ok(update_job) = global_state_lock
-                        .lock_guard()
-                        .await
-                        .update_single_proof_job(
-                            old_kernel.to_owned(),
-                            old_single_proof.to_owned(),
-                            upgrade_incentive,
-                        )
-                        .await
-                    else {
+                    let (update_job, consensus_rule_set) = {
+                        let state = global_state_lock.lock_guard().await;
+                        let update_job = state
+                            .update_single_proof_job(
+                                old_kernel.to_owned(),
+                                old_single_proof.to_owned(),
+                                upgrade_incentive,
+                            )
+                            .await;
+                        (update_job, state.next_block_consensus_rule_set())
+                    };
+                    let Ok(update_job) = update_job else {
                         result.push(MempoolUpdateJobResult::Failure(txid));
                         continue;
                     };
@@ -635,6 +658,7 @@ impl MainLoopHandler {
                     result.push(MempoolUpdateJobResult::Success {
                         new_primitive_witness: None,
                         new_transaction: Box::new(updated_tx),
+                        consensus_rule_set,
                     });
                 }
             }
@@ -650,6 +674,7 @@ impl MainLoopHandler {
     /// valid under a new mutator set.
     async fn handle_updated_mempool_txs(&mut self, update_results: Vec<MempoolUpdateJobResult>) {
         let mut link_tx_notifications = vec![];
+        let mut transaction_notifications = vec![];
         {
             let mut state = self.global_state_lock.lock_guard_mut().await;
             for update_result in &update_results {
@@ -659,13 +684,59 @@ impl MainLoopHandler {
                             "Failed to update transaction {txkid} to be valid under new mutator \
                         set. Removing from the mempool."
                         );
-                        state.mempool_remove(*txkid).await
+                        state.mempool_remove_keeping_parked(*txkid).await
                     }
                     MempoolUpdateJobResult::Success {
                         new_primitive_witness,
                         new_transaction,
+                        consensus_rule_set,
                     } => {
                         let txid = new_transaction.kernel.txid();
+
+                        // A block may have changed the next block's rule set
+                        // while proving; the proof is then for the wrong era.
+                        let next_block_rule_set = state.next_block_consensus_rule_set();
+                        if *consensus_rule_set != next_block_rule_set {
+                            warn!(
+                                "Discarding update of transaction {txid}: it was made for \
+                                 {consensus_rule_set}, but the next block follows \
+                                 {next_block_rule_set}."
+                            );
+                            continue;
+                        }
+
+                        // In the legacy era, only this node's own transactions
+                        // are updated, and only while the legacy relay pool
+                        // still holds them as such: a block may have mined
+                        // one, or it may have been removed, while proving.
+                        if consensus_rule_set.is_legacy_era()
+                            && !state.legacy_relay_pool.is_own(txid)
+                        {
+                            info!(
+                                "Discarding update of transaction {txid}: the legacy relay \
+                                 pool no longer holds it."
+                            );
+                            continue;
+                        }
+
+                        // A transaction synced to the tip whose inputs the
+                        // tip spends can never be mined.
+                        let tip_mutator_set = state
+                            .chain
+                            .light_state()
+                            .mutator_set_accumulator_after()
+                            .expect("Block from state must have mutator set after");
+                        if new_transaction.kernel.mutator_set_hash == tip_mutator_set.hash()
+                            && !new_transaction.is_confirmable_relative_to(&tip_mutator_set)
+                        {
+                            warn!(
+                                "Discarding update of transaction {txid}: an input is spent \
+                                 already. Removing it."
+                            );
+                            state.mempool_remove(txid).await;
+                            continue;
+                        }
+
                         info!("Updated transaction {txid} to be valid under new mutator set");
 
                         // First update the primitive-witness data associated with the transaction,
@@ -678,8 +749,16 @@ impl MainLoopHandler {
                                 .await;
                         }
                         state
-                            .mempool_insert(*new_transaction.to_owned(), UpgradePriority::Critical, AddReason::Updated)
+                            .mempool_insert(
+                                *new_transaction.to_owned(),
+                                UpgradePriority::Critical,
+                                AddReason::Updated,
+                            )
                             .await;
+                        if let Ok(notification) = new_transaction.as_ref().try_into() {
+                            transaction_notifications
+                                .push(MainToPeerTask::TransactionNotification(notification));
+                        }
                     }
                     MempoolUpdateJobResult::LinkFailure(txid) => {
                         // Only remove the link transaction, not a transaction
@@ -734,20 +813,8 @@ impl MainLoopHandler {
         }
 
         // Then notify all peers about shareable transactions.
-        for updated in update_results {
-            match updated {
-                MempoolUpdateJobResult::Success {
-                    new_transaction, ..
-                } => {
-                    if let Ok(pmsg) = new_transaction.as_ref().try_into() {
-                        let pmsg = MainToPeerTask::TransactionNotification(pmsg);
-                        self.main_to_peer_broadcast(pmsg);
-                    }
-                }
-                MempoolUpdateJobResult::SuccessLink { .. }
-                | MempoolUpdateJobResult::Failure(_)
-                | MempoolUpdateJobResult::LinkFailure(_) => {}
-            }
+        for notification in transaction_notifications {
+            self.main_to_peer_broadcast(notification);
         }
         for notification in link_tx_notifications {
             self.main_to_peer_broadcast(MainToPeerTask::LinkTxNotification(notification));
@@ -850,6 +917,7 @@ impl MainLoopHandler {
         info!("broadcasting new block to peers");
 
         self.spawn_mempool_txs_update_job(main_loop_state, update_jobs);
+        self.spawn_wallet_maintenance().await;
 
         Ok(())
     }
@@ -1072,91 +1140,7 @@ impl MainLoopHandler {
                 //       identified by transaction-ID, into *one* update job.
                 self.spawn_mempool_txs_update_job(main_loop_state, update_jobs);
 
-                // Move funds held at legacy-format dCTIDH keys to a destination,
-                // one batch per new block, if configured.
-                let migrate_spec = {
-                    let cli = self.global_state_lock.cli();
-                    cli.migrate_dctidh.as_ref().map(|spec| {
-                        (
-                            spec.clone(),
-                            cli.network,
-                            cli.migrate_dctidh_fee,
-                            cli.migrate_dctidh_batch,
-                            cli.migrate_dctidh_index,
-                        )
-                    })
-                };
-                let migration = migrate_spec.and_then(|(spec, network, fee, batch, index)| {
-                    let destination = match spec.as_str() {
-                        "generation" => Some(MigrationDestination::NewGeneration { index }),
-                        "dctidh" => Some(MigrationDestination::NewDctidh { index }),
-                        address => match ReceivingAddress::from_bech32m(address, network) {
-                            Ok(address) => Some(MigrationDestination::Address(address)),
-                            Err(e) => {
-                                warn!("invalid --migrate-dctidh value: {e}");
-                                None
-                            }
-                        },
-                    };
-                    destination.map(|destination| (destination, fee, batch))
-                });
-
-                // Consolidate a batch of old UTXOs, if configured.
-                let consolidation = {
-                    let settings = self.global_state_lock.cli().auto_consolidate();
-                    let num_inputs = usize::from(settings.num_inputs);
-                    match settings.policy {
-                        ConsolidationTarget::Inactive => None,
-                        ConsolidationTarget::ActiveDynamic => Some((num_inputs, None)),
-                        ConsolidationTarget::ActiveFixed { address } => {
-                            Some((num_inputs, Some(*address)))
-                        }
-                    }
-                };
-
-                // Both run in one task, one after the other, so that the
-                // consolidation does not select inputs the migration spends.
-                // Skipped while syncing, since the tip is not current, and
-                // while the task started by an earlier block still runs.
-                let syncing = self
-                    .global_state_lock
-                    .lock_guard()
-                    .await
-                    .net
-                    .sync_anchor
-                    .is_some();
-                if !syncing && (migration.is_some() || consolidation.is_some()) {
-                    let mut tx_initiator = self.global_state_lock.api().tx_initiator();
-                    let timestamp =
-                        crate::protocol::proof_abstractions::timestamp::Timestamp::now();
-                    let wallet_maintenance = self.wallet_maintenance.clone();
-                    tokio::task::spawn(async move {
-                        let Ok(_running) = wallet_maintenance.try_lock_owned() else {
-                            debug!("wallet maintenance for an earlier block still running");
-                            return;
-                        };
-
-                        if let Some((destination, fee, batch)) = migration {
-                            if let Err(e) = tx_initiator
-                                .migrate_dctidh_utxos(destination, fee, timestamp, 0, Some(batch))
-                                .await
-                            {
-                                warn!("dCTIDH migration: {e}");
-                            }
-                        }
-
-                        if let Some((num_inputs, address)) = consolidation {
-                            match tx_initiator
-                                .consolidate(num_inputs, address, timestamp)
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(e) if e.is_nothing_to_do() => debug!("auto-consolidation: {e}"),
-                                Err(e) => warn!("auto-consolidation: {e}"),
-                            }
-                        }
-                    });
-                }
+                self.spawn_wallet_maintenance().await;
 
                 // Inform miner about new block.
                 self.main_to_miner_tx.send(MainToMiner::NewBlock);
@@ -1848,6 +1832,65 @@ impl MainLoopHandler {
         Ok(())
     }
 
+    /// Move funds held at legacy-format dCTIDH locks and consolidate UTXOs, as
+    /// configured, in a spawned task. Runs for every new tip, whether it comes
+    /// from a peer or from this node, and once after startup.
+    ///
+    /// Skipped while syncing, since the tip is not current, and while the task
+    /// started for an earlier tip still runs, so that two such tasks never
+    /// select the same inputs.
+    async fn spawn_wallet_maintenance(&self) {
+        let migration = self.global_state_lock.cli().dctidh_migration();
+        let consolidation = {
+            let settings = self.global_state_lock.cli().auto_consolidate();
+            let num_inputs = usize::from(settings.num_inputs);
+            match settings.policy {
+                ConsolidationTarget::Inactive => None,
+                ConsolidationTarget::ActiveDynamic => Some((num_inputs, None)),
+                ConsolidationTarget::ActiveFixed { address } => Some((num_inputs, Some(*address))),
+            }
+        };
+
+        let syncing = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .net
+            .sync_anchor
+            .is_some();
+        if syncing {
+            return;
+        }
+
+        let global_state_lock = self.global_state_lock.clone();
+        let wallet_maintenance = self.wallet_maintenance.clone();
+        tokio::task::spawn(async move {
+            let Ok(mut maintenance) = wallet_maintenance.try_lock_owned() else {
+                debug!("wallet maintenance for an earlier block still running");
+                return;
+            };
+            maintenance
+                .run(global_state_lock, migration, consolidation)
+                .await;
+        });
+    }
+
+    /// Whether the tip is recent enough for the wallet maintenance after
+    /// startup, see [`STARTUP_WALLET_MAINTENANCE_MAX_TIP_AGE`].
+    async fn tip_is_recent(&self) -> bool {
+        let tip_timestamp = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .timestamp;
+        let max_age = self.global_state_lock.cli().network.target_block_interval()
+            * STARTUP_WALLET_MAINTENANCE_MAX_TIP_AGE;
+        tip_timestamp + max_age >= Timestamp::now()
+    }
+
     /// Post-processing when new block has arrived. Spawn a task to update
     /// transactions in the mempool. Only when the spawned task has completed,
     /// should the miner continue.
@@ -1937,6 +1980,19 @@ impl MainLoopHandler {
 
         let mut tx_proof_upgrade_interval = time::interval(PROOF_UPGRADE_INTERVAL);
         tx_proof_upgrade_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        // Report funds held at legacy-format dCTIDH locks that are not moved,
+        // and run the wallet maintenance once shortly after startup.
+        if self.global_state_lock.cli().dctidh_migration().is_none() {
+            self.wallet_maintenance
+                .lock()
+                .await
+                .report_unmoved_legacy_funds(&self.global_state_lock)
+                .await;
+        }
+        let startup_wallet_maintenance = time::sleep(STARTUP_WALLET_MAINTENANCE_DELAY);
+        tokio::pin!(startup_wallet_maintenance);
+        let mut startup_wallet_maintenance_pending = true;
 
         // Spawn tasks to monitor for SIGTERM, SIGINT, and SIGQUIT. These
         // signals are only used on Unix systems.
@@ -2197,6 +2253,15 @@ impl MainLoopHandler {
                     self.proof_upgrader(&mut main_loop_state).await?;
                 }
 
+                // Run the wallet maintenance once after startup if the tip is
+                // recent by then. Otherwise, the next tip runs it.
+                _ = &mut startup_wallet_maintenance, if startup_wallet_maintenance_pending => {
+                    startup_wallet_maintenance_pending = false;
+                    if self.tip_is_recent().await {
+                        self.spawn_wallet_maintenance().await;
+                    }
+                }
+
             }
         };
 
@@ -2324,6 +2389,16 @@ impl MainLoopHandler {
                 let mut notifications = vec![];
                 {
                     let state = self.global_state_lock.lock_guard().await;
+                    for txid in state.legacy_relay_pool.txids_by_fee_density() {
+                        let transaction = state
+                            .legacy_relay_pool
+                            .get(txid)
+                            .expect("listed transaction must be in the legacy relay pool");
+                        if let Ok(notification) = TransactionNotification::try_from(transaction) {
+                            notifications
+                                .push(MainToPeerTask::TransactionNotification(notification));
+                        }
+                    }
                     for (txid, _) in state.mempool.fee_density_iter() {
                         // Since a read-lock is held over global state, the
                         // transaction must exist in the mempool. It is on the
@@ -2424,24 +2499,31 @@ impl MainLoopHandler {
                 // shut down
                 Ok(true)
             }
-            RPCServerToMain::SubmitTx(transaction) => {
+            RPCServerToMain::SubmitTx(transaction, consensus_rule_set) => {
                 // Technically RPC is not supposed/capable to handle ProofWitness but just in case
                 // Until a decision is made. (As this might get used by api too.)
                 let notification: Option<TransactionNotification> =
                     transaction.as_ref().try_into().ok();
 
-                {
+                // The transaction was verified under the given rule set, and
+                // is held only while that is the next block's.
+                let inserted = {
                     let mut state = self.global_state_lock.lock_guard_mut().await;
 
                     state
-                        .mempool_insert(*transaction, UpgradePriority::Critical, AddReason::Submitted)
-                        .await;
-                }
+                        .mempool_insert_for_rule_set(
+                            *transaction,
+                            consensus_rule_set,
+                            UpgradePriority::Critical,
+                            AddReason::Submitted,
+                        )
+                        .await
+                };
 
                 // If transaction can be sent thru P2P, submit instantly.
                 // This might be mempools responsibility but for now...
                 // We know upgraded transactions gets announced but not sure about new entries, might get moved into mempool too.
-                if let Some(notification) = notification {
+                if let Some(notification) = notification.filter(|_| inserted) {
                     let pmsg = MainToPeerTask::TransactionNotification(notification);
                     self.main_to_peer_broadcast(pmsg);
                 }
@@ -2743,10 +2825,18 @@ mod tests {
                 let tx = genesis_tx_with_proof_type(tx_proving_capability, network, fee).await;
                 let update_jobs = {
                     let mut gsl = main_loop_handler.global_state_lock.lock_guard_mut().await;
-                    gsl.mempool_insert(pw_tx.into(), UpgradePriority::Critical, AddReason::Submitted)
-                        .await;
-                    gsl.mempool_insert(tx.clone().into(), UpgradePriority::Critical, AddReason::Submitted)
-                        .await;
+                    gsl.mempool_insert(
+                        pw_tx.into(),
+                        UpgradePriority::Critical,
+                        AddReason::Submitted,
+                    )
+                    .await;
+                    gsl.mempool_insert(
+                        tx.clone().into(),
+                        UpgradePriority::Critical,
+                        AddReason::Submitted,
+                    )
+                    .await;
                     gsl.set_new_tip(block1.clone()).await.unwrap()
                 };
 
@@ -3051,7 +3141,11 @@ mod tests {
                 .global_state_lock
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*proof_collection_tx).clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
+                .mempool_insert(
+                    (*proof_collection_tx).clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::Submitted,
+                )
                 .await;
             assert!(
                 main_loop_handler

@@ -44,6 +44,25 @@ pub enum SubmitTransactionError {
 
     #[error("Transaction not confirmable relative to the mutator set")]
     NotConfirmable,
+
+    /// The transaction is valid under the rule set of a neighboring era, but
+    /// not under that of the next block: it was made for the other side of a
+    /// hard fork.
+    #[error("Transaction is valid in another era than that of the next block")]
+    OtherEra,
+
+    /// Before the next hard fork: a transaction backed by a proof collection
+    /// that does not meet the terms on which the nodes of that era relay it and
+    /// upgrade it to a single proof, a minimum fee and at most 16 proofs; or
+    /// any transaction submitted within the cutoff margin before the fork
+    /// (`--fork-tx-cutoff-margin`), which might not be mined before it. The
+    /// name of the variant is kept for clients that match on it.
+    #[error(
+        "Transaction does not meet the terms of the era before the next hard fork: it comes \
+         within the cutoff margin of the fork, or its proof collection pays too low a fee or has \
+         too many proofs"
+    )]
+    BelowLegacyEraTerms,
 }
 
 #[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]

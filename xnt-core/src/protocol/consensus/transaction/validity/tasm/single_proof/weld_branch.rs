@@ -2317,7 +2317,11 @@ pub(crate) mod tests {
         let witness = WeldWitness::weld(transaction, link_tx, [0u8; 32]);
         let claim = single_proof_claim(witness.kernel_mast_hash(), CONSENSUS_RULE_SET);
         let single_proof = SingleProofV2Witness::from_weld(witness)
-            .produce(vm_job_queue(), TritonVmProofJobOptions::default())
+            .produce(
+                vm_job_queue(),
+                TritonVmProofJobOptions::default(),
+                CONSENSUS_RULE_SET,
+            )
             .await
             .unwrap();
 

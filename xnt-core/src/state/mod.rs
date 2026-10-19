@@ -1,6 +1,7 @@
 pub mod archival_state;
 pub mod blockchain_state;
 pub mod database;
+pub mod legacy_relay_pool;
 pub mod light_state;
 pub mod mempool;
 pub mod mining;
@@ -9,6 +10,10 @@ pub mod shared;
 pub mod transaction;
 pub mod utxo_indexer;
 pub mod wallet;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod legacy_era_tests;
 
 use std::cmp::max;
 use std::collections::HashMap;
@@ -28,6 +33,7 @@ use anyhow::Result;
 use blockchain_state::BlockchainArchivalState;
 use blockchain_state::BlockchainState;
 use itertools::Itertools;
+use legacy_relay_pool::LegacyRelayPool;
 use light_state::LightState;
 use mempool::Mempool;
 use mining::block_proposal::BlockProposal;
@@ -75,6 +81,7 @@ use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+use crate::protocol::consensus::consensus_rule_set::upgrade_vm_v8_activation_height;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
@@ -94,8 +101,10 @@ use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 use crate::state::mempool::mempool_event::AddReason;
+use crate::state::mempool::mempool_event::MempoolEvent;
 use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
+use crate::state::mempool::primitive_witness_update::PrimitiveWitnessUpdate;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
 use crate::state::transaction::chained_tx_artifacts::ChainedTxArtifacts;
@@ -378,9 +387,7 @@ impl GlobalStateLock {
 
         // acquire write-lock
         let mut gsm = self.lock_guard_mut().await;
-        let block_height = gsm.chain.light_state().header().height;
-        let network = gsm.cli().network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+        let consensus_rule_set = gsm.next_block_consensus_rule_set();
         tx_artifacts
             .verify(gsm.cli().network, consensus_rule_set)
             .await?;
@@ -440,9 +447,11 @@ impl GlobalStateLock {
     ) -> std::result::Result<(), RecordTransactionError> {
         // acquire write-lock
         let mut gsm = self.lock_guard_mut().await;
-        let block_height = gsm.chain.light_state().header().height;
         let network = gsm.cli().network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+
+        // Like any transaction, it is verified and held for the rule set of
+        // the next block, in which it is mined.
+        let consensus_rule_set = gsm.next_block_consensus_rule_set();
 
         let transaction = tx_artifacts.transaction.clone();
         let details = tx_artifacts.details.clone();
@@ -777,6 +786,22 @@ impl<'a> StateLock<'a> {
     //  state_lock_call_mut_async
 }
 
+/// The number of blocks on which a parked transaction of this node is handed to
+/// the updater at most, to be proven for the era after the fork; see
+/// `GlobalState::parked_own_witnesses`.
+pub(crate) const MAX_PARKED_WITNESS_ATTEMPTS: usize = 20;
+
+/// A transaction of this node carried across the fork, see
+/// `GlobalState::parked_own_witnesses`.
+#[derive(Debug, Clone)]
+struct ParkedOwnWitness {
+    primitive_witness: PrimitiveWitness,
+
+    /// The number of blocks on which it was handed to the updater, to be
+    /// proven for the era after the fork.
+    attempts: usize,
+}
+
 /// `GlobalState` handles all state of a Neptune node that is shared across its tasks.
 ///
 /// Some fields are only written to by certain tasks.
@@ -797,6 +822,27 @@ pub struct GlobalState {
 
     /// The `Mempool` may only be updated by the main task.
     pub mempool: Mempool,
+
+    /// The transactions of the era before the next hard fork, held apart from
+    /// the mempool; see [`legacy_relay_pool`]. Like the mempool, it may only be
+    /// updated by the main task.
+    pub legacy_relay_pool: LegacyRelayPool,
+
+    /// The primitive witnesses of this node's transactions that were in the
+    /// legacy relay pool when the next block came to belong to the era after
+    /// the fork.
+    ///
+    /// They go to the mempool then, backed by their primitive witnesses,
+    /// which are never relayed, so that the wallet keeps their inputs
+    /// reserved, and they are proven for the next block, of the era after the
+    /// fork. While the next block belongs to that era, each that the mempool
+    /// does not hold with a proof is handed to the updater on every block, and
+    /// put back into the mempool if a reorganization cleared it, until a block
+    /// spends one of its inputs, it is too old to be mined, or it was handed
+    /// over [`MAX_PARKED_WITNESS_ATTEMPTS`] times: the updater skips the jobs
+    /// of a block while its queue is busy, and a proof can fail. Kept in
+    /// memory only, like the mempool.
+    parked_own_witnesses: Vec<ParkedOwnWitness>,
 
     /// The `mining_state` can be updated by main task, mining task, or RPC server.
     pub mining_state: MiningState,
@@ -922,12 +968,19 @@ impl GlobalState {
         mempool: Mempool,
         utxo_indexer: Option<utxo_indexer::UtxoIndexerDatabase>,
     ) -> Self {
+        // The legacy relay pool takes a quarter of the mempool's size limit.
+        let legacy_relay_pool_max_size =
+            usize::try_from(cli.max_mempool_size.0 / 4).unwrap_or(usize::MAX);
+        let legacy_relay_pool =
+            LegacyRelayPool::new(legacy_relay_pool_max_size, chain.light_state());
         Self {
             wallet_state,
             chain,
             net,
             cli,
             mempool,
+            legacy_relay_pool,
+            parked_own_witnesses: vec![],
             mining_state: MiningState::default(),
             utxo_indexer,
             #[cfg(test)]
@@ -958,6 +1011,13 @@ impl GlobalState {
     pub(crate) fn consensus_rule_set(&self) -> ConsensusRuleSet {
         let tip_height = self.chain.light_state().header().height;
         ConsensusRuleSet::infer_from(self.cli().network, tip_height)
+    }
+
+    /// The consensus rule set of the block that follows the tip: the one
+    /// under which transactions are made, verified and held now.
+    pub(crate) fn next_block_consensus_rule_set(&self) -> ConsensusRuleSet {
+        let tip_height = self.chain.light_state().header().height;
+        ConsensusRuleSet::infer_for_next_block(self.cli().network, tip_height)
     }
 
     /// The block height in which the latest UTXO was either spent or received.
@@ -1454,6 +1514,7 @@ impl GlobalState {
             recovery_data_for_missing_mutxos.len()
         );
         let current_aocl_leaf_count = ams_ref.ams().aocl.num_leafs().await;
+        let legacy_dctidh_locks = self.wallet_state.legacy_dctidh_lock_hashes();
         let mut restored_mutxos = 0;
         for incoming_utxo in recovery_data_for_missing_mutxos {
             // If the referenced UTXO is in the future from our tip, do not attempt to recover it. Instead: warn the user of this.
@@ -1498,6 +1559,21 @@ impl GlobalState {
                 .get_block_header(confirming_block_digest)
                 .await
                 .expect("Confirming block header must exist");
+
+            // UTXOs at legacy-format dCTIDH locks are recognized only below the
+            // legacy cutoff.
+            if legacy_dctidh_locks.contains(&incoming_utxo.utxo.lock_script_hash())
+                && !self
+                    .wallet_state
+                    .legacy_dctidh_lock_recognized_at(confirming_block_header.height)
+            {
+                info!(
+                    "Not restoring UTXO with AOCL index {}: it is held at a legacy-format \
+                     dCTIDH lock and was confirmed at or above the legacy cutoff height.",
+                    incoming_utxo.aocl_index
+                );
+                continue;
+            }
 
             let mut restored_mutxo = MonitoredUtxo::new_from_block_hash(
                 incoming_utxo.utxo,
@@ -2012,6 +2088,136 @@ impl GlobalState {
         self.set_new_tip_internal(new_block).await
     }
 
+    /// The ids of this node's parked transactions, and the number of blocks on
+    /// which each was handed to the updater; see [`Self::parked_own_witnesses`].
+    #[cfg(test)]
+    pub(crate) fn parked_own_transactions(&self) -> Vec<(TransactionKernelId, usize)> {
+        self.parked_own_witnesses
+            .iter()
+            .map(|parked| (parked.primitive_witness.kernel.txid(), parked.attempts))
+            .collect()
+    }
+
+    /// Drop the parked transactions of this node of which the block spends an
+    /// input, whichever era the next block belongs to: they can no longer be
+    /// mined. See [`Self::parked_own_witnesses`].
+    fn unpark_spent(&mut self, block: &Block) {
+        let block_indices: HashSet<u128> = block
+            .body()
+            .transaction_kernel
+            .inputs
+            .iter()
+            .flat_map(|removal_record| removal_record.absolute_indices.to_array())
+            .collect();
+        let block_height = block.header().height;
+        self.parked_own_witnesses.retain(|parked| {
+            let spends_an_input =
+                parked
+                    .primitive_witness
+                    .kernel
+                    .inputs
+                    .iter()
+                    .any(|removal_record| {
+                        removal_record
+                            .absolute_indices
+                            .to_array()
+                            .iter()
+                            .all(|index| block_indices.contains(index))
+                    });
+            if spends_an_input {
+                info!(
+                    "Parked transaction {} of this node is parked no longer: block \
+                     {block_height} spends one of its inputs",
+                    parked.primitive_witness.kernel.txid()
+                );
+            }
+            !spends_an_input
+        });
+    }
+
+    /// Carry the parked transactions of this node across the fork, for a new
+    /// tip whose next block belongs to the era after it; see
+    /// [`Self::parked_own_witnesses`]. Returns the mempool's events, the
+    /// update jobs that prove the transactions for that era, and the ids of
+    /// the transactions whose update jobs from the mempool these jobs replace,
+    /// or that are no longer held.
+    ///
+    /// A transaction that the mempool holds with a proof stays parked, without
+    /// a job: the mempool updates it as any of its own transactions, and if a
+    /// reorganization clears the mempool, it is put back. See
+    /// [`Self::unpark_spent`] for those of which a block spends an input.
+    fn carry_parked_own_transactions(
+        &mut self,
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> (
+        Vec<MempoolEvent>,
+        Vec<MempoolUpdateJob>,
+        HashSet<TransactionKernelId>,
+    ) {
+        let timestamp_cutoff =
+            Timestamp::now() - Timestamp::seconds(mempool::MEMPOOL_TX_THRESHOLD_AGE_IN_SECS);
+
+        let mut events = vec![];
+        let mut jobs = vec![];
+        let mut replaced_txids = HashSet::new();
+        let mut still_parked = vec![];
+        for mut parked in std::mem::take(&mut self.parked_own_witnesses) {
+            let txid = parked.primitive_witness.kernel.txid();
+            let held_with_proof = self
+                .mempool
+                .get(txid)
+                .is_some_and(|transaction| !transaction.proof.is_witness());
+            if !held_with_proof {
+                replaced_txids.insert(txid);
+            }
+            if parked.primitive_witness.kernel.timestamp < timestamp_cutoff {
+                info!("Dropping parked transaction {txid} of this node: it is too old to be mined");
+                if !held_with_proof {
+                    events.extend(self.mempool.remove(txid));
+                }
+                continue;
+            }
+            if let Some(primitive_witness) = self.mempool.primitive_witness(txid) {
+                parked.primitive_witness = primitive_witness.clone();
+            }
+            if held_with_proof {
+                still_parked.push(parked);
+                continue;
+            }
+            if parked.attempts >= MAX_PARKED_WITNESS_ATTEMPTS {
+                warn!(
+                    "Dropping parked transaction {txid} of this node: it was not proven for \
+                     {consensus_rule_set} in {MAX_PARKED_WITNESS_ATTEMPTS} attempts"
+                );
+                events.extend(self.mempool.remove(txid));
+                continue;
+            }
+
+            if !self.mempool.contains(txid) {
+                events.extend(self.mempool.insert(
+                    parked.primitive_witness.clone().into(),
+                    UpgradePriority::Critical,
+                    AddReason::Updated,
+                ));
+            }
+            parked.attempts += 1;
+            jobs.push(MempoolUpdateJob::ProofCollection(
+                PrimitiveWitnessUpdate::new(parked.primitive_witness.clone()),
+            ));
+            still_parked.push(parked);
+        }
+        self.parked_own_witnesses = still_parked;
+
+        if !jobs.is_empty() {
+            info!(
+                "Proving {} parked transactions of this node for {consensus_rule_set}",
+                jobs.len()
+            );
+        }
+
+        (events, jobs, replaced_txids)
+    }
+
     /// Store a block to client's state *without* marking this block as a new
     /// tip. No validation of block happens, as this is the caller's
     /// responsibility.
@@ -2100,6 +2306,9 @@ impl GlobalState {
         // the updater. Doing it the other way round spends update work, and then
         // proving work, on transactions that are about to be discarded anyway.
         let mut mempool_events = self.mempool.prune_stale_transactions();
+        let mut legacy_pool_events = self
+            .legacy_relay_pool
+            .prune_stale_transactions(Timestamp::now());
 
         // Update mempool with UTXOs from this block. This is done by
         // removing all transaction that became invalid/was mined by this
@@ -2107,6 +2316,13 @@ impl GlobalState {
         // performed by this client.
         let (update_events, mut update_jobs) = self.mempool.update_with_block(&new_tip)?;
         mempool_events.extend(update_events);
+
+        // The same for the legacy relay pool, which holds the transactions of
+        // the era before the next hard fork. Its own transactions are proven
+        // again while the next block belongs to that era.
+        let (legacy_update_events, legacy_update_jobs) =
+            self.legacy_relay_pool.update_with_block(&new_tip)?;
+        legacy_pool_events.extend(legacy_update_events);
 
         // A link proof attests to the `SingleProof` program of the rule set it
         // was made under. When this block changes that program, the resident
@@ -2124,6 +2340,82 @@ impl GlobalState {
             mempool_events.extend(self.mempool.remove_link_txs(RemovalReason::Abandoned));
             update_jobs.retain(|job| !matches!(job, MempoolUpdateJob::Link { .. }));
         }
+
+        // Transactions are held for the rule set of the next block: those of
+        // the era before the fork in the legacy relay pool, all others in the
+        // mempool. When the next block's rule set changes between the two,
+        // the transactions held for the old one can no longer be mined.
+        let old_next_rules = ConsensusRuleSet::infer_for_next_block(network, old_tip_height);
+        let new_next_rules = ConsensusRuleSet::infer_for_next_block(network, new_tip_height);
+        if new_next_rules.is_legacy_era() {
+            update_jobs.extend(legacy_update_jobs);
+
+            // Back across the fork, as by a reorganization: the mempool's
+            // transactions are for the era after it, and no block before it
+            // can mine them. The reorganization already cleared the mempool;
+            // clear it in any case, so that none is relayed or composed with.
+            if !old_next_rules.is_legacy_era() && !self.mempool.is_empty() {
+                info!(
+                    "The next block {} follows {new_next_rules}: removing the transactions of \
+                     the era after the hard fork from the mempool",
+                    new_tip_height.next()
+                );
+                mempool_events.extend(self.mempool.clear_with_reason(RemovalReason::Orphaned));
+                update_jobs.retain(|job| match job {
+                    MempoolUpdateJob::PrimitiveWitness(update)
+                    | MempoolUpdateJob::ProofCollection(update) => self
+                        .legacy_relay_pool
+                        .contains(update.old_primitive_witness.kernel.txid()),
+                    MempoolUpdateJob::SingleProof { .. } | MempoolUpdateJob::Link { .. } => false,
+                });
+            }
+        } else if !self.legacy_relay_pool.is_empty() {
+            // Across the fork: the legacy relay pool's transactions can no
+            // longer be mined. This node's own ones are parked, to be proven
+            // for the new era.
+            let (events, witnesses) = self
+                .legacy_relay_pool
+                .clear_and_take_own_witnesses(RemovalReason::Abandoned);
+            info!(
+                "The next block {} follows {new_next_rules}: removed {} transactions of the era \
+                 before the hard fork at block {}, {} of them this node's, which are proven \
+                 again for the new era",
+                new_tip_height.next(),
+                events.len(),
+                upgrade_vm_v8_activation_height(network),
+                witnesses.len(),
+            );
+            legacy_pool_events.extend(events);
+            for primitive_witness in witnesses {
+                let txid = primitive_witness.kernel.txid();
+                if self
+                    .parked_own_witnesses
+                    .iter()
+                    .all(|parked| parked.primitive_witness.kernel.txid() != txid)
+                {
+                    self.parked_own_witnesses.push(ParkedOwnWitness {
+                        primitive_witness,
+                        attempts: 0,
+                    });
+                }
+            }
+        }
+
+        // Prove the parked transactions for the era after the fork, from their
+        // primitive witnesses, which the update job first brings to the tip's
+        // mutator set. Their jobs replace the mempool's, which would only
+        // update the witnesses.
+        if !self.parked_own_witnesses.is_empty() {
+            self.unpark_spent(&new_tip);
+        }
+        if !new_next_rules.is_legacy_era() && !self.parked_own_witnesses.is_empty() {
+            let (events, jobs, replaced_txids) = self.carry_parked_own_transactions(new_next_rules);
+            update_jobs.retain(|job| !replaced_txids.contains(&job.txid()));
+            update_jobs.extend(jobs);
+            legacy_pool_events.extend(events);
+        }
+        self.mempool.log_events(&legacy_pool_events, new_tip_height);
+        mempool_events.extend(legacy_pool_events);
 
         let parent_ms_accumulator =
             self.chain
@@ -2188,7 +2480,7 @@ impl GlobalState {
         }
 
         self.wallet_state
-            .handle_mempool_events(mempool_events)
+            .handle_mempool_events(mempool_events, new_tip.header().height.next())
             .await;
 
         // Reset block proposal, as that field pertains to the block that
@@ -2560,8 +2852,24 @@ impl GlobalState {
         .ok()
     }
 
-    /// Remove one transaction from the mempool and notify wallet of changes.
+    /// Remove one transaction from the mempool, or from the legacy relay
+    /// pool, and notify wallet of changes. A parked transaction of this node
+    /// (see [`Self::parked_own_witnesses`]) is parked no longer: its inputs
+    /// can be spent again.
     pub(crate) async fn mempool_remove(&mut self, transaction_id: TransactionKernelId) {
+        self.parked_own_witnesses
+            .retain(|parked| parked.primitive_witness.kernel.txid() != transaction_id);
+        self.mempool_remove_keeping_parked(transaction_id).await
+    }
+
+    /// [`Self::mempool_remove`], for a transaction whose update failed, as
+    /// when the mutator set it was made for is not on the chain: a parked
+    /// transaction of this node stays parked, to be proven again on a later
+    /// block, see [`Self::parked_own_witnesses`].
+    pub(crate) async fn mempool_remove_keeping_parked(
+        &mut self,
+        transaction_id: TransactionKernelId,
+    ) {
         let tip_height = self.chain.light_state().header().height;
         let mut events = self
             .mempool
@@ -2571,8 +2879,14 @@ impl GlobalState {
         if !events.is_empty() {
             events.extend(self.mempool.remove_stranded_links());
         }
+        events.extend(
+            self.legacy_relay_pool
+                .remove(transaction_id, RemovalReason::Explicit),
+        );
         self.mempool.log_events(&events, tip_height);
-        self.wallet_state.handle_mempool_events(events).await;
+        self.wallet_state
+            .handle_mempool_events(events, tip_height.next())
+            .await;
     }
 
     /// Record that upgrading the proofs of these transactions failed, so the
@@ -2587,15 +2901,27 @@ impl GlobalState {
         self.mempool.record_upgrade_failure(txids);
     }
 
-    /// clears all Tx from mempool and notifies wallet of changes.
+    /// clears all Tx from mempool and from the legacy relay pool, drops the
+    /// parked transactions of this node, and notifies wallet of changes.
     pub async fn mempool_clear(&mut self) {
+        self.parked_own_witnesses.clear();
         let tip_height = self.chain.light_state().header().height;
-        let events = self.mempool.clear();
+        let mut events = self.mempool.clear();
+        events.extend(self.legacy_relay_pool.clear(RemovalReason::Explicit));
         self.mempool.log_events(&events, tip_height);
-        self.wallet_state.handle_mempool_events(events).await
+        self.wallet_state
+            .handle_mempool_events(events, tip_height.next())
+            .await
     }
 
     /// adds Tx to mempool and notifies wallet of change.
+    ///
+    /// Transactions are held for the rule set of the next block, under which
+    /// the caller must have verified them: while that is the rule set of the
+    /// era before the fork, in the legacy relay pool, apart from the mempool,
+    /// so that the composer and the proof upgrader never see them (see
+    /// [`legacy_relay_pool`]). A transaction backed by a primitive witness is
+    /// one of this node's there, and is proven again on every block.
     pub async fn mempool_insert(
         &mut self,
         transaction: Transaction,
@@ -2604,21 +2930,22 @@ impl GlobalState {
     ) {
         let tip_height = self.chain.light_state().header().height;
 
-        // Transactions live in the tip's era. Before the fork this version holds
-        // none: it cannot merge or upgrade legacy-era transactions, and one held
-        // across the fork would make the first block after it impossible to
-        // compose. See `ConsensusRuleSet::is_legacy_era`.
-        if ConsensusRuleSet::infer_from(self.cli().network, tip_height).is_legacy_era() {
-            debug!(
-                "Not adding transaction {} to the mempool: the tip is in the legacy era",
-                transaction.kernel.txid()
-            );
+        if self.next_block_consensus_rule_set().is_legacy_era() {
+            let events =
+                self.legacy_relay_pool
+                    .insert(transaction, None, add_reason, Timestamp::now());
+            self.mempool.log_events(&events, tip_height);
+            self.wallet_state
+                .handle_mempool_events(events, tip_height.next())
+                .await;
             return;
         }
 
         let events = self.mempool.insert(transaction, priority, add_reason);
         self.mempool.log_events(&events, tip_height);
-        self.wallet_state.handle_mempool_events(events).await
+        self.wallet_state
+            .handle_mempool_events(events, tip_height.next())
+            .await
     }
 
     /// Adds a link transaction to the mempool and notifies wallet of change.
@@ -2642,30 +2969,89 @@ impl GlobalState {
 
         let events = self.mempool.insert_link(link_tx, priority, add_reason);
         self.mempool.log_events(&events, tip_height);
-        self.wallet_state.handle_mempool_events(events).await
+        self.wallet_state
+            .handle_mempool_events(events, tip_height.next())
+            .await
     }
 
-    /// prunes stale tx in mempool and notifies wallet of changes.
+    /// prunes stale tx in mempool and in the legacy relay pool, and notifies
+    /// wallet of changes.
     pub async fn mempool_prune_stale_transactions(&mut self) {
         let tip_height = self.chain.light_state().header().height;
-        let events = self.mempool.prune_stale_transactions();
+        let mut events = self.mempool.prune_stale_transactions();
+        events.extend(
+            self.legacy_relay_pool
+                .prune_stale_transactions(Timestamp::now()),
+        );
         self.mempool.log_events(&events, tip_height);
-        self.wallet_state.handle_mempool_events(events).await
+        self.wallet_state
+            .handle_mempool_events(events, tip_height.next())
+            .await
+    }
+
+    /// Like [`Self::mempool_insert`], for a transaction that was verified
+    /// under the given rule set: inserted only if that is still the rule set
+    /// of the next block. Returns whether it was offered to the mempool or
+    /// the legacy relay pool.
+    ///
+    /// A transaction verified for one era is never held for the other, also
+    /// when a block changed the next block's rule set after the verification.
+    pub(crate) async fn mempool_insert_for_rule_set(
+        &mut self,
+        transaction: Transaction,
+        consensus_rule_set: ConsensusRuleSet,
+        priority: UpgradePriority,
+        add_reason: AddReason,
+    ) -> bool {
+        let next_block_rule_set = self.next_block_consensus_rule_set();
+        if consensus_rule_set != next_block_rule_set {
+            debug!(
+                "Not adding transaction {}: it was verified under {consensus_rule_set}, but the \
+                 next block follows {next_block_rule_set}",
+                transaction.kernel.txid()
+            );
+            return false;
+        }
+
+        self.mempool_insert(transaction, priority, add_reason).await;
+        true
+    }
+
+    /// The transaction with this id, from the mempool or else from the legacy
+    /// relay pool.
+    pub(crate) fn mempool_or_legacy_pool_get(
+        &self,
+        transaction_id: TransactionKernelId,
+    ) -> Option<&Transaction> {
+        self.mempool
+            .get(transaction_id)
+            .or_else(|| self.legacy_relay_pool.get(transaction_id))
     }
 
     /// Update the primitive witness of a mempool transaction. Inserts the
-    /// transaction into the mempool if it's not already there.
+    /// transaction into the mempool if it's not already there. While the next
+    /// block belongs to the era before the fork, the same for the legacy relay
+    /// pool.
     pub(crate) async fn mempool_update_primitive_witness(
         &mut self,
         transaction_id: TransactionKernelId,
         new_primitive_witness: PrimitiveWitness,
     ) {
         let tip_height = self.chain.light_state().header().height;
-        let events = self
-            .mempool
-            .update_primitive_witness(transaction_id, new_primitive_witness);
+        let events = if self.next_block_consensus_rule_set().is_legacy_era() {
+            self.legacy_relay_pool.set_primitive_witness(
+                transaction_id,
+                new_primitive_witness,
+                Timestamp::now(),
+            )
+        } else {
+            self.mempool
+                .update_primitive_witness(transaction_id, new_primitive_witness)
+        };
         self.mempool.log_events(&events, tip_height);
-        self.wallet_state.handle_mempool_events(events).await
+        self.wallet_state
+            .handle_mempool_events(events, tip_height.next())
+            .await
     }
 
     pub(crate) async fn upgrade_proof_collection_job(
@@ -2721,7 +3107,8 @@ impl GlobalState {
 
         ensure!(!mutator_set_update.is_empty(), "No update needed");
 
-        let consensus_rule_set = self.consensus_rule_set();
+        // The updated transaction is mined in a later block.
+        let consensus_rule_set = self.next_block_consensus_rule_set();
         Ok(UpdateMutatorSetDataJob::new(
             old_kernel,
             old_proof,

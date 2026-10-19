@@ -2,20 +2,6 @@
 //!
 //! Common patterns across FFI functions.
 
-/// Generate a free function for an opaque handle type
-/// Usage: ffi_free!(xnt_wallet_free, WalletHandle);
-#[macro_export]
-macro_rules! ffi_free {
-    ($fn_name:ident, $handle_type:ty) => {
-        #[no_mangle]
-        pub extern "C" fn $fn_name(handle: *mut $handle_type) {
-            if !handle.is_null() {
-                unsafe { drop(Box::from_raw(handle)) }
-            }
-        }
-    };
-}
-
 /// Convert string to CString and return raw pointer
 /// Returns null on failure, optionally sets error
 /// Usage: ffi_cstring!(string_expr) or ffi_cstring!(string_expr, "error msg")

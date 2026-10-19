@@ -9,6 +9,7 @@ use tracing::warn;
 use crate::application::config::network::Network;
 use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+use crate::protocol::proof_abstractions::tasm::legacy_v7;
 
 // This claims-cache stores mock proof-claims that are simply asserted to be valid.
 //
@@ -184,17 +185,8 @@ async fn verify_inner(
             let claim = claim.clone();
             Box::new(move || triton_vm::verify(Stark::default(), &claim, &proof.into()))
         } else if claim.version == TritonProofVersion::V7.claim_version() {
-            let legacy_claim = legacy_v7::claim(&claim);
-            let legacy_proof = legacy_v7::proof(&proof.into());
-            if !legacy_v7::has_supported_padded_height(&legacy_proof) {
-                warn!("rejecting legacy v7 proof of unsupported padded height");
-                return false;
-            }
-            if reject_superfluous && !legacy_v7::has_expected_num_proof_items(&legacy_proof) {
-                warn!("rejecting legacy v7 proof that holds an unexpected number of proof items");
-                return false;
-            }
-            Box::new(move || legacy_v7::verify(&legacy_claim, &legacy_proof))
+            let claim = claim.clone();
+            Box::new(move || legacy_v7::verify_with(&claim, &proof.into(), reject_superfluous))
         } else {
             warn!(
                 "rejecting proof of unsupported proof format version {}",
@@ -221,87 +213,6 @@ async fn verify_inner(
     }
 
     verdict
-}
-
-/// Verification of `UpgradeVMv7` proofs (proof format 5) with the linked
-/// legacy triton-vm v7, so that a node running this release before the
-/// `UpgradeVMv8` fork checks v7 blocks instead of trusting them. Field elements
-/// are carried across by value; both versions use the same field.
-mod legacy_v7 {
-    use tasm_lib::triton_vm::prelude::BFieldElement;
-    use tasm_lib::triton_vm::proof::Claim;
-    use tasm_lib::triton_vm::proof::Proof as VmProof;
-    use triton_vm_v7 as tvm7;
-
-    fn to_v7(elements: &[BFieldElement]) -> Vec<tvm7::prelude::BFieldElement> {
-        elements
-            .iter()
-            .map(|element| tvm7::prelude::BFieldElement::new(element.value()))
-            .collect()
-    }
-
-    pub(super) fn claim(claim: &Claim) -> tvm7::proof::Claim {
-        let digest: [tvm7::prelude::BFieldElement; 5] = to_v7(&claim.program_digest.values())
-            .try_into()
-            .expect("a digest has five elements");
-        tvm7::proof::Claim::new(tvm7::prelude::Digest::new(digest))
-            .about_version(claim.version)
-            .with_input(to_v7(&claim.input))
-            .with_output(to_v7(&claim.output))
-    }
-
-    pub(super) fn proof(proof: &VmProof) -> tvm7::proof::Proof {
-        tvm7::proof::Proof(to_v7(&proof.0))
-    }
-
-    /// Like [`super::has_expected_num_proof_items`], for triton-vm v7, which
-    /// sends one item fewer outside of FRI: its quotient segments are a single
-    /// item.
-    pub(super) fn has_expected_num_proof_items(proof: &tvm7::proof::Proof) -> bool {
-        const NUM_ITEMS_OUTSIDE_FRI: usize = 15;
-        const NUM_ROUND_INDEPENDENT_FRI_ITEMS: usize = 4;
-        const NUM_FRI_ITEMS_PER_ROUND: usize = 2;
-
-        let Ok(padded_height) = proof.padded_height() else {
-            return false;
-        };
-        let Ok(fri) = tvm7::prelude::Stark::default().fri(padded_height) else {
-            return false;
-        };
-        let Ok(proof_stream) = tvm7::proof_stream::ProofStream::try_from(proof) else {
-            return false;
-        };
-        let expected = NUM_ITEMS_OUTSIDE_FRI
-            + NUM_ROUND_INDEPENDENT_FRI_ITEMS
-            + NUM_FRI_ITEMS_PER_ROUND * fri.num_rounds();
-        proof_stream.items.len() == expected
-    }
-
-    /// Like [`super::has_supported_padded_height`], for triton-vm v7.
-    pub(super) fn has_supported_padded_height(proof: &tvm7::proof::Proof) -> bool {
-        let Ok(proof_stream) = tvm7::proof_stream::ProofStream::try_from(proof) else {
-            return false;
-        };
-        let Some(Ok(log2_padded_height)) = proof_stream
-            .items
-            .into_iter()
-            .next()
-            .map(|item| item.try_into_log2_padded_height())
-        else {
-            return false;
-        };
-        let Some(padded_height) = 1_usize.checked_shl(log2_padded_height) else {
-            return false;
-        };
-
-        tvm7::prelude::Stark::default()
-            .fri(padded_height)
-            .is_ok_and(|fri| u32::try_from(fri.domain.len()).is_ok())
-    }
-
-    pub(super) fn verify(claim: &tvm7::proof::Claim, proof: &tvm7::proof::Proof) -> bool {
-        tvm7::verify(tvm7::prelude::Stark::default(), claim, proof)
-    }
 }
 
 /// Add a claim to the [`CLAIMS_CACHE`].

@@ -3,13 +3,14 @@
 use bip39::{Language, Mnemonic, MnemonicType};
 use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
 use neptune_privacy::prelude::twenty_first::prelude::Tip5;
+use neptune_privacy::state::wallet::address::dctidh_address::legacy_dctidh_cutoff as core_legacy_dctidh_cutoff;
 use neptune_privacy::state::wallet::address::SpendingKey as CoreSpendingKey;
 use neptune_privacy::state::wallet::secret_key_material::SecretKeyMaterial;
 use neptune_privacy::state::wallet::wallet_entropy::WalletEntropy as CoreWalletEntropy;
 
 use super::address::Address;
 use super::error::{Result, XntError};
-use super::types::Digest;
+use super::types::{Digest, Network};
 
 /// Wallet entropy - root secret for key derivation
 #[derive(Clone)]
@@ -118,6 +119,12 @@ impl SpendingKey {
     }
 
     /// Get receiver preimage (privacy_preimage) for commitment computation
+    ///
+    /// For dCTIDH keys this is also the unlock preimage of the key's lock
+    /// script: anyone who knows it can spend the UTXOs locked to the key.
+    /// Treat it as a spending secret for dCTIDH keys: keep it on the device
+    /// that holds the seed, do not log it, send it to a server or store it
+    /// unencrypted.
     pub fn receiver_preimage(&self) -> Digest {
         Digest::from_core(self.inner.privacy_preimage())
     }
@@ -138,5 +145,87 @@ impl SpendingKey {
     /// Returns true if this is a Generation spending key.
     pub fn is_generation(&self) -> bool {
         matches!(self.inner, CoreSpendingKey::Generation(_))
+    }
+
+    /// Returns true for dCTIDH keys derived with the legacy (pre-v0.3) lock
+    /// derivation, see [WalletEntropy::derive_legacy_dctidh_spending_key].
+    ///
+    /// UTXOs locked to such a key are sweep-only: move them to a key of the
+    /// current format and never count them towards the available balance.
+    pub fn is_legacy(&self) -> bool {
+        self.inner.is_legacy()
+    }
+
+    /// Whether UTXOs locked to this key and confirmed in a block of height
+    /// `block_height` are recognized on `network`.
+    ///
+    /// Always true for keys that are not legacy. For legacy keys true only
+    /// below [legacy_dctidh_cutoff], the same rule the node wallet applies.
+    pub fn recognizes_utxos_at(&self, network: Network, block_height: u64) -> bool {
+        !self.is_legacy()
+            || legacy_dctidh_cutoff(network).is_none_or(|cutoff| block_height < cutoff)
+    }
+}
+
+/// The block height from which UTXOs locked to legacy-format (pre-v0.3) dCTIDH
+/// locks are no longer recognized, or `None` if they are recognized at any
+/// height.
+///
+/// Same rule as the node wallet: on main net this is the `UpgradeVMv8`
+/// activation height; other networks run `UpgradeVMv8` from genesis and have
+/// no cutoff.
+pub fn legacy_dctidh_cutoff(network: Network) -> Option<u64> {
+    core_legacy_dctidh_cutoff(network.into()).map(u64::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use neptune_privacy::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
+
+    use super::*;
+
+    const MAIN_NET_CUTOFF: u64 = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET.value();
+
+    #[test]
+    fn legacy_dctidh_cutoff_is_set_on_main_net_only() {
+        assert_eq!(Some(MAIN_NET_CUTOFF), legacy_dctidh_cutoff(Network::Main));
+        for network in [Network::TestnetMock, Network::RegTest, Network::Testnet] {
+            assert_eq!(None, legacy_dctidh_cutoff(network), "{network:?}");
+        }
+    }
+
+    #[test]
+    fn only_legacy_derivation_keys_are_legacy() {
+        let wallet = WalletEntropy::devnet();
+        let generation = wallet.derive_spending_key(0);
+        let current = wallet.derive_dctidh_spending_key(0);
+        let legacy = wallet.derive_legacy_dctidh_spending_key(0);
+
+        assert!(!generation.is_legacy());
+        assert!(!current.is_legacy());
+        assert!(legacy.is_legacy());
+
+        // The legacy key is the pre-v0.3 key: its own receiver identifier and lock
+        assert_ne!(current.receiver_id(), legacy.receiver_id());
+        assert_ne!(current.lock_script_hash(), legacy.lock_script_hash());
+        assert!(legacy.to_address().is_err());
+    }
+
+    #[test]
+    fn legacy_keys_recognize_utxos_only_below_the_cutoff() {
+        let wallet = WalletEntropy::devnet();
+        let legacy = wallet.derive_legacy_dctidh_spending_key(1);
+        let current = wallet.derive_dctidh_spending_key(1);
+        let generation = wallet.derive_spending_key(1);
+
+        assert!(legacy.recognizes_utxos_at(Network::Main, MAIN_NET_CUTOFF - 1));
+        assert!(!legacy.recognizes_utxos_at(Network::Main, MAIN_NET_CUTOFF));
+        assert!(!legacy.recognizes_utxos_at(Network::Main, u64::MAX));
+        assert!(legacy.recognizes_utxos_at(Network::RegTest, u64::MAX));
+
+        for key in [current, generation] {
+            assert!(key.recognizes_utxos_at(Network::Main, MAIN_NET_CUTOFF));
+            assert!(key.recognizes_utxos_at(Network::Main, u64::MAX));
+        }
     }
 }

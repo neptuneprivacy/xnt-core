@@ -5,20 +5,67 @@ style = "Both"
 tab_width = 4
 documentation = true
 documentation_style = "c99"
+after_includes = """
+/*
+ * Conventions
+ *
+ * - Handles are freed with the matching *_free function; every *_free
+ *   function ignores NULL.
+ * - On failure a function returns an error code or its documented failure
+ *   value (NULL, false, 0, -1 or an empty result) and sets a thread-local
+ *   message, see xnt_get_last_error. A Rust panic inside the library is
+ *   reported the same way: XNT_ERROR_CODE_INTERNAL_ERROR or the failure
+ *   value, and a message starting with "internal error". This needs a
+ *   library built with panic = "unwind", the default for release builds.
+ * - Network arguments are a uint32_t holding one of the XntNetwork values.
+ * - Amounts are in nau. Functions ending in _le pass them as 16 bytes,
+ *   little-endian two's complement. The other amount functions and the
+ *   amount fields use __int128 (GCC and Clang on 64-bit targets), which has
+ *   the same size and alignment as Rust's i128 there.
+ * - Spending secrets: for dCTIDH keys the receiver preimage
+ *   (xnt_spending_key_receiver_preimage, _hex) is the unlock preimage of the
+ *   key's lock script, and the witness of a built transaction
+ *   (xnt_built_transaction_witness, xnt_built_transaction_serialize) holds
+ *   the unlock data of its inputs. Anyone who has them can spend the
+ *   corresponding UTXOs: keep them on the device that holds the seed, do not
+ *   log them, send them to a server or store them unencrypted.
+ * - Keys from xnt_wallet_derive_legacy_dctidh_key are sweep-only: move their
+ *   UTXOs to a current-format key and never count them towards the
+ *   available balance, see xnt_spending_key_is_legacy.
+ */
+"""
 
 [export]
-include = []
+# Not referenced by any function signature (network arguments are uint32_t)
+include = ["XntNetwork"]
 exclude = []
+# Types get the Xnt prefix, except those listed in [export.rename]
 prefix = "Xnt"
+renaming_overrides_prefixing = true
 
 [export.rename]
-# Types get Xnt prefix automatically via export.prefix
+# Already prefixed in Rust
+"XntErrorCode" = "XntErrorCode"
+"XntNetwork" = "XntNetwork"
+"XntDigest" = "XntDigest"
+"XntIndexedUtxo" = "XntIndexedUtxo"
+"XntIndexedUtxoArray" = "XntIndexedUtxoArray"
+"XntDecryptedUtxo" = "XntDecryptedUtxo"
+"XntSpentStatus" = "XntSpentStatus"
+"XntAoclIndices" = "XntAoclIndices"
+"XntTxInputInfo" = "XntTxInputInfo"
+"XntTxInputInfoArray" = "XntTxInputInfoArray"
+"XntTxOutputInfo" = "XntTxOutputInfo"
+"XntTxOutputInfoArray" = "XntTxOutputInfoArray"
+"XntMigrationInputInfo" = "XntMigrationInputInfo"
+# 128-bit amounts, see the conventions above
+"i128" = "__int128"
+"MAX_INPUTS" = "XNT_MAX_INPUTS"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"
 prefix_with_name = true
 
 [fn]
-# Function prefix - all #[no_mangle] extern "C" fns get this prefix
-prefix = "xnt_"
+# Exported function names already start with xnt_
 rename_args = "None"

@@ -35,16 +35,19 @@ use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
+use crate::protocol::consensus::transaction::validity::legacy_v7::check_v7_single_proof_capability_blocking;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof;
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof_mock;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_claim;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
 use crate::triton_vm::prelude::Program;
 use crate::protocol::consensus::transaction::validity::tasm::single_proof::update_branch::UpdateWitness;
 use crate::protocol::consensus::transaction::TransactionProof;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::legacy_v7;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
-use crate::protocol::proof_abstractions::SecretWitness;
+use crate::protocol::proof_abstractions::tasm::prover_job::ProverJobSettings;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::triton_vm::proof::Claim;
 use crate::triton_vm::vm::NonDeterminism;
@@ -268,43 +271,65 @@ impl<'a> TransactionProofBuilder<'a> {
 
         let proof_job_options = proof_job_options.ok_or(ProofRequirement::ProofJobOptions)?;
 
-        // Any transaction built for the legacy era is useless to this version: it
-        // can neither hold nor relay it (see `ConsensusRuleSet::is_legacy_era`),
-        // so a ProofCollection or PrimitiveWitness one would be dropped silently.
-        // Refuse it up front, for every proof type.
-        if let Some(rule_set) = consensus_rule_set {
-            if rule_set.is_legacy_era() {
-                return Err(CreateProofError::LegacyEra(rule_set));
-            }
-        }
-
         let valid_mock = valid_mock.unwrap_or(true);
         let job_queue = job_queue.unwrap_or_else(vm_job_queue);
 
         // note: evaluation order must match order stated in the method doc-comment.
 
         if proof_job_options.job_settings.proof_type.is_single_proof() {
-            let _ = consensus_rule_set;
-            use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
-            let single_proof_program = SingleProofV2.program();
+            // The rule set selects the SingleProof program and how its
+            // nondeterminism is made; without one, `UpgradeVMv8`'s, the rule
+            // set of the newest era.
+            let rule_set = consensus_rule_set.unwrap_or(ConsensusRuleSet::UpgradeVMv8);
+            let network = proof_job_options.job_settings.network;
 
             // claim, nondeterminism --> single proof
             if let Some((c, nd)) = claim_and_nondeterminism {
-                return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
+                let single_proof_program = SingleProofV2::program_for(rule_set)?;
+                let options = SingleProofV2::job_options_for(rule_set, proof_job_options);
+                return gen_single(
+                    single_proof_program,
+                    c,
+                    || nd,
+                    job_queue,
+                    options,
+                    valid_mock,
+                )
+                .await;
             }
             // update-witness --> single proof
             else if let Some(w) = update_witness {
                 let spw = SingleProofV2Witness::from_update(w.clone());
-                let c = spw.claim();
-                let nd = spw.nondeterminism();
-                return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
+                let single_proof_program = SingleProofV2::program_for(rule_set)?;
+                let c = single_proof_claim(spw.kernel_mast_hash(), rule_set);
+                let nd = spw.nondeterminism_for(rule_set, network).await?;
+                let options = SingleProofV2::job_options_for(rule_set, proof_job_options);
+                return gen_single(
+                    single_proof_program,
+                    c,
+                    || nd,
+                    job_queue,
+                    options,
+                    valid_mock,
+                )
+                .await;
             }
             // proof-collection --> single proof
             else if let Some(pc) = proof_collection {
                 let spw = SingleProofV2Witness::from_collection(pc);
-                let c = spw.claim();
-                let nd = spw.nondeterminism();
-                return gen_single(single_proof_program, c, || nd, job_queue, proof_job_options, valid_mock).await;
+                let single_proof_program = SingleProofV2::program_for(rule_set)?;
+                let c = single_proof_claim(spw.kernel_mast_hash(), rule_set);
+                let nd = spw.nondeterminism_for(rule_set, network).await?;
+                let options = SingleProofV2::job_options_for(rule_set, proof_job_options);
+                return gen_single(
+                    single_proof_program,
+                    c,
+                    || nd,
+                    job_queue,
+                    options,
+                    valid_mock,
+                )
+                .await;
             }
         }
 
@@ -416,8 +441,15 @@ async fn proof_collection_from_witness(
         });
     }
 
-    let _ = consensus_rule_set;
-    let pc = ProofCollection::produce_v2(witness_cow.borrow(), job_queue, proof_job_options).await?;
+    // Without a rule set, `UpgradeVMv8`, the rule set of the newest era.
+    let consensus_rule_set = consensus_rule_set.unwrap_or(ConsensusRuleSet::UpgradeVMv8);
+    let pc = ProofCollection::produce_v2(
+        witness_cow.borrow(),
+        job_queue,
+        proof_job_options,
+        consensus_rule_set,
+    )
+    .await?;
 
     Ok(pc)
 }
@@ -455,6 +487,35 @@ async fn single_proof_from_witness(
         });
     }
 
+    // A v7 single proof is attempted only where this machine can hold it,
+    // which the v7 proof collection it is raised from tells.
+    if consensus_rule_set == ConsensusRuleSet::UpgradeVMv7 {
+        let pc_options = TritonVmProofJobOptions {
+            job_settings: ProverJobSettings {
+                proof_type: TransactionProofType::ProofCollection,
+                ..proof_job_options.job_settings.clone()
+            },
+            ..proof_job_options.clone()
+        };
+        let proof_collection = ProofCollection::produce_v2(
+            witness_cow.borrow(),
+            job_queue.clone(),
+            pc_options,
+            consensus_rule_set,
+        )
+        .await?;
+        check_v7_single_proof_capability_blocking(
+            proof_collection.clone(),
+            proof_job_options.job_settings.clone(),
+            legacy_v7::available_memory(),
+        )
+        .await?;
+
+        return SingleProofV2Witness::from_collection(proof_collection)
+            .produce(job_queue, proof_job_options, consensus_rule_set)
+            .await;
+    }
+
     // produce proof of requested type
     let sp = produce_single_proof(
         witness_cow.borrow(),
@@ -477,48 +538,68 @@ mod tests {
     use crate::application::config::network::Network;
     use crate::tests::shared_tokio_runtime;
 
-    /// Before the fork no transaction can be built, whatever its proof type: a
-    /// legacy-era transaction could neither be held nor relayed by this version.
-    /// The guard fires before any witness data is needed.
+    /// Proofs are built for the legacy era as for the current one, whatever
+    /// their type: the builder proceeds and only stops for the missing witness
+    /// data. Whether a transaction may still be created for the legacy era is
+    /// decided where it is created, see `legacy_era`.
     #[apply(shared_tokio_runtime)]
-    async fn legacy_era_transactions_are_refused_for_every_proof_type() {
-        for proof_type in [
-            TransactionProofType::PrimitiveWitness,
-            TransactionProofType::ProofCollection,
-            TransactionProofType::SingleProof,
-        ] {
-            let options = TritonVmProofJobOptionsBuilder::new()
-                .network(Network::Main)
-                .proof_type(proof_type)
-                .build();
-            let result = TransactionProofBuilder::new()
-                .consensus_rule_set(ConsensusRuleSet::UpgradeVMv7)
-                .proof_job_options(options)
-                .build()
-                .await;
-            assert!(
-                matches!(
-                    result,
-                    Err(CreateProofError::LegacyEra(ConsensusRuleSet::UpgradeVMv7))
-                ),
-                "{proof_type}: expected the legacy-era refusal, got {result:?}"
+    async fn proofs_are_built_for_the_legacy_era_and_the_current_one() {
+        for consensus_rule_set in [ConsensusRuleSet::UpgradeVMv7, ConsensusRuleSet::UpgradeVMv8] {
+            for proof_type in [
+                TransactionProofType::PrimitiveWitness,
+                TransactionProofType::ProofCollection,
+                TransactionProofType::SingleProof,
+            ] {
+                let options = TritonVmProofJobOptionsBuilder::new()
+                    .network(Network::Main)
+                    .proof_type(proof_type)
+                    .build();
+                let result = TransactionProofBuilder::new()
+                    .consensus_rule_set(consensus_rule_set)
+                    .proof_job_options(options)
+                    .build()
+                    .await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(CreateProofError::MissingRequirement(
+                            ProofRequirement::TransactionProofInput
+                        ))
+                    ),
+                    "{consensus_rule_set}, {proof_type}: expected the missing witness, got \
+                     {result:?}"
+                );
+            }
+        }
+    }
+
+    /// Proof collections carry the claim version of `UpgradeVMv7` for the
+    /// legacy era and that of `UpgradeVMv8` otherwise: never the claim version
+    /// of a checkpointed era, which no verifier of this version checks, and
+    /// never the v7 one for `UpgradeVMv5`, which shares it.
+    #[test]
+    fn proof_collections_carry_the_claim_version_of_a_verified_era() {
+        use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
+        use strum::IntoEnumIterator;
+
+        for consensus_rule_set in ConsensusRuleSet::iter() {
+            let expected = match consensus_rule_set {
+                ConsensusRuleSet::UpgradeVMv7 => TritonProofVersion::V7.claim_version(),
+                _ => TritonProofVersion::V8.claim_version(),
+            };
+            assert_eq!(
+                expected,
+                ProofCollection::claim_version_for(consensus_rule_set),
+                "{consensus_rule_set}"
             );
         }
-
-        // The current era is not refused: the builder proceeds and only stops
-        // for the missing witness data.
-        let options = TritonVmProofJobOptionsBuilder::new()
-            .network(Network::Main)
-            .proof_type(TransactionProofType::ProofCollection)
-            .build();
-        let result = TransactionProofBuilder::new()
-            .consensus_rule_set(ConsensusRuleSet::UpgradeVMv8)
-            .proof_job_options(options)
-            .build()
-            .await;
-        assert!(
-            !matches!(result, Err(CreateProofError::LegacyEra(_))),
-            "the current era must not be refused, got {result:?}"
+        assert_eq!(
+            5,
+            ProofCollection::claim_version_for(ConsensusRuleSet::UpgradeVMv7)
+        );
+        assert_eq!(
+            8,
+            ProofCollection::claim_version_for(ConsensusRuleSet::UpgradeVMv5)
         );
     }
 }

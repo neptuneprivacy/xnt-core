@@ -47,6 +47,7 @@ use super::link_proof_witness::DISCRIMINANT_FOR_FORGE;
 use super::link_tx::LinkTx;
 use super::link_tx::LinkTxProof;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
 use crate::api::tx_initiation::error::CreateProofError;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
@@ -312,6 +313,7 @@ impl ForgeWitness {
             lock_scripts_halt.push(
                 lsaw.prove(
                     lock_script_input.clone(),
+                    TritonProofVersion::V8.claim_version(),
                     job_queue.clone(),
                     options.clone(),
                 )
@@ -346,6 +348,7 @@ impl ForgeWitness {
                     inner_root,
                     salted_inputs_hash,
                     salted_outputs_hash,
+                    TritonProofVersion::V8.claim_version(),
                     job_queue.clone(),
                     options.clone(),
                 )

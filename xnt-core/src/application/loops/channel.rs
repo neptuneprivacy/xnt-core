@@ -15,6 +15,7 @@ use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::peer::link_tx_notification::LinkTxNotification;
@@ -261,8 +262,9 @@ pub enum RPCServerToMain {
     RestartMiner,
     SetTipToStoredBlock(Digest),
 
-    // Used by JSON-RPC
-    SubmitTx(Box<Transaction>),
+    /// Used by JSON-RPC: a transaction verified under the given rule set,
+    /// that of the next block at the time.
+    SubmitTx(Box<Transaction>, ConsensusRuleSet),
 
     /// Give the IP address a bad standing, disconnect the peers at it, and
     /// refuse it on both network stacks.

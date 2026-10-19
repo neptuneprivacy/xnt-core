@@ -165,6 +165,12 @@ pub(super) struct WalletDbTables {
     // table number: 14
     /// Counter for next CTIDH key derivation index.
     pub(super) dctidh_key_counter: DbtSingleton<u64>,
+
+    // table number: 15
+    /// The CTIDH derivation indices below this bound may hold funds at
+    /// legacy-format locks. Recorded the first time this version opens the
+    /// wallet; `None` before that.
+    pub(super) legacy_dctidh_key_bound: DbtSingleton<Option<u64>>,
 }
 
 impl WalletDbTables {
@@ -219,6 +225,11 @@ impl WalletDbTables {
             .new_singleton::<u64>("dctidh_key_counter")
             .await;
 
+        let legacy_dctidh_key_bound = storage
+            .schema
+            .new_singleton::<Option<u64>>("legacy_dctidh_key_bound")
+            .await;
+
         WalletDbTables {
             sync_label,
             monitored_utxos,
@@ -232,6 +243,7 @@ impl WalletDbTables {
             index_set_to_mutxo,
             addition_record_to_expected_utxo,
             dctidh_key_counter,
+            legacy_dctidh_key_bound,
         }
     }
 

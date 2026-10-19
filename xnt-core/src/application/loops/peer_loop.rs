@@ -12,6 +12,7 @@ use futures::sink::SinkExt;
 use futures::stream::TryStream;
 use futures::stream::TryStreamExt;
 use futures::FutureExt;
+use itertools::Itertools;
 use rand::rngs::StdRng;
 use rand::RngExt;
 use rand::SeedableRng;
@@ -27,6 +28,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::application::config::network::Network;
 use crate::application::config::parser::multiaddr::canonical_socket_addr;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::PeerTaskToMain;
@@ -47,6 +49,7 @@ use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionConfirmabilityError;
 use crate::protocol::consensus::transaction::Transaction;
+use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::handshake_data::HandshakeData;
 use crate::protocol::peer::peer_info::PeerConnectionInfo;
 use crate::protocol::peer::peer_info::PeerInfo;
@@ -62,6 +65,8 @@ use crate::protocol::peer::PeerSanction;
 use crate::protocol::peer::PeerStanding;
 use crate::protocol::peer::PositivePeerSanction;
 use crate::protocol::peer::SyncChallenge;
+use crate::protocol::peer::UntakenReason;
+use crate::protocol::peer::UntakenTransaction;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::link_tx_admission::link_tx_admissible;
@@ -69,6 +74,7 @@ use crate::state::mempool::link_tx_admission::link_tx_precheck;
 use crate::state::mempool::link_tx_admission::LinkTxAdmissionError;
 use crate::state::mempool::MEMPOOL_TX_THRESHOLD_AGE_IN_SECS;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
+use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
 use crate::util_types::mutator_set::removal_record::RemovalRecordValidityError;
@@ -182,29 +188,50 @@ impl PeerLoopHandler {
         }
     }
 
-    /// Punish a peer for bad behavior.
-    ///
-    /// Return `Err` if the peer in question is (now) banned.
-    ///
-    /// # Locking:
-    ///   * acquires `global_state_lock` for write
-    /// Whether the chain tip is in the legacy era, see
-    /// [`ConsensusRuleSet::is_legacy_era`]. Transactions are validated in the
-    /// tip's era. Before the fork this version neither verifies nor holds them:
-    /// it cannot merge or upgrade them, and one held across the fork would make
-    /// the first block after it impossible to compose. They are ignored rather
-    /// than punished, since the peers relaying them are honest.
-    async fn tip_is_in_legacy_era(&self) -> bool {
-        let tip_height = self
-            .global_state_lock
-            .lock_guard()
-            .await
-            .chain
-            .light_state()
-            .header()
-            .height;
-        ConsensusRuleSet::infer_from(self.global_state_lock.cli().network, tip_height)
-            .is_legacy_era()
+    /// The consensus rule sets a transaction from a peer may be meant for,
+    /// other than that of the next block, under which transactions are
+    /// verified: those of the tip and of the block after the next one, if they
+    /// differ. Next to a hard fork, a peer may relay a transaction made for the
+    /// other side of it, which is not held but not punished either.
+    fn neighboring_rule_sets(
+        network: Network,
+        tip_height: BlockHeight,
+    ) -> impl Iterator<Item = ConsensusRuleSet> {
+        let next_block_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
+        [
+            ConsensusRuleSet::infer_from(network, tip_height),
+            ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
+        ]
+        .into_iter()
+        .filter(move |rule_set| *rule_set != next_block_rule_set)
+        .dedup()
+    }
+
+    /// A fingerprint of a transaction proof, by which another proof of the
+    /// same transaction is told apart, see [`UntakenTransaction`].
+    fn proof_fingerprint(proof: &TransactionProof) -> u64 {
+        use std::hash::Hash;
+        use std::hash::Hasher;
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bincode::serialize(proof)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Whether the peer may be sent the transaction with this id, which the
+    /// node holds in its mempool or legacy relay pool: a transaction of the
+    /// era before the next hard fork goes to every peer, one of the mempool
+    /// only to a peer whose version follows `UpgradeVMv8`. A peer of an
+    /// earlier version cannot verify that one, and is entitled to sanction
+    /// the sender.
+    fn peer_may_receive(&self, state: &GlobalState, txid: TransactionKernelId) -> bool {
+        state.legacy_relay_pool.contains(txid)
+            || version_follows_rule_set(
+                &self.peer_handshake_data.version,
+                ConsensusRuleSet::UpgradeVMv8,
+            )
     }
 
     /// Whether the chain tip's rule set has chain branches, see
@@ -264,6 +291,12 @@ impl PeerLoopHandler {
         }
     }
 
+    /// Punish a peer for bad behavior.
+    ///
+    /// Return `Err` if the peer in question is (now) banned.
+    ///
+    /// # Locking:
+    ///   * acquires `global_state_lock` for write
     async fn punish(&mut self, reason: NegativePeerSanction) -> Result<()> {
         let sanction_result = {
             let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
@@ -1439,13 +1472,6 @@ impl PeerLoopHandler {
             PeerMessage::Transaction(transaction) => {
                 log_slow_scope!(fn_name!() + "::PeerMessage::Transaction");
 
-                if self.tip_is_in_legacy_era().await {
-                    debug!(
-                        "Ignoring transaction: this version does not hold legacy-era transactions"
-                    );
-                    return Ok(KEEP_CONNECTION_ALIVE);
-                }
-
                 // Early check for oversized announcements to prevent DoS
                 for announcement in &transaction.kernel.announcements {
                     if announcement.message.len() > MAX_ANNOUNCEMENT_MESSAGE_SIZE {
@@ -1495,9 +1521,11 @@ impl PeerLoopHandler {
                     )
                 };
 
+                // Transactions are verified and held for the rule set of the
+                // next block: before the fork, in the legacy relay pool.
                 let network = self.global_state_lock.cli().network;
                 let consensus_rule_set =
-                    ConsensusRuleSet::infer_from(network, current_block_height);
+                    ConsensusRuleSet::infer_for_next_block(network, current_block_height);
 
                 // 0. If transaction can never be mined, punish. Checked before
                 // validity because it reads only kernel lengths, whereas
@@ -1536,23 +1564,58 @@ impl PeerLoopHandler {
                 }
 
                 // 3. Check if transaction is already known.
-                if !self
-                    .global_state_lock
-                    .lock_guard()
-                    .await
-                    .mempool
-                    .accept_transaction(
-                        transaction.kernel.txid(),
-                        transaction.proof.proof_quality()?,
-                        transaction.kernel.mutator_set_hash,
-                    )
-                {
+                let accept_transaction = {
+                    let state = self.global_state_lock.lock_guard().await;
+                    let txid = transaction.kernel.txid();
+                    let proof_quality = transaction.proof.proof_quality()?;
+                    let mutator_set_hash = transaction.kernel.mutator_set_hash;
+                    if consensus_rule_set.is_legacy_era() {
+                        state.legacy_relay_pool.accept_transaction(
+                            txid,
+                            proof_quality,
+                            mutator_set_hash,
+                        )
+                    } else {
+                        state
+                            .mempool
+                            .accept_transaction(txid, proof_quality, mutator_set_hash)
+                    }
+                };
+                if !accept_transaction {
                     warn!("Received transaction that was already known");
 
                     // We received a transaction that we *probably* haven't requested.
                     // Consider punishing here, if this is abused.
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
+
+                // A transaction this peer sent before, with the same proof,
+                // at this tip, that was verified but not taken, is not
+                // verified again.
+                let txid = transaction.kernel.txid();
+                let proof_quality = transaction.proof.proof_quality()?;
+                let mut fingerprint = None;
+                if peer_state_info.has_untaken_transaction(tip, txid) {
+                    let proof_fingerprint = Self::proof_fingerprint(&transaction.proof);
+                    if peer_state_info.is_untaken_transaction(
+                        tip,
+                        txid,
+                        proof_quality,
+                        proof_fingerprint,
+                    ) {
+                        debug!("Ignoring transaction {txid}: it was verified at this tip already");
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                    fingerprint = Some(proof_fingerprint);
+                }
+                let untaken = |reason| UntakenTransaction {
+                    tip,
+                    txid,
+                    proof_quality,
+                    proof_fingerprint: fingerprint
+                        .unwrap_or_else(|| Self::proof_fingerprint(&transaction.proof)),
+                    reason,
+                };
 
                 // 4. if transaction is not confirmable, punish.
                 if !transaction.is_confirmable_relative_to(&mutator_set_accumulator_after) {
@@ -1656,8 +1719,43 @@ impl PeerLoopHandler {
 
                 // 7. If transaction is invalid, punish. Checked last because
                 // it verifies proofs, whereas the checks above read only the
-                // kernel and the mempool.
+                // kernel and the mempool. Next to a hard fork, a transaction
+                // valid on the other side of it is ignored, not punished.
                 if !transaction.is_valid(network, consensus_rule_set).await {
+                    for neighboring_rule_set in
+                        Self::neighboring_rule_sets(network, current_block_height)
+                    {
+                        if transaction.is_valid(network, neighboring_rule_set).await {
+                            debug!(
+                                "Ignoring transaction {txid}: it is valid under \
+                                 {neighboring_rule_set}, but the next block follows \
+                                 {consensus_rule_set}"
+                            );
+                            peer_state_info
+                                .record_untaken_transaction(untaken(UntakenReason::OtherEra));
+                            return Ok(KEEP_CONNECTION_ALIVE);
+                        }
+                    }
+
+                    // Before the fork, the nodes of the previous release take
+                    // and relay some transactions that this version, checking
+                    // proof collections more strictly, does not. Such a
+                    // transaction is not taken, nor sanctioned.
+                    if consensus_rule_set.is_legacy_era()
+                        && transaction
+                            .proof
+                            .verify_as_previous_release(transaction.kernel.mast_hash(), network)
+                            .await
+                    {
+                        info!(
+                            "Ignoring transaction {txid}: it is valid under {consensus_rule_set} \
+                             as the previous release checks it, but not as this version does"
+                        );
+                        peer_state_info
+                            .record_untaken_transaction(untaken(UntakenReason::PreviousRelease));
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
                     warn!("Received invalid tx");
                     self.punish(NegativePeerSanction::InvalidTransaction)
                         .await?;
@@ -1676,14 +1774,6 @@ impl PeerLoopHandler {
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             PeerMessage::TransactionNotification(tx_notification) => {
-                if self.tip_is_in_legacy_era().await {
-                    debug!(
-                        "Ignoring transaction notification: \
-                         this version does not hold legacy-era transactions"
-                    );
-                    return Ok(KEEP_CONNECTION_ALIVE);
-                }
-
                 // addresses #457
                 // new scope for state read-lock to avoid holding across peer.send()
                 {
@@ -1701,12 +1791,56 @@ impl PeerLoopHandler {
 
                     // 1. Ignore if we already know this transaction, and
                     // the proof quality is not higher than what we already know.
+                    // Before the fork, transactions are held in the legacy
+                    // relay pool.
                     let state = self.global_state_lock.lock_guard().await;
-                    let accept_tx = state.mempool.accept_transaction(
+                    let next_block_rule_set = state.next_block_consensus_rule_set();
+
+                    // A peer whose version does not follow the rule set of the
+                    // next block, as one of the previous release once the next
+                    // block belongs to the era after the fork, has only
+                    // transactions that cannot be mined in that block.
+                    if !version_follows_rule_set(
+                        &self.peer_handshake_data.version,
+                        next_block_rule_set,
+                    ) {
+                        debug!(
+                            "Not requesting transaction {} from peer {}: its version {} does not \
+                             follow {next_block_rule_set}",
+                            tx_notification.txid,
+                            self.peer_address,
+                            self.peer_handshake_data.version
+                        );
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
+                    // An announcement of a transaction that this peer sent at
+                    // this tip, and that was not taken, is not followed up.
+                    if peer_state_info.skips_announcement(
+                        state.chain.light_state().hash(),
                         tx_notification.txid,
                         tx_notification.proof_quality,
-                        tx_notification.mutator_set_hash,
-                    );
+                    ) {
+                        debug!(
+                            "Not requesting transaction {}: it was verified at this tip already",
+                            tx_notification.txid
+                        );
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
+                    let accept_tx = if next_block_rule_set.is_legacy_era() {
+                        state.legacy_relay_pool.accept_transaction(
+                            tx_notification.txid,
+                            tx_notification.proof_quality,
+                            tx_notification.mutator_set_hash,
+                        )
+                    } else {
+                        state.mempool.accept_transaction(
+                            tx_notification.txid,
+                            tx_notification.proof_quality,
+                            tx_notification.mutator_set_hash,
+                        )
+                    };
                     if !accept_tx {
                         debug!("transaction with same or higher proof quality was already known");
                         return Ok(KEEP_CONNECTION_ALIVE);
@@ -1736,9 +1870,18 @@ impl PeerLoopHandler {
             }
             PeerMessage::TransactionRequest(transaction_identifier) => {
                 let state = self.global_state_lock.lock_guard().await;
-                let Some(transaction) = state.mempool.get(transaction_identifier) else {
+                let Some(transaction) = state.mempool_or_legacy_pool_get(transaction_identifier)
+                else {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 };
+                if !self.peer_may_receive(&state, transaction_identifier) {
+                    debug!(
+                        "Not serving transaction {transaction_identifier} to peer {}: its version \
+                         {} does not follow the rule set of the transaction",
+                        self.peer_address, self.peer_handshake_data.version
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
 
                 let Ok(transfer_transaction) = transaction.try_into() else {
                     warn!("Peer requested transaction that cannot be converted to transfer object");
@@ -2006,6 +2149,23 @@ impl PeerLoopHandler {
                     .filter(|x| x.body().mast_hash() == block_proposal_request.body_mast_hash)
                     .map(|x| x.to_owned());
                 if let Some(proposal) = matching_proposal {
+                    // Not to a peer whose version does not follow the rule set
+                    // of the proposed block, which does not announce it to
+                    // such a peer either; the request is ignored.
+                    let rule_set = ConsensusRuleSet::infer_from(
+                        self.global_state_lock.cli().network,
+                        proposal.header().height,
+                    );
+                    if !version_follows_rule_set(&self.peer_handshake_data.version, rule_set) {
+                        debug!(
+                            "Not serving the block proposal for block {} to peer {}: its version \
+                             {} does not follow {rule_set}",
+                            proposal.header().height,
+                            self.peer_address,
+                            self.peer_handshake_data.version
+                        );
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
                     peer.send(PeerMessage::BlockProposal(Box::new(proposal)))
                         .await?;
                 } else {
@@ -2211,6 +2371,15 @@ impl PeerLoopHandler {
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             MainToPeerTask::TransactionNotification(transaction_notification) => {
+                // A peer is told only of transactions it may be sent.
+                let may_receive = {
+                    let state = self.global_state_lock.lock_guard().await;
+                    self.peer_may_receive(&state, transaction_notification.txid)
+                };
+                if !may_receive {
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
                 debug!("Sending PeerMessage::TransactionNotification");
                 peer.send(PeerMessage::TransactionNotification(
                     transaction_notification,
@@ -2232,6 +2401,24 @@ impl PeerLoopHandler {
                 Ok(KEEP_CONNECTION_ALIVE)
             }
             MainToPeerTask::BlockProposalNotification(block_proposal_notification) => {
+                // A peer whose version does not follow the rule set of the
+                // proposed block cannot validate it, and sanctions the sender;
+                // see `version_follows_rule_set`.
+                let rule_set = ConsensusRuleSet::infer_from(
+                    self.global_state_lock.cli().network,
+                    block_proposal_notification.height,
+                );
+                if !version_follows_rule_set(&self.peer_handshake_data.version, rule_set) {
+                    debug!(
+                        "Not announcing the block proposal for block {} to peer {}: its version \
+                         {} does not follow {rule_set}",
+                        block_proposal_notification.height,
+                        self.peer_address,
+                        self.peer_handshake_data.version
+                    );
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+
                 debug!("Sending PeerMessage::BlockProposalNotification");
                 peer.send(PeerMessage::BlockProposalNotification(
                     block_proposal_notification,
@@ -4858,7 +5045,7 @@ mod tests {
                         match proof_type {
                             TransactionProofQuality::ProofCollection => {
                                 PrimitiveWitnessToProofCollection { primitive_witness }
-                                    .upgrade(vm_job_queue(), &proof_job_options)
+                                    .upgrade(vm_job_queue(), &proof_job_options, consensus_rule_set)
                                     .await
                                     .unwrap()
                             }
@@ -5403,6 +5590,464 @@ mod tests {
                 .await
                 .unwrap();
             assert!(stream.is_done());
+        }
+    }
+
+    mod legacy_era_transactions {
+        use tasm_lib::triton_vm::proof::Claim;
+
+        use super::*;
+        use crate::api::tx_initiation::migrate_dctidh::tests::main_net_placeholder_block;
+        use crate::protocol::consensus::consensus_rule_set::tests::V8ActivationHeightForTests;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+        use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+        use crate::protocol::consensus::transaction::TransactionProof;
+        use crate::protocol::peer::handshake_data::VersionString;
+        use crate::protocol::peer::transfer_transaction::TransferTransaction;
+        use crate::tests::shared::mock_tx::genesis_tx_with_proof_type;
+
+        /// A peer loop handler for a peer of the given version, on a node
+        /// whose tip is at the given main-net height, or at genesis on
+        /// `RegTest`, which follows `UpgradeVMv8` from genesis on.
+        async fn handler(
+            network: Network,
+            tip_height: Option<u64>,
+            version: &str,
+        ) -> PeerLoopHandler {
+            let cli = cli_args::Args {
+                network,
+                ..Default::default()
+            };
+            let (_peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, mut state_lock, _hsd) =
+                get_test_genesis_setup(network, 1, cli).await.unwrap();
+            if let Some(tip_height) = tip_height {
+                let tip = state_lock.lock_guard().await.chain.light_state().clone();
+                let block = main_net_placeholder_block(&tip, tip_height.into());
+                state_lock.set_new_tip(block).await.unwrap();
+            }
+            let peer_address = state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .keys()
+                .next()
+                .unwrap()
+                .to_owned();
+            let mut peer_handshake_data = get_dummy_handshake_data_for_genesis(network);
+            peer_handshake_data.version = VersionString::try_from_str(version).unwrap();
+
+            PeerLoopHandler::new(
+                to_main_tx,
+                state_lock,
+                peer_address,
+                peer_handshake_data,
+                true,
+                1,
+            )
+        }
+
+        async fn hold(handler: &mut PeerLoopHandler, transaction: &Transaction) {
+            handler
+                .global_state_lock
+                .lock_guard_mut()
+                .await
+                .mempool_insert(
+                    transaction.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+        }
+
+        /// Whether the handler announces the transaction to its peer, and
+        /// serves it when asked.
+        async fn announces_and_serves(
+            handler: &mut PeerLoopHandler,
+            transaction: &Transaction,
+        ) -> (bool, bool) {
+            let notification = TransactionNotification::try_from(transaction).unwrap();
+            let mut peer_state = MutablePeerState::new(BlockHeight::genesis());
+
+            let mut stream = Mock::new(vec![Action::Write(PeerMessage::TransactionNotification(
+                notification,
+            ))]);
+            handler
+                .handle_main_task_message(
+                    MainToPeerTask::TransactionNotification(notification),
+                    &mut stream,
+                    &mut peer_state,
+                )
+                .await
+                .unwrap();
+            let announced = stream.is_done();
+
+            let transfer = TransferTransaction::try_from(transaction).unwrap();
+            let mut request_stream = Mock::new(vec![Action::Write(PeerMessage::Transaction(
+                Box::new(transfer),
+            ))]);
+            handler
+                .handle_peer_message(
+                    PeerMessage::TransactionRequest(transaction.txid()),
+                    &mut request_stream,
+                    &mut peer_state,
+                )
+                .await
+                .unwrap();
+            let served = request_stream.is_done();
+
+            (announced, served)
+        }
+
+        /// A transaction of the mempool, which is one of the era after the
+        /// fork, is neither announced nor served to a peer of an earlier
+        /// version, which cannot verify it.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn v8_transactions_go_only_to_peers_that_follow_v8() {
+            let transaction = invalid_empty_single_proof_transaction();
+            for (version, follows_v8) in [("0.2.5", false), ("0.3.0", true)] {
+                let mut handler = handler(Network::RegTest, None, version).await;
+                hold(&mut handler, &transaction).await;
+                assert!(handler
+                    .global_state_lock
+                    .lock_guard()
+                    .await
+                    .mempool
+                    .contains(transaction.txid()));
+
+                let expected = (follows_v8, follows_v8);
+                assert_eq!(
+                    expected,
+                    announces_and_serves(&mut handler, &transaction).await,
+                    "version {version}"
+                );
+            }
+        }
+
+        /// Before the fork, transactions are held in the legacy relay pool,
+        /// and announced and served to every peer, whatever its version.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn legacy_era_transactions_go_to_every_peer() {
+            let transaction = invalid_empty_single_proof_transaction();
+            for version in ["0.2.5", "0.3.0"] {
+                let mut handler = handler(Network::Main, Some(94_000), version).await;
+                hold(&mut handler, &transaction).await;
+                {
+                    let state = handler.global_state_lock.lock_guard().await;
+                    assert!(state.legacy_relay_pool.contains(transaction.txid()));
+                    assert!(!state.mempool.contains(transaction.txid()));
+                }
+
+                assert_eq!(
+                    (true, true),
+                    announces_and_serves(&mut handler, &transaction).await,
+                    "version {version}"
+                );
+            }
+        }
+
+        /// A handler for a peer of the given version on a `RegTest` node,
+        /// whose clock reads the given time, and the receiver of its messages
+        /// to the main loop.
+        async fn handler_at(
+            version: &str,
+            now: Timestamp,
+        ) -> (PeerLoopHandler, mpsc::Receiver<PeerTaskToMain>) {
+            let network = Network::RegTest;
+            let cli = cli_args::Args {
+                network,
+                ..Default::default()
+            };
+            let (_peer_broadcast_tx, _from_main_rx, to_main_tx, to_main_rx, state_lock, _hsd) =
+                get_test_genesis_setup(network, 1, cli).await.unwrap();
+            let peer_address = state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .keys()
+                .next()
+                .unwrap()
+                .to_owned();
+            let mut peer_handshake_data = get_dummy_handshake_data_for_genesis(network);
+            peer_handshake_data.version = VersionString::try_from_str(version).unwrap();
+            let handler = PeerLoopHandler::with_mocked_time(
+                to_main_tx,
+                state_lock,
+                peer_address,
+                peer_handshake_data,
+                true,
+                1,
+                now,
+            );
+
+            (handler, to_main_rx)
+        }
+
+        async fn standing(handler: &PeerLoopHandler) -> i32 {
+            handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .get(&handler.peer_address)
+                .unwrap()
+                .standing
+                .standing
+        }
+
+        /// Before the fork, a proof collection with one halting proof more
+        /// than it has lock scripts, as a third party can make from a valid
+        /// one, is taken and relayed by the nodes of the previous release,
+        /// but not by this version. A peer relaying it is not sanctioned, and
+        /// it is verified once per tip only. A collection that is invalid also
+        /// as that release checks it is sanctioned.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn a_collection_the_previous_release_takes_is_ignored_without_a_sanction() {
+            let network = Network::RegTest;
+            let _activation_height = V8ActivationHeightForTests::set(network, 100u64.into());
+            let witness_backed = genesis_tx_with_proof_type(
+                TxProvingCapability::PrimitiveWitness,
+                network,
+                NativeCurrencyAmount::coins(1),
+            )
+            .await;
+            let TransactionProof::Witness(primitive_witness) = &witness_backed.proof else {
+                panic!("expected a primitive witness");
+            };
+            let proof_collection = ProofCollection::produce_mock(primitive_witness, true);
+            let transaction = Transaction {
+                kernel: witness_backed.kernel.clone(),
+                proof: TransactionProof::ProofCollection(proof_collection.clone()),
+            };
+            let rule_set = ConsensusRuleSet::UpgradeVMv7;
+            assert!(transaction.is_valid(network, rule_set).await);
+            let mut extra_halting_proof = proof_collection.clone();
+            extra_halting_proof
+                .lock_scripts_halt
+                .push(extra_halting_proof.lock_scripts_halt[0].clone());
+            let taken_only_by_the_previous_release = Transaction {
+                kernel: transaction.kernel.clone(),
+                proof: TransactionProof::ProofCollection(extra_halting_proof),
+            };
+            let kernel_mast_hash = transaction.kernel.mast_hash();
+            assert!(
+                !taken_only_by_the_previous_release
+                    .is_valid(network, rule_set)
+                    .await
+            );
+            assert!(
+                taken_only_by_the_previous_release
+                    .proof
+                    .verify_as_previous_release(kernel_mast_hash, network)
+                    .await
+            );
+
+            let now = transaction.kernel.timestamp + Timestamp::minutes(1);
+            let (mut handler, mut to_main_rx) = handler_at("0.2.5", now).await;
+            let mut peer_state = MutablePeerState::new(BlockHeight::genesis());
+            let transfer =
+                TransferTransaction::try_from(&taken_only_by_the_previous_release).unwrap();
+            for _ in 0..2 {
+                handler
+                    .handle_peer_message(
+                        PeerMessage::Transaction(Box::new(transfer.clone())),
+                        &mut Mock::new(vec![]),
+                        &mut peer_state,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                to_main_rx.try_recv().is_err(),
+                "the transaction is not taken"
+            );
+            assert_eq!(0, standing(&handler).await);
+            assert!(logs_contain("as the previous release checks it"));
+            assert!(logs_contain("it was verified at this tip already"));
+
+            // Its announcement is not followed up at this tip.
+            let notification = TransactionNotification::try_from(&transaction).unwrap();
+            let mut no_request = Mock::new(vec![]);
+            handler
+                .handle_peer_message(
+                    PeerMessage::TransactionNotification(notification),
+                    &mut no_request,
+                    &mut peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(no_request.is_done());
+
+            // Another proof of the same transaction is verified, and taken.
+            handler
+                .handle_peer_message(
+                    PeerMessage::Transaction(Box::new(
+                        TransferTransaction::try_from(&transaction).unwrap(),
+                    )),
+                    &mut Mock::new(vec![]),
+                    &mut peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                to_main_rx.try_recv(),
+                Ok(PeerTaskToMain::Transaction(_))
+            ));
+
+            let mut invalid = proof_collection.clone();
+            invalid.removal_records_integrity = Proof::invalid_mock(Claim::new(Digest::default()));
+            let invalid = Transaction {
+                kernel: transaction.kernel.clone(),
+                proof: TransactionProof::ProofCollection(invalid),
+            };
+            assert!(
+                !invalid
+                    .proof
+                    .verify_as_previous_release(kernel_mast_hash, network)
+                    .await
+            );
+            // On a new connection: on this one, the transaction was verified
+            // at this tip already.
+            handler
+                .handle_peer_message(
+                    PeerMessage::Transaction(Box::new(
+                        TransferTransaction::try_from(&invalid).unwrap(),
+                    )),
+                    &mut Mock::new(vec![]),
+                    &mut MutablePeerState::new(BlockHeight::genesis()),
+                )
+                .await
+                .unwrap();
+            assert!(to_main_rx.try_recv().is_err());
+            assert!(standing(&handler).await < 0);
+        }
+
+        /// A block proposal of the era after the fork is announced only to peers
+        /// whose version follows that era; one of the era before it, to all.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn block_proposals_go_only_to_peers_that_follow_their_rule_set() {
+            use crate::application::loops::channel::BlockProposalNotification;
+
+            let network = Network::RegTest;
+            let _activation_height = V8ActivationHeightForTests::set(network, 5u64.into());
+            let notification = |height: u64| BlockProposalNotification {
+                body_mast_hash: Digest::default(),
+                guesser_fee: NativeCurrencyAmount::coins(1),
+                height: height.into(),
+            };
+            for (version, height, announced) in [
+                ("0.2.5", 4, true),
+                ("0.2.5", 5, false),
+                ("0.3.0", 4, true),
+                ("0.3.0", 5, true),
+            ] {
+                let (mut handler, _to_main_rx) = handler_at(version, Timestamp::now()).await;
+                let actions = if announced {
+                    vec![Action::Write(PeerMessage::BlockProposalNotification(
+                        notification(height),
+                    ))]
+                } else {
+                    vec![]
+                };
+                let mut stream = Mock::new(actions);
+                handler
+                    .handle_main_task_message(
+                        MainToPeerTask::BlockProposalNotification(notification(height)),
+                        &mut stream,
+                        &mut MutablePeerState::new(BlockHeight::genesis()),
+                    )
+                    .await
+                    .unwrap();
+                assert!(stream.is_done(), "version {version}, block {height}");
+            }
+        }
+
+        /// A block proposal of the era after the fork is served only to peers
+        /// whose version follows that era; the request of another is ignored,
+        /// without a sanction.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn block_proposals_are_served_only_to_peers_that_follow_their_rule_set() {
+            use crate::state::mining::block_proposal::BlockProposal;
+
+            let network = Network::RegTest;
+            let genesis = Block::genesis(network);
+            let proposal = invalid_empty_block(&genesis, network);
+            let request = BlockProposalRequest {
+                body_mast_hash: proposal.body().mast_hash(),
+            };
+            for (version, served) in [("0.2.5", false), ("0.3.0", true)] {
+                let (mut handler, _to_main_rx) = handler_at(version, Timestamp::now()).await;
+                handler
+                    .global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .mining_state
+                    .block_proposal = BlockProposal::foreign_proposal(proposal.clone());
+                let actions = if served {
+                    vec![Action::Write(PeerMessage::BlockProposal(Box::new(
+                        proposal.clone(),
+                    )))]
+                } else {
+                    vec![]
+                };
+                let mut stream = Mock::new(actions);
+                handler
+                    .handle_peer_message(
+                        PeerMessage::BlockProposalRequest(request.clone()),
+                        &mut stream,
+                        &mut MutablePeerState::new(BlockHeight::genesis()),
+                    )
+                    .await
+                    .unwrap();
+                assert!(stream.is_done(), "version {version}");
+                assert_eq!(0, standing(&handler).await, "version {version}");
+            }
+        }
+
+        /// Once the next block belongs to the era after the fork, a
+        /// transaction announced by a peer whose version does not follow it is
+        /// not requested; one announced by a peer whose version does, is.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn transactions_are_requested_only_from_peers_that_follow_the_next_block() {
+            let transaction = invalid_empty_single_proof_transaction();
+            for (version, requested) in [("0.2.5", false), ("0.3.0", true)] {
+                let (mut handler, _to_main_rx) = handler_at(version, Timestamp::now()).await;
+                let mut notification = TransactionNotification::try_from(&transaction).unwrap();
+                notification.mutator_set_hash = handler
+                    .global_state_lock
+                    .lock_guard()
+                    .await
+                    .chain
+                    .light_state()
+                    .mutator_set_accumulator_after()
+                    .unwrap()
+                    .hash();
+                let actions = if requested {
+                    vec![Action::Write(PeerMessage::TransactionRequest(
+                        transaction.txid(),
+                    ))]
+                } else {
+                    vec![]
+                };
+                let mut stream = Mock::new(actions);
+                handler
+                    .handle_peer_message(
+                        PeerMessage::TransactionNotification(notification),
+                        &mut stream,
+                        &mut MutablePeerState::new(BlockHeight::genesis()),
+                    )
+                    .await
+                    .unwrap();
+                assert!(stream.is_done(), "version {version}");
+            }
         }
     }
 
