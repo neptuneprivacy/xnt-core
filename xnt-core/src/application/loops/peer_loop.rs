@@ -1019,7 +1019,9 @@ impl PeerLoopHandler {
                 }
 
                 // Is there some specific (*i.e.*, not aggregate) proof of work?
-                if !challenge_response.check_difficulty(own_tip_header.difficulty) {
+                if !challenge_response
+                    .check_difficulty(&own_tip_header, self.global_state_lock.cli().network)
+                {
                     self.punish(NegativePeerSanction::FishyDifficultiesChallengeResponse)
                         .await?;
                     return Ok(KEEP_CONNECTION_ALIVE);

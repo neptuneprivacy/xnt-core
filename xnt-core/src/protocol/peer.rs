@@ -18,7 +18,6 @@ use link_tx_notification::LinkTxNotification;
 use num_bigint::BigUint;
 use num_traits::CheckedSub;
 use num_traits::ToPrimitive;
-use num_traits::Zero;
 use peer_block_notifications::PeerBlockNotification;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -40,13 +39,13 @@ use transfer_transaction::TransferTransaction;
 use super::consensus::block::block_header::BlockHeader;
 use super::consensus::block::block_header::BlockHeaderWithBlockHashWitness;
 use super::consensus::block::block_height::BlockHeight;
-use super::consensus::block::difficulty_control::Difficulty;
 use super::consensus::block::difficulty_control::ProofOfWork;
 use super::consensus::block::Block;
 use super::proof_abstractions::timestamp::Timestamp;
 use crate::application::config::network::Network;
 use crate::application::loops::channel::BlockProposalNotification;
 use crate::protocol::consensus::block::difficulty_control::max_cumulative_pow_after;
+use crate::protocol::consensus::block::difficulty_control::min_difficulty_after;
 use crate::protocol::peer::transfer_block::TransferBlock;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 
@@ -1117,18 +1116,49 @@ impl SyncChallengeResponse {
     /// Check whether the claimed difficulties are large enough relative to that
     /// of our own tip.
     ///
-    /// Sum all verified difficulties and verify that this number is larger than
-    /// our own tip difficulty. This inequality guarantees that the successful
-    /// attacker must have spent at least one block's worth of guessing power to
-    /// produce the malicious chain, and probably much more.
-    pub(crate) fn check_difficulty(&self, own_tip_difficulty: Difficulty) -> bool {
-        let own_tip_difficulty = ProofOfWork::zero() + own_tip_difficulty;
-        let mut fork_relative_cumpow = ProofOfWork::zero();
-        for (_parent, child) in &self.blocks {
-            fork_relative_cumpow = fork_relative_cumpow + child.header.difficulty;
+    /// The difficulty control rules bound how far the difficulty can fall over
+    /// a number of blocks and a span of time. Every challenged block above our
+    /// own tip must have at least the lowest difficulty that these rules allow
+    /// for a chain that passed through a block like our tip, given its height
+    /// and timestamp. The bound follows the rules rather than assuming that the
+    /// difficulty stays put, so a difficulty that fell over months because
+    /// less guessing power was spent is accepted.
+    pub(crate) fn check_difficulty(&self, own_tip: &BlockHeader, network: Network) -> bool {
+        // Difficulty resets make any difficulty reachable at any time.
+        if network.difficulty_reset_interval().is_some() {
+            return true;
         }
 
-        fork_relative_cumpow > own_tip_difficulty
+        self.blocks
+            .iter()
+            .map(|(_parent, child)| &child.header)
+            .filter(|child| child.height > own_tip.height)
+            .all(|child| {
+                let num_blocks = u64::try_from(child.height - own_tip.height).unwrap_or(u64::MAX);
+                let elapsed = Timestamp::millis(
+                    child
+                        .timestamp
+                        .to_millis()
+                        .saturating_sub(own_tip.timestamp.to_millis()),
+                );
+                let lower_bound = min_difficulty_after(
+                    own_tip.difficulty,
+                    num_blocks,
+                    elapsed,
+                    network.target_block_interval(),
+                    network.minimum_block_time(),
+                );
+                let difficulty = BigUint::from(child.difficulty).to_f64().unwrap();
+                if difficulty < lower_bound {
+                    debug!(
+                        "Difficulty {} at height {} is below {lower_bound:e}, the lowest that \
+                         {num_blocks} blocks and {elapsed} after our tip allow.",
+                        child.difficulty, child.height,
+                    );
+                }
+
+                difficulty >= lower_bound
+            })
     }
 }
 
@@ -1345,6 +1375,67 @@ mod tests {
             block.header.cumulative_proof_of_work + [1u32];
 
         assert!(!response.check_pow(network, 1u64.into()));
+    }
+
+    /// On main net the difficulty fell from about 2.1e13 at height 9,000 to
+    /// about 9.7e11 at height 93,800 over ten months, as less guessing power
+    /// was spent. A node whose tip is at height 9,000 accepts that chain, but
+    /// not one whose difficulty falls faster than the difficulty control rules
+    /// allow.
+    #[test]
+    fn difficulty_check_follows_the_difficulty_control_rules() {
+        use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;
+        use crate::protocol::consensus::block::difficulty_control::Difficulty;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+
+        let network = Network::Main;
+        let genesis = Block::genesis(network);
+        let block = TransferBlock {
+            header: *genesis.header(),
+            body: genesis.body().clone(),
+            appendix: genesis.appendix().clone(),
+            proof: Proof::invalid(),
+        };
+        let witness = BlockHeaderWithBlockHashWitness::new(
+            *genesis.header(),
+            HeaderToBlockHashWitness::from(&genesis),
+        );
+        let response_with_children_at = |height: u64, timestamp: Timestamp, difficulty: u64| {
+            let mut child = block.clone();
+            child.header.height = height.into();
+            child.header.timestamp = timestamp;
+            child.header.difficulty = Difficulty::from_u64(difficulty);
+            SyncChallengeResponse {
+                blocks: std::array::from_fn(|_| (block.clone(), child.clone())),
+                membership_proofs: std::array::from_fn(|_| MmrMembershipProof::new(vec![])),
+                tip_parent: block.clone(),
+                tip: block.clone(),
+                pow_witnesses: std::array::from_fn(|_| witness.clone()),
+            }
+        };
+
+        let mut own_tip = *genesis.header();
+        own_tip.height = 9_000u64.into();
+        own_tip.timestamp = Timestamp::millis(1_766_890_648_746);
+        own_tip.difficulty = Difficulty::from_u64(21_312_894_178_840);
+
+        let ten_months_later = response_with_children_at(
+            93_800,
+            Timestamp::millis(1_792_334_465_110),
+            966_001_234_024,
+        );
+        assert!(ten_months_later.check_difficulty(&own_tip, network));
+
+        let one_hour_later = own_tip.timestamp + Timestamp::hours(1);
+        let gradual_decrease = response_with_children_at(9_012, one_hour_later, 18_000_000_000_000);
+        assert!(gradual_decrease.check_difficulty(&own_tip, network));
+
+        let tenfold_decrease = response_with_children_at(9_012, one_hour_later, 2_131_289_417_884);
+        assert!(!tenfold_decrease.check_difficulty(&own_tip, network));
+
+        // Challenged blocks at or below the own tip are not compared.
+        let below_own_tip = response_with_children_at(8_990, one_hour_later, 1);
+        assert!(below_own_tip.check_difficulty(&own_tip, network));
     }
 
     /// Peer messages are encoded by variant index, so the link-transaction

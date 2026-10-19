@@ -531,6 +531,48 @@ pub(crate) fn max_cumulative_pow_after(
     })
 }
 
+/// Determine a lower bound for the difficulty of a block that follows a block
+/// of difficulty `difficulty_start` on the same chain, `num_blocks` blocks
+/// later and `elapsed` time later.
+///
+/// [`difficulty_control`] multiplies the difficulty with `1 - e/16` for every
+/// block, where `e` is the relative deviation of the block time from the target
+/// block interval, clamped to `[-1, 4]`. So a block lowers the difficulty by at
+/// most a factor 3/4, which takes a block time of five target block intervals,
+/// and a block with the minimum block time does not lower it at all. Every
+/// block time `t` thus contributes a factor of at least
+/// `(3/4)^((t - t_min) / (5 * target - t_min))`, and the factors of all blocks
+/// together amount to at least `(3/4)^k`, where `k` is the time in excess of
+/// the minimum block times divided by `5 * target - t_min`, and at most
+/// `num_blocks`.
+///
+/// The returned bound is halved to absorb the rounding in the fixed-point
+/// arithmetic of [`difficulty_control`].
+pub(crate) fn min_difficulty_after(
+    difficulty_start: Difficulty,
+    num_blocks: u64,
+    elapsed: Timestamp,
+    target_block_interval: Timestamp,
+    minimum_block_time: Timestamp,
+) -> f64 {
+    const MAX_DECREASE_FACTOR: f64 = 0.75;
+    const SLOWEST_EFFECTIVE_BLOCK_TIME_IN_TARGET_INTERVALS: u64 = 5;
+    const ROUNDING_SLACK: f64 = 0.5;
+
+    let minimum_total_time = num_blocks.saturating_mul(minimum_block_time.to_millis());
+    let excess_time = elapsed.to_millis().saturating_sub(minimum_total_time);
+    let excess_time_per_slowest_block = (SLOWEST_EFFECTIVE_BLOCK_TIME_IN_TARGET_INTERVALS
+        * target_block_interval.to_millis())
+    .saturating_sub(minimum_block_time.to_millis())
+    .max(1);
+    let num_slowest_blocks =
+        (excess_time as f64 / excess_time_per_slowest_block as f64).min(num_blocks as f64);
+
+    BigUint::from(difficulty_start).to_f64().unwrap()
+        * MAX_DECREASE_FACTOR.powf(num_slowest_blocks)
+        * ROUNDING_SLACK
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -977,5 +1019,79 @@ mod tests {
             let back = big.try_into().expect("Conversion to succeed");
             assert_eq!(pow, back);
         }
+    }
+
+    #[proptest(cases = 200)]
+    fn min_difficulty_after_bounds_the_controlled_difficulty(
+        #[strategy(1u64 << 30..1u64 << 62)] start: u64,
+        #[strategy(proptest::collection::vec(
+            proptest::prop_oneof![
+                proptest::strategy::Just(60_000u64),
+                proptest::strategy::Just(300_000u64),
+                proptest::strategy::Just(1_500_000u64),
+                60_000u64..3_000_000,
+                3_000_000u64..100_000_000,
+            ],
+            1..400,
+        ))]
+        block_times_in_millis: Vec<u64>,
+    ) {
+        let network = Network::Main;
+        let start_difficulty = Difficulty::from_u64(start);
+        let start_timestamp = Timestamp::millis(1_800_000_000_000);
+
+        let mut difficulty = start_difficulty;
+        let mut timestamp = start_timestamp;
+        for (num_blocks, block_time) in (1u64..).zip(block_times_in_millis) {
+            let next_timestamp = timestamp + Timestamp::millis(block_time);
+            difficulty = difficulty_control(
+                next_timestamp,
+                timestamp,
+                difficulty,
+                network.target_block_interval(),
+                BlockHeight::from(num_blocks),
+            );
+            timestamp = next_timestamp;
+            if difficulty < Difficulty::MINIMUM {
+                break;
+            }
+
+            let lower_bound = min_difficulty_after(
+                start_difficulty,
+                num_blocks,
+                timestamp - start_timestamp,
+                network.target_block_interval(),
+                network.minimum_block_time(),
+            );
+            prop_assert!(BigUint::from(difficulty).to_f64().unwrap() >= lower_bound);
+        }
+    }
+
+    #[test]
+    fn min_difficulty_after_allows_slow_blocks_to_lower_the_difficulty() {
+        let network = Network::Main;
+        let start = Difficulty::from_u64(1 << 40);
+        let bound = |num_blocks: u64, elapsed: Timestamp| {
+            min_difficulty_after(
+                start,
+                num_blocks,
+                elapsed,
+                network.target_block_interval(),
+                network.minimum_block_time(),
+            ) / BigUint::from(start).to_f64().unwrap()
+        };
+
+        // Blocks at the minimum block time cannot lower the difficulty.
+        assert_eq!(0.5, bound(10, Timestamp::minutes(10)));
+
+        // Two blocks of five target intervals each can lower it by 3/4 twice.
+        let two_slowest_blocks = Timestamp::minutes(2 * 25);
+        assert!((bound(2, two_slowest_blocks) - 0.5 * 0.75 * 0.75).abs() < 1e-9);
+
+        // A single block lowers it by at most 3/4, however slow it is.
+        assert!((bound(1, Timestamp::days(30)) - 0.5 * 0.75).abs() < 1e-9);
+
+        // Many slow blocks over months make the bound negligible.
+        assert!(bound(85_000, Timestamp::days(300)) < 1e-100);
     }
 }
