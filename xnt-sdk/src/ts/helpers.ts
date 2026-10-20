@@ -5,10 +5,12 @@ import {
   XntTransactionBuilder,
   XntMembershipProof,
   XntDecryptedUtxo,
+  XntTransaction,
   xntBuildMigration,
   xntCheckSpent,
   xntGetMembershipProofs,
   xntGetMutatorSet,
+  xntMempoolSpending,
 } from "../napi/output";
 
 /**
@@ -188,7 +190,11 @@ export type MigrationOptions = {
    * submitting anything; default true. Set to false to prove and submit.
    */
   dryRun?: boolean;
-  /** Build rounds before giving up, a new round after each block that made a proof stale. */
+  /**
+   * Build rounds before giving up; a new round after the submitted
+   * transactions are confirmed, after a block that made a proof stale before
+   * it was submitted, and after a submitted transaction was dropped.
+   */
   maxRounds?: number;
   watchIntervalMs?: number;
   watchTimeoutMs?: number;
@@ -203,6 +209,9 @@ export type MigrationOptions = {
  * `round` and `txIndex` name the plan and the transaction in it. `submitted`
  * is true if that transaction was submitted, i.e. queued by the node; it is
  * confirmed once `absoluteIndexSetHashHex` is spent on chain (`xntCheckSpent`).
+ * `status` is what was last seen of that transaction, see
+ * `MigratedInputStatus`, and `confirmedAt` the height of the block it was
+ * mined in.
  */
 export type MigratedInput = {
   round: number;
@@ -213,7 +222,22 @@ export type MigratedInput = {
   blockHeight: number;
   absoluteIndexSetHashHex: string;
   submitted: boolean;
+  status: MigratedInputStatus;
+  confirmedAt?: number;
 };
+
+/**
+ * What was last seen of the transaction of a `MigratedInput`:
+ * - `"planned"`: not submitted (a dry run, or the tip moved before it was);
+ * - `"submitted"`: submitted, not watched yet;
+ * - `"pending"`: in a mempool, or submitted and no block since;
+ * - `"confirmed"`: mined, all its inputs are spent on chain;
+ * - `"dropped"`: not mined, and after a block no longer in the mempool; its
+ *   UTXOs are moved by a later round;
+ * - `"conflicted"`: some of its inputs were spent on chain by another
+ *   transaction, so it cannot be mined; `migrateLegacyFunds` stops.
+ */
+export type MigratedInputStatus = "planned" | "submitted" | "pending" | "confirmed" | "dropped" | "conflicted";
 
 /** The inputs of one legacy key index and payment id, see `MigrationReport.byPaymentId`. */
 export type PaymentIdTotal = {
@@ -230,22 +254,29 @@ export type PaymentIdTotal = {
  * they send to the destination and their fees (in nau). `remaining` is true
  * if funds are left at legacy-format locks, for example because the rounds or
  * the watch time ran out, or in a dry run that found funds to move; run it
- * again.
+ * again. It is also true if a transaction conflicted (see
+ * `MigratedInputStatus`); look at the inputs with that status first.
+ *
+ * `submitted`, `moved` and `fees` cover the submitted transactions that were
+ * neither dropped nor conflicted, see `MigratedInputStatus`. `dropped` counts
+ * the submitted transactions that were dropped; their UTXOs are built into the
+ * transactions of the next round.
  *
  * A migration transaction merges the UTXOs of many payment ids into one
  * output. `inputs` lists every input of the transactions of every plan built,
  * one plan per round, with `submitted` true for those of the transactions
  * submitted; in a dry run all are `submitted` false. A UTXO whose transaction
- * was not submitted in a round is listed again in the next.
+ * was not submitted or was dropped in a round is listed again in the next.
  * `byPaymentId` sums them per legacy key index and payment id, sorted by both:
  * in a dry run over the inputs of the plan, otherwise over the inputs of the
- * submitted transactions only. Record these per payment id before crediting
- * the moved funds.
+ * submitted transactions that were neither dropped nor conflicted. Record
+ * these per payment id before crediting the moved funds.
  */
 export type MigrationReport = {
   submitted: number;
   moved: bigint;
   fees: bigint;
+  dropped: number;
   dustInputs: number;
   timeLocked: number;
   remaining: boolean;
@@ -293,6 +324,57 @@ async function withRetry<T>(f: () => T, attempts = 5, delayMs = 3000): Promise<T
 }
 
 /**
+ * Whether `proven`, built on the mutator set of the tip at `buildTip`, may be
+ * submitted now: only while that tip is still the tip and the transaction is
+ * confirmable.
+ *
+ * Confirmability alone is not enough. Before the UpgradeVMv8 fork, the nodes
+ * that upgrade proof collections to single proofs, which is how they get
+ * mined, take only those built on the mutator set of their own tip: they
+ * cannot update someone else's proof collection to a new block. A proof
+ * collection built on an earlier tip is often still confirmable, so nodes
+ * accept it into their mempools, but none upgrades or mines it.
+ */
+async function syncedToTip(client: XntRpcClient, proven: XntTransaction, buildTip: number): Promise<boolean> {
+  try {
+    const current = await withRetry(() => xntGetMutatorSet(client), 3);
+    return current.tipHeight() === buildTip && proven.isConfirmable(current);
+  } catch {
+    return false; // the tip is not known: do not submit
+  }
+}
+
+/** What one poll tells of a submitted transaction, see `pollTransaction`. */
+type TransactionPoll =
+  | { status: "confirmed"; height: number }
+  | { status: "pending" }
+  | { status: "dropped" }
+  | { status: "conflicted" };
+
+/**
+ * Classify a submitted transaction built on the tip at `buildTip`, from the
+ * current tip, the heights its inputs are spent at (`xntCheckSpent`, -1 if
+ * unspent) and the number of its inputs spent by a mempool transaction
+ * (`xntMempoolSpending`).
+ */
+function pollTransaction(tip: number, buildTip: number, spentAt: number[], inMempool: number): TransactionPoll {
+  const onChain = spentAt.filter(height => height >= 0);
+  if (onChain.length > 0) {
+    // A transaction is mined in one block, so all its inputs are spent at one height.
+    const height = onChain[0];
+    if (onChain.length === spentAt.length && onChain.every(h => h === height)) return { status: "confirmed", height };
+    return { status: "conflicted" };
+  }
+  if (inMempool > 0 || tip <= buildTip) return { status: "pending" };
+  // A block came, and the transaction is neither mined nor in the mempool:
+  // nodes drop the proof collections they cannot update to the new block.
+  return { status: "dropped" };
+}
+
+/** Polls in a row that must find the transactions dropped before they are built again. */
+const DROPPED_POLLS = 2;
+
+/**
  * Move the funds at legacy-format dCTIDH locks of `options.indices` to a
  * current-format address.
  *
@@ -302,9 +384,13 @@ async function withRetry<T>(f: () => T, attempts = 5, delayMs = 3000): Promise<T
  * submits them one by one. `prove()` picks the rule set from the tip the
  * transactions were built on, a v7 proof collection before the UpgradeVMv8
  * fork. A proof collection is valid only for the mutator set it was built on,
- * so each transaction is checked right before it is submitted; after a new
- * block the rest are built again. After submitting, it waits until the inputs
- * of the submitted transactions are spent on chain.
+ * so each transaction is submitted only while the tip it was built on is still
+ * the tip (see `syncedToTip`); after a new block the rest are built again.
+ * After submitting, it watches the inputs of the submitted transactions until
+ * each transaction is confirmed (its inputs are spent on chain) or dropped
+ * (after a block, neither mined nor in the mempool); the UTXOs of the dropped
+ * ones are built into the transactions of the next round. It stops if an input
+ * was spent on chain by another transaction.
  */
 export async function migrateLegacyFunds(
   client: XntRpcClient,
@@ -326,6 +412,7 @@ export async function migrateLegacyFunds(
     submitted: 0,
     moved: 0n,
     fees: 0n,
+    dropped: 0,
     dustInputs: 0,
     timeLocked: 0,
     remaining: false,
@@ -333,12 +420,17 @@ export async function migrateLegacyFunds(
     byPaymentId: [],
   };
   const finish = (): MigrationReport => {
-    report.byPaymentId = totalsByPaymentId(report.inputs.filter(input => dryRun || input.submitted));
+    report.byPaymentId = totalsByPaymentId(
+      report.inputs.filter(
+        input => dryRun || (input.submitted && input.status !== "dropped" && input.status !== "conflicted"),
+      ),
+    );
     return report;
   };
   for (let round = 1; round <= maxRounds; round++) {
     const plan = await withRetry(() => xntBuildMigration(client, wallet, indices, destination, network), 3);
     const transactions = plan.takeTransactions();
+    const buildTip = plan.tipHeight();
     report.dustInputs = plan.dustInputs();
     report.timeLocked = plan.timeLocked();
     const planned: MigratedInput[][] = transactions.map((_, txIndex) =>
@@ -351,11 +443,12 @@ export async function migrateLegacyFunds(
         blockHeight: input.blockHeight,
         absoluteIndexSetHashHex: input.absoluteIndexSetHashHex,
         submitted: false,
+        status: "planned" as MigratedInputStatus,
       })),
     );
     report.inputs.push(...planned.flat());
     log(
-      `round ${round}, tip ${plan.tipHeight()}: ${transactions.length} transaction(s), ` +
+      `round ${round}, tip ${buildTip}: ${transactions.length} transaction(s), ` +
         `${formatCoins(plan.total())} for ${formatCoins(plan.fees())} in fees`,
     );
     if (transactions.length === 0) return finish();
@@ -364,42 +457,117 @@ export async function migrateLegacyFunds(
       return finish();
     }
 
-    const watched: string[] = [];
+    type Sent = { txIndex: number; hashes: string[]; amount: bigint; fee: bigint };
+    const sent: Sent[] = [];
     for (let i = 0; i < transactions.length; i++) {
-      const sent = transactions[i].outputs().reduce((sum, o) => sum + o.amount, 0n);
-      const spentAmount = transactions[i].inputs().reduce((sum, x) => sum + x.amount, 0n);
+      const amount = transactions[i].outputs().reduce((sum, o) => sum + o.amount, 0n);
+      const fee = transactions[i].inputs().reduce((sum, x) => sum + x.amount, 0n) - amount;
       const proven = transactions[i].prove();
-      const tip = await withRetry(() => xntGetMutatorSet(client));
-      if (!proven.isConfirmable(tip)) {
-        log(`transaction ${i} went stale while proving; building again`);
+      if (!(await syncedToTip(client, proven, buildTip))) {
+        log(`transaction ${i}: the tip moved past ${buildTip} while proving; building again`);
         break;
       }
-      if (!proven.submit(client)) {
+      let queued: boolean;
+      try {
+        queued = proven.submit(client);
+      } catch (e) {
+        if (await syncedToTip(client, proven, buildTip)) throw e;
+        log(`transaction ${i}: a block arrived while submitting; building again`);
+        break;
+      }
+      if (!queued) {
         log(`transaction ${i} was not queued by the node; building again`);
         break;
       }
-      const inputs = plan.inputHashes(i);
-      log(`transaction ${i} submitted, ${inputs.length} input(s)`);
-      watched.push(...inputs);
-      for (const input of planned[i]) input.submitted = true;
+      const hashes = plan.inputHashes(i);
+      log(`transaction ${i} submitted, ${hashes.length} input(s)`);
+      sent.push({ txIndex: i, hashes, amount, fee });
+      for (const input of planned[i]) {
+        input.submitted = true;
+        input.status = "submitted";
+      }
       report.submitted += 1;
-      report.moved += sent;
-      report.fees += spentAmount - sent;
+      report.moved += amount;
+      report.fees += fee;
     }
-    if (watched.length === 0) continue;
+    if (sent.length === 0) continue;
 
+    // A dropped or conflicted transaction moves nothing.
+    const retract = (tx: Sent, status: "dropped" | "conflicted") => {
+      for (const input of planned[tx.txIndex]) input.status = status;
+      report.submitted -= 1;
+      report.moved -= tx.amount;
+      report.fees -= tx.fee;
+    };
+    const watched = sent.flatMap(tx => tx.hashes);
     const started = Date.now();
+    let droppedPolls = 0;
     for (;;) {
       await sleep(watchIntervalMs);
-      let spent: number[];
+      let polls: TransactionPoll[] | undefined;
       try {
-        spent = xntCheckSpent(client, watched);
-      } catch {
-        continue;
+        // The mempool is read before the spent status: a transaction mined
+        // in between is then seen as confirmed, not as dropped.
+        const tip = client.chainHeight();
+        const inMempool = new Set(xntMempoolSpending(client, watched));
+        const spentAt = xntCheckSpent(client, watched);
+        let offset = 0;
+        polls = sent.map(tx => {
+          const positions = tx.hashes.map((_, j) => offset + j);
+          offset += tx.hashes.length;
+          return pollTransaction(
+            tip,
+            buildTip,
+            positions.map(k => spentAt[k]),
+            positions.filter(k => inMempool.has(k)).length,
+          );
+        });
+      } catch (e) {
+        log(`watch: ${e}; trying again`);
       }
-      const done = spent.filter(height => height >= 0).length;
-      log(`${done} of ${watched.length} submitted input(s) spent on chain`);
-      if (done === watched.length) break;
+      if (polls) {
+        const count = { confirmed: 0, pending: 0, dropped: 0, conflicted: 0 };
+        for (const p of polls) count[p.status] += 1;
+        polls.forEach((p, n) => {
+          for (const input of planned[sent[n].txIndex]) {
+            if (p.status === "confirmed") {
+              input.status = "confirmed";
+              input.confirmedAt = p.height;
+            } else if (p.status === "pending") {
+              input.status = "pending";
+            }
+          }
+        });
+        log(
+          `${count.confirmed} of ${sent.length} submitted transaction(s) confirmed, ` +
+            `${count.pending} pending, ${count.dropped} dropped`,
+        );
+        if (count.conflicted > 0) {
+          polls.forEach((p, n) => {
+            if (p.status !== "conflicted") return;
+            retract(sent[n], "conflicted");
+            log(`transaction ${sent[n].txIndex}: an input was spent on chain by another transaction; stopping`);
+          });
+          report.remaining = true;
+          return finish();
+        }
+        if (count.confirmed === sent.length) break;
+        if (count.pending > 0) {
+          droppedPolls = 0;
+        } else if (++droppedPolls >= DROPPED_POLLS) {
+          // Every transaction is confirmed or dropped: build the dropped ones again.
+          polls.forEach((p, n) => {
+            if (p.status !== "dropped") return;
+            retract(sent[n], "dropped");
+            report.dropped += 1;
+            log(
+              `transaction ${sent[n].txIndex} was dropped: after block ${buildTip + 1} neither mined nor ` +
+                `in the mempool; building it again`,
+            );
+          });
+          break;
+        }
+      }
       if (Date.now() - started > watchTimeoutMs) {
         report.remaining = true;
         return finish();

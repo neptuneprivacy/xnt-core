@@ -18,18 +18,30 @@
 //! - XNT_NETWORK: main, testnet, regtest or testnet-mock (default main)
 //!
 //! A proof collection is valid only for the mutator set it was built on, so
-//! each transaction is proven and checked right before it is submitted. After
-//! a submission, the example waits until the inputs of the transaction are
-//! spent on chain, then builds the remaining transactions again.
+//! each transaction is proven and submitted only while the tip it was built
+//! on is still the tip (see `synced_to_tip`). After the submissions, the
+//! example watches the inputs of the submitted transactions until each is
+//! confirmed (spent on chain) or dropped (after a block, neither mined nor in
+//! the mempool), then builds the remaining transactions, and those dropped,
+//! again. It stops if an input was spent on chain by another transaction.
 
 use std::time::{Duration, Instant};
 
 use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
-use xnt_sdk::core::{build_migration, check_spent, get_mutator_set, Network, RpcClient, WalletEntropy};
+use xnt_sdk::core::{
+    build_migration, check_spent, get_mutator_set, mempool_spending, Digest, Network, RpcClient, Transaction,
+    WalletEntropy,
+};
 
 /// How long to wait for the inputs of a submitted transaction to be spent.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const WATCH_INTERVAL: Duration = Duration::from_secs(30);
+/// Rounds in a row that confirm nothing (stale before submitting, or
+/// dropped) before giving up.
+const MAX_ATTEMPTS: usize = 5;
+/// Polls in a row that must find the transactions dropped before they are
+/// built again.
+const DROPPED_POLLS: usize = 2;
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -46,6 +58,100 @@ fn network() -> Network {
         Some("regtest") => Network::RegTest,
         Some("testnet-mock") => Network::TestnetMock,
         Some(other) => panic!("unknown network {other}"),
+    }
+}
+
+/// Whether `transaction`, built on the mutator set of the tip at `build_tip`,
+/// may be submitted now: only while that tip is still the tip and the
+/// transaction is confirmable.
+///
+/// Confirmability alone is not enough. Before the UpgradeVMv8 fork, the nodes
+/// that upgrade proof collections to single proofs, which is how they get
+/// mined, take only those built on the mutator set of their own tip: they
+/// cannot update someone else's proof collection to a new block. A proof
+/// collection built on an earlier tip is often still confirmable, so nodes
+/// accept it into their mempools, but none upgrades or mines it.
+fn synced_to_tip(client: &RpcClient, transaction: &Transaction, build_tip: u64) -> bool {
+    match get_mutator_set(client) {
+        Ok(mutator_set) => {
+            mutator_set.tip_height() == Some(build_tip) && transaction.is_confirmable(&mutator_set)
+        }
+        Err(e) => {
+            // The tip is not known: do not submit.
+            println!("mutator set: {e}");
+            false
+        }
+    }
+}
+
+/// Watch the inputs of the transactions submitted on the tip at `build_tip`,
+/// one list per transaction, until each is confirmed or dropped; returns how
+/// many were confirmed. Panics if an input was spent on chain by another
+/// transaction, or on timeout.
+fn watch(client: &RpcClient, submitted: &[Vec<Digest>], build_tip: u64) -> usize {
+    let watched: Vec<Digest> = submitted.iter().flatten().copied().collect();
+    let start = Instant::now();
+    let mut dropped_polls = 0;
+    loop {
+        std::thread::sleep(WATCH_INTERVAL);
+        if start.elapsed() > WATCH_TIMEOUT {
+            panic!("the submitted transactions were not mined in time");
+        }
+        // The mempool is read before the spent status: a transaction mined in
+        // between is then seen as confirmed, not as dropped.
+        let poll = client.chain_height().and_then(|tip| {
+            let in_mempool = mempool_spending(client, &watched)?;
+            let spent_at = check_spent(client, &watched)?;
+            Ok((tip, in_mempool, spent_at))
+        });
+        let (tip, in_mempool, spent_at) = match poll {
+            Ok(poll) if poll.2.len() == watched.len() => poll,
+            Ok(_) => {
+                println!("watch: the spent status does not match the inputs; trying again");
+                continue;
+            }
+            Err(e) => {
+                println!("watch: {e}; trying again");
+                continue;
+            }
+        };
+
+        let (mut confirmed, mut pending, mut offset) = (0, 0, 0);
+        for inputs in submitted {
+            let positions = offset..offset + inputs.len();
+            offset += inputs.len();
+            let on_chain: Vec<i64> = spent_at[positions.clone()]
+                .iter()
+                .copied()
+                .filter(|&height| height >= 0)
+                .collect();
+            if !on_chain.is_empty() {
+                // A transaction is mined in one block: all its inputs at one
+                // height.
+                if on_chain.len() < inputs.len() || on_chain.iter().any(|&height| height != on_chain[0]) {
+                    panic!("an input was spent on chain by another transaction");
+                }
+                confirmed += 1;
+            } else if positions.into_iter().any(|k| in_mempool.contains(&k)) || tip <= build_tip {
+                pending += 1;
+            }
+            // Otherwise dropped: after a block, neither mined nor in the
+            // mempool, as nodes drop the proof collections they cannot update
+            // to the new block.
+        }
+        let dropped = submitted.len() - confirmed - pending;
+        println!(
+            "{confirmed} of {} submitted transactions confirmed, {pending} pending, {dropped} dropped",
+            submitted.len()
+        );
+        if pending > 0 {
+            dropped_polls = 0;
+            continue;
+        }
+        dropped_polls += 1;
+        if dropped == 0 || dropped_polls >= DROPPED_POLLS {
+            return confirmed;
+        }
     }
 }
 
@@ -83,12 +189,14 @@ fn main() {
     println!("legacy key indices {indices:?}, destination {destination}");
 
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let mut attempts = 0;
     loop {
         let mut plan =
             build_migration(&client, &wallet, &indices, &destination, network).expect("build migration");
+        let build_tip = plan.tip_height;
         println!(
             "tip {}: {} transactions moving {} for {} in fees; {} dust inputs, {} time-locked, {} skipped entries",
-            plan.tip_height,
+            build_tip,
             plan.transactions.len(),
             coins(plan.total),
             coins(plan.fees),
@@ -122,47 +230,43 @@ fn main() {
             println!("dry run; pass dry_run=no to prove and submit");
             return;
         }
+        attempts += 1;
+        if attempts > MAX_ATTEMPTS {
+            panic!("nothing confirmed in {MAX_ATTEMPTS} rounds; run again later");
+        }
 
-        // Prove and submit the transactions one after the other, while they
-        // are still confirmable; watch the inputs of those submitted.
+        // Prove and submit the transactions one after the other, while the
+        // tip they were built on is still the tip; watch the inputs of those
+        // submitted.
         let mut submitted = Vec::new();
         for (built, inputs) in plan.transactions.drain(..).zip(plan.swept.drain(..)) {
             let start = Instant::now();
             let transaction = runtime.block_on(built.prove()).expect("prove");
             println!("proven in {:.1} s", start.elapsed().as_secs_f64());
-            let mutator_set = get_mutator_set(&client).expect("mutator set");
-            if !transaction.is_confirmable(&mutator_set) {
-                println!("a block arrived while proving; building again");
+            if !synced_to_tip(&client, &transaction, build_tip) {
+                println!("the tip moved past {build_tip} while proving; building again");
                 break;
             }
             match transaction.submit(&client) {
                 Ok(true) => println!("submitted"),
                 Ok(false) => panic!("the node did not queue the transaction"),
-                Err(e) => panic!("submit: {e}"),
+                Err(e) => {
+                    if synced_to_tip(&client, &transaction, build_tip) {
+                        panic!("submit: {e}");
+                    }
+                    println!("a block arrived while submitting ({e}); building again");
+                    break;
+                }
             }
-            submitted.push(inputs);
+            submitted.push(inputs.iter().map(|input| input.absolute_index_set_hash()).collect::<Vec<_>>());
         }
         if submitted.is_empty() {
             continue;
         }
 
-        let hashes: Vec<_> = submitted
-            .iter()
-            .flatten()
-            .map(|input| input.absolute_index_set_hash())
-            .collect();
-        let start = Instant::now();
-        loop {
-            let spent = check_spent(&client, &hashes).expect("check spent");
-            let num_spent = spent.iter().filter(|&&height| height >= 0).count();
-            println!("{num_spent} of {} submitted inputs spent", hashes.len());
-            if num_spent == hashes.len() {
-                break;
-            }
-            if start.elapsed() > WATCH_TIMEOUT {
-                panic!("the submitted transactions were not mined in time");
-            }
-            std::thread::sleep(WATCH_INTERVAL);
+        // Build the remaining transactions, and those dropped, again.
+        if watch(&client, &submitted, build_tip) > 0 {
+            attempts = 0;
         }
     }
 }

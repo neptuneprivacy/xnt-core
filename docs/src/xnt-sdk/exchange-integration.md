@@ -431,8 +431,10 @@ const proofBuffers = xntGetMembershipProofs(
   selectedUtxos.map(u => u.aoclIndex)
 );
 
-// Get mutator set
+// Get mutator set, and the height of its tip: submit only while that is still
+// the tip, see Avoiding Stale Proof Collections
 const mutatorSet = xntGetMutatorSet(client);
+const buildTip = mutatorSet.tipHeight();
 
 // Build transaction
 const builder = new XntTransactionBuilder();
@@ -522,9 +524,12 @@ does so via a JSON-RPC error whose `data` carries the reason (e.g.
 `submit()` also throws on RPC/transport errors.
 
 ```typescript
-// Confirmability mirrors the node's submit gate. Check against the current tip
-// BEFORE submit to detect a tx that went stale while proving.
-if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+// Submit only while the tip the transaction was built on (buildTip, the
+// tipHeight() of the mutator set passed to build()) is still the tip, see
+// Avoiding Stale Proof Collections. Confirmability mirrors the node's submit
+// gate; check against the current tip BEFORE submit.
+const current = xntGetMutatorSet(client);
+if (current.tipHeight() !== buildTip || !provenTx.isConfirmable(current)) {
   // stale — re-prove (see below)
 }
 
@@ -549,13 +554,20 @@ retry loop and re-prove whenever the result is stale:
 ```typescript
 const MAX_ATTEMPTS = 5;
 
+const synced = (provenTx: XntTransaction, buildTip: number | null) => {
+  const current = xntGetMutatorSet(client);
+  return current.tipHeight() === buildTip && provenTx.isConfirmable(current);
+};
+
 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   // Rebuild from a CURRENT sync each attempt (fresh UTXOs, proofs, mutator set)
-  const builtTx = buildTransaction(client, key, recipientBech32, sendAmount, fee);
+  const mutatorSet = xntGetMutatorSet(client);
+  const buildTip = mutatorSet.tipHeight(); // the tip the transaction is built on
+  const builtTx = buildTransaction(client, key, mutatorSet, recipientBech32, sendAmount, fee);
   const provenTx = builtTx.prove();
 
   // Pre-flight: did the chain advance during proving?
-  if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+  if (!synced(provenTx, buildTip)) {
     console.log(`attempt ${attempt}: stale, re-proving...`);
     continue; // re-prove against the new tip
   }
@@ -563,11 +575,11 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   try {
     const success = provenTx.submit(client);
     console.log(`submitted: ${success}`);
-    break;
+    break; // now watch its inputs, see Avoiding Stale Proof Collections
   } catch (e) {
     // A block landing mid-submit is also staleness (retryable); anything else
     // is a real rejection (stop).
-    if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+    if (!synced(provenTx, buildTip)) {
       console.log(`attempt ${attempt}: went stale on submit, re-proving...`);
       continue;
     }
@@ -583,6 +595,48 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 
 The bundled example (`examples/xnt-sdk-test.ts`, `tx` command) implements this
 loop; cap the attempts via `XNT_TX_MAX_ATTEMPTS` (default `5`).
+
+### Avoiding Stale Proof Collections
+
+Before the hard fork at block 95,000, the nodes that upgrade a proof collection
+to a single proof, which is how it gets mined, take only one built on the
+mutator set of their own tip: they cannot update someone else's proof
+collection to a new block. A proof collection built on tip `h` and submitted
+after block `h + 1` is often still confirmable, as its removal records are
+still valid, so nodes accept it into their mempools; but none upgrades or mines
+it, and nodes drop it with the next block. `isConfirmable` alone does not tell.
+
+1. Remember the height of the tip the transaction is built on: the
+   `tipHeight()` of the mutator set passed to `build()` (Rust
+   `built.tip_height()`, C `xnt_mutator_set_tip_height`), or `plan.tipHeight()`
+   of a migration plan (Rust `plan.tip_height`).
+2. After proving, right before `submit()`, fetch the current mutator set
+   (`xntGetMutatorSet`, which records the height of its tip) and submit only if
+   its tip height equals the build tip and the transaction is confirmable
+   against it. Otherwise do not submit: build again from a fresh sync, a
+   bounded number of times.
+3. After `submit()`, watch the inputs by their absolute index set hashes and
+   classify each poll, polling again after RPC errors:
+   - *confirmed*: all inputs spent on chain at one height (`xntCheckSpent`);
+   - *pending*: an input is spent by a mempool transaction
+     (`xntMempoolSpending`), or no block arrived since the build tip;
+   - *dropped*: the tip is past the build tip, and the inputs are neither spent
+     on chain nor by a mempool transaction: build again and resend, a bounded
+     number of times. For a payment, spend the same inputs again, so that the
+     dropped transaction and the resent one cannot both be mined;
+   - *conflicted*: some inputs are spent on chain otherwise: stop and look into
+     it.
+
+   Read the mempool before the spent status, so that a transaction mined
+   between the two calls is seen as confirmed, not as dropped. The examples
+   take a transaction for dropped only on two polls in a row.
+
+`examples/xnt-sdk-test.ts` (`tx`), `examples/xnt-sdk-test.rs` (`tx`,
+`tx-dctidh`), `examples/migrate.ts` and `examples/migrate.rs` implement this, as
+does `migrateLegacyFunds` in `src/ts/helpers.ts` (used by
+`examples/migrate-legacy.ts` and the `migrate` command of
+`examples/xnt-sdk-test.ts`): its report counts the dropped transactions in
+`dropped` and gives the last state of each input in `inputs[].status`.
 
 ### Before the Hard Fork at Block 95,000
 
@@ -618,8 +672,9 @@ spent again.
 
 A proof collection is valid only against the mutator set it was built on, and
 nodes take it only if it is synced to their tip: submit right after proving,
-and rebuild and prove again after every block until it is mined (see
-[Re-proving on Staleness](#re-proving-on-staleness)).
+only while the tip it was built on is still the tip, and rebuild and prove
+again after every block until it is mined (see
+[Avoiding Stale Proof Collections](#avoiding-stale-proof-collections)).
 
 Nodes of this release answer a transaction made for the other side of the fork
 with the JSON-RPC error data `{"SubmitTransaction":"OtherEra"}` (prove again for
@@ -670,7 +725,9 @@ xntComputeCommitmentForOutput(
 1. `syncWallet()` to get available UTXOs
 2. Filter out `pendingSpending` indices
 3. `xntSelectInputs()` to select UTXOs
-4. Build, prove, submit transaction — re-prove on staleness (see [Re-proving on Staleness](#re-proving-on-staleness))
+4. Build, prove, submit transaction — re-prove on staleness, and resend when
+   dropped (see [Re-proving on Staleness](#re-proving-on-staleness) and
+   [Avoiding Stale Proof Collections](#avoiding-stale-proof-collections))
 5. Track `commitmentHex` for confirmation: a successful `submit()` only means the
    node queued the transaction
 
@@ -727,13 +784,15 @@ for (;;) {
   const watched: string[] = [];
   for (let i = 0; i < transactions.length; i++) {
     const provenTx = transactions[i].prove(); // the era of the block after plan.tipHeight()
-    if (!provenTx.isConfirmable(xntGetMutatorSet(client))) break; // a block arrived: build again
+    const current = xntGetMutatorSet(client);
+    if (current.tipHeight() !== plan.tipHeight() || !provenTx.isConfirmable(current)) break; // a block arrived: build again
     provenTx.submit(client);
     watched.push(...plan.inputHashes(i));
   }
 
-  // Wait until the submitted transactions are mined: their inputs are spent.
-  while (xntCheckSpent(client, watched).some(height => height < 0)) await sleep(30_000);
+  // Wait until the submitted transactions are mined (their inputs are spent on
+  // chain) or dropped, see Avoiding Stale Proof Collections; then build again.
+  await waitUntilMinedOrDropped(client, watched, plan.tipHeight());
 }
 ```
 
@@ -790,10 +849,11 @@ plan.timeLockedInfo();  // time lock not released yet
 ```
 
 `migrateLegacyFunds` reports the same: `report.inputs` lists every input of the
-transactions it built, with `round`, `txIndex` and `submitted`, and
-`report.byPaymentId` sums them as `{ keyIndex, paymentId, amount, inputs }`: in
-a dry run over the planned inputs, otherwise over the inputs of the submitted
-transactions only. `examples/migrate-legacy.ts` prints it as a table.
+transactions it built, with `round`, `txIndex`, `submitted` and `status`
+(`"confirmed"`, `"dropped"`, ...), and `report.byPaymentId` sums them as
+`{ keyIndex, paymentId, amount, inputs }`: in a dry run over the planned inputs,
+otherwise over the inputs of the submitted transactions that were neither
+dropped nor conflicted. `examples/migrate-legacy.ts` prints it as a table.
 
 In Rust the plan has `swept_inputs`, `dust_inputs`, `time_locked_inputs`
 (`MigrationInput`) and `totals_by_payment_id()`; in C,
