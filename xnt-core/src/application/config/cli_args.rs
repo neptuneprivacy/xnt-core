@@ -273,8 +273,8 @@ pub struct Args {
     ///
     /// Such a transaction must be mined before the fork, and this version
     /// cannot carry it over. Main net follows the `UpgradeVMv7` consensus rule
-    /// set until the `UpgradeVMv8` hard fork at block 95000; with the default,
-    /// the last such transactions are created on top of block 94989. The
+    /// set until the `UpgradeVMv8` hard fork at block 97000; with the default,
+    /// the last such transactions are created on top of block 96989. The
     /// transactions created before go on being relayed and re-proven until the
     /// next block belongs to the new era.
     #[clap(long, default_value = "10", value_name = "BLOCKS")]
@@ -282,7 +282,7 @@ pub struct Args {
 
     /// On a test network, the height of the first block that follows the
     /// `UpgradeVMv8` consensus rule set. The blocks below it follow
-    /// `UpgradeVMv7`, as main net does until its hard fork at block 95000, so
+    /// `UpgradeVMv7`, as main net does until its hard fork at block 97000, so
     /// that the switch between the two eras can be exercised on a test
     /// network, also together with nodes of the previous release, which follow
     /// `UpgradeVMv7` there from genesis on. This node does not compose blocks

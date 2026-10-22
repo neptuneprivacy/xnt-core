@@ -626,7 +626,7 @@ mod tests {
             vec![11, 1],
             before.swept.iter().map(Vec::len).collect::<Vec<_>>()
         );
-        let after = plan(many, 95_000, &options).unwrap();
+        let after = plan(many, 97_000, &options).unwrap();
         assert_eq!(
             vec![12],
             after.swept.iter().map(Vec::len).collect::<Vec<_>>()
@@ -893,10 +893,10 @@ mod tests {
         let wallet = WalletEntropy::devnet();
         let key = wallet.derive_legacy_dctidh_spending_key(0);
         let inputs = vec![input(&key, 0, coins("5"))];
-        for tip_height in [94_990, 94_998] {
+        for tip_height in [96_990, 96_998] {
             assert!(plan(inputs.clone(), tip_height, &MigrationOptions::default()).is_err());
         }
-        assert!(plan(inputs.clone(), 94_999, &MigrationOptions::default()).is_ok());
+        assert!(plan(inputs.clone(), 96_999, &MigrationOptions::default()).is_ok());
 
         // Before the fork, at least 0.017 coins; after it, the relay minimum.
         let low_fee = MigrationOptions {
@@ -904,7 +904,7 @@ mod tests {
             ..MigrationOptions::default()
         };
         assert!(plan(inputs.clone(), 94_000, &low_fee).is_err());
-        assert!(plan(inputs, 95_000, &low_fee).is_ok());
+        assert!(plan(inputs, 97_000, &low_fee).is_ok());
     }
 
     #[test]

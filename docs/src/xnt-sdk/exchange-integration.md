@@ -508,7 +508,7 @@ const provenForTip = builtTx.proveForTip(tipHeight);
 
 `prove()` throws if the tip height is unknown; give it with
 `mutatorSet.withTipHeight(tipHeight)` before building, or use
-`proveForTip(tipHeight)`. See [Before the Hard Fork at Block 95,000](#before-the-hard-fork-at-block-95000)
+`proveForTip(tipHeight)`. See [Before the Hard Fork at Block 97,000](#before-the-hard-fork-at-block-97000)
 for what changes around the fork.
 
 ### Submit Transaction
@@ -598,7 +598,7 @@ loop; cap the attempts via `XNT_TX_MAX_ATTEMPTS` (default `5`).
 
 ### Avoiding Stale Proof Collections
 
-Before the hard fork at block 95,000, the nodes that upgrade a proof collection
+Before the hard fork at block 97,000, the nodes that upgrade a proof collection
 to a single proof, which is how it gets mined, take only one built on the
 mutator set of their own tip: they cannot update someone else's proof
 collection to a new block. A proof collection built on tip `h` and submitted
@@ -638,18 +638,18 @@ does `migrateLegacyFunds` in `src/ts/helpers.ts` (used by
 `examples/xnt-sdk-test.ts`): its report counts the dropped transactions in
 `dropped` and gives the last state of each input in `inputs[].status`.
 
-### Before the Hard Fork at Block 95,000
+### Before the Hard Fork at Block 97,000
 
-Main net follows the `UpgradeVMv7` consensus rule set until block 95,000, and
+Main net follows the `UpgradeVMv7` consensus rule set until block 97,000, and
 `UpgradeVMv8` from then on. A transaction is proven for the rule set of the
 block that follows the tip it was built on:
 
 - `prove()` takes that tip from the mutator set: `xntGetMutatorSet(client)`
   (Rust `get_mutator_set`, C `xnt_sync_get_mutator_set`) records the height of
-  the tip it belongs to. Up to tip 94,998 the result is a v7 proof collection,
+  the tip it belongs to. Up to tip 96,998 the result is a v7 proof collection,
   which the nodes of the previous release relay, upgrade and mine; from tip
-  94,999 on, a v8 one. Releases of the SDK before this one always made a v8
-  proof, which main-net nodes refuse before block 95,000.
+  96,999 on, a v8 one. Releases of the SDK before this one always made a v8
+  proof, which main-net nodes refuse before block 97,000.
 - `proveForTip(tipHeight)` (Rust `prove_for_tip`, C
   `xnt_built_transaction_prove_for_tip`) does the same for a given tip height:
   for cold signing, or for a mutator set restored from bytes, which carries no
@@ -664,10 +664,10 @@ transaction does not meet them:
 - at most 10 inputs, 11 if no input or output carries a time lock;
 - outputs with native currency and time locks only.
 
-No new transaction is made within 10 blocks of the fork: from tip 94,990 to
-94,998, proving fails, since the transaction might not be mined before block
-95,000; build and prove again from tip 94,999 on, for v8. A v7 transaction that
-is not mined by block 95,000 can no longer be mined; its inputs are free to be
+No new transaction is made within 10 blocks of the fork: from tip 96,990 to
+96,998, proving fails, since the transaction might not be mined before block
+97,000; build and prove again from tip 96,999 on, for v8. A v7 transaction that
+is not mined by block 97,000 can no longer be mined; its inputs are free to be
 spent again.
 
 A proof collection is valid only against the mutator set it was built on, and
@@ -751,9 +751,9 @@ address and never count them towards the available balance.
 ### Before Upgrading
 
 Moving the funds with the old release is no longer needed: the v0.3 SDK moves
-them, before and after the hard fork at block 95,000, see
+them, before and after the hard fork at block 97,000, see
 [Migrating in One Call](#migrating-in-one-call). Funds at legacy-format locks
-are recognized only if they were confirmed below block 95,000; move them soon.
+are recognized only if they were confirmed below block 97,000; move them soon.
 
 After upgrading, create new dCTIDH deposit addresses with the v0.3 SDK and
 replace every legacy-format address you have handed out.
@@ -919,9 +919,9 @@ builder.addOutput(genAddr.toReceivingAddress(), total - fee, xntRandomSenderRand
 builder.setFee(fee);
 ```
 
-Before the hard fork at block 95,000, a transaction may have at most 10 inputs
+Before the hard fork at block 97,000, a transaction may have at most 10 inputs
 (11 if none carries a time lock) and must pay at least 0.017 XNT, 0.1 XNT by
-default, see [Before the Hard Fork at Block 95,000](#before-the-hard-fork-at-block-95000);
+default, see [Before the Hard Fork at Block 97,000](#before-the-hard-fork-at-block-97000);
 after it, the usual limits apply: at most 200 inputs and at least 0.0005 XNT fee
 per input. Sweep large numbers of UTXOs in batches. A node can also do this for
 its own wallet, see `--migrate-dctidh`.

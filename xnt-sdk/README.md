@@ -88,12 +88,12 @@ refuses recipients that cannot receive a UTXO notification. A successful
 `submit()` means the node queued the transaction, not that it is in the mempool
 or mined; confirm by looking it up.
 
-## Proving Around the Hard Fork at Block 95,000
+## Proving Around the Hard Fork at Block 97,000
 
 `BuiltTransaction::prove` / `prove()` / `xnt_built_transaction_prove` prove for
 the consensus rule set of the block after the tip whose mutator set the
 transaction was built on, whose height `get_mutator_set` records: before main-net
-block 95,000 a v7 proof collection, which must pay at least 0.017 coins and have
+block 97,000 a v7 proof collection, which must pay at least 0.017 coins and have
 at most 10 inputs (11 without time locks), and none within 10 blocks of the
 fork. For a mutator set without a height, as one restored from bytes, set it
 with `MutatorSet::with_tip_height` / `withTipHeight` /

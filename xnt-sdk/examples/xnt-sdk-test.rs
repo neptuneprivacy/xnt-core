@@ -846,7 +846,7 @@ fn ffi_send_tx(ctx: &Ctx, client: *mut RpcClientHandle, resend: Option<&[XntDige
     }
 
     // Prove for the block after the tip the mutator set belongs to: before
-    // main-net block 95000, a v7 proof collection.
+    // main-net block 97000, a v7 proof collection.
     println!("Proving for the block after tip {build_tip}...");
     let start = std::time::Instant::now();
     let proven = xnt_built_transaction_prove(built);

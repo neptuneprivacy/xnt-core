@@ -98,7 +98,7 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
 /// Mainnet v8 activation height. Read it through
 /// [`upgrade_vm_v8_activation_height`], which also covers the other networks.
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET: BlockHeight =
-    BlockHeight::new(BFieldElement::new(95_000u64));
+    BlockHeight::new(BFieldElement::new(97_000u64));
 
 /// The height of the first block that follows the `UpgradeVMv8` consensus
 /// rule set on the given network: [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET`]
@@ -932,7 +932,7 @@ pub(crate) mod tests {
     }
 
     /// Transactions are made for the rule set of the next block. On main net,
-    /// a tip at 94,998 is followed by the last v7 block, a tip at 94,999 by the
+    /// a tip at 96,998 is followed by the last v7 block, a tip at 96,999 by the
     /// fork block, so from that tip on transactions are made for v8. The test
     /// networks follow v8 from genesis on.
     #[test]
@@ -940,12 +940,12 @@ pub(crate) mod tests {
         let height = |h: u64| BlockHeight::new(BFieldElement::new(h));
         let fork = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
         assert_eq!(fork, upgrade_vm_v8_activation_height(Network::Main));
-        assert_eq!(95_000, fork.value());
+        assert_eq!(97_000, fork.value());
 
         for (tip, expected) in [
-            (94_998, ConsensusRuleSet::UpgradeVMv7),
-            (94_999, ConsensusRuleSet::UpgradeVMv8),
-            (95_000, ConsensusRuleSet::UpgradeVMv8),
+            (96_998, ConsensusRuleSet::UpgradeVMv7),
+            (96_999, ConsensusRuleSet::UpgradeVMv8),
+            (97_000, ConsensusRuleSet::UpgradeVMv8),
         ] {
             assert_eq!(
                 expected,

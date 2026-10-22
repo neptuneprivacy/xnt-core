@@ -55,8 +55,8 @@ async fn insert(state: &mut GlobalStateLock, transaction: &Transaction) {
 }
 
 /// A v7 transaction is never held in the mempool, and a v8 one never in the
-/// legacy relay pool: a tip at 94,998 is followed by a v7 block, a tip at
-/// 94,999 by the fork block.
+/// legacy relay pool: a tip at 96,998 is followed by a v7 block, a tip at
+/// 96,999 by the fork block.
 #[traced_test]
 #[apply(shared_tokio_runtime)]
 async fn transactions_are_held_for_the_rule_set_of_the_next_block() {
@@ -144,7 +144,7 @@ async fn the_fork_clears_the_legacy_pool_and_proves_own_transactions_for_v8() {
     insert(&mut state, &foreign).await;
     assert_eq!(2, state.lock_guard().await.legacy_relay_pool.len());
 
-    // The tip at 94,998: the next block is still a v7 block.
+    // The tip at 96,998: the next block is still a v7 block.
     let (tip, jobs) = extend(&mut state, &tip).await;
     {
         let state = state.lock_guard().await;
@@ -154,7 +154,7 @@ async fn the_fork_clears_the_legacy_pool_and_proves_own_transactions_for_v8() {
     }
     assert!(jobs.iter().any(|job| job.txid() == own.txid()));
 
-    // The tip at 94,999: the next block is the fork block. The own
+    // The tip at 96,999: the next block is the fork block. The own
     // transaction is parked, held in the mempool backed by its witness, and
     // handed to the updater to be proven for the fork block.
     let (tip, switch_jobs) = extend(&mut state, &tip).await;
@@ -222,7 +222,7 @@ async fn a_reorganization_back_across_the_fork_drops_v8_transactions() {
         .mempool
         .contains(transaction.txid()));
 
-    // A sibling of the tip's parent, at 94,998: the next block is a v7 block.
+    // A sibling of the tip's parent, at 96,998: the next block is a v7 block.
     let mut sibling = main_net_placeholder_block(&before, last_v7_parent.header().height);
     let mut header = *sibling.header();
     header.timestamp += Timestamp::minutes(1);

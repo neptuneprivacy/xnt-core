@@ -1330,7 +1330,7 @@ impl XntBuiltTransaction {
     /// Prove the transaction (creates ProofCollection) for the consensus rule set
     /// of the block that follows the tip whose mutator set it was built on, as
     /// proveForTip does with that tip's height: before the UpgradeVMv8 hard fork
-    /// at main-net block 95000, a v7 proof collection. Fails if that height is
+    /// at main-net block 97000, a v7 proof collection. Fails if that height is
     /// unknown (see XntMutatorSet.tipHeight); then use withTipHeight before
     /// building, or proveForTip.
     /// WARNING: CPU-intensive, requires ~16 GB RAM.

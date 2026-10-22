@@ -323,7 +323,7 @@ pub extern "C" fn xnt_built_transaction_free(handle: *mut BuiltTransactionHandle
 /// Prove the built transaction (creates ProofCollection) for the consensus rule
 /// set of the block that follows the tip whose mutator set it was built on, as
 /// xnt_built_transaction_prove_for_tip does with that tip's height: before the
-/// UpgradeVMv8 hard fork at main-net block 95000, a v7 proof collection.
+/// UpgradeVMv8 hard fork at main-net block 97000, a v7 proof collection.
 /// Fails if that height is unknown (see xnt_mutator_set_tip_height); then
 /// record it with xnt_mutator_set_set_tip_height before building, or use
 /// xnt_built_transaction_prove_for_tip.

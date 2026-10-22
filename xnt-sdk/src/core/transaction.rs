@@ -492,7 +492,7 @@ impl BuiltTransaction {
     /// Prove transaction (creates ProofCollection) for the consensus rule set of
     /// the block that follows the tip whose mutator set it was built on, as
     /// [Self::prove_for_tip] does with that tip's height: before the
-    /// UpgradeVMv8 hard fork at main-net block 95000, a v7 proof collection.
+    /// UpgradeVMv8 hard fork at main-net block 97000, a v7 proof collection.
     ///
     /// Fails if that height is unknown, as for a mutator set restored with
     /// [MutatorSet::from_bytes]: then pass it with [MutatorSet::with_tip_height]
@@ -750,25 +750,25 @@ mod tests {
         use neptune_privacy::api::export::ConsensusRuleSet;
 
         // With the default cutoff margin of 10 blocks, the last transactions of
-        // the era before the fork at 95000 are made on top of block 94989.
+        // the era before the fork at 97000 are made on top of block 96989.
         let rule_set = |tip_height: u64| {
             let built = main_net_payment("0.02", Some(tip_height));
             built.rule_set_for_tip(built.known_tip_height().unwrap())
         };
-        assert_eq!(ConsensusRuleSet::UpgradeVMv7, rule_set(94_989).unwrap());
-        for tip_height in [94_990, 94_998] {
+        assert_eq!(ConsensusRuleSet::UpgradeVMv7, rule_set(96_989).unwrap());
+        for tip_height in [96_990, 96_998] {
             let err = rule_set(tip_height).unwrap_err().to_string();
             assert!(err.contains("UpgradeVMv7"), "tip {tip_height}: {err}");
         }
-        assert_eq!(ConsensusRuleSet::UpgradeVMv8, rule_set(94_999).unwrap());
-        assert_eq!(ConsensusRuleSet::UpgradeVMv8, rule_set(95_000).unwrap());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, rule_set(96_999).unwrap());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, rule_set(97_000).unwrap());
 
         // Before the fork, the terms of that era apply: a fee of 0.017 at least.
         let low_fee = main_net_payment("0.01", Some(94_000));
         assert!(low_fee.rule_set_for_tip(94_000).is_err());
         assert_eq!(
             ConsensusRuleSet::UpgradeVMv8,
-            low_fee.rule_set_for_tip(95_000).unwrap()
+            low_fee.rule_set_for_tip(97_000).unwrap()
         );
     }
 
