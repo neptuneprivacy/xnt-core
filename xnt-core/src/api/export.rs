@@ -17,6 +17,8 @@ pub use crate::protocol::consensus::transaction::transparent_input::TransparentI
 pub use crate::protocol::consensus::transaction::transparent_transaction_info::TransparentTransactionInfo;
 pub use crate::protocol::consensus::transaction::utxo::Utxo;
 pub use crate::protocol::consensus::transaction::utxo_triple::UtxoTriple;
+pub use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
+pub use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::LeviathanProofCollection;
 pub use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
 pub use crate::protocol::consensus::transaction::Transaction;
 pub use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;

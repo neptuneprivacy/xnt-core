@@ -74,6 +74,8 @@ use crate::protocol::peer::handshake_data::HandshakeData;
 use crate::protocol::peer::link_tx_notification::LinkTxNotification;
 use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
+use crate::protocol::peer::NegativePeerSanction;
+use crate::protocol::peer::PeerSanction;
 use crate::protocol::peer::PeerSynchronizationState;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
@@ -84,8 +86,15 @@ use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mining::block_proposal::BlockProposal;
 use crate::state::networking_state::SyncAnchor;
 use crate::state::transaction::tx_proving_capability::TxProvingCapability;
+use crate::state::BridgePoolRebuildFailed;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
+use crate::state::InvalidBridgeChange;
+use crate::state::InvalidBridgeRegistration;
+use crate::state::StaleBridgeSettlement;
+use crate::state::UnauthorizedBridgeRotation;
+use crate::state::UnauthorizedBridgeSettlement;
+use crate::state::UnregisteredBridgeSettlement;
 use crate::SUCCESS_EXIT_CODE;
 
 const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2 * 60);
@@ -188,6 +197,8 @@ struct MutableMainLoopState {
     /// A join-handle to a task performing transaction-proof upgrades.
     proof_upgrader_task: Option<JoinHandle<()>>,
 
+    rpc_upgrade_tasks: Vec<JoinHandle<()>>,
+
     /// A join-handle to a task running the update of the mempool transactions.
     update_mempool_txs_handle: Option<JoinHandle<()>>,
 
@@ -205,9 +216,35 @@ impl MutableMainLoopState {
             potential_peers: PotentialPeersState::default(),
             task_handles,
             proof_upgrader_task: None,
+            rpc_upgrade_tasks: vec![],
             update_mempool_txs_handle: None,
             update_mempool_receiver: dummy_receiver,
         }
+    }
+
+    fn track_rpc_upgrade(&mut self, task: JoinHandle<()>) {
+        self.rpc_upgrade_tasks.retain(|th| !th.is_finished());
+        self.rpc_upgrade_tasks.push(task);
+    }
+
+    /// Dropping an upgrade's job handle also cancels its queued or running prover job.
+    fn abort_proof_upgrades(&mut self) {
+        if let Some(task) = self.proof_upgrader_task.take() {
+            task.abort();
+        }
+        for task in self.rpc_upgrade_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    fn drop_mempool_update_job(&mut self) -> bool {
+        let Some(handle) = self.update_mempool_txs_handle.take() else {
+            return false;
+        };
+        handle.abort();
+        let (_sender, receiver) = mpsc::channel(TX_UPDATER_CHANNEL_CAPACITY);
+        self.update_mempool_receiver = receiver;
+        true
     }
 }
 
@@ -431,6 +468,17 @@ fn stay_in_sync_mode(
                     > sync_mode_threshold as i128 / 2
         }
     }
+}
+
+/// Errors `set_new_tip` returns for a block failing the bridge rules, before it writes anything.
+fn is_bridge_rejection(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<StaleBridgeSettlement>().is_some()
+        || e.downcast_ref::<UnauthorizedBridgeSettlement>().is_some()
+        || e.downcast_ref::<UnauthorizedBridgeRotation>().is_some()
+        || e.downcast_ref::<UnregisteredBridgeSettlement>().is_some()
+        || e.downcast_ref::<InvalidBridgeRegistration>().is_some()
+        || e.downcast_ref::<InvalidBridgeChange>().is_some()
+        || e.downcast_ref::<BridgePoolRebuildFailed>().is_some()
 }
 
 impl MainLoopHandler {
@@ -748,13 +796,17 @@ impl MainLoopHandler {
                                 .mempool_update_primitive_witness(txid, *new_pw.to_owned())
                                 .await;
                         }
-                        state
+                        if !state
                             .mempool_insert(
                                 *new_transaction.to_owned(),
                                 UpgradePriority::Critical,
                                 AddReason::Updated,
                             )
-                            .await;
+                            .await
+                        {
+                            state.mempool_remove(txid).await;
+                            continue;
+                        }
                         if let Ok(notification) = new_transaction.as_ref().try_into() {
                             transaction_notifications
                                 .push(MainToPeerTask::TransactionNotification(notification));
@@ -899,7 +951,18 @@ impl MainLoopHandler {
                 return Ok(());
             }
 
-            let update_jobs = gsm.set_new_tip(new_block_clone).await?;
+            let update_jobs = match gsm.set_new_tip(new_block_clone).await {
+                Ok(jobs) => jobs,
+                Err(e) if is_bridge_rejection(&e) => {
+                    // Or the miner keeps guessing on the same proposal.
+                    gsm.mining_state.block_proposal = BlockProposal::none();
+                    drop(gsm);
+                    warn!("Discarding self-guessed block with invalid bridge settlement: {e:#}");
+                    self.main_to_miner_tx.send(MainToMiner::Continue);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             gsm.flush_databases().await?;
             update_jobs
         };
@@ -1011,12 +1074,11 @@ impl MainLoopHandler {
     ) -> Result<()> {
         debug!("Received {} from a peer task", msg.get_type());
         match msg {
-            PeerTaskToMain::NewBlocks(blocks) => {
+            PeerTaskToMain::NewBlocks(blocks, peer_address) => {
                 log_slow_scope!(fn_name!() + "::PeerTaskToMain::NewBlocks");
 
-                let block_hashes = blocks.iter().map(|x| x.hash()).collect_vec();
                 let last_block = blocks.last().unwrap().to_owned();
-                let update_jobs = {
+                let (update_jobs, applied, rejected, tip) = {
                     // The peer tasks also check this condition, if block is more canonical than current
                     // tip, but we have to check it again since the block update might have already been applied
                     // through a message from another peer (or from own miner).
@@ -1063,36 +1125,16 @@ impl MainLoopHandler {
                     // Ask miner to stop work until state update is completed
                     self.main_to_miner_tx.send(MainToMiner::WaitForContinue);
 
-                    // Register sync progress on the healthy (canonical) path
-                    // too. The global synchronization timeout measures time
-                    // since the anchor was last updated; without this refresh
-                    // it fires a fixed 480 s after sync-mode entry no matter
-                    // how well the sync is going, and the forced re-entry gap
-                    // pushes catch-up onto the unbounded fork-reconciliation
-                    // path.
-                    if let Some(sync_anchor) = global_state_mut.net.sync_anchor.as_mut() {
-                        sync_anchor.catch_up(last_block.header().height, last_block.hash());
-                    }
-
-                    // Get out of sync mode if needed
-                    if global_state_mut.net.sync_anchor.is_some() {
-                        let stay_in_sync_mode = stay_in_sync_mode(
-                            &last_block.kernel.header,
-                            &main_loop_state.sync_state,
-                            sync_mode_threshold,
-                        );
-                        if !stay_in_sync_mode {
-                            info!("Exiting sync mode");
-                            global_state_mut.net.sync_anchor = None;
-                            self.main_to_miner_tx.send(MainToMiner::StopSyncing);
-                        }
-                    }
+                    let old_tip = global_state_mut.chain.light_state().hash();
+                    let old_tip_header = *global_state_mut.chain.light_state().header();
 
                     // Track the "update" jobs that should be performed after a
                     // new tip is set. Keyed by transaction ID, so that multiple
                     // incoming blocks do not schedule the same mempool
                     // transaction to be updated more than once.
                     let mut update_jobs: HashMap<_, _> = HashMap::new();
+                    let mut applied = vec![];
+                    let mut rejected = None;
                     for new_block in blocks {
                         debug!(
                             "Storing block {:x} in database. Height: {}, Mined: {}",
@@ -1110,7 +1152,17 @@ impl MainLoopHandler {
                         // [GlobalState::tests::setting_same_tip_twice_is_allowed]
                         // test for a test of this phenomenon.
 
-                        let update_jobs_ = global_state_mut.set_new_tip(new_block).await?;
+                        let (height, digest) = (new_block.header().height, new_block.hash());
+                        let update_jobs_ = match global_state_mut.set_new_tip(new_block).await {
+                            Ok(jobs) => jobs,
+                            // Later blocks of the batch build on this one.
+                            Err(e) if is_bridge_rejection(&e) => {
+                                rejected = Some((height, digest, e));
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        applied.push(digest);
 
                         update_jobs.extend(
                             update_jobs_
@@ -1119,26 +1171,105 @@ impl MainLoopHandler {
                         );
                     }
 
+                    // A fork prefix the batch's rejected block cut short may not beat the old tip.
+                    let new_tip_header = *global_state_mut.chain.light_state().header();
+                    if rejected.is_some()
+                        && !applied.is_empty()
+                        && !(new_tip_header.height != old_tip_header.height
+                            && new_tip_header.cumulative_proof_of_work
+                                > old_tip_header.cumulative_proof_of_work)
+                    {
+                        let old_tip_block = global_state_mut
+                            .chain
+                            .archival_state()
+                            .get_block(old_tip)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("old tip {old_tip:x} is not stored"))?;
+                        info!("Restoring tip {old_tip:x} over the shorter fork prefix");
+                        update_jobs.extend(
+                            global_state_mut
+                                .set_new_tip(old_tip_block)
+                                .await?
+                                .into_iter()
+                                .map(|update_job| (update_job.txid(), update_job)),
+                        );
+                        applied.clear();
+                    }
+
+                    // Register sync progress on the healthy (canonical) path
+                    // too. The global synchronization timeout measures time
+                    // since the anchor was last updated; without this refresh
+                    // it fires a fixed 480 s after sync-mode entry no matter
+                    // how well the sync is going, and the forced re-entry gap
+                    // pushes catch-up onto the unbounded fork-reconciliation
+                    // path.
+                    let tip_header = *global_state_mut.chain.light_state().header();
+                    let tip_digest = global_state_mut.chain.light_state().hash();
+                    if let Some(sync_anchor) = global_state_mut.net.sync_anchor.as_mut() {
+                        sync_anchor.catch_up(tip_header.height, tip_digest);
+                    }
+
+                    // Get out of sync mode if needed
+                    if global_state_mut.net.sync_anchor.is_some() {
+                        let stay_in_sync_mode = stay_in_sync_mode(
+                            &tip_header,
+                            &main_loop_state.sync_state,
+                            sync_mode_threshold,
+                        );
+                        if !stay_in_sync_mode {
+                            info!("Exiting sync mode");
+                            global_state_mut.net.sync_anchor = None;
+                            self.main_to_miner_tx.send(MainToMiner::StopSyncing);
+                        }
+                    }
+
                     global_state_mut.flush_databases().await?;
 
-                    update_jobs.into_values().collect_vec()
+                    let tip = match &rejected {
+                        None => last_block,
+                        Some(_) => global_state_mut.chain.light_state().to_owned(),
+                    };
+                    (
+                        update_jobs.into_values().collect_vec(),
+                        applied,
+                        rejected,
+                        tip,
+                    )
                 };
 
-                // Inform all peers about new block
-                let pmsg = MainToPeerTask::Block(Box::new(last_block.clone()));
-                self.main_to_peer_broadcast(pmsg);
-
-                for block_hash in block_hashes {
-                    Self::spawn_block_notify_command(
-                        &self.global_state_lock.cli().block_notify,
-                        block_hash,
+                if let Some((height, digest, e)) = rejected {
+                    warn!(
+                        "Rejecting block {digest:x} at height {height} from peer {peer_address}: {e:#}"
                     );
+                    if e.downcast_ref::<BridgePoolRebuildFailed>().is_none() {
+                        self.punish_peer(
+                            peer_address,
+                            NegativePeerSanction::InvalidBlock((height, digest)),
+                        )
+                        .await;
+                    }
                 }
 
                 // Spawn task to handle mempool tx-updating after new blocks.
                 // TODO: Do clever trick to collapse all jobs relating to the same transaction,
                 //       identified by transaction-ID, into *one* update job.
                 self.spawn_mempool_txs_update_job(main_loop_state, update_jobs);
+
+                if applied.is_empty() {
+                    self.main_to_miner_tx.send(MainToMiner::Continue);
+                    return Ok(());
+                }
+
+                // Inform all peers about new block
+                let pmsg = MainToPeerTask::Block(Box::new(tip));
+                self.main_to_peer_broadcast(pmsg);
+
+                for block_hash in applied {
+                    Self::spawn_block_notify_command(
+                        &self.global_state_lock.cli().block_notify,
+                        block_hash,
+                    );
+                }
 
                 self.spawn_wallet_maintenance().await;
 
@@ -1239,6 +1370,14 @@ impl MainLoopHandler {
                         != global_state_mut.chain.light_state().hash()
                     {
                         warn!("main loop got unmined transaction with bad mutator set data, discarding transaction");
+                        return Ok(());
+                    }
+
+                    if let Err(e) = global_state_mut
+                        .bridge_admission_check(&pt2m_transaction.transaction.kernel)
+                        .await
+                    {
+                        warn!("main loop got transaction failing the bridge gate, discarding: {e}");
                         return Ok(());
                     }
 
@@ -1390,6 +1529,25 @@ impl MainLoopHandler {
         }
 
         Ok(())
+    }
+
+    /// Sanctions a peer the way its peer task would, banning it when its standing runs out.
+    async fn punish_peer(&mut self, peer_address: SocketAddr, reason: NegativePeerSanction) {
+        let banned = {
+            let mut global_state = self.global_state_lock.lock_guard_mut().await;
+            let Some(peer_info) = global_state.net.peer_map.get_mut(&peer_address) else {
+                warn!("Cannot sanction {peer_address} for {reason:?}: no longer connected");
+                return;
+            };
+            peer_info
+                .standing
+                .sanction(PeerSanction::Negative(reason))
+                .is_err()
+        };
+        if banned {
+            self.main_to_peer_broadcast(MainToPeerTask::Disconnect(peer_address));
+            self.ban_peer_in_bad_standing(peer_address).await;
+        }
     }
 
     /// If necessary, disconnect from peers.
@@ -1910,6 +2068,8 @@ impl MainLoopHandler {
                 "Not updating mempool txs since job queue \
                    already contains {num_queued_job} jobs"
             );
+            // No update task will release the miner from its wait for this block.
+            self.main_to_miner_tx.send(MainToMiner::Continue);
             return;
         }
 
@@ -2316,7 +2476,7 @@ impl MainLoopHandler {
 
                     let global_state_lock_clone = self.global_state_lock.clone();
                     let main_to_peer_broadcast_tx_clone = self.main_to_peer_broadcast_tx.clone();
-                    let _proof_upgrader_task = tokio::task::spawn(async move {
+                    let proof_upgrader_task = tokio::task::spawn(async move {
                         upgrade_job
                             .handle_upgrade(
                                 vm_job_queue.clone(),
@@ -2325,6 +2485,7 @@ impl MainLoopHandler {
                             )
                             .await
                     });
+                    main_loop_state.track_rpc_upgrade(proof_upgrader_task);
 
                     // main_loop_state.proof_upgrader_task = Some(proof_upgrader_task);
                     // If transaction could not be shared immediately because
@@ -2370,7 +2531,7 @@ impl MainLoopHandler {
                     "Attempting to upgrade transactions: {}",
                     upgrade_job.affected_txids().iter().join(", ")
                 );
-                tokio::task::spawn(async move {
+                let proof_upgrader_task = tokio::task::spawn(async move {
                     upgrade_job
                         .handle_upgrade(
                             vm_job_queue,
@@ -2379,6 +2540,7 @@ impl MainLoopHandler {
                         )
                         .await
                 });
+                main_loop_state.track_rpc_upgrade(proof_upgrader_task);
 
                 Ok(false)
             }
@@ -2467,6 +2629,12 @@ impl MainLoopHandler {
             }
             RPCServerToMain::ClearMempool => {
                 info!("Clearing mempool");
+                // A finishing upgrade or update would put its transaction back.
+                main_loop_state.abort_proof_upgrades();
+                if main_loop_state.drop_mempool_update_job() {
+                    // The miner may be waiting for that update.
+                    self.main_to_miner_tx.send(MainToMiner::Continue);
+                }
                 self.global_state_lock
                     .lock_guard_mut()
                     .await
@@ -2634,6 +2802,7 @@ mod tests {
     use crate::application::config::network::Network;
     use crate::tests::shared::blocks::invalid_empty_block;
     use crate::tests::shared::blocks::invalid_empty_block1_with_guesser_fraction;
+    use crate::tests::shared::blocks::invalid_empty_block_with_timestamp;
     use crate::tests::shared::globalstate::get_dummy_peer_incoming;
     use crate::tests::shared::globalstate::get_test_genesis_setup;
     use crate::tests::shared_tokio_runtime;
@@ -2718,6 +2887,269 @@ mod tests {
             main_to_peer_rx,
             main_to_miner_rx,
         }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn clear_mempool_aborts_proof_upgrades_and_mempool_updates() {
+        use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
+
+        let TestSetup {
+            mut main_loop_handler,
+            ..
+        } = setup(1, 0, cli_args::Args::default()).await;
+        let mut main_loop_state = main_loop_handler.mutable();
+        let mempool_tx =
+            make_mock_transaction_with_mutator_set_hash(vec![], vec![], Digest::default());
+        main_loop_handler
+            .global_state_lock
+            .lock_guard_mut()
+            .await
+            .mempool_insert(mempool_tx, UpgradePriority::Critical, AddReason::Submitted)
+            .await;
+
+        // Each fake upgrade holds a sender; aborting the task drops it.
+        let mut receivers = vec![];
+        let mut fake_upgrade = || {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            receivers.push(rx);
+            tokio::task::spawn(async move {
+                std::future::pending::<()>().await;
+                drop(tx);
+            })
+        };
+        main_loop_state.proof_upgrader_task = Some(fake_upgrade());
+        let finished = tokio::task::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        main_loop_state.track_rpc_upgrade(finished);
+        main_loop_state.track_rpc_upgrade(fake_upgrade());
+        main_loop_state.track_rpc_upgrade(fake_upgrade());
+        main_loop_state.update_mempool_txs_handle = Some(fake_upgrade());
+        assert_eq!(
+            2,
+            main_loop_state.rpc_upgrade_tasks.len(),
+            "finished task is pruned"
+        );
+
+        main_loop_handler
+            .handle_rpc_server_message(RPCServerToMain::ClearMempool, &mut main_loop_state)
+            .await
+            .unwrap();
+
+        assert!(main_loop_state.proof_upgrader_task.is_none());
+        assert!(main_loop_state.rpc_upgrade_tasks.is_empty());
+        assert!(main_loop_state.update_mempool_txs_handle.is_none());
+        assert!(main_loop_handler
+            .global_state_lock
+            .lock_guard()
+            .await
+            .mempool
+            .is_empty());
+        for rx in receivers {
+            assert!(rx.await.is_err(), "upgrade task must have been aborted");
+        }
+    }
+
+    fn any_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9800))
+    }
+
+    /// Passes the stateless checks but fails the bridge gate: its registration is unsigned.
+    fn block_with_unsigned_registration(parent: &Block, network: Network) -> Block {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::block::block_transaction::BlockTransaction;
+        use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetRegistrationAnnouncement;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
+
+        let unsigned_registration = FaucetRegistrationAnnouncement {
+            registration: BridgeRegistration {
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(1 << 8),
+                    prefix: BFieldElement::new(1),
+                },
+                genesis_state_commitment: Digest::default(),
+            },
+            signatures: vec![],
+        };
+        let mut tx = make_mock_transaction_with_mutator_set_hash(
+            vec![],
+            vec![],
+            parent.mutator_set_accumulator_after().unwrap().hash(),
+        );
+        tx.kernel = TransactionKernelModifier::default()
+            .announcements(vec![unsigned_registration.to_announcement()])
+            .modify(tx.kernel);
+        Block::block_template_invalid_proof(
+            parent,
+            BlockTransaction::upgrade(tx),
+            parent.header().timestamp + Timestamp::hours(1),
+            None,
+            network,
+        )
+    }
+
+    async fn bridge_peer_setup(network: Network) -> (TestSetup, SocketAddr, i32) {
+        let test_setup = setup(1, 0, cli_args::Args::default_with_network(network)).await;
+        let (peer, standing) = {
+            let state = test_setup
+                .main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await;
+            let (peer, info) = state.net.peer_map.iter().next().unwrap();
+            (*peer, info.standing.standing)
+        };
+        (test_setup, peer, standing)
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_peer_block_failing_the_bridge_rules_is_skipped_and_its_peer_sanctioned() {
+        let network = Network::RegTest;
+        let (
+            TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            },
+            peer,
+            standing_before,
+        ) = bridge_peer_setup(network).await;
+        let mut main_loop_state = main_loop_handler.mutable();
+        let block1 = block_with_unsigned_registration(&Block::genesis(network), network);
+
+        main_loop_handler
+            .handle_peer_task_message(
+                PeerTaskToMain::NewBlocks(vec![block1], peer),
+                &mut main_loop_state,
+            )
+            .await
+            .unwrap();
+
+        let state = main_loop_handler.global_state_lock.lock_guard().await;
+        assert!(state.chain.light_state().header().height.is_genesis());
+        assert!(state.net.peer_map[&peer].standing.standing < standing_before);
+        assert!(main_to_peer_rx.try_recv().is_err(), "nothing is broadcast");
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_batch_keeps_the_blocks_before_one_failing_the_bridge_rules() {
+        let network = Network::RegTest;
+        let (
+            TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            },
+            peer,
+            _,
+        ) = bridge_peer_setup(network).await;
+        let mut main_loop_state = main_loop_handler.mutable();
+        let block1 = invalid_empty_block(&Block::genesis(network), network);
+        let block2 = block_with_unsigned_registration(&block1, network);
+
+        main_loop_handler
+            .handle_peer_task_message(
+                PeerTaskToMain::NewBlocks(vec![block1.clone(), block2], peer),
+                &mut main_loop_state,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            block1.hash(),
+            main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .chain
+                .light_state()
+                .hash()
+        );
+        let Ok(MainToPeerTask::Block(broadcast)) = main_to_peer_rx.try_recv() else {
+            panic!("the kept tip is broadcast");
+        };
+        assert_eq!(block1.hash(), broadcast.hash());
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_failed_reorg_batch_restores_the_old_tip() {
+        let network = Network::RegTest;
+        let (
+            TestSetup {
+                mut main_loop_handler,
+                ..
+            },
+            peer,
+            _,
+        ) = bridge_peer_setup(network).await;
+        let mut main_loop_state = main_loop_handler.mutable();
+        let genesis = Block::genesis(network);
+        let old_tip = invalid_empty_block(&genesis, network);
+        main_loop_handler
+            .global_state_lock
+            .lock_guard_mut()
+            .await
+            .set_new_tip(old_tip.clone())
+            .await
+            .unwrap();
+        let fork = invalid_empty_block_with_timestamp(
+            &genesis,
+            genesis.header().timestamp + Timestamp::hours(2),
+            network,
+        );
+        let failing = block_with_unsigned_registration(&fork, network);
+
+        main_loop_handler
+            .handle_peer_task_message(
+                PeerTaskToMain::NewBlocks(vec![fork, failing], peer),
+                &mut main_loop_state,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            old_tip.hash(),
+            main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .chain
+                .light_state()
+                .hash(),
+            "the fork's prefix does not beat the old tip"
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_guessed_block_failing_the_bridge_rules_drops_its_proposal() {
+        let network = Network::RegTest;
+        let TestSetup {
+            mut main_loop_handler,
+            ..
+        } = setup(1, 0, cli_args::Args::default_with_network(network)).await;
+        let mut main_loop_state = main_loop_handler.mutable();
+
+        let block1 = block_with_unsigned_registration(&Block::genesis(network), network);
+        main_loop_handler
+            .global_state_lock
+            .lock_guard_mut()
+            .await
+            .mining_state
+            .block_proposal = BlockProposal::foreign_proposal(block1.clone());
+
+        main_loop_handler
+            .handle_self_guessed_block(&mut main_loop_state, Box::new(block1))
+            .await
+            .unwrap();
+
+        let state = main_loop_handler.global_state_lock.lock_guard().await;
+        assert!(state.chain.light_state().header().height.is_genesis());
+        assert!(state.mining_state.block_proposal.is_none());
     }
 
     #[apply(shared_tokio_runtime)]
@@ -3723,7 +4155,7 @@ mod tests {
             );
             main_loop_handler
                 .handle_peer_task_message(
-                    PeerTaskToMain::NewBlocks(vec![block1.clone()]),
+                    PeerTaskToMain::NewBlocks(vec![block1.clone()], any_peer()),
                     &mut main_loop_state,
                 )
                 .await
@@ -3742,7 +4174,7 @@ mod tests {
 
             main_loop_handler
                 .handle_peer_task_message(
-                    PeerTaskToMain::NewBlocks(vec![block1.clone(), block2.clone()]),
+                    PeerTaskToMain::NewBlocks(vec![block1.clone(), block2.clone()], any_peer()),
                     &mut main_loop_state,
                 )
                 .await
@@ -3804,7 +4236,7 @@ mod tests {
             } = setup(incoming_connections, outgoing_connections, cli).await;
             let mut mutable_main_loop_state = main_loop_handler.mutable();
 
-            let msg = PeerTaskToMain::NewBlocks(vec![dummy_block]);
+            let msg = PeerTaskToMain::NewBlocks(vec![dummy_block], any_peer());
             main_loop_handler
                 .handle_peer_task_message(msg, &mut mutable_main_loop_state)
                 .await

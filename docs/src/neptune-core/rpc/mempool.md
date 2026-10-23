@@ -132,6 +132,7 @@ Submits a proven transaction to the mempool for broadcast.
 - `FeeNegative` - negative fee
 - `FutureDated` - timestamp too far in future
 - `NotConfirmable` - invalid mutator set state
+- `FailsBridgeGate` - bridge announcements (settlement, registration, rotation) fail the bridge rules against the tip
 
 **Example**
 

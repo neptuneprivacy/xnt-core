@@ -182,7 +182,7 @@ impl MainToPeerTask {
 
 #[derive(Clone, Debug, PartialEq, Eq, strum::Display)]
 pub(crate) enum PeerTaskToMain {
-    NewBlocks(Vec<Block>),
+    NewBlocks(Vec<Block>, SocketAddr),
     AddPeerMaxBlockHeight {
         peer_address: SocketAddr,
         claimed_height: BlockHeight,
@@ -222,7 +222,7 @@ pub struct PeerTaskToMainLinkTx {
 impl PeerTaskToMain {
     pub fn get_type(&self) -> String {
         match self {
-            PeerTaskToMain::NewBlocks(_) => "new blocks",
+            PeerTaskToMain::NewBlocks(..) => "new blocks",
             PeerTaskToMain::AddPeerMaxBlockHeight { .. } => "add peer max block height",
             PeerTaskToMain::RemovePeerMaxBlockHeight(_) => "remove peer max block height",
             PeerTaskToMain::PeerDiscoveryAnswer(_) => "peer discovery answer",

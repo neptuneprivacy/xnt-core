@@ -39,6 +39,7 @@ pub struct BlockInfo {
     pub num_outputs: usize,
     pub outputs: Vec<String>,
     pub num_announcements: usize,
+    pub public_announcements: Vec<Vec<u64>>,
     pub coinbase_amount: NativeCurrencyAmount,
     pub fee: NativeCurrencyAmount,
     pub is_genesis: bool,
@@ -122,6 +123,12 @@ impl BlockInfo {
                 .map(|output| output.canonical_commitment.to_hex())
                 .collect(),
             num_announcements: body.transaction_kernel.announcements.len(),
+            public_announcements: body
+                .transaction_kernel
+                .announcements
+                .iter()
+                .map(|ann| ann.message.iter().map(|bfe| bfe.value()).collect())
+                .collect(),
             fee: body.transaction_kernel.fee,
             coinbase_amount: block.coinbase_amount(),
             is_genesis: digest == genesis_digest,
@@ -174,6 +181,7 @@ impl Distribution<BlockInfo> for StandardUniform {
                 .map(|d: Digest| d.to_hex())
                 .collect_vec(),
             num_announcements: rng.random_range(0..10),
+            public_announcements: vec![],
             coinbase_amount: NativeCurrencyAmount::from_nau(
                 (1i128 << rng.random_range(0..=8)) >> 1,
             ),

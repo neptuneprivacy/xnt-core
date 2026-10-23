@@ -33,11 +33,14 @@ use crate::api::tx_initiation::error::CreateTxError;
 use crate::application::config::network::Network;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::block_height::BlockHeight;
+use crate::protocol::consensus::consensus_rule_set::leviathan_settlement_activation_height;
 use crate::protocol::consensus::consensus_rule_set::upgrade_vm_v8_activation_height;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::validity::legacy_v7::check_v7_single_proof_capability_blocking;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
@@ -123,18 +126,17 @@ pub(crate) fn num_type_script_proofs(primitive_witness: &PrimitiveWitness) -> us
 /// The consensus rule set of a transaction created now, after a tip at
 /// `tip_height`: that of the next block.
 ///
-/// Fails with [`CreateProofError::LegacyEra`] if the next block belongs to the
-/// era before the fork and the tip is within `margin` blocks of the fork: a
-/// transaction created then may not be mined before the fork, and this
-/// version cannot carry it over.
+/// Fails with [`CreateProofError::LegacyEra`] if the tip is within `margin`
+/// blocks of the fork that ends the next block's era: a transaction created
+/// then may not be mined before the fork, and this version cannot carry it
+/// over.
 pub fn rule_set_for_new_transaction(
     network: Network,
     tip_height: BlockHeight,
     margin: u64,
 ) -> Result<ConsensusRuleSet, CreateProofError> {
     let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
-    if consensus_rule_set.is_legacy_era() {
-        let fork_height = upgrade_vm_v8_activation_height(network);
+    if let Some(fork_height) = era_end(consensus_rule_set, network) {
         if tip_height.value().saturating_add(margin) >= fork_height.value() {
             info!(
                 "Not creating a transaction for consensus rule set {consensus_rule_set}: the tip \
@@ -146,6 +148,23 @@ pub fn rule_set_for_new_transaction(
     }
 
     Ok(consensus_rule_set)
+}
+
+/// The height of the hard fork that ends this rule set's era, if this version cannot carry the
+/// era's transactions across it: their proofs are not valid under the next era's programs.
+fn era_end(consensus_rule_set: ConsensusRuleSet, network: Network) -> Option<BlockHeight> {
+    match consensus_rule_set {
+        ConsensusRuleSet::UpgradeVMv7 => Some(upgrade_vm_v8_activation_height(network)),
+        ConsensusRuleSet::UpgradeVMv8 => Some(leviathan_settlement_activation_height(network)),
+        ConsensusRuleSet::Reboot
+        | ConsensusRuleSet::HardforkAlpha
+        | ConsensusRuleSet::Xnt
+        | ConsensusRuleSet::TimelockExtension
+        | ConsensusRuleSet::UpgradeVM
+        | ConsensusRuleSet::UpgradeVMv4
+        | ConsensusRuleSet::UpgradeVMv5
+        | ConsensusRuleSet::LeviathanSettlement => None,
+    }
 }
 
 /// Whether a transaction with this witness meets the terms on which the nodes
@@ -198,6 +217,8 @@ pub fn check_proof_collection_terms(
 /// [`LEGACY_ERA_MAX_NUM_PROOFS`] proofs, see [`check_proof_collection_terms`].
 /// Its outputs are commitments, so their type scripts are not checked.
 ///
+/// In any other era only the margin before the fork that ends it applies.
+///
 /// The same for every way of submitting a transaction to this node.
 pub(crate) fn submitted_transaction_meets_terms(
     transaction: &Transaction,
@@ -205,8 +226,11 @@ pub(crate) fn submitted_transaction_meets_terms(
     tip_height: BlockHeight,
     margin: u64,
 ) -> bool {
-    if rule_set_for_new_transaction(network, tip_height, margin).is_err() {
+    let Ok(consensus_rule_set) = rule_set_for_new_transaction(network, tip_height, margin) else {
         return false;
+    };
+    if !consensus_rule_set.is_legacy_era() {
+        return true;
     }
 
     match &transaction.proof {
@@ -292,7 +316,9 @@ pub(crate) async fn prove_legacy_era_single_proof(
     job_queue: Arc<TritonVmJobQueue>,
     proof_job_options: &TritonVmProofJobOptions,
 ) -> Result<Option<Transaction>, CreateProofError> {
-    let TransactionProof::ProofCollection(proof_collection) = &transaction.proof else {
+    let TransactionProof::ProofCollection(AnyProofCollection::Upstream(proof_collection)) =
+        &transaction.proof
+    else {
         return Ok(None);
     };
     let network = proof_job_options.job_settings.network;
@@ -364,6 +390,7 @@ pub(crate) async fn verify_legacy_era_transaction(
             transaction.kernel.mast_hash(),
             network,
             ConsensusRuleSet::UpgradeVMv7,
+            VerifyOptions::default(),
         )
         .await
 }
@@ -487,8 +514,40 @@ mod tests {
 
         for test_network in [Network::Testnet(0), Network::RegTest] {
             assert_eq!(
-                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::LeviathanSettlement,
                 rule_set_for_new_transaction(test_network, BlockHeight::genesis(), margin).unwrap()
+            );
+        }
+    }
+
+    /// Likewise before the bridge era: no v8 proof is valid under its programs.
+    #[test]
+    fn new_transactions_stop_within_the_margin_of_the_bridge_era() {
+        use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET;
+
+        let fork = BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET.value();
+        let margin = DEFAULT_FORK_TX_CUTOFF_MARGIN;
+        let rule_set =
+            |tip: u64| rule_set_for_new_transaction(Network::Main, BlockHeight::from(tip), margin);
+
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            rule_set(fork - margin - 1).unwrap()
+        );
+        for tip in [fork - margin, fork - 2] {
+            assert!(
+                matches!(
+                    rule_set(tip),
+                    Err(CreateProofError::LegacyEra(ConsensusRuleSet::UpgradeVMv8))
+                ),
+                "tip {tip}"
+            );
+        }
+        for tip in [fork - 1, fork, fork + 1] {
+            assert_eq!(
+                ConsensusRuleSet::LeviathanSettlement,
+                rule_set(tip).unwrap(),
+                "tip {tip}"
             );
         }
     }
@@ -508,10 +567,9 @@ mod tests {
             proof: if single_proof {
                 TransactionProof::invalid()
             } else {
-                TransactionProof::ProofCollection(ProofCollection::produce_mock(
-                    primitive_witness,
-                    true,
-                ))
+                TransactionProof::ProofCollection(
+                    ProofCollection::produce_mock(primitive_witness, true).into(),
+                )
             },
         };
         let meets = |transaction: &Transaction, tip: u64| {
@@ -755,13 +813,23 @@ mod tests {
         assert!(
             transaction
                 .proof
-                .verify(kernel_mast_hash, network, ConsensusRuleSet::UpgradeVMv7)
+                .verify(
+                    kernel_mast_hash,
+                    network,
+                    ConsensusRuleSet::UpgradeVMv7,
+                    VerifyOptions::default()
+                )
                 .await
         );
         assert!(
             !transaction
                 .proof
-                .verify(kernel_mast_hash, network, ConsensusRuleSet::UpgradeVMv8)
+                .verify(
+                    kernel_mast_hash,
+                    network,
+                    ConsensusRuleSet::UpgradeVMv8,
+                    VerifyOptions::default()
+                )
                 .await
         );
         let Ok(MainToPeerTask::TransactionNotification(notification)) = main_to_peer_rx.try_recv()

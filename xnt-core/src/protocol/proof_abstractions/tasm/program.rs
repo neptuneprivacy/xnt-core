@@ -100,7 +100,7 @@ where
 /// A proof for a claim of the `UpgradeVMv7` era is checked with the legacy
 /// triton-vm v7 verifier, which nodes of that era apply, before it is
 /// returned: no v7 proof leaves this function unless it verifies.
-pub(crate) async fn prove_consensus_program(
+pub async fn prove_consensus_program(
     program: Program,
     claim: Claim,
     nondeterminism: NonDeterminism,
@@ -164,7 +164,7 @@ pub(crate) async fn prove_consensus_program(
 
 /// Options for executing the triton-vm proving job
 #[derive(Clone, Debug)]
-#[cfg_attr(test, derive(Default))]
+#[cfg_attr(any(test, feature = "arbitrary-impls"), derive(Default))]
 pub struct TritonVmProofJobOptions {
     /// priority of this job in the job-queue
     ///

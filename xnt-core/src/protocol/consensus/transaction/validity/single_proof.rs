@@ -309,7 +309,8 @@ pub(crate) async fn produce_single_proof(
         | ConsensusRuleSet::UpgradeVMv4
         | ConsensusRuleSet::UpgradeVMv5
         | ConsensusRuleSet::UpgradeVMv7
-        | ConsensusRuleSet::UpgradeVMv8 => {
+        | ConsensusRuleSet::UpgradeVMv8
+        | ConsensusRuleSet::LeviathanSettlement => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
                 ::produce(
                     primitive_witness,
@@ -398,6 +399,11 @@ pub(crate) fn single_proof_claim(
         // SingleProofV2, current (v8) bytecode — recompute from the linked program.
         ConsensusRuleSet::UpgradeVMv8 => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2::claim(
+                tx_kernel_mast_hash,
+            )
+        }
+        ConsensusRuleSet::LeviathanSettlement => {
+            crate::protocol::consensus::transaction::validity::single_proof_v2::LeviathanSingleProofV2::claim(
                 tx_kernel_mast_hash,
             )
         }

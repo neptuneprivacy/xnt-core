@@ -125,8 +125,7 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<MainLoopHandler> {
 
     info!("Starting xnt-core node on {}.", cli_args.network);
 
-    // The rule set of every height derives from the activation height of
-    // `UpgradeVMv8`, so it is set before any state is built.
+    // Refused by this build on every network; see `set_v8_activation_height`.
     cli_args
         .apply_v8_activation_height()
         .map_err(anyhow::Error::msg)?;

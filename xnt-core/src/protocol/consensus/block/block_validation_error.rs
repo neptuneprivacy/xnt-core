@@ -91,6 +91,33 @@ pub enum BlockValidationError {
     /// 2.n
     #[error("Transaction mutator set must match parent block")]
     TransactionMutatorSetMismatch,
+    ///   2.o) at most one settlement announcement per block.
+    #[error("block carries more than one settlement announcement")]
+    TooManySettlements,
+    ///   2.o) a settlement-tagged announcement must parse.
+    #[error("block carries a malformed settlement announcement")]
+    MalformedSettlement,
+    ///   2.p) at most one bridge registration announcement per block.
+    #[error("block carries more than one bridge registration announcement")]
+    TooManyBridgeRegistrations,
+    ///   2.p) a registration-tagged announcement must parse.
+    #[error("block carries a malformed bridge registration announcement")]
+    MalformedBridgeRegistration,
+    ///   2.q) no deposit may claim a settlement's pool change output.
+    #[error("block carries a deposit claiming a settlement's change output")]
+    DepositReusesSettlementChange,
+    ///   2.r) at most one pool consolidation authorization per block.
+    #[error("block carries more than one pool consolidation authorization")]
+    TooManyPoolConsolidations,
+    ///   2.r) a pool-consolidation-tagged announcement must parse.
+    #[error("block carries a malformed pool consolidation authorization")]
+    MalformedPoolConsolidation,
+    ///   2.r) the authorization rides a no-op settlement.
+    #[error("pool consolidation authorization without a no-op settlement")]
+    PoolConsolidationWithoutNoOpSettlement,
+    ///   2.t) no deposit commitment is announced twice.
+    #[error("block carries two deposits of the same commitment")]
+    DuplicateDeposit,
 }
 
 impl From<RemovalRecordListUnpackError> for BlockValidationError {

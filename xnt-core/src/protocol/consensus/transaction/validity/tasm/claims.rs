@@ -1,3 +1,5 @@
+pub mod generate_aggregated_claim;
+pub mod generate_bridge_deposit_claim;
 pub mod generate_collect_lock_scripts_claim;
 pub mod generate_collect_type_scripts_claim;
 pub mod generate_collect_type_scripts_claim_v2;

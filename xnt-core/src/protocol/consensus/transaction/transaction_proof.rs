@@ -6,10 +6,11 @@ use tasm_lib::prelude::Digest;
 use crate::api::export::NeptuneProof;
 use crate::application::config::network::Network;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions;
 use crate::protocol::consensus::transaction::validity::single_proof::single_proof_claim;
 use crate::protocol::consensus::transaction::BFieldCodec;
 use crate::protocol::consensus::transaction::PrimitiveWitness;
-use crate::protocol::consensus::transaction::ProofCollection;
 use crate::protocol::peer::transfer_transaction::TransactionProofQuality;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
@@ -57,7 +58,7 @@ pub enum TransactionProof {
     /// a strong proof.  required for confirming a transaction into a block.
     SingleProof(NeptuneProof),
     /// a weak proof that does not expose secrets. can be shared with peers, but cannot be confirmed into a block.
-    ProofCollection(ProofCollection),
+    ProofCollection(AnyProofCollection),
 }
 
 impl TransactionProof {
@@ -131,11 +132,15 @@ impl TransactionProof {
     ///
     /// Block height is the height of the block that matches the transaction's
     /// mutator set accumulator.
+    ///
+    /// `verify_options` carries chain state (e.g. current Leviathan state commitment)
+    /// needed for bridge proof verification.
     pub async fn verify(
         &self,
         kernel_mast_hash: Digest,
         network: Network,
         consensus_rule_set: ConsensusRuleSet,
+        verify_options: VerifyOptions,
     ) -> bool {
         match self {
             TransactionProof::Witness(primitive_witness) => {
@@ -157,17 +162,28 @@ impl TransactionProof {
             TransactionProof::ProofCollection(proof_collection) => match consensus_rule_set {
                 ConsensusRuleSet::Reboot
                 | ConsensusRuleSet::HardforkAlpha
-                | ConsensusRuleSet::Xnt => {
-                    proof_collection.verify(kernel_mast_hash, network).await
-                }
+                | ConsensusRuleSet::Xnt => match proof_collection {
+                    AnyProofCollection::Upstream(proof_collection) => {
+                        proof_collection.verify(kernel_mast_hash, network).await
+                    }
+                    AnyProofCollection::Leviathan(_) => false,
+                },
                 ConsensusRuleSet::TimelockExtension
                 | ConsensusRuleSet::UpgradeVM
                 | ConsensusRuleSet::UpgradeVMv4
                 | ConsensusRuleSet::UpgradeVMv5 => false,
-                ConsensusRuleSet::UpgradeVMv7 | ConsensusRuleSet::UpgradeVMv8 => {
+                ConsensusRuleSet::UpgradeVMv7
+                | ConsensusRuleSet::UpgradeVMv8
+                | ConsensusRuleSet::LeviathanSettlement => {
                     let claim_version = consensus_rule_set.triton_proof_version().claim_version();
                     proof_collection
-                        .verify_v2(kernel_mast_hash, network, claim_version)
+                        .verify_v2(
+                            kernel_mast_hash,
+                            network,
+                            claim_version,
+                            consensus_rule_set,
+                            verify_options,
+                        )
                         .await
                 }
             },
@@ -178,7 +194,7 @@ impl TransactionProof {
     /// valid as the previous release checks it, which runs that era's
     /// composers and proof upgraders: a proof collection without the checks
     /// this version adds (see
-    /// [`ProofCollection::verify_v2_as_previous_release`]). That release checks
+    /// [`ProofCollection::verify_v2_as_previous_release`](crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection::verify_v2_as_previous_release)). That release checks
     /// a single proof as this version does, so a single proof is not valid
     /// here, and neither is a primitive witness, which is never relayed.
     pub(crate) async fn verify_as_previous_release(
@@ -188,11 +204,12 @@ impl TransactionProof {
     ) -> bool {
         match self {
             TransactionProof::Witness(_) | TransactionProof::SingleProof(_) => false,
-            TransactionProof::ProofCollection(proof_collection) => {
+            TransactionProof::ProofCollection(AnyProofCollection::Upstream(proof_collection)) => {
                 proof_collection
                     .verify_v2_as_previous_release(kernel_mast_hash, network)
                     .await
             }
+            TransactionProof::ProofCollection(AnyProofCollection::Leviathan(_)) => false,
         }
     }
 }
@@ -237,7 +254,7 @@ mod tests {
             Self::SingleProof(NeptuneProof::from(bfe_vec![0; size]))
         }
 
-        pub(crate) fn into_proof_collection(self) -> ProofCollection {
+        pub(crate) fn into_proof_collection(self) -> AnyProofCollection {
             match self {
                 TransactionProof::Witness(_primitive_witness) => {
                     panic!("Expected ProofCollection, got Witness")

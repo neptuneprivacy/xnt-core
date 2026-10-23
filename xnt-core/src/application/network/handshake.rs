@@ -560,13 +560,13 @@ pub(crate) mod tests {
 
     #[test]
     fn handshake_with_version_before_the_rule_set_of_the_tip_is_refused() {
-        // Every block of these networks follows `UpgradeVMv8`.
+        // Every block of these networks follows `LeviathanSettlement`.
         let local = handshake_with_version(Network::RegTest, "0.4.0");
         let remote = handshake_with_version(Network::RegTest, "0.2.9");
         assert_eq!(
             Err(HandshakeValidationError::RuleSetNotFollowed {
                 remote: remote.version,
-                rule_set: ConsensusRuleSet::UpgradeVMv8,
+                rule_set: ConsensusRuleSet::LeviathanSettlement,
             }),
             HandshakeUpgrade::validate(&local, &remote)
         );

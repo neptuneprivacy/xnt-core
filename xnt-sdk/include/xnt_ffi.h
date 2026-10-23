@@ -167,6 +167,21 @@ typedef struct XntIndexedUtxoArray {
     uintptr_t len;
 } XntIndexedUtxoArray;
 
+// Bridge payout from sync: a public UTXO, found by its receiver identifier
+typedef struct XntPublicIndexedUtxo {
+    uint64_t block_height;
+    struct XntDigest block_digest;
+    struct XntDigest lock_script_hash;
+    __int128 amount_nau;
+    struct XntDigest sender_randomness;
+} XntPublicIndexedUtxo;
+
+// Array of bridge payouts
+typedef struct XntPublicIndexedUtxoArray {
+    struct XntPublicIndexedUtxo *data;
+    uintptr_t len;
+} XntPublicIndexedUtxoArray;
+
 // Decrypted UTXO notification result
 typedef struct XntDecryptedUtxo {
     struct XntUtxoHandle *utxo;
@@ -573,6 +588,15 @@ struct XntIndexedUtxoArray xnt_sync_fetch_utxos_with_skipped(const struct XntRpc
 
 // Free indexed UTXO array
 void xnt_sync_indexed_utxos_free(struct XntIndexedUtxoArray *arr);
+
+// Fetch bridge payouts by receiver_id_hash from indexer
+struct XntPublicIndexedUtxoArray xnt_sync_fetch_public_utxos(const struct XntRpcClientHandle *client,
+                                                             const struct XntDigest *receiver_id_hash,
+                                                             uint64_t from_height,
+                                                             uint64_t to_height);
+
+// Free bridge payout array
+void xnt_sync_public_utxos_free(struct XntPublicIndexedUtxoArray *arr);
 
 // Decrypt indexed UTXO ciphertext with spending key
 //

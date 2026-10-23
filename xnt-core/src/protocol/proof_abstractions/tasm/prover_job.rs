@@ -139,7 +139,7 @@ pub struct ProverJobSettings {
     pub triton_vm_env_vars: TritonVmEnvVars,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "arbitrary-impls"))]
 impl Default for ProverJobSettings {
     fn default() -> Self {
         Self {

@@ -13,6 +13,12 @@
 //! The transactions carry mock or placeholder proofs and a deterministic
 //! kernel, which holds commitments, index sets and one authenticated chunk,
 //! no keys.
+//!
+//! The `pc` and `sp` files are the previous release's, checked by decoding only:
+//! this fork's arbitrary witnesses make another kernel. The `pc_leviathan`
+//! files are this fork's `LeviathanProofCollection` frames, `pc_bridge` with
+//! every bridge field set. `pc_leviathan_index0` is the fork's frame from before
+//! that layout got its own variant.
 
 use std::path::PathBuf;
 
@@ -20,16 +26,21 @@ use bincode::Options;
 use proptest::prelude::Strategy;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
+use tasm_lib::prelude::Digest;
+use tasm_lib::triton_vm::prelude::bfe_array;
+use tasm_lib::triton_vm::prelude::BFieldElement;
 
 use crate::application::loops::connect_to_peers::MAX_PEER_FRAME_LENGTH_IN_BYTES;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::LeviathanProofCollection;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::peer::transfer_transaction::TransferTransaction;
+use crate::protocol::peer::transfer_transaction::TransferTransactionProof;
 use crate::protocol::peer::PeerMessage;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::tests::shared::files::test_helper_data_dir;
@@ -53,7 +64,7 @@ fn wire_options() -> impl Options {
 /// placeholder single proof, of the same deterministic kernel. Neither proof
 /// is valid; the frames carry them as bytes. The harness of the previous
 /// release makes the same.
-fn transactions() -> [(&'static str, Transaction); 2] {
+fn transactions() -> [(&'static str, Transaction); 4] {
     let mut primitive_witness = PrimitiveWitness::arbitrary_with_size_numbers(Some(2), 2, 1)
         .new_tree(&mut TestRunner::deterministic())
         .unwrap()
@@ -81,12 +92,36 @@ fn transactions() -> [(&'static str, Transaction); 2] {
         .modify(primitive_witness.kernel);
 
     let proof_collection = ProofCollection::produce_mock(&primitive_witness, true);
+    let leviathan_proof_collection =
+        LeviathanProofCollection::produce_mock(&primitive_witness, true);
+    let bridge_proof_collection = LeviathanProofCollection {
+        bridge_deposit_announcement_validator: Some(Proof::invalid_with_size(3)),
+        bridge_aggregated_proof: Some(Proof::invalid_with_size(4)),
+        bridge_prev_state_commitment: Some(Digest::new(bfe_array![1, 2, 3, 4, 5])),
+        bridge_new_state_commitment: Some(Digest::new(bfe_array![6, 7, 8, 9, 10])),
+        bridge_exit_root: Some(Digest::new(bfe_array![11, 12, 13, 14, 15])),
+        ..leviathan_proof_collection.clone()
+    };
     [
         (
             "pc",
             Transaction {
                 kernel: primitive_witness.kernel.clone(),
-                proof: TransactionProof::ProofCollection(proof_collection),
+                proof: TransactionProof::ProofCollection(proof_collection.into()),
+            },
+        ),
+        (
+            "pc_leviathan",
+            Transaction {
+                kernel: primitive_witness.kernel.clone(),
+                proof: TransactionProof::ProofCollection(leviathan_proof_collection.into()),
+            },
+        ),
+        (
+            "pc_bridge",
+            Transaction {
+                kernel: primitive_witness.kernel.clone(),
+                proof: TransactionProof::ProofCollection(bridge_proof_collection.into()),
             },
         ),
         (
@@ -138,9 +173,16 @@ fn kernel_line(prefix: &str, transfer: &TransferTransaction) -> String {
 #[test]
 fn frames_of_the_previous_release_decode_and_encode_identically() {
     let kernels = String::from_utf8(read("kernels.txt")).unwrap();
-    for prefix in ["pc", "sp"] {
+    for prefix in ["pc", "pc_leviathan", "pc_bridge", "sp"] {
         let transfer_bytes = read(&format!("{prefix}_transfer_transaction.bin"));
         let transfer: TransferTransaction = bincode::deserialize(&transfer_bytes).unwrap();
+        if prefix != "sp" {
+            assert_eq!(
+                prefix == "pc",
+                matches!(transfer.proof, TransferTransactionProof::ProofCollection(_)),
+                "{prefix}: layout"
+            );
+        }
         assert_eq!(
             transfer_bytes,
             bincode::serialize(&transfer).unwrap(),
@@ -190,12 +232,24 @@ fn frames_of_the_previous_release_decode_and_encode_identically() {
     }
 }
 
+/// The bridge layout under upstream's variant does not decode as upstream's layout.
+#[test]
+fn bridge_layout_under_the_upstream_variant_is_refused() {
+    let bytes = read("pc_leviathan_index0_peer_message_transaction.bin");
+    assert!(wire_options().deserialize::<PeerMessage>(&bytes).is_err());
+}
+
 /// This version encodes the transactions that the previous release encoded
 /// into the files to the same bytes.
 #[test]
 fn this_version_encodes_the_frames_as_the_previous_release() {
     let kernels = String::from_utf8(read("kernels.txt")).unwrap();
-    for (prefix, transaction) in transactions() {
+    // This fork's arbitrary witnesses share one input lock script, so its `pc` and `sp` kernels
+    // are not the previous release's; those frames are covered by the decoding test above.
+    for (prefix, transaction) in transactions()
+        .into_iter()
+        .filter(|(prefix, _)| !matches!(*prefix, "pc" | "sp"))
+    {
         for (name, bytes) in frames(prefix, &transaction) {
             assert_eq!(read(&name), bytes, "{name}");
         }

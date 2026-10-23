@@ -36,6 +36,7 @@ use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::validity::legacy_v7::check_v7_single_proof_capability_blocking;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof;
 use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof_mock;
@@ -63,7 +64,7 @@ pub struct TransactionProofBuilder<'a> {
     primitive_witness_ref: Option<&'a PrimitiveWitness>,
 
     // these 4 types apply only to SingleProof
-    proof_collection: Option<ProofCollection>,
+    proof_collection: Option<AnyProofCollection>,
     update_witness: Option<&'a UpdateWitness>,
     claim_and_nondeterminism: Option<(Claim, NonDeterminism)>,
 
@@ -119,8 +120,8 @@ impl<'a> TransactionProofBuilder<'a> {
     /// add proof collection (optional)
     ///
     /// only used for building single-proof
-    pub fn proof_collection(mut self, proof_collection: ProofCollection) -> Self {
-        self.proof_collection = Some(proof_collection);
+    pub fn proof_collection(mut self, proof_collection: impl Into<AnyProofCollection>) -> Self {
+        self.proof_collection = Some(proof_collection.into());
         self
     }
 
@@ -143,7 +144,8 @@ impl<'a> TransactionProofBuilder<'a> {
         self
     }
 
-    /// Add a [`ConsensusRuleSet`] (optional)
+    /// Add a [`ConsensusRuleSet`]: required for a proof collection or a single proof, whose
+    /// programs differ per era.
     pub fn consensus_rule_set(mut self, consensus_rule_set: ConsensusRuleSet) -> Self {
         self.consensus_rule_set = Some(consensus_rule_set);
         self
@@ -278,9 +280,8 @@ impl<'a> TransactionProofBuilder<'a> {
 
         if proof_job_options.job_settings.proof_type.is_single_proof() {
             // The rule set selects the SingleProof program and how its
-            // nondeterminism is made; without one, `UpgradeVMv8`'s, the rule
-            // set of the newest era.
-            let rule_set = consensus_rule_set.unwrap_or(ConsensusRuleSet::UpgradeVMv8);
+            // nondeterminism is made.
+            let rule_set = consensus_rule_set.ok_or(ProofRequirement::ConsensusRuleSet)?;
             let network = proof_job_options.job_settings.network;
 
             // claim, nondeterminism --> single proof
@@ -422,13 +423,16 @@ async fn proof_collection_from_witness(
     proof_job_options: TritonVmProofJobOptions,
     valid_mock: bool,
     consensus_rule_set: Option<ConsensusRuleSet>,
-) -> Result<ProofCollection, CreateProofError> {
+) -> Result<AnyProofCollection, CreateProofError> {
     let proof_type = TransactionProofType::ProofCollection;
     assert_eq!(proof_type, proof_job_options.job_settings.proof_type);
 
+    let consensus_rule_set = consensus_rule_set.ok_or(ProofRequirement::ConsensusRuleSet)?;
+
     // generate mock proof, if network uses mock proofs.
     if proof_job_options.job_settings.network.use_mock_proof() {
-        let pc = ProofCollection::produce_mock(witness_cow.borrow(), valid_mock);
+        let pc =
+            AnyProofCollection::produce_mock(witness_cow.borrow(), valid_mock, consensus_rule_set);
         return Ok(pc);
     }
 
@@ -441,9 +445,7 @@ async fn proof_collection_from_witness(
         });
     }
 
-    // Without a rule set, `UpgradeVMv8`, the rule set of the newest era.
-    let consensus_rule_set = consensus_rule_set.unwrap_or(ConsensusRuleSet::UpgradeVMv8);
-    let pc = ProofCollection::produce_v2(
+    let pc = AnyProofCollection::produce_v2(
         witness_cow.borrow(),
         job_queue,
         proof_job_options,
@@ -570,6 +572,37 @@ mod tests {
                      {result:?}"
                 );
             }
+        }
+    }
+
+    /// Without a rule set no proof collection or single proof is made: their programs differ per
+    /// era.
+    #[apply(shared_tokio_runtime)]
+    async fn proofs_need_a_rule_set() {
+        use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::tests::plain_tx_witness;
+
+        for proof_type in [
+            TransactionProofType::ProofCollection,
+            TransactionProofType::SingleProof,
+        ] {
+            let options = TritonVmProofJobOptionsBuilder::new()
+                .network(Network::RegTest)
+                .proof_type(proof_type)
+                .build();
+            let result = TransactionProofBuilder::new()
+                .primitive_witness(plain_tx_witness(false))
+                .proof_job_options(options)
+                .build()
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(CreateProofError::MissingRequirement(
+                        ProofRequirement::ConsensusRuleSet
+                    ))
+                ),
+                "{proof_type}: got {result:?}"
+            );
         }
     }
 

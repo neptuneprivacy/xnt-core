@@ -184,7 +184,7 @@ impl SpendingKey {
     }
 
     /// Return the lock script and its witness
-    pub(crate) fn lock_script_and_witness(&self) -> LockScriptAndWitness {
+    pub fn lock_script_and_witness(&self) -> LockScriptAndWitness {
         match self {
             SpendingKey::Generation(generation_spending_key) => {
                 generation_spending_key.lock_script_and_witness()
@@ -262,7 +262,10 @@ impl SpendingKey {
     ///
     /// Returns (utxo, sender_randomness, payment_id)
     /// payment_id is 0 for base addresses, non-zero for subaddresses
-    pub fn decrypt(&self, ciphertext_bfes: &[BFieldElement]) -> Result<(Utxo, Digest, BFieldElement)> {
+    pub fn decrypt(
+        &self,
+        ciphertext_bfes: &[BFieldElement],
+    ) -> Result<(Utxo, Digest, BFieldElement)> {
         match self {
             Self::Generation(k) => k.decrypt(ciphertext_bfes),
             Self::Symmetric(k) => k.decrypt(ciphertext_bfes).map_err(anyhow::Error::new),

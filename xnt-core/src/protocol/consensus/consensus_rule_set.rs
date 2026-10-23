@@ -100,13 +100,16 @@ pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V7_MAIN_NET: BlockHeight =
 pub const BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET: BlockHeight =
     BlockHeight::new(BFieldElement::new(97_000u64));
 
+/// Height of the 1st main net block that follows `LeviathanSettlement`.
+pub const BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET: BlockHeight =
+    BlockHeight::new(BFieldElement::new(100_000u64));
+
 /// The height of the first block that follows the `UpgradeVMv8` consensus
 /// rule set on the given network: [`BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET`]
-/// on main net, and on the test networks the genesis block, so that they
-/// follow `UpgradeVMv8` from genesis on, unless the process has another
-/// activation height for the network (see [`set_v8_activation_height`]).
+/// on main net, and on the test networks the genesis block (only tests set
+/// another height).
 ///
-/// [`ConsensusRuleSet::infer_from`] switches to `UpgradeVMv8` at this height,
+/// [`ConsensusRuleSet::infer_from`] switches to the v8 program set at this height,
 /// and so does everything that derives from it: the rule set transactions are
 /// made for, the legacy relay pool, the peer version rule, and the legacy
 /// dCTIDH lock cutoff.
@@ -117,6 +120,33 @@ pub(crate) fn upgrade_vm_v8_activation_height(network: Network) -> BlockHeight {
             v8_activation_height_override(network).unwrap_or_else(BlockHeight::genesis)
         }
     }
+}
+
+/// The height of the first block that follows `LeviathanSettlement`:
+/// [`BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET`] on main net, the genesis block
+/// on the test networks (only tests set another height). Below it, main net
+/// follows upstream's program set exactly.
+pub(crate) fn leviathan_settlement_activation_height(network: Network) -> BlockHeight {
+    match network {
+        Network::Main => BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET,
+        Network::TestnetMock | Network::RegTest | Network::Testnet(_) => {
+            #[cfg(test)]
+            if let Some((test_network, height)) = LEVIATHAN_SETTLEMENT_HEIGHT_FOR_TESTS.get() {
+                if test_network == network {
+                    return height;
+                }
+            }
+            BlockHeight::genesis()
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own `LeviathanSettlement` height, see
+    /// [`tests::LeviathanSettlementHeightForTests`].
+    static LEVIATHAN_SETTLEMENT_HEIGHT_FOR_TESTS: std::cell::Cell<Option<(Network, BlockHeight)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The `UpgradeVMv8` activation height of one test network, for the whole
@@ -159,6 +189,9 @@ pub enum V8ActivationHeightError {
     #[error("the UpgradeVMv8 activation height must be above the genesis block")]
     Genesis,
 
+    #[error("test networks of this build follow LeviathanSettlement from genesis")]
+    LeviathanSettlement,
+
     #[error("the UpgradeVMv8 activation height is set already, to block {height} on {network}")]
     AlreadySet {
         network: Network,
@@ -166,20 +199,18 @@ pub enum V8ActivationHeightError {
     },
 }
 
-/// Set the `UpgradeVMv8` activation height of a test network for this
-/// process, as `--v8-activation-height` does: blocks below it follow
-/// `UpgradeVMv7`, as main net does until its fork, the others `UpgradeVMv8`.
-/// The genesis block is the same either way: it has no proof, and is made
-/// without regard to rule sets.
-///
-/// Must be called before any state is built, as every rule set derived
-/// before would be that of the default. Can be called once only, but again
-/// with the same arguments. Refused on main net, whose activation height is
-/// fixed, and for the genesis block, which is the default.
+/// Refused on every network in this build: main net's activation height is
+/// fixed, and test networks follow `LeviathanSettlement` from genesis. Upstream
+/// sets the `UpgradeVMv8` activation height of a test network here, as
+/// `--v8-activation-height` does.
 pub fn set_v8_activation_height(
     network: Network,
     height: BlockHeight,
 ) -> Result<(), V8ActivationHeightError> {
+    // A pre-v8 prefix would run bridge-less `UpgradeVMv7` blocks, where deposit tags go unchecked.
+    if network != Network::Main {
+        return Err(V8ActivationHeightError::LeviathanSettlement);
+    }
     set_v8_activation_height_in(&V8_ACTIVATION_HEIGHT, network, height)
 }
 
@@ -291,6 +322,9 @@ pub enum ConsensusRuleSet {
     /// earlier eras are checkpointed. UpgradeVMv8 blocks use the recomputed v8
     /// proof-program digests.
     UpgradeVMv8,
+    /// The Leviathan bridge: deposit (BDAV) and settlement (BAAV) proofs are
+    /// required and checked, on the v8 virtual machine and program set.
+    LeviathanSettlement,
 }
 
 /// The triton-vm crate major a rule set's proofs were produced under. The
@@ -360,7 +394,9 @@ impl ConsensusRuleSet {
             ConsensusRuleSet::UpgradeVMv4 => TritonProofVersion::V4,
             ConsensusRuleSet::UpgradeVMv5 => TritonProofVersion::V5,
             ConsensusRuleSet::UpgradeVMv7 => TritonProofVersion::V7,
-            ConsensusRuleSet::UpgradeVMv8 => TritonProofVersion::V8,
+            ConsensusRuleSet::UpgradeVMv8 | ConsensusRuleSet::LeviathanSettlement => {
+                TritonProofVersion::V8
+            }
         }
     }
 
@@ -385,7 +421,9 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5 => true,
-            ConsensusRuleSet::UpgradeVMv7 | ConsensusRuleSet::UpgradeVMv8 => false,
+            ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => false,
         }
     }
 
@@ -416,7 +454,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv8 => false,
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => false,
         }
     }
 
@@ -431,7 +470,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7
-            | ConsensusRuleSet::UpgradeVMv8 => {
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => {
                 // This size is 8MB which should keep it feasible to run archival nodes for
                 // many years without requiring excessive disk space.
                 1_000_000
@@ -484,18 +524,27 @@ impl ConsensusRuleSet {
                     ConsensusRuleSet::UpgradeVMv5
                 } else if block_height < upgrade_vm_v8_activation_height(network) {
                     ConsensusRuleSet::UpgradeVMv7
-                } else {
+                } else if block_height < leviathan_settlement_activation_height(network) {
                     ConsensusRuleSet::UpgradeVMv8
+                } else {
+                    ConsensusRuleSet::LeviathanSettlement
                 }
             }
             Network::TestnetMock | Network::RegTest | Network::Testnet(_) => {
                 if block_height < upgrade_vm_v8_activation_height(network) {
                     ConsensusRuleSet::UpgradeVMv7
-                } else {
+                } else if block_height < leviathan_settlement_activation_height(network) {
                     ConsensusRuleSet::UpgradeVMv8
+                } else {
+                    ConsensusRuleSet::LeviathanSettlement
                 }
             }
         }
+    }
+
+    /// Whether bridge deposit (BDAV) and settlement (BAAV) proofs are active.
+    pub fn bav_active(&self) -> bool {
+        matches!(self, ConsensusRuleSet::LeviathanSettlement)
     }
 
     /// Whether the `SingleProof` program carries the
@@ -506,10 +555,10 @@ impl ConsensusRuleSet {
     /// chained transaction can become block-borne.
     ///
     /// Activated together with the v8 virtual machine. Only the `UpgradeVMv8`
-    /// `SingleProofV2` program is assembled from this source tree; every
-    /// earlier era is verified against a hardcoded digest (see
-    /// `single_proof_claim`), so the two branches change the v8 program digest
-    /// and nothing else.
+    /// and `LeviathanSettlement` `SingleProofV2` programs are assembled from
+    /// this source tree; every earlier era is verified against a hardcoded
+    /// digest (see `single_proof_claim`), so the two branches change those
+    /// program digests and nothing else.
     pub fn has_chain_branches(&self) -> bool {
         match self {
             ConsensusRuleSet::Reboot
@@ -520,7 +569,7 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7 => false,
-            ConsensusRuleSet::UpgradeVMv8 => true,
+            ConsensusRuleSet::UpgradeVMv8 | ConsensusRuleSet::LeviathanSettlement => true,
         }
     }
 
@@ -545,7 +594,7 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7 => false,
-            ConsensusRuleSet::UpgradeVMv8 => true,
+            ConsensusRuleSet::UpgradeVMv8 | ConsensusRuleSet::LeviathanSettlement => true,
         }
     }
 
@@ -574,7 +623,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7
-            | ConsensusRuleSet::UpgradeVMv8 => false,
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => false,
         }
     }
 
@@ -588,7 +638,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7
-            | ConsensusRuleSet::UpgradeVMv8 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
     pub(crate) fn max_num_outputs(&self) -> usize {
@@ -601,7 +652,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7
-            | ConsensusRuleSet::UpgradeVMv8 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
     pub(crate) fn max_num_announcements(&self) -> usize {
@@ -614,7 +666,8 @@ impl ConsensusRuleSet {
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
             | ConsensusRuleSet::UpgradeVMv7
-            | ConsensusRuleSet::UpgradeVMv8 => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS,
         }
     }
 
@@ -764,6 +817,39 @@ pub(crate) mod tests {
         }
     }
 
+    /// A test's own `LeviathanSettlement` height for a test network, until
+    /// dropped, on the setting thread only, as [`V8ActivationHeightForTests`].
+    /// A height at or below the v8 activation height leaves no v8 era.
+    pub(crate) struct LeviathanSettlementHeightForTests {
+        previous: Option<(Network, BlockHeight)>,
+    }
+
+    impl LeviathanSettlementHeightForTests {
+        pub(crate) fn set(network: Network, height: BlockHeight) -> Self {
+            assert_ne!(Network::Main, network, "main net's height is fixed");
+            let previous = LEVIATHAN_SETTLEMENT_HEIGHT_FOR_TESTS.replace(Some((network, height)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for LeviathanSettlementHeightForTests {
+        fn drop(&mut self) {
+            LEVIATHAN_SETTLEMENT_HEIGHT_FOR_TESTS.set(self.previous);
+        }
+    }
+
+    #[test]
+    fn a_test_network_can_run_all_three_eras() {
+        let network = Network::RegTest;
+        let _v8 = V8ActivationHeightForTests::set(network, 10u64.into());
+        let _ls = LeviathanSettlementHeightForTests::set(network, 20u64.into());
+        let era = |h: u64| ConsensusRuleSet::infer_from(network, h.into());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv7, era(9));
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, era(10));
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, era(19));
+        assert_eq!(ConsensusRuleSet::LeviathanSettlement, era(20));
+    }
+
     /// The activation height can be set once, for a test network, above the
     /// genesis block; again with the same arguments, but not with others.
     #[test]
@@ -804,8 +890,8 @@ pub(crate) mod tests {
         assert_eq!(Some(&(Network::Testnet(3), height(100))), setting.get());
     }
 
-    /// With an activation height, a test network follows `UpgradeVMv7` below
-    /// it and `UpgradeVMv8` from it on, as main net does around its fork, and
+    /// With a (test-only) activation height, a test network follows `UpgradeVMv7`
+    /// below it and `LeviathanSettlement` from it on, as main net does around its fork, and
     /// so do the rule set of the next block, the peer version rule and the
     /// legacy dCTIDH lock cutoff. The genesis block is unchanged, and so are
     /// main net and the other test networks.
@@ -828,7 +914,7 @@ pub(crate) mod tests {
             let expected = if h < 5 {
                 ConsensusRuleSet::UpgradeVMv7
             } else {
-                ConsensusRuleSet::UpgradeVMv8
+                ConsensusRuleSet::LeviathanSettlement
             };
             assert_eq!(
                 expected,
@@ -862,7 +948,7 @@ pub(crate) mod tests {
             );
             assert_eq!(None, legacy_dctidh_cutoff(other), "{other}");
             assert_eq!(
-                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::LeviathanSettlement,
                 ConsensusRuleSet::infer_from(other, BlockHeight::genesis()),
                 "{other}"
             );
@@ -882,7 +968,7 @@ pub(crate) mod tests {
         assert!(upgrade_vm_v8_activation_height(network).is_genesis());
         assert_eq!(None, legacy_dctidh_cutoff(network));
         assert_eq!(
-            ConsensusRuleSet::UpgradeVMv8,
+            ConsensusRuleSet::LeviathanSettlement,
             ConsensusRuleSet::infer_from(network, BlockHeight::genesis())
         );
     }
@@ -971,7 +1057,7 @@ pub(crate) mod tests {
             let activation = upgrade_vm_v8_activation_height(network);
             assert!(activation.is_genesis(), "{network}");
             assert_eq!(
-                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::LeviathanSettlement,
                 ConsensusRuleSet::infer_for_next_block(network, BlockHeight::genesis()),
                 "{network}"
             );
@@ -1366,7 +1452,7 @@ pub(crate) mod tests {
     #[test]
     fn timelock_extension_never_activates_off_mainnet() {
         // The fork is mainnet-only. Off-mainnet networks (Testnet, RegTest,
-        // TestnetMock) run the newest ruleset (UpgradeVMv8) from genesis, so they
+        // TestnetMock) run the newest ruleset (LeviathanSettlement) from genesis, so they
         // never pass through the TimelockExtension ruleset regardless of height.
         let high = BLOCK_HEIGHT_HARDFORK_TIMELOCK_EXTENSION_MAIN_NET;
         for nw in [
@@ -1377,7 +1463,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 ConsensusRuleSet::infer_from(nw, high),
-                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::LeviathanSettlement,
                 "{nw:?} must never activate TimelockExtension"
             );
         }
@@ -1426,6 +1512,84 @@ pub(crate) mod tests {
             ConsensusRuleSet::UpgradeVMv4,
             "the block below the v5 height must still be UpgradeVMv4 (v4 verifier)"
         );
+    }
+
+    #[test]
+    fn leviathan_settlement_is_genesis_on_testnets() {
+        for network in [Network::RegTest, Network::Testnet(0), Network::TestnetMock] {
+            assert_eq!(
+                ConsensusRuleSet::LeviathanSettlement,
+                ConsensusRuleSet::infer_from(network, BlockHeight::genesis())
+            );
+            assert_eq!(
+                ConsensusRuleSet::LeviathanSettlement,
+                ConsensusRuleSet::infer_for_next_block(network, BlockHeight::genesis())
+            );
+        }
+    }
+
+    #[test]
+    fn leviathan_settlement_follows_v8_on_main() {
+        assert!(
+            BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET
+                > BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET
+        );
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            ConsensusRuleSet::infer_from(
+                Network::Main,
+                BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET
+                    .previous()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            ConsensusRuleSet::LeviathanSettlement,
+            ConsensusRuleSet::infer_from(Network::Main, BLOCK_HEIGHT_LEVIATHAN_SETTLEMENT_MAIN_NET)
+        );
+    }
+
+    #[test]
+    fn v8_eras_have_their_own_program_sets() {
+        use crate::protocol::consensus::chaintx::link_proof::link_proof_claim;
+        use crate::protocol::consensus::transaction::validity::single_proof::single_proof_claim;
+
+        let txk = tasm_lib::prelude::Digest::default();
+        let v8 = ConsensusRuleSet::UpgradeVMv8;
+        let bridge = ConsensusRuleSet::LeviathanSettlement;
+        assert_ne!(single_proof_claim(txk, v8), single_proof_claim(txk, bridge));
+        assert_ne!(
+            link_proof_claim(txk, txk, v8),
+            link_proof_claim(txk, txk, bridge)
+        );
+    }
+
+    #[test]
+    fn leviathan_settlement_proves_like_v8() {
+        let rule_set = ConsensusRuleSet::LeviathanSettlement;
+        let v8 = ConsensusRuleSet::UpgradeVMv8;
+        assert_eq!(v8.triton_proof_version(), rule_set.triton_proof_version());
+        assert!(!rule_set.is_legacy_era());
+        assert!(!rule_set.proofs_are_trusted());
+        assert!(!rule_set.pow_index_bit_reversal());
+        assert!(rule_set.allow_big_chunks());
+        assert!(rule_set.has_chain_branches());
+        assert_eq!(v8.max_block_size(), rule_set.max_block_size());
+        assert_eq!(v8.max_num_inputs(), rule_set.max_num_inputs());
+        assert!(rule_set.bav_active());
+        assert!(ConsensusRuleSet::iter()
+            .filter(|rs| *rs != rule_set)
+            .all(|rs| !rs.bav_active()));
+    }
+
+    #[test]
+    fn v8_activation_height_is_refused_on_leviathan_testnets() {
+        for network in [Network::RegTest, Network::Testnet(0), Network::TestnetMock] {
+            assert_eq!(
+                Err(V8ActivationHeightError::LeviathanSettlement),
+                set_v8_activation_height(network, BlockHeight::from(10u64))
+            );
+        }
     }
 
     #[test]

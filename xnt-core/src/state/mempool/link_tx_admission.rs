@@ -19,6 +19,7 @@
 //! [`Mempool::insert_link`]: super::Mempool::insert_link
 //! [`Mempool::contains_outputs`]: super::Mempool::contains_outputs
 
+use crate::protocol::consensus::bridge::has_proof_bound_tag;
 use std::collections::HashSet;
 
 use crate::application::config::network::Network;
@@ -53,6 +54,9 @@ pub(crate) enum LinkTxAdmissionError {
 
     /// Only the miner may produce transactions that mint a coinbase.
     HasCoinbase,
+
+    /// Carries a bridge announcement that only a ProofCollection-backed transaction may carry.
+    ProofBoundAnnouncement,
 
     /// Only proof upgraders may produce transactions with negative fees.
     NegativeFee,
@@ -172,6 +176,11 @@ pub(crate) fn link_tx_precheck(
         return Err(LinkTxAdmissionError::HasCoinbase);
     }
 
+    // Bridge transactions are never chained, and `Forge` refuses these announcements.
+    if consensus_rule_set.bav_active() && kernel.announcements.iter().any(has_proof_bound_tag) {
+        return Err(LinkTxAdmissionError::ProofBoundAnnouncement);
+    }
+
     // No negative fees anywhere in the chain pipeline.
     if kernel.fee.is_negative() {
         return Err(LinkTxAdmissionError::NegativeFee);
@@ -233,6 +242,7 @@ mod tests {
     use super::*;
     use crate::protocol::consensus::block::Block;
     use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+    use crate::protocol::consensus::transaction::announcement::Announcement;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
     use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
@@ -312,6 +322,30 @@ mod tests {
             Err(LinkTxAdmissionError::NotYetActive),
             admit(&link_tx, &tip_msa, ConsensusRuleSet::UpgradeVMv7).await
         );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn link_tx_with_a_proof_bound_announcement_is_refused_in_the_bridge_era() {
+        let (tip_msa, link_tx) = setup(true);
+        for tag in crate::protocol::consensus::bridge::PROOF_BOUND_TAGS {
+            let tagged = LinkTx {
+                kernel: LinkKernel {
+                    kernel: TransactionKernelModifier::default()
+                        .announcements(vec![Announcement::new(vec![BFieldElement::new(tag)])])
+                        .modify(link_tx.kernel.kernel.clone()),
+                    thruputs: vec![],
+                },
+                proof: link_tx.proof.clone(),
+            };
+            assert_eq!(
+                Err(LinkTxAdmissionError::ProofBoundAnnouncement),
+                admit(&tagged, &tip_msa, ConsensusRuleSet::LeviathanSettlement).await
+            );
+            assert_ne!(
+                Err(LinkTxAdmissionError::ProofBoundAnnouncement),
+                admit(&tagged, &tip_msa, ConsensusRuleSet::UpgradeVMv8).await
+            );
+        }
     }
 
     /// Each of these link transactions carries an invalid proof, but is

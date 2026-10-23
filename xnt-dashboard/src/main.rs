@@ -1,4 +1,5 @@
 mod address_screen;
+mod bridge_screen;
 mod dashboard_app;
 mod dashboard_rpc_client;
 mod history_screen;

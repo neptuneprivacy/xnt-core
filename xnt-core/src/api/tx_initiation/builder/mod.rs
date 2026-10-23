@@ -124,8 +124,9 @@
 //! # use neptune_privacy::api::export::TransactionDetails;
 //! # use neptune_privacy::api::export::GlobalStateLock;
 //! # use neptune_privacy::application::triton_vm_job_queue::vm_job_queue;
+//! # use neptune_privacy::api::export::ConsensusRuleSet;
 //!
-//! # async fn example(tx_details: TransactionDetails, gsl: GlobalStateLock) -> anyhow::Result<TransactionProof> {
+//! # async fn example(tx_details: TransactionDetails, gsl: GlobalStateLock, consensus_rule_set: ConsensusRuleSet) -> anyhow::Result<TransactionProof> {
 //!
 //! // specify target proof-type = SingleProof
 //! let options = TritonVmProofJobOptionsBuilder::new()
@@ -138,6 +139,7 @@
 //!     .transaction_details(&tx_details)
 //!     .job_queue(vm_job_queue())
 //!     .proof_job_options(options)
+//!     .consensus_rule_set(consensus_rule_set)
 //!     .build()
 //!     .await?;
 //! # Ok(proof)

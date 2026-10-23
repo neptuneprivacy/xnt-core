@@ -10,7 +10,7 @@ use crate::application::database::storage::storage_schema::DbtMap;
 use crate::application::database::storage::storage_schema::DbtSingleton;
 use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 
-pub(super) const UTXO_INDEXER_SCHEMA_VERSION: u16 = 1;
+pub(super) const UTXO_INDEXER_SCHEMA_VERSION: u16 = 2;
 
 pub const BUCKET_SIZE: u64 = 1000;
 

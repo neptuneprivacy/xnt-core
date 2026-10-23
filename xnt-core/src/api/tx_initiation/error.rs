@@ -47,6 +47,17 @@ pub enum CreateTxError {
     #[error("tip does not have mutator-set-after")]
     NoMutatorSetAccumulatorAfter,
 
+    #[error("covering the amount needs {needed} inputs, more than the {max} allowed; consolidate UTXOs first")]
+    TooManyInputs { needed: usize, max: usize },
+
+    #[error("the bridge is not active under consensus rule set {0}")]
+    BridgeNotActive(crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet),
+
+    #[error("bridge deposit of {amount} is below the minimum of {min}")]
+    BelowBridgeMinimum {
+        amount: NativeCurrencyAmount,
+        min: NativeCurrencyAmount,
+    },
     #[error("transparent transactions can only spend UTXOs held by Generation keys")]
     TransparentInputNotAllowed,
 
@@ -131,6 +142,11 @@ pub enum CreateProofError {
     #[error("Could not forward job cancellation msg to proving job. {0}")]
     JobCancelSendError(#[from] tokio::sync::watch::error::SendError<()>),
 
+    #[error("in-process proving failed: {0}")]
+    InProcessProving(#[from] tasm_lib::triton_vm::error::ProvingError),
+
+    #[error("in-process proving task did not finish: {0}")]
+    InProcessTask(tokio::task::JoinError),
     /// No new transaction is created for this rule set, the one of the era
     /// before the next hard fork: the fork is too close for the transaction to
     /// be mined before it. See [`legacy_era`](super::legacy_era). Transactions

@@ -102,6 +102,7 @@ pub struct BlockBody {
     merkle_tree: OnceLock<MerkleTree>,
 }
 
+
 impl PartialEq for BlockBody {
     fn eq(&self, other: &Self) -> bool {
         self.mast_hash() == other.mast_hash()

@@ -53,7 +53,6 @@ use super::link_proof_witness::DISCRIMINANT_FOR_ADVANCE;
 use super::link_tx::LinkTx;
 use super::link_tx::LinkTxProof;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::proof_abstractions::SecretWitness;
@@ -248,14 +247,14 @@ impl LinkTx {
 
             tracing::info!("starting link proof via advance ...");
             let witness = LinkProofWitness::from_advance(witness);
-            let proof = LinkProof
-                .prove(
-                    witness.claim(),
-                    witness.nondeterminism(),
-                    triton_vm_job_queue,
-                    proof_job_options,
-                )
-                .await?;
+            let proof = LinkProof::prove_paired_with(
+                single_proof_digest,
+                witness.claim(),
+                witness.nondeterminism(),
+                triton_vm_job_queue,
+                proof_job_options,
+            )
+            .await?;
             tracing::info!("done.");
             proof
         };
@@ -384,7 +383,7 @@ impl AdvanceWitness {
     /// the old kernel's MAST hash, under the same `D`.
     fn old_claim(&self) -> Claim {
         let input = link_proof_public_input(self.old_kernel.mast_hash(), self.single_proof_digest);
-        Claim::new(LinkProof.hash())
+        Claim::new(LinkProof::digest_paired_with(self.single_proof_digest))
             .with_input(input.individual_tokens)
             .with_output(link_proof_public_output(self.single_proof_digest))
     }
@@ -400,7 +399,7 @@ impl SecretWitness for AdvanceWitness {
     }
 
     fn program(&self) -> Program {
-        LinkProof.program()
+        LinkProof::program_paired_with(self.single_proof_digest)
     }
 
     fn nondeterminism(&self) -> NonDeterminism {

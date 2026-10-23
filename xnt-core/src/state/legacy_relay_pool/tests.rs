@@ -29,10 +29,9 @@ fn as_proof_collection(transaction: &Transaction) -> Transaction {
     };
     Transaction {
         kernel: transaction.kernel.clone(),
-        proof: TransactionProof::ProofCollection(ProofCollection::produce_mock(
-            primitive_witness,
-            true,
-        )),
+        proof: TransactionProof::ProofCollection(
+            ProofCollection::produce_mock(primitive_witness, true).into(),
+        ),
     }
 }
 

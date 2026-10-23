@@ -102,6 +102,22 @@ impl TypeScriptAndWitness {
             .with_ram(self.nd_memory.iter().copied().collect::<HashMap<_, _>>())
     }
 
+    pub(crate) fn claim(
+        &self,
+        txk_mast_hash: Digest,
+        salted_inputs_hash: Digest,
+        salted_outputs_hash: Digest,
+        claim_version: u32,
+    ) -> Claim {
+        let input = [txk_mast_hash, salted_inputs_hash, salted_outputs_hash]
+            .into_iter()
+            .flat_map(|d| d.reversed().values())
+            .collect_vec();
+        Claim::new(self.program.hash())
+            .about_version(claim_version)
+            .with_input(input)
+    }
+
     /// Assuming the type script halts gracefully, prove it, for a claim of
     /// the given version.
     pub(crate) async fn prove(

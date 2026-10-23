@@ -3,12 +3,18 @@ use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::twenty_first::util_types::mmr::mmr_trait::Mmr;
 
+use get_size2::GetSize;
+use tasm_lib::prelude::TasmObject;
+use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
+
 use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::authenticated_item::AuthenticatedItem;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 use crate::util_types::mutator_set::removal_record::RemovalRecord;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default, BFieldCodec, GetSize, TasmObject,
+)]
 pub struct MutatorSetUpdate {
     // The ordering of the removal/addition records must match that of
     // the block.

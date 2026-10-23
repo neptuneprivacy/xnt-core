@@ -125,7 +125,7 @@ pub fn migration_fee(
 }
 
 /// An input's share of the fee of a transaction with `num_inputs` inputs.
-fn fee_share(fee: NativeCurrencyAmount, num_inputs: usize) -> NativeCurrencyAmount {
+pub fn fee_share(fee: NativeCurrencyAmount, num_inputs: usize) -> NativeCurrencyAmount {
     let num_inputs = i128::try_from(num_inputs.max(1)).unwrap_or(i128::MAX);
     NativeCurrencyAmount::from_nau(fee.to_nau() / num_inputs)
 }
@@ -134,7 +134,7 @@ fn fee_share(fee: NativeCurrencyAmount, num_inputs: usize) -> NativeCurrencyAmou
 /// sorted in descending order, and the fee: as many of the largest, at most
 /// `max_inputs`, as are each worth more than their share of the fee. `None`
 /// if no candidate is.
-fn num_inputs_worth_moving(
+pub fn num_inputs_worth_moving(
     amounts: &[NativeCurrencyAmount],
     max_inputs: usize,
     fee_for: impl Fn(usize) -> NativeCurrencyAmount,
@@ -584,7 +584,7 @@ pub(crate) mod tests {
     use crate::BFieldElement;
     use crate::GlobalStateLock;
 
-    /// Runs `UpgradeVMv8` from genesis, without legacy cutoff, and without
+    /// Runs `LeviathanSettlement` from genesis, without legacy cutoff, and without
     /// mock proofs.
     const NETWORK: Network = Network::Testnet(0);
 
@@ -1035,7 +1035,7 @@ pub(crate) mod tests {
                 None,
                 timestamp,
                 10,
-                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::LeviathanSettlement,
             )
             .await
             .unwrap();

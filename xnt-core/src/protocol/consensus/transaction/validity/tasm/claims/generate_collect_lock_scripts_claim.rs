@@ -1,8 +1,12 @@
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use tasm_lib::data_type::DataType;
 use tasm_lib::field;
 use tasm_lib::field_with_size;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::*;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::traits::basic_snippet::BasicSnippet;
 use tasm_lib::triton_vm::prelude::*;
 
@@ -11,9 +15,18 @@ use crate::protocol::consensus::transaction::validity::proof_collection::ProofCo
 use crate::protocol::consensus::transaction::validity::tasm::claims::new_claim::NewClaim;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 
-pub(crate) struct GenerateCollectLockScriptsClaim;
+pub(crate) struct GenerateCollectLockScriptsClaimFor<P>(pub(crate) PhantomData<P>);
 
-impl BasicSnippet for GenerateCollectLockScriptsClaim {
+/// [`GenerateCollectLockScriptsClaimFor`] of upstream's [`ProofCollection`].
+pub(crate) type GenerateCollectLockScriptsClaim =
+    GenerateCollectLockScriptsClaimFor<ProofCollection>;
+#[allow(non_upper_case_globals)]
+pub(crate) const GenerateCollectLockScriptsClaim: GenerateCollectLockScriptsClaim =
+    GenerateCollectLockScriptsClaimFor(PhantomData);
+
+impl<P: TasmStruct + Clone + Debug + 'static> BasicSnippet
+    for GenerateCollectLockScriptsClaimFor<P>
+{
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![(DataType::VoidPointer, "proof_collection_pointer".to_owned())]
     }
@@ -41,7 +54,7 @@ impl BasicSnippet for GenerateCollectLockScriptsClaim {
                 // _ *proof_collection
 
                 dup 0
-                {&field_with_size!(ProofCollection::lock_script_hashes)}
+                {&field_with_size!(P::lock_script_hashes)}
                 // _ *proof_collection *ls_hashes ls_hashes_si
 
                 /* calculate end of `ls_hashes` list */
@@ -89,7 +102,7 @@ impl BasicSnippet for GenerateCollectLockScriptsClaim {
 
                 /* Load claim's input reversed, since given as input in stream-form */
                 pick 5
-                {&field!(ProofCollection::salted_inputs_hash)}
+                {&field!(P::salted_inputs_hash)}
                 addi {Digest::LEN - 1}
                 read_mem {Digest::LEN}
                 hint salted_inputs_hash: Digest = stack[1..6]

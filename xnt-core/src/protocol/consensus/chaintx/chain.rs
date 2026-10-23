@@ -57,7 +57,6 @@ use crate::protocol::consensus::transaction::transaction_kernel::TransactionKern
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::tasm::hash_removal_record_index_sets::HashRemovalRecordIndexSets;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::SecretWitness;
 
@@ -142,14 +141,14 @@ pub async fn chain(
     } else {
         let claim = link_proof_claim(kernel.mast_hash(), single_proof_digest, consensus_rule_set);
         let witness = LinkProofWitness::from_chain(witness);
-        LinkProof
-            .prove(
-                claim,
-                witness.nondeterminism(),
-                job_queue,
-                proof_job_options,
-            )
-            .await?
+        LinkProof::prove_paired_with(
+            single_proof_digest,
+            claim,
+            witness.nondeterminism(),
+            job_queue,
+            proof_job_options,
+        )
+        .await?
     };
 
     Ok(LinkTx {
@@ -299,7 +298,7 @@ impl ChainWitness {
     /// program, on the operand's kernel MAST hash, under the same `D`.
     fn operand_claim(&self, kernel: &LinkKernel) -> Claim {
         let input = link_proof_public_input(kernel.mast_hash(), self.single_proof_digest);
-        Claim::new(LinkProof.hash())
+        Claim::new(LinkProof::digest_paired_with(self.single_proof_digest))
             .with_input(input.individual_tokens)
             .with_output(link_proof_public_output(self.single_proof_digest))
     }
@@ -315,7 +314,7 @@ impl SecretWitness for ChainWitness {
     }
 
     fn program(&self) -> Program {
-        LinkProof.program()
+        LinkProof::program_paired_with(self.single_proof_digest)
     }
 
     fn nondeterminism(&self) -> NonDeterminism {
@@ -1130,6 +1129,7 @@ pub(crate) mod tests {
     use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
+    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
     use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 
     /// The `Chain` branch of the `LinkProof` rust shadow, called by
