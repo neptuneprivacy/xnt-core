@@ -70,7 +70,7 @@ impl Difficulty {
     ///
     /// # Panics
     /// - If the difficulty is zero.
-    pub(crate) fn target(&self) -> Digest {
+    pub fn target(&self) -> Digest {
         let difficulty_as_bui: BigUint = BigUint::from(*self);
         let max_threshold_as_bui: BigUint =
             Digest([BFieldElement::new(BFieldElement::MAX); Digest::LEN]).into();
@@ -591,6 +591,31 @@ mod tests {
 
     use super::*;
     use crate::protocol::consensus::block::Network;
+
+    /// Guards the bridge PoW difficulty floor: the MASM mint gate hardcodes this
+    /// as `POW_TARGET_CEILING` (index 0 = LSB), the largest `target` a valid
+    /// Neptune block can carry. If these drift, `bridge_mint_proof.masm` is stale.
+    #[test]
+    fn minimum_target_ceiling_felts_are_pinned() {
+        let v = Difficulty::MINIMUM.target().values();
+        let felts: [u64; 5] = [
+            v[0].value(),
+            v[1].value(),
+            v[2].value(),
+            v[3].value(),
+            v[4].value(),
+        ];
+        assert_eq!(
+            felts,
+            [
+                5168162796780986040,
+                6643902322334152786,
+                15498339475653153260,
+                13284730187323403141,
+                3074457344902430,
+            ]
+        );
+    }
 
     impl Difficulty {
         /// Convert a u64 into a difficulty.

@@ -1,20 +1,28 @@
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use tasm_lib::library::Library;
 use tasm_lib::memory::FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS;
+use tasm_lib::prelude::BasicSnippet;
 use tasm_lib::triton_vm::prelude::*;
 
 use super::advance::Advance;
 use super::cast::Cast;
 use super::chain::Chain;
 use super::forge::Forge;
+use super::forge::LeviathanForge;
 use super::link_proof_witness::DISCRIMINANT_FOR_ADVANCE;
 use super::link_proof_witness::DISCRIMINANT_FOR_CAST;
 use super::link_proof_witness::DISCRIMINANT_FOR_CHAIN;
 use super::link_proof_witness::DISCRIMINANT_FOR_FORGE;
+use crate::api::tx_initiation::error::CreateProofError;
+use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::LeviathanSingleProofV2;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 
 /// No branch of the `LinkProof` program ran: the discriminant found in memory
 /// matched none of them.
@@ -64,7 +72,7 @@ pub fn link_proof_claim(
         "no link proof is verified under {consensus_rule_set:?}"
     );
     let input = link_proof_public_input(link_kernel_mast_hash, single_proof_digest);
-    Claim::new(LinkProof.hash())
+    Claim::new(LinkProof::digest_for(consensus_rule_set))
         .with_input(input.individual_tokens)
         .with_output(link_proof_public_output(single_proof_digest))
         .about_version(consensus_rule_set.triton_proof_version().claim_version())
@@ -124,8 +132,77 @@ pub(super) fn merge_bit_false_leaf() -> Digest {
 #[derive(Debug, Copy, Clone)]
 pub struct LinkProof;
 
-impl ConsensusProgram for LinkProof {
-    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
+impl LinkProof {
+    /// The digest of this consensus rule set's link-proof program.
+    pub(crate) fn digest_for(consensus_rule_set: ConsensusRuleSet) -> Digest {
+        match consensus_rule_set {
+            ConsensusRuleSet::LeviathanSettlement => LeviathanLinkProof.hash(),
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5
+            | ConsensusRuleSet::UpgradeVMv7
+            | ConsensusRuleSet::UpgradeVMv8 => LinkProof.hash(),
+        }
+    }
+
+    /// Whether `D` is the `SingleProof` program digest of `LeviathanSettlement`, whose link proofs
+    /// are [`LeviathanLinkProof`]'s.
+    pub(crate) fn pairs_with_leviathan(single_proof_digest: Digest) -> bool {
+        single_proof_digest == LeviathanSingleProofV2.hash()
+    }
+
+    /// The digest of the link-proof program of the era whose `SingleProof` program digest is `D`.
+    pub(crate) fn digest_paired_with(single_proof_digest: Digest) -> Digest {
+        if Self::pairs_with_leviathan(single_proof_digest) {
+            LeviathanLinkProof.hash()
+        } else {
+            LinkProof.hash()
+        }
+    }
+
+    /// Like [`Self::digest_paired_with`], the program.
+    pub(crate) fn program_paired_with(single_proof_digest: Digest) -> Program {
+        if Self::pairs_with_leviathan(single_proof_digest) {
+            LeviathanLinkProof.program()
+        } else {
+            LinkProof.program()
+        }
+    }
+
+    /// Prove under the link-proof program paired with `D`.
+    pub(crate) async fn prove_paired_with(
+        single_proof_digest: Digest,
+        claim: Claim,
+        nondeterminism: NonDeterminism,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> Result<Proof, CreateProofError> {
+        if Self::pairs_with_leviathan(single_proof_digest) {
+            LeviathanLinkProof
+                .prove(
+                    claim,
+                    nondeterminism,
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await
+        } else {
+            LinkProof
+                .prove(
+                    claim,
+                    nondeterminism,
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await
+        }
+    }
+
+    fn assemble(forge: impl BasicSnippet + 'static) -> (Library, Vec<LabelledInstruction>) {
         let mut library = Library::new();
 
         // `D`'s slot is allocated before anything else, so that it sits at the
@@ -133,7 +210,7 @@ impl ConsensusProgram for LinkProof {
         // on gets the one address that no later import can push around.
         let single_proof_digest_alloc = library.kmalloc(u32::try_from(Digest::LEN).unwrap());
 
-        let forge_branch = library.import(Box::new(Forge));
+        let forge_branch = library.import(Box::new(forge));
         let chain_branch = library.import(Box::new(Chain {
             single_proof_digest_address: single_proof_digest_alloc.read_address(),
         }));
@@ -247,6 +324,29 @@ impl ConsensusProgram for LinkProof {
         );
 
         (library, code)
+    }
+}
+
+impl ConsensusProgram for LinkProof {
+    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
+        Self::assemble(Forge)
+    }
+
+    fn hash(&self) -> Digest {
+        static HASH: OnceLock<Digest> = OnceLock::new();
+
+        *HASH.get_or_init(|| self.program().hash())
+    }
+}
+
+/// The link-proof program of `LeviathanSettlement`: [`LinkProof`] whose `Forge` refuses the
+/// announcements that need a bridge sub-proof.
+#[derive(Debug, Copy, Clone)]
+pub struct LeviathanLinkProof;
+
+impl ConsensusProgram for LeviathanLinkProof {
+    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
+        LinkProof::assemble(LeviathanForge)
     }
 
     fn hash(&self) -> Digest {
@@ -362,4 +462,13 @@ mod tests {
         LinkProof,
         "acc11d0a313fb18b7fdb3c844707ba9c1fe95d3182da29566c1d6c7b86b6a4bffb32ffcf98e7afc5"
     );
+
+    mod leviathan_snapshot {
+        use super::*;
+
+        test_program_snapshot!(
+            LeviathanLinkProof,
+            "163811dd917b558094b7dcb380811e4466336f48c9bf3c10cc0531be2184f557ddc5267131f1552b"
+        );
+    }
 }

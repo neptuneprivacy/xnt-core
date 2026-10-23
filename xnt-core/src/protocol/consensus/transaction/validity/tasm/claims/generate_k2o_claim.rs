@@ -1,7 +1,11 @@
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use tasm_lib::data_type::DataType;
 use tasm_lib::field;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::*;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::traits::basic_snippet::BasicSnippet;
 use tasm_lib::triton_vm::prelude::*;
 
@@ -10,9 +14,14 @@ use crate::protocol::consensus::transaction::validity::proof_collection::ProofCo
 use crate::protocol::consensus::transaction::validity::tasm::claims::new_claim::NewClaim;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 
-pub(crate) struct GenerateK2oClaim;
+pub(crate) struct GenerateK2oClaimFor<P>(pub(crate) PhantomData<P>);
 
-impl BasicSnippet for GenerateK2oClaim {
+/// [`GenerateK2oClaimFor`] of upstream's [`ProofCollection`].
+pub(crate) type GenerateK2oClaim = GenerateK2oClaimFor<ProofCollection>;
+#[allow(non_upper_case_globals)]
+pub(crate) const GenerateK2oClaim: GenerateK2oClaim = GenerateK2oClaimFor(PhantomData);
+
+impl<P: TasmStruct + Clone + Debug + 'static> BasicSnippet for GenerateK2oClaimFor<P> {
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "transaction_kernel_digest".to_owned()),
@@ -54,8 +63,7 @@ impl BasicSnippet for GenerateK2oClaim {
         };
         let push_k2os_program_hash = push_digest(KernelToOutputs.program().hash());
 
-        let proof_collection_field_salted_outputs_hash =
-            field!(ProofCollection::salted_outputs_hash);
+        let proof_collection_field_salted_outputs_hash = field!(P::salted_outputs_hash);
 
         let load_digest = triton_asm!(
             // _ *digest

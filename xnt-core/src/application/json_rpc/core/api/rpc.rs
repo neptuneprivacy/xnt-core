@@ -45,6 +45,8 @@ pub enum SubmitTransactionError {
     #[error("Transaction not confirmable relative to the mutator set")]
     NotConfirmable,
 
+    #[error("Transaction fails the bridge gate against the tip")]
+    FailsBridgeGate,
     /// The transaction is valid under the rule set of a neighboring era, but
     /// not under that of the next block: it was made for the other side of a
     /// hard fork.
@@ -551,6 +553,40 @@ pub trait RpcApi: Sync + Send {
         request: GetArchivalMutatorSetRequest,
     ) -> RpcResult<GetArchivalMutatorSetResponse>;
 
+    async fn get_bridge_state_commitment(&self) -> RpcResult<GetBridgeStateCommitmentResponse> {
+        self.get_bridge_state_commitment_call(GetBridgeStateCommitmentRequest {})
+            .await
+    }
+    async fn get_bridge_state_commitment_call(
+        &self,
+        request: GetBridgeStateCommitmentRequest,
+    ) -> RpcResult<GetBridgeStateCommitmentResponse>;
+
+    async fn get_bridge_authority_set(&self) -> RpcResult<GetBridgeAuthoritySetResponse> {
+        self.get_bridge_authority_set_call(GetBridgeAuthoritySetRequest {})
+            .await
+    }
+    async fn get_bridge_authority_set_call(
+        &self,
+        request: GetBridgeAuthoritySetRequest,
+    ) -> RpcResult<GetBridgeAuthoritySetResponse>;
+
+    async fn get_bridge_registration(&self) -> RpcResult<GetBridgeRegistrationResponse> {
+        self.get_bridge_registration_call(GetBridgeRegistrationRequest {})
+            .await
+    }
+    async fn get_bridge_registration_call(
+        &self,
+        request: GetBridgeRegistrationRequest,
+    ) -> RpcResult<GetBridgeRegistrationResponse>;
+
+    async fn get_bridge_pool(&self) -> RpcResult<GetBridgePoolResponse> {
+        self.get_bridge_pool_call(GetBridgePoolRequest {}).await
+    }
+    async fn get_bridge_pool_call(
+        &self,
+        request: GetBridgePoolRequest,
+    ) -> RpcResult<GetBridgePoolResponse>;
     /* Networking */
 
     async fn network_overview(&self) -> RpcResult<NetworkOverviewResponse> {

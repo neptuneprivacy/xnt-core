@@ -45,6 +45,7 @@ use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
+use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionConfirmabilityError;
@@ -69,12 +70,15 @@ use crate::protocol::peer::UntakenReason;
 use crate::protocol::peer::UntakenTransaction;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::bridge_gate::BridgeGate;
+use crate::state::bridge_pool::advance_pool;
 use crate::state::mempool::link_tx_admission::link_tx_admissible;
 use crate::state::mempool::link_tx_admission::link_tx_precheck;
 use crate::state::mempool::link_tx_admission::LinkTxAdmissionError;
 use crate::state::mempool::MEMPOOL_TX_THRESHOLD_AGE_IN_SECS;
 use crate::state::mining::block_proposal::BlockProposalRejectError;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
+use crate::state::BridgePoolRebuildFailed;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
 use crate::util_types::mutator_set::removal_record::RemovalRecordValidityError;
@@ -100,7 +104,7 @@ const MAX_BLOCK_SIZE_IN_FORK_RECONCILIATION: usize =
 ///
 /// Note that this limit is enforced as a policy for relaying transactions, and
 /// not affect block (in)validity.
-pub(crate) const MAX_ANNOUNCEMENT_MESSAGE_SIZE: usize = 4096;
+pub const MAX_ANNOUNCEMENT_MESSAGE_SIZE: usize = 4096;
 
 const KEEP_CONNECTION_ALIVE: bool = false;
 const DISCONNECT_CONNECTION: bool = true;
@@ -223,14 +227,14 @@ impl PeerLoopHandler {
     /// Whether the peer may be sent the transaction with this id, which the
     /// node holds in its mempool or legacy relay pool: a transaction of the
     /// era before the next hard fork goes to every peer, one of the mempool
-    /// only to a peer whose version follows `UpgradeVMv8`. A peer of an
+    /// only to a peer whose version follows `LeviathanSettlement`. A peer of an
     /// earlier version cannot verify that one, and is entitled to sanction
     /// the sender.
     fn peer_may_receive(&self, state: &GlobalState, txid: TransactionKernelId) -> bool {
         state.legacy_relay_pool.contains(txid)
             || version_follows_rule_set(
                 &self.peer_handshake_data.version,
-                ConsensusRuleSet::UpgradeVMv8,
+                ConsensusRuleSet::LeviathanSettlement,
             )
     }
 
@@ -270,6 +274,7 @@ impl PeerLoopHandler {
                 Some(NegativePeerSanction::TransactionWithNegativeFee)
             }
             LinkTxAdmissionError::TooBig(_)
+            | LinkTxAdmissionError::ProofBoundAnnouncement
             | LinkTxAdmissionError::DuplicateThruput
             | LinkTxAdmissionError::ThruputIsOwnOutput => {
                 Some(NegativePeerSanction::UnrelayableTransaction)
@@ -505,6 +510,75 @@ impl PeerLoopHandler {
             previous_block = new_block;
         }
 
+        // Settlement/registration/rotation pre-check (A0 anti-replay + F1 authority). Here, not in the
+        // stateless `Block::validate`, because it needs chain state; a graceful reject keeps
+        // an invalid block off the fatal per-block `set_new_tip_internal` peer path. Running
+        // commitment + authority are threaded through the batch to match that gate's per-block
+        // view (an earlier block's rotation changes the set for later ones).
+        {
+            let network = self.global_state_lock.cli().network;
+            let offender = {
+                let state = self.global_state_lock.lock_guard().await;
+                let mut gate =
+                    BridgeGate::as_of(state.chain.archival_state(), parent_of_first_block.hash())
+                        .await;
+                // Apply rebuilds each settlement's change from the pool, so check it can.
+                let settles = received_blocks.iter().any(|block| {
+                    AggregatedAnnouncementData::find_in_announcements(
+                        &block.body().transaction_kernel.announcements,
+                    )
+                    .is_some()
+                });
+                let mut pool = None;
+                if settles {
+                    match state
+                        .chain
+                        .archival_state()
+                        .bridge_pool_as_of(parent_of_first_block.hash())
+                        .await
+                    {
+                        Ok(view) => pool = Some(view),
+                        Err(e) => {
+                            // Our own stored blocks fail, not the peer's: drop the batch unpunished.
+                            error!("cannot rebuild the bridge pool as of the batch's parent: {e}");
+                            return Ok(None);
+                        }
+                    }
+                }
+                let mut offender = None;
+                for new_block in &received_blocks {
+                    let bav_active =
+                        ConsensusRuleSet::infer_from(network, new_block.header().height)
+                            .bav_active();
+                    let gate_ok = !bav_active
+                        || match gate.check(&new_block.body().transaction_kernel.announcements) {
+                            Ok(effects) => {
+                                gate.advance(effects);
+                                true
+                            }
+                            Err(_) => false,
+                        };
+                    let pool_ok = pool
+                        .as_mut()
+                        .is_none_or(|pool| advance_pool(pool, new_block, bav_active).is_ok());
+                    if !gate_ok || !pool_ok {
+                        offender = Some((new_block.kernel.header.height, new_block.hash()));
+                        break;
+                    }
+                }
+                offender
+            };
+            if let Some((height, hash)) = offender {
+                warn!(
+                    "Received block of height {height} with invalid bridge settlement/registration/rotation from peer {}",
+                    self.peer_address
+                );
+                self.punish(NegativePeerSanction::InvalidBlock((height, hash)))
+                    .await?;
+                return Ok(None);
+            }
+        }
+
         // evaluate the fork choice rule
         debug!("Checking last block's canonicity ...");
         let last_block = received_blocks.last().unwrap();
@@ -538,7 +612,10 @@ impl PeerLoopHandler {
         // and storage to the database.
         let number_of_received_blocks = received_blocks.len();
         self.to_main_tx
-            .send(PeerTaskToMain::NewBlocks(received_blocks))
+            .send(PeerTaskToMain::NewBlocks(
+                received_blocks,
+                self.peer_address,
+            ))
             .await?;
         debug!(
             "Updated block info by block from peer. block height {}",
@@ -1526,6 +1603,8 @@ impl PeerLoopHandler {
                 let network = self.global_state_lock.cli().network;
                 let consensus_rule_set =
                     ConsensusRuleSet::infer_for_next_block(network, current_block_height);
+                // A collection made for the previous era has the sub-proofs of this one's.
+                let transaction = transaction.with_proof_collection_layout_of(consensus_rule_set);
 
                 // 0. If transaction can never be mined, punish. Checked before
                 // validity because it reads only kernel lengths, whereas
@@ -1721,11 +1800,26 @@ impl PeerLoopHandler {
                 // it verifies proofs, whereas the checks above read only the
                 // kernel and the mempool. Next to a hard fork, a transaction
                 // valid on the other side of it is ignored, not punished.
-                if !transaction.is_valid(network, consensus_rule_set).await {
+                let verify_options = {
+                    let state = self.global_state_lock.lock_guard().await;
+                    let bridge_state = state.chain.archival_state().bridge_state_commitment().await;
+                    crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions {
+                        prev_state_commitment: bridge_state,
+                    }
+                };
+                if !transaction
+                    .is_valid_with_options(network, consensus_rule_set, verify_options)
+                    .await
+                {
                     for neighboring_rule_set in
                         Self::neighboring_rule_sets(network, current_block_height)
                     {
-                        if transaction.is_valid(network, neighboring_rule_set).await {
+                        if transaction
+                            .clone()
+                            .with_proof_collection_layout_of(neighboring_rule_set)
+                            .is_valid_with_options(network, neighboring_rule_set, verify_options)
+                            .await
+                        {
                             debug!(
                                 "Ignoring transaction {txid}: it is valid under \
                                  {neighboring_rule_set}, but the next block follows \
@@ -2205,6 +2299,16 @@ impl PeerLoopHandler {
                     drop(state);
                     self.punish(NegativePeerSanction::InvalidBlockProposal)
                         .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                }
+                // Guessers would otherwise grind a block every node rejects.
+                if let Err(e) = state.check_bridge_rules_against_parent(&new_proposal).await {
+                    drop(state);
+                    warn!("Rejecting block proposal failing the bridge rules: {e:#}");
+                    if e.downcast_ref::<BridgePoolRebuildFailed>().is_none() {
+                        self.punish(NegativePeerSanction::InvalidBlockProposal)
+                            .await?;
+                    }
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
@@ -3472,6 +3576,139 @@ mod tests {
             )
         }
 
+        /// R6: a valid block whose settlement fails the bridge gate is refused and punished
+        /// before it reaches the main loop, where `set_new_tip` would fail on it.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn peer_block_with_a_settlement_failing_the_bridge_gate_is_refused() {
+            use tasm_lib::triton_vm::prelude::BFieldElement;
+
+            use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+            use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+            use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+            use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+            use crate::protocol::consensus::transaction::announcement::Announcement;
+            use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
+            use crate::protocol::consensus::transaction::transaction_proof::TransactionProof;
+            use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+            use crate::protocol::consensus::transaction::validity::single_proof::single_proof_claim;
+            use crate::protocol::consensus::transaction::Transaction;
+            use crate::protocol::proof_abstractions::mast_hash::MastHash;
+            use crate::protocol::proof_abstractions::verifier::cache_true_claim;
+            use crate::state::transaction::transaction_details::TransactionDetails;
+            use crate::tests::shared::blocks::fake_block_successor_with_merged_tx;
+            use crate::tests::shared::Randomness;
+
+            // RegTest takes only mock proofs, which the fake blocks are not.
+            let network = Network::Testnet(0);
+            let (_peer_broadcast_tx, _from_main_rx, to_main_tx, _to_main_rx, state_lock, hsd) =
+                get_test_genesis_setup(network, 1, cli_args::Args::default_with_network(network))
+                    .await
+                    .unwrap();
+            let peer_address = state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .clone()
+                .into_keys()
+                .next()
+                .unwrap();
+            let genesis = Block::genesis(network);
+            let mut peer_loop_handler = PeerLoopHandler::new(
+                to_main_tx.clone(),
+                state_lock.clone(),
+                peer_address,
+                hsd,
+                true,
+                1,
+            );
+
+            // No faucet is registered, so no settlement passes the gate.
+            let settlement = AggregatedAnnouncementData {
+                prev_state_commitment: Digest::default(),
+                new_state_commitment: Digest::new([BFieldElement::new(5); 5]),
+                exit_root: Digest::default(),
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(1),
+                    prefix: BFieldElement::new(2),
+                },
+                prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+                burns: vec![],
+                change_sender_randomness: None,
+                authority_signatures: vec![],
+            }
+            .to_announcement();
+            let timestamp = genesis.header().timestamp + Timestamp::hours(1);
+            let block_with = async |announcements: Vec<Announcement>| {
+                let details = TransactionDetails::nop(
+                    genesis.mutator_set_accumulator_after().unwrap(),
+                    timestamp,
+                    network,
+                )
+                .with_announcements(announcements);
+                let kernel = PrimitiveWitness::from_transaction_details(&details).kernel;
+                let rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis().next());
+                cache_true_claim(single_proof_claim(kernel.mast_hash(), rule_set)).await;
+                let tx = Transaction {
+                    kernel,
+                    proof: TransactionProof::SingleProof(NeptuneProof::invalid()),
+                };
+                fake_block_successor_with_merged_tx(
+                    &genesis,
+                    timestamp,
+                    true,
+                    vec![tx],
+                    Randomness::default(),
+                    network,
+                )
+                .await
+            };
+
+            let settling = block_with(vec![settlement]).await;
+            let plain = block_with(vec![]).await;
+            assert_eq!(
+                Ok(()),
+                plain
+                    .validate(&genesis, plain.header().timestamp, network)
+                    .await
+            );
+            assert_eq!(
+                Ok(()),
+                settling
+                    .validate(&genesis, settling.header().timestamp, network)
+                    .await
+            );
+            assert!(peer_loop_handler
+                .handle_blocks(vec![settling.clone()], genesis.clone())
+                .await
+                .unwrap()
+                .is_none());
+            let punishment = state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .get(&peer_address)
+                .unwrap()
+                .standing
+                .latest_punishment
+                .unwrap()
+                .0;
+            assert_eq!(
+                NegativePeerSanction::InvalidBlock((settling.header().height, settling.hash())),
+                punishment
+            );
+
+            assert_eq!(
+                Some(BlockHeight::genesis().next()),
+                peer_loop_handler
+                    .handle_blocks(vec![plain], genesis)
+                    .await
+                    .unwrap()
+            );
+        }
+
         #[traced_test]
         #[apply(shared_tokio_runtime)]
         async fn handle_blocks_rejects_blocks_with_invalid_pow() {
@@ -4234,7 +4471,7 @@ mod tests {
 
             // Verify that a block was sent to `main_loop`
             match to_main_rx1.recv().await {
-                Some(PeerTaskToMain::NewBlocks(_block)) => (),
+                Some(PeerTaskToMain::NewBlocks(..)) => (),
                 _ => bail!("Did not find msg sent to main task"),
             };
 
@@ -4306,7 +4543,7 @@ mod tests {
                 .await?;
 
             match to_main_rx1.recv().await {
-                Some(PeerTaskToMain::NewBlocks(blocks)) => {
+                Some(PeerTaskToMain::NewBlocks(blocks, _)) => {
                     if blocks[0].hash() != block_1.hash() {
                         bail!("1st received block by main loop must be block 1");
                     }
@@ -4469,7 +4706,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let Some(PeerTaskToMain::NewBlocks(blocks)) = to_main_rx1.recv().await else {
+            let Some(PeerTaskToMain::NewBlocks(blocks, _)) = to_main_rx1.recv().await else {
                 panic!("Did not find msg sent to main task");
             };
             assert_eq!(blocks[0].hash(), block_2.hash());
@@ -4541,7 +4778,7 @@ mod tests {
                 .await?;
 
             match to_main_rx1.recv().await {
-                Some(PeerTaskToMain::NewBlocks(blocks)) => {
+                Some(PeerTaskToMain::NewBlocks(blocks, _)) => {
                     if blocks[0].hash() != block_1.hash() {
                         bail!("1st received block by main loop must be block 1");
                     }
@@ -4646,7 +4883,7 @@ mod tests {
                 .await?;
 
             match to_main_rx1.recv().await {
-                Some(PeerTaskToMain::NewBlocks(blocks)) => {
+                Some(PeerTaskToMain::NewBlocks(blocks, _)) => {
                     if blocks[0].hash() != block_2.hash() {
                         bail!("1st received block by main loop must be block 1");
                     }
@@ -4755,7 +4992,7 @@ mod tests {
 
             // Verify that blocks are sent to `main_loop` in expected ordering
             match to_main_rx1.recv().await {
-                Some(PeerTaskToMain::NewBlocks(blocks)) => {
+                Some(PeerTaskToMain::NewBlocks(blocks, _)) => {
                     if blocks[0].hash() != block_2.hash() {
                         bail!("1st received block by main loop must be block 1");
                     }
@@ -5822,7 +6059,7 @@ mod tests {
             let proof_collection = ProofCollection::produce_mock(primitive_witness, true);
             let transaction = Transaction {
                 kernel: witness_backed.kernel.clone(),
-                proof: TransactionProof::ProofCollection(proof_collection.clone()),
+                proof: TransactionProof::ProofCollection(proof_collection.clone().into()),
             };
             let rule_set = ConsensusRuleSet::UpgradeVMv7;
             assert!(transaction.is_valid(network, rule_set).await);
@@ -5832,7 +6069,7 @@ mod tests {
                 .push(extra_halting_proof.lock_scripts_halt[0].clone());
             let taken_only_by_the_previous_release = Transaction {
                 kernel: transaction.kernel.clone(),
-                proof: TransactionProof::ProofCollection(extra_halting_proof),
+                proof: TransactionProof::ProofCollection(extra_halting_proof.into()),
             };
             let kernel_mast_hash = transaction.kernel.mast_hash();
             assert!(
@@ -5903,7 +6140,7 @@ mod tests {
             invalid.removal_records_integrity = Proof::invalid_mock(Claim::new(Digest::default()));
             let invalid = Transaction {
                 kernel: transaction.kernel.clone(),
-                proof: TransactionProof::ProofCollection(invalid),
+                proof: TransactionProof::ProofCollection(invalid.into()),
             };
             assert!(
                 !invalid

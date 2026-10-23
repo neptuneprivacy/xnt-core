@@ -23,6 +23,17 @@ pub struct IndexedUtxo {
     pub ciphertext: Vec<u8>,
 }
 
+/// Bridge payout from sync: a public UTXO, found by its receiver identifier
+/// instead of an encrypted notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicIndexedUtxo {
+    pub block_height: u64,
+    pub block_digest: Digest,
+    pub lock_script_hash: Digest,
+    pub amount_nau: i128,
+    pub sender_randomness: Digest,
+}
+
 /// Spent status (-1 = not spent, >= 0 = spent at height)
 pub type SpentStatus = Vec<i64>;
 
@@ -265,6 +276,27 @@ pub fn fetch_utxos_with_skipped(
     from_height: u64,
     to_height: u64,
 ) -> Result<(Vec<IndexedUtxo>, usize)> {
+    fetch_indexed(client, receiver_id_hash, from_height, to_height)
+        .map(|entries| (entries.encrypted, entries.skipped))
+}
+
+/// Fetch the bridge payouts of `from_height..=to_height` from the indexer by
+/// receiver_id_hash, see [PublicIndexedUtxo].
+pub fn fetch_public_utxos(
+    client: &RpcClient,
+    receiver_id_hash: &Digest,
+    from_height: u64,
+    to_height: u64,
+) -> Result<Vec<PublicIndexedUtxo>> {
+    fetch_indexed(client, receiver_id_hash, from_height, to_height).map(|entries| entries.public)
+}
+
+fn fetch_indexed(
+    client: &RpcClient,
+    receiver_id_hash: &Digest,
+    from_height: u64,
+    to_height: u64,
+) -> Result<IndexedEntries> {
     fetch_in_block_ranges(from_height, to_height, |from, to| {
         let params = json!({
             "receiverIdHash": receiver_id_hash.to_hex(),
@@ -308,21 +340,29 @@ fn block_ranges(from_height: u64, to_height: u64) -> Vec<(u64, u64)> {
 fn fetch_in_block_ranges(
     from_height: u64,
     to_height: u64,
-    mut fetch: impl FnMut(u64, u64) -> Result<(Vec<IndexedUtxo>, usize)>,
-) -> Result<(Vec<IndexedUtxo>, usize)> {
-    let mut utxos = Vec::new();
-    let mut skipped = 0;
+    mut fetch: impl FnMut(u64, u64) -> Result<IndexedEntries>,
+) -> Result<IndexedEntries> {
+    let mut entries = IndexedEntries::default();
     for (from, to) in block_ranges(from_height, to_height) {
-        let (range_utxos, range_skipped) = fetch(from, to)?;
-        utxos.extend(range_utxos);
-        skipped += range_skipped;
+        let range = fetch(from, to)?;
+        entries.encrypted.extend(range.encrypted);
+        entries.public.extend(range.public);
+        entries.skipped += range.skipped;
     }
-    Ok((utxos, skipped))
+    Ok(entries)
+}
+
+/// The entries of one or more `archival_getUtxosByReceiver` results.
+#[derive(Default)]
+struct IndexedEntries {
+    encrypted: Vec<IndexedUtxo>,
+    public: Vec<PublicIndexedUtxo>,
+    skipped: usize,
 }
 
 /// Parse an `archival_getUtxosByReceiver` result, skipping and counting
 /// malformed entries.
-fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
+fn parse_indexed_utxos(result: &Value) -> Result<IndexedEntries> {
     let utxos = result
         .get("utxos")
         .and_then(|v| v.as_array())
@@ -337,9 +377,18 @@ fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
     }
 
     let mut indexed_utxos = Vec::with_capacity(utxos.len());
+    let mut public = Vec::new();
     let mut skipped = 0;
 
     for utxo in utxos {
+        if utxo.get("type").and_then(|v| v.as_str()) == Some("public") {
+            match public_utxo_from_json(utxo) {
+                Some(payout) => public.push(payout),
+                None => skipped += 1,
+            }
+            continue;
+        }
+
         let Some(block_height) = utxo.get("blockHeight").and_then(|v| v.as_u64()) else {
             skipped += 1;
             continue;
@@ -362,7 +411,35 @@ fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
         });
     }
 
-    Ok((indexed_utxos, skipped))
+    Ok(IndexedEntries {
+        encrypted: indexed_utxos,
+        public,
+        skipped,
+    })
+}
+
+fn public_utxo_from_json(value: &Value) -> Option<PublicIndexedUtxo> {
+    use neptune_privacy::application::json_rpc::core::model::message::RpcIndexedUtxo;
+    use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+
+    let RpcIndexedUtxo::Public {
+        block_height,
+        block_digest,
+        lock_script_hash,
+        amount_nau,
+        sender_randomness,
+        ..
+    } = serde_json::from_value(value.clone()).ok()?
+    else {
+        return None;
+    };
+    Some(PublicIndexedUtxo {
+        block_height: block_height.into(),
+        block_digest: Digest::from_core(block_digest),
+        lock_script_hash: Digest::from_core(lock_script_hash),
+        amount_nau: NativeCurrencyAmount::from(amount_nau).to_nau(),
+        sender_randomness: Digest::from_core(sender_randomness),
+    })
 }
 
 /// Ciphertext of an indexed entry as little-endian u64s, or `None` if it is
@@ -462,13 +539,14 @@ pub fn collect_spendable_inputs(
     let receiver_preimage = key.receiver_preimage();
 
     // Fetch indexed UTXOs from archival node
-    let (indexed, malformed) = fetch_utxos_with_skipped(client, &rid_hash, from_height, to_height)?;
+    let entries = fetch_indexed(client, &rid_hash, from_height, to_height)?;
     let mut stats = ScanStats {
-        malformed,
+        malformed: entries.skipped,
         ..ScanStats::default()
     };
 
-    let utxos = decrypt_indexed_utxos(key, network, indexed, &mut stats);
+    let mut utxos = decrypt_indexed_utxos(key, network, entries.encrypted, &mut stats);
+    utxos.extend(own_public_utxos(key, network, entries.public, &mut stats));
     if utxos.is_empty() {
         return Ok((Vec::new(), stats));
     }
@@ -585,6 +663,44 @@ pub fn collect_spendable_inputs(
     }
 
     Ok((res, stats))
+}
+
+/// The bridge payouts this key can spend, as [decrypt_indexed_utxos] returns
+/// them, with the same lock-script and legacy-cutoff checks.
+fn own_public_utxos(
+    key: &SpendingKey,
+    network: Network,
+    public: Vec<PublicIndexedUtxo>,
+    stats: &mut ScanStats,
+) -> Vec<(Utxo, Digest, i128, u64, Digest, u64)> {
+    use neptune_privacy::protocol::consensus::transaction::utxo::Utxo as CoreUtxo;
+    use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+
+    let own_lock_script_hash = key.lock_script_hash();
+    let mut utxos = Vec::new();
+    for payout in public {
+        if payout.lock_script_hash != own_lock_script_hash {
+            stats.foreign_lock += 1;
+            continue;
+        }
+        if !key.recognizes_utxos_at(network, payout.block_height) {
+            stats.legacy_after_cutoff += 1;
+            continue;
+        }
+        let utxo = Utxo::from_core(CoreUtxo::new_native_currency(
+            payout.lock_script_hash.to_core(),
+            NativeCurrencyAmount::from_nau(payout.amount_nau),
+        ));
+        utxos.push((
+            utxo,
+            payout.sender_randomness,
+            payout.amount_nau,
+            payout.block_height,
+            payout.block_digest,
+            0,
+        ));
+    }
+    utxos
 }
 
 /// Decrypt indexed entries with `key`, skipping and counting in `stats` the
@@ -1166,9 +1282,17 @@ mod tests {
     #[test]
     fn utxos_of_a_long_range_are_fetched_in_parts_and_merged() {
         let mut requests = Vec::new();
-        let (utxos, skipped) = fetch_in_block_ranges(0, 25_000, |from, to| {
+        let IndexedEntries {
+            encrypted: utxos,
+            skipped,
+            ..
+        } = fetch_in_block_ranges(0, 25_000, |from, to| {
             requests.push((from, to));
-            Ok((vec![indexed(from, &[1]), indexed(to, &[2])], 1))
+            Ok(IndexedEntries {
+                encrypted: vec![indexed(from, &[1]), indexed(to, &[2])],
+                public: vec![],
+                skipped: 1,
+            })
         })
         .unwrap();
 
@@ -1184,7 +1308,7 @@ mod tests {
             if from > 0 {
                 Err(XntError::RpcError("BlockRangeExceedsLimit".to_string()))
             } else {
-                Ok((vec![], 0))
+                Ok(IndexedEntries::default())
             }
         });
         assert!(result.is_err());
@@ -1247,7 +1371,11 @@ mod tests {
             good,
         ]});
 
-        let (utxos, skipped) = parse_indexed_utxos(&result).unwrap();
+        let IndexedEntries {
+            encrypted: utxos,
+            skipped,
+            ..
+        } = parse_indexed_utxos(&result).unwrap();
         assert_eq!(6, skipped);
         assert_eq!(2, utxos.len());
         for utxo in utxos {
@@ -1299,6 +1427,50 @@ mod tests {
             stats
         );
         assert_eq!(3, stats.total());
+    }
+
+    /// A bridge payout, as the node's indexer serializes it, is parsed apart
+    /// from the encrypted entries and credited only to the key it is locked to.
+    #[test]
+    fn public_payouts_are_parsed_and_credited_to_their_lock() {
+        use neptune_privacy::application::json_rpc::core::model::message::RpcIndexedUtxo;
+
+        let wallet = WalletEntropy::generate().unwrap();
+        let key = wallet.derive_spending_key(0);
+        let other = wallet.derive_spending_key(1);
+        let amount = NativeCurrencyAmount::coins(3);
+        let payout = |lock: &SpendingKey| {
+            serde_json::to_value(RpcIndexedUtxo::Public {
+                block_height: 9u64.into(),
+                block_digest: CoreDigest::default(),
+                receiver_digest: CoreDigest::default(),
+                lock_script_hash: lock.lock_script_hash().to_core(),
+                amount_nau: amount.into(),
+                sender_randomness: CoreDigest::default(),
+            })
+            .unwrap()
+        };
+        let result = json!({ "utxos": [payout(&key), payout(&other), { "type": "public" }] });
+
+        let entries = parse_indexed_utxos(&result).unwrap();
+        assert!(entries.encrypted.is_empty());
+        assert_eq!(1, entries.skipped);
+        assert_eq!(2, entries.public.len());
+        assert_eq!(amount.to_nau(), entries.public[0].amount_nau);
+        assert_eq!(9, entries.public[0].block_height);
+
+        let mut stats = ScanStats::default();
+        let utxos = own_public_utxos(&key, Network::Main, entries.public, &mut stats);
+        assert_eq!(1, utxos.len());
+        assert_eq!(key.lock_script_hash(), utxos[0].0.lock_script_hash());
+        assert_eq!(amount.to_nau(), utxos[0].2);
+        assert_eq!(
+            ScanStats {
+                foreign_lock: 1,
+                ..ScanStats::default()
+            },
+            stats
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use tasm_lib::twenty_first::util_types::mmr::mmr_successor_proof::MmrSuccessorProof;
 use tracing::info;
 pub(crate) use transaction_proof::TransactionProof;
-use validity::proof_collection::ProofCollection;
+use validity::leviathan_proof_collection::VerifyOptions;
 use validity::tasm::single_proof::merge_branch::MergeWitness;
 use validity::tasm::single_proof::update_branch::UpdateWitness;
 
@@ -170,9 +170,44 @@ impl Transaction {
     /// This method tests the transaction's internal consistency in isolation,
     /// without the context of the canonical chain.
     pub async fn is_valid(&self, network: Network, consensus_rule_set: ConsensusRuleSet) -> bool {
+        self.is_valid_with_options(network, consensus_rule_set, Default::default())
+            .await
+    }
+
+    /// This transaction with its proof collection, if any, in the layout of the given rule set's
+    /// collections, unchanged if that is impossible; see
+    /// [`into_layout_of`](validity::leviathan_proof_collection::AnyProofCollection::into_layout_of).
+    pub(crate) fn with_proof_collection_layout_of(
+        self,
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> Self {
+        let TransactionProof::ProofCollection(collection) = &self.proof else {
+            return self;
+        };
+        match collection
+            .clone()
+            .into_layout_of(consensus_rule_set, &self.kernel)
+        {
+            Some(collection) => Self {
+                proof: TransactionProof::ProofCollection(collection),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Like [`is_valid`](Self::is_valid) but accepts [`VerifyOptions`] for
+    /// bridge transactions that need the chain's current Leviathan state
+    /// commitment to verify the bridge aggregated proof.
+    pub async fn is_valid_with_options(
+        &self,
+        network: Network,
+        consensus_rule_set: ConsensusRuleSet,
+        verify_options: VerifyOptions,
+    ) -> bool {
         let kernel_hash = self.kernel.mast_hash();
         self.proof
-            .verify(kernel_hash, network, consensus_rule_set)
+            .verify(kernel_hash, network, consensus_rule_set, verify_options)
             .await
     }
 
@@ -192,7 +227,7 @@ impl Transaction {
         shuffle_seed: [u8; 32],
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
-        _consensus_rule_set: ConsensusRuleSet,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Transaction> {
         assert_eq!(
             self.kernel.mutator_set_hash, other.kernel.mutator_set_hash,
@@ -205,7 +240,13 @@ impl Transaction {
         );
 
         let merge_witness = MergeWitness::from_transactions(self, other, shuffle_seed);
-        MergeWitness::merge(merge_witness, triton_vm_job_queue, proof_job_options).await
+        MergeWitness::merge_with_rule(
+            merge_witness,
+            triton_vm_job_queue,
+            proof_job_options,
+            consensus_rule_set,
+        )
+        .await
     }
 
     /// Calculates a fraction representing the fee-density, defined as:

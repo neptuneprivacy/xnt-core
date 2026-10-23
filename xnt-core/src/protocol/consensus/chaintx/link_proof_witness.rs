@@ -15,8 +15,7 @@ use super::cast::CastWitness;
 use super::chain::ChainWitness;
 use super::forge::ForgeWitness;
 use super::forge::ForgeWitnessMemory;
-use super::link_proof::LinkProof;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
+use super::forge::LeviathanForgeWitnessMemory;
 use crate::protocol::proof_abstractions::SecretWitness;
 
 /// Discriminant of the various pathways into `LinkProof`.
@@ -77,6 +76,13 @@ pub(super) enum LinkProofWitnessMemory {
     /// Likewise its own projection -- of which the branch reads only the proof;
     /// see [`CastWitness`].
     Cast(Box<CastWitness>),
+}
+
+/// [`LinkProofWitnessMemory`] of `LeviathanSettlement`, for its `Forge` memory: the one variant
+/// has the same discriminant.
+#[derive(Debug, Clone, BFieldCodec)]
+pub(super) enum LeviathanLinkProofWitnessMemory {
+    Forge(Box<LeviathanForgeWitnessMemory>),
 }
 
 // Required for `decode_from_memory`; `derive(TasmObject)` does not handle enums.
@@ -168,7 +174,12 @@ impl SecretWitness for LinkProofWitness {
     }
 
     fn program(&self) -> Program {
-        LinkProof.program()
+        match self {
+            Self::Forge(witness) => witness.program(),
+            Self::Chain(witness) => witness.program(),
+            Self::Advance(witness) => witness.program(),
+            Self::Cast(witness) => witness.program(),
+        }
     }
 
     fn nondeterminism(&self) -> NonDeterminism {

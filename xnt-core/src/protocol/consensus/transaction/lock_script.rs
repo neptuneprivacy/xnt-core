@@ -125,7 +125,7 @@ impl LockScriptAndWitness {
 
     /// Create a [`LockScriptAndWitness`] whose lock script is a standard hash
     /// lock, from the preimage.
-    pub(crate) fn standard_hash_lock_from_preimage(preimage: Digest) -> LockScriptAndWitness {
+    pub fn standard_hash_lock_from_preimage(preimage: Digest) -> LockScriptAndWitness {
         let after_image = preimage.hash();
         let lock_script = LockScript::standard_hash_lock_from_after_image(after_image);
         LockScriptAndWitness::new_with_nondeterminism(
@@ -184,6 +184,12 @@ impl LockScriptAndWitness {
 
     pub fn halts_gracefully(&self, public_input: PublicInput) -> bool {
         VM::run(self.program.clone(), public_input, self.nondeterminism()).is_ok()
+    }
+
+    pub(crate) fn claim(&self, public_input: PublicInput, claim_version: u32) -> Claim {
+        Claim::new(self.program.hash())
+            .about_version(claim_version)
+            .with_input(public_input.individual_tokens)
     }
 
     /// Assuming the lock script halts gracefully, prove it, for a claim of

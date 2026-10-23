@@ -239,6 +239,21 @@ impl DataDirectory {
             .join(Path::new(BLOCK_INDEX_DB_NAME))
     }
 
+    /// The bridge pool database directory path.
+    ///
+    /// This directory lives within `DataDirectory::database_dir_path()`.
+    pub fn bridge_pool_database_dir_path(&self) -> PathBuf {
+        self.database_dir_path().join(Path::new("bridge_pool"))
+    }
+
+    /// The bridge pool delta database directory path.
+    ///
+    /// This directory lives within `DataDirectory::database_dir_path()`.
+    pub fn bridge_pool_delta_database_dir_path(&self) -> PathBuf {
+        self.database_dir_path()
+            .join(Path::new("bridge_pool_delta"))
+    }
+
     /// The file path that contains block(s) with `file_index`.
     ///
     /// Note that multiple blocks can be stored in one block file.

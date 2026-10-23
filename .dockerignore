@@ -1,0 +1,7 @@
+target/
+makefile-target*/
+.git/
+.claude/
+.idea/
+.vscode/
+xnt-core/test_data/

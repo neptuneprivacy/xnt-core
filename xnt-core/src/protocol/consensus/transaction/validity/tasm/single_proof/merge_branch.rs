@@ -174,19 +174,29 @@ impl MergeWitness {
         proof_job_options: TritonVmProofJobOptions,
         consensus_rule_set: crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet,
     ) -> Result<Transaction> {
-        let _ = consensus_rule_set;
         let new_kernel = self.new_kernel.clone();
 
         info!("Start: creating new single proof through merge");
-        let new_single_proof = {
+        let new_single_proof = if consensus_rule_set == ConsensusRuleSet::LeviathanSettlement {
+            use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
+            SingleProofV2Witness::from_merge(self)
+                .produce(triton_vm_job_queue, proof_job_options, consensus_rule_set)
+                .await?
+        } else {
             use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
             use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
             let new_single_proof_witness = SingleProofV2Witness::from_merge(self);
             let new_single_proof_claim = new_single_proof_witness.claim();
+            // Mock proofs carry no stark_verify nondeterminism.
+            let nondeterminism = if proof_job_options.job_settings.network.use_mock_proof() {
+                NonDeterminism::default()
+            } else {
+                new_single_proof_witness.nondeterminism()
+            };
             SingleProofV2
                 .prove(
                     new_single_proof_claim,
-                    new_single_proof_witness.nondeterminism(),
+                    nondeterminism,
                     triton_vm_job_queue,
                     proof_job_options,
                 )

@@ -1,5 +1,7 @@
 pub mod archival_state;
 pub mod blockchain_state;
+pub(crate) mod bridge_gate;
+pub mod bridge_pool;
 pub mod database;
 pub mod legacy_relay_pool;
 pub mod light_state;
@@ -79,13 +81,16 @@ use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+use crate::protocol::consensus::bridge::has_proof_bound_tag;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
 use crate::protocol::consensus::consensus_rule_set::upgrade_vm_v8_activation_height;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
-use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::link_tx_claim;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
@@ -388,6 +393,9 @@ impl GlobalStateLock {
         // acquire write-lock
         let mut gsm = self.lock_guard_mut().await;
         let consensus_rule_set = gsm.next_block_consensus_rule_set();
+        gsm.bridge_admission_check(&tx_artifacts.transaction.kernel)
+            .await
+            .map_err(|e| RecordTransactionError::BridgeGate(format!("{e:#}")))?;
         tx_artifacts
             .verify(gsm.cli().network, consensus_rule_set)
             .await?;
@@ -571,9 +579,69 @@ pub enum RecordTransactionError {
     #[error("Invalid transaction: {0}")]
     InvalidTransaction(#[from] TxCreationArtifactsError),
 
+    #[error("transaction fails the bridge gate: {0}")]
+    BridgeGate(String),
+
     #[error("the mempool refused the transaction")]
     RefusedByMempool,
 }
+
+/// Typed (not bare `anyhow`) so a caller can distinguish a stale settlement
+/// (discard the block) from a fatal error (abort the node).
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("stale bridge settlement: chain has {expected:?}, announcement claims {claimed:?}")]
+pub struct StaleBridgeSettlement {
+    pub expected: Digest,
+    pub claimed: Digest,
+}
+
+/// Settlement lacking N-of-M authority signatures (or the set is unset). Typed
+/// so the install path discards the block instead of aborting the node.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("unauthorized bridge settlement: authority signatures missing or below threshold")]
+pub struct UnauthorizedBridgeSettlement;
+
+/// Rotation not signed by a threshold of the current set. Typed so the install
+/// path discards instead of aborting.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("unauthorized bridge authority rotation")]
+pub struct UnauthorizedBridgeRotation;
+
+/// Settlement for a faucet other than the registered one (or before any registration).
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("bridge settlement for faucet {announced:?}, registered: {registered:?}")]
+pub struct UnregisteredBridgeSettlement {
+    pub announced: FaucetId,
+    pub registered: Option<FaucetId>,
+}
+
+/// Our own stored blocks fail the pool rebuild, so a block is discarded without blaming its sender.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("cannot rebuild the bridge pool from stored blocks: {0}")]
+pub struct BridgePoolRebuildFailed(pub InvalidBridgeChange);
+
+/// A settlement whose pool change apply could not track. Typed so install paths discard the block.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum InvalidBridgeChange {
+    #[error("bridge settlement burns more than the pool inputs it spends")]
+    BurnsExceedPoolInputs,
+    #[error("bridge settlement amounts overflow")]
+    AmountOverflow,
+    #[error("bridge settlement change output {0:?} is not in the block")]
+    ChangeMissing(Digest),
+    #[error("pool consolidation spends other pool entries than the authority signed")]
+    ConsolidationInputsMismatch,
+    #[error("pool consolidation change rebuilds to {rebuilt:?}, the authority signed {signed:?}")]
+    ConsolidationChangeMismatch {
+        rebuilt: Option<Digest>,
+        signed: Digest,
+    },
+}
+
+/// Registration not signed by a threshold of the current set, or one is already in effect.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("invalid bridge registration")]
+pub struct InvalidBridgeRegistration;
 
 /// abstracts over lock acquisition types for [GlobalStateLock]
 ///
@@ -2135,6 +2203,23 @@ impl GlobalState {
         });
     }
 
+    /// Park these primitive witnesses of this node's transactions, to be proven for the new era.
+    fn park_own_witnesses(&mut self, witnesses: Vec<PrimitiveWitness>) {
+        for primitive_witness in witnesses {
+            let txid = primitive_witness.kernel.txid();
+            if self
+                .parked_own_witnesses
+                .iter()
+                .all(|parked| parked.primitive_witness.kernel.txid() != txid)
+            {
+                self.parked_own_witnesses.push(ParkedOwnWitness {
+                    primitive_witness,
+                    attempts: 0,
+                });
+            }
+        }
+    }
+
     /// Carry the parked transactions of this node across the fork, for a new
     /// tip whose next block belongs to the era after it; see
     /// [`Self::parked_own_witnesses`]. Returns the mempool's events, the
@@ -2235,6 +2320,32 @@ impl GlobalState {
         Ok(())
     }
 
+    /// The bridge rules a block must pass against its parent's chain state, which the stateless
+    /// `Block::validate` cannot check. Errors are the typed bridge errors.
+    pub(crate) async fn check_bridge_rules_against_parent(&self, block: &Block) -> Result<()> {
+        let announcements = &block.kernel.body.transaction_kernel.announcements;
+        if !ConsensusRuleSet::infer_from(self.cli().network, block.header().height).bav_active()
+            || !bridge_gate::has_bridge_announcements(announcements)
+        {
+            return Ok(());
+        }
+        let parent = block.header().prev_block_digest;
+        bridge_gate::BridgeGate::as_of(self.chain.archival_state(), parent)
+            .await
+            .check(announcements)?;
+        // Apply rebuilds the settlement's change from the pool, so check it can.
+        if AggregatedAnnouncementData::find_in_announcements(announcements).is_some() {
+            let mut pool = self
+                .chain
+                .archival_state()
+                .bridge_pool_as_of(parent)
+                .await
+                .map_err(BridgePoolRebuildFailed)?;
+            bridge_pool::advance_pool(&mut pool, block, true)?;
+        }
+        Ok(())
+    }
+
     /// Update client's state with a new block. Block is assumed to be valid,
     /// also wrt. to PoW. The received block will be set as the new tip,
     /// regardless of its accumulated PoW. or its validity.
@@ -2250,6 +2361,11 @@ impl GlobalState {
     /// - If the new tip does not have a mutator set update.
     async fn set_new_tip_internal(&mut self, new_tip: Block) -> Result<Vec<MempoolUpdateJob>> {
         crate::macros::log_scope_duration!();
+
+        // Bridge settlement anti-replay (A0), before any DB write so every install
+        // path rejects a stale settlement cleanly instead of aborting mid-apply.
+        // peer_loop batch-checks multi-block reorgs.
+        self.check_bridge_rules_against_parent(&new_tip).await?;
 
         let old_tip_height = self.chain.light_state().header().height;
         let old_tip_digest = self.chain.light_state().hash();
@@ -2386,19 +2502,38 @@ impl GlobalState {
                 witnesses.len(),
             );
             legacy_pool_events.extend(events);
-            for primitive_witness in witnesses {
-                let txid = primitive_witness.kernel.txid();
-                if self
-                    .parked_own_witnesses
-                    .iter()
-                    .all(|parked| parked.primitive_witness.kernel.txid() != txid)
-                {
-                    self.parked_own_witnesses.push(ParkedOwnWitness {
-                        primitive_witness,
-                        attempts: 0,
-                    });
-                }
-            }
+            self.park_own_witnesses(witnesses);
+        }
+
+        // Likewise when the next block's `SingleProof` program changes: the mempool's proofs are old.
+        if !old_next_rules.is_legacy_era()
+            && !new_next_rules.is_legacy_era()
+            && single_proof_program_digest(old_next_rules)
+                != single_proof_program_digest(new_next_rules)
+        {
+            let (events, witnesses) = self
+                .mempool
+                .remove_single_proofs_and_links(RemovalReason::Abandoned);
+            info!(
+                "The next block {} follows {new_next_rules}: removed {} single-proof-backed and \
+                 link transactions of {old_next_rules}, {} of them this node's, which are proven \
+                 again for the new era",
+                new_tip_height.next(),
+                events.len(),
+                witnesses.len(),
+            );
+            mempool_events.extend(events);
+            mempool_events.extend(self.mempool.remove_proof_collections_without_layout_of(
+                new_next_rules,
+                RemovalReason::Abandoned,
+            ));
+            update_jobs.retain(|job| {
+                !matches!(
+                    job,
+                    MempoolUpdateJob::SingleProof { .. } | MempoolUpdateJob::Link { .. }
+                )
+            });
+            self.park_own_witnesses(witnesses);
         }
 
         // Prove the parked transactions for the era after the fork, from their
@@ -2482,6 +2617,12 @@ impl GlobalState {
         self.wallet_state
             .handle_mempool_events(mempool_events, new_tip.header().height.next())
             .await;
+
+        let evicted = self.evict_bridge_inadmissible().await;
+        let update_jobs = update_jobs
+            .into_iter()
+            .filter(|job| !evicted.contains(&job.txid()))
+            .collect();
 
         // Reset block proposal, as that field pertains to the block that
         // was just set as new tip. Also reset set of exported block proposals.
@@ -2707,10 +2848,7 @@ impl GlobalState {
         let sync_height = indexer.get_sync_height();
 
         if sync_height >= tip_height {
-            debug!(
-                "UTXO indexer already synced to tip (height {})",
-                tip_height
-            );
+            debug!("UTXO indexer already synced to tip (height {})", tip_height);
             return Ok(0);
         }
 
@@ -2781,7 +2919,9 @@ impl GlobalState {
             current_height = current_height.next();
 
             if blocks_indexed % 1000 == 0 {
-                indexer.set_sync_height(current_height.previous().unwrap_or(current_height)).await;
+                indexer
+                    .set_sync_height(current_height.previous().unwrap_or(current_height))
+                    .await;
                 indexer.persist().await;
                 info!(
                     "UTXO indexer sync progress: {} / {} blocks",
@@ -2790,7 +2930,9 @@ impl GlobalState {
             }
         }
 
-        indexer.set_sync_height(current_height.previous().unwrap_or(start_height)).await;
+        indexer
+            .set_sync_height(current_height.previous().unwrap_or(start_height))
+            .await;
         indexer.persist().await;
 
         info!(
@@ -2922,12 +3064,22 @@ impl GlobalState {
     /// so that the composer and the proof upgrader never see them (see
     /// [`legacy_relay_pool`]). A transaction backed by a primitive witness is
     /// one of this node's there, and is proven again on every block.
+    ///
+    /// Returns false if the bridge gate refuses the transaction.
     pub async fn mempool_insert(
         &mut self,
         transaction: Transaction,
         priority: UpgradePriority,
         add_reason: AddReason,
-    ) {
+    ) -> bool {
+        if let Err(error) = self.bridge_admission_check(&transaction.kernel).await {
+            debug!(
+                "Not adding transaction {}: {error:#}",
+                transaction.kernel.txid()
+            );
+            return false;
+        }
+
         let tip_height = self.chain.light_state().header().height;
 
         if self.next_block_consensus_rule_set().is_legacy_era() {
@@ -2938,14 +3090,15 @@ impl GlobalState {
             self.wallet_state
                 .handle_mempool_events(events, tip_height.next())
                 .await;
-            return;
+            return true;
         }
 
         let events = self.mempool.insert(transaction, priority, add_reason);
         self.mempool.log_events(&events, tip_height);
         self.wallet_state
             .handle_mempool_events(events, tip_height.next())
-            .await
+            .await;
+        true
     }
 
     /// Adds a link transaction to the mempool and notifies wallet of change.
@@ -2964,6 +3117,25 @@ impl GlobalState {
                 "Not adding link transaction {} to the mempool: chain branches are not active",
                 link_tx.txid()
             );
+            return;
+        }
+        // Bridge transactions are never chained; see `link_tx_precheck`.
+        if self.bridge_rules_apply_to_next_block()
+            && link_tx
+                .kernel
+                .kernel
+                .announcements
+                .iter()
+                .any(has_proof_bound_tag)
+        {
+            debug!(
+                "Not adding link transaction {}: it carries a bridge announcement",
+                link_tx.txid()
+            );
+            return;
+        }
+        if let Err(error) = self.bridge_admission_check(&link_tx.kernel.kernel).await {
+            debug!("Not adding link transaction {}: {error:#}", link_tx.txid());
             return;
         }
 
@@ -2992,7 +3164,7 @@ impl GlobalState {
     /// Like [`Self::mempool_insert`], for a transaction that was verified
     /// under the given rule set: inserted only if that is still the rule set
     /// of the next block. Returns whether it was offered to the mempool or
-    /// the legacy relay pool.
+    /// the legacy relay pool, which the bridge gate can refuse.
     ///
     /// A transaction verified for one era is never held for the other, also
     /// when a block changed the next block's rule set after the verification.
@@ -3013,8 +3185,7 @@ impl GlobalState {
             return false;
         }
 
-        self.mempool_insert(transaction, priority, add_reason).await;
-        true
+        self.mempool_insert(transaction, priority, add_reason).await
     }
 
     /// The transaction with this id, from the mempool or else from the legacy
@@ -3057,7 +3228,7 @@ impl GlobalState {
     pub(crate) async fn upgrade_proof_collection_job(
         &self,
         kernel: TransactionKernel,
-        proof: ProofCollection,
+        proof: AnyProofCollection,
         upgrade_incentive: UpgradeIncentive,
     ) -> Result<ProofCollectionToSingleProof> {
         let msa_lookup_result = self
@@ -3825,6 +3996,1050 @@ mod tests {
                 .await
                 .get_own_handshakedata();
             assert!(handshake_data.listen_port.is_none());
+        }
+    }
+
+    mod bridge_registration {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::Signature;
+        use k256::ecdsa::SigningKey;
+        use tasm_lib::prelude::Tip5;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use super::*;
+        use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+        use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+        use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+        use crate::protocol::consensus::bridge::authority::settlement_signing_prehash;
+        use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetRegistrationAnnouncement;
+        use crate::protocol::consensus::transaction::announcement::Announcement;
+        use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
+
+        const NETWORK: Network = Network::RegTest;
+
+        /// Signs as RegTest's genesis authority (the dev key, scalar 1).
+        fn sign(digest: Digest) -> [u8; 64] {
+            let mut scalar_one = [0u8; 32];
+            scalar_one[31] = 1;
+            let key = SigningKey::from_bytes(&scalar_one.into()).unwrap();
+            let sig: Signature = key
+                .sign_prehash(&settlement_signing_prehash(digest))
+                .unwrap();
+            sig.to_bytes().into()
+        }
+
+        fn registration(seed: u64) -> BridgeRegistration {
+            BridgeRegistration {
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(seed << 8),
+                    prefix: BFieldElement::new(seed),
+                },
+                genesis_state_commitment: Tip5::hash_varlen(&[BFieldElement::new(seed)]),
+            }
+        }
+
+        fn registration_announcement(
+            registration: BridgeRegistration,
+            signed: bool,
+        ) -> Announcement {
+            let mut announcement = FaucetRegistrationAnnouncement {
+                registration,
+                signatures: vec![],
+            };
+            if signed {
+                let authority = NETWORK.bridge_genesis_authority_set().unwrap();
+                announcement.signatures = vec![sign(
+                    announcement.registration_digest(NETWORK, authority.commitment()),
+                )];
+            }
+            announcement.to_announcement()
+        }
+
+        /// A signed, empty settlement moving `prev` to `new` for `faucet_id`.
+        fn settlement(prev: Digest, new: Digest, faucet_id: FaucetId) -> Announcement {
+            let mut data = AggregatedAnnouncementData {
+                prev_state_commitment: prev,
+                new_state_commitment: new,
+                exit_root: Digest::default(),
+                faucet_id,
+                prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+                burns: vec![],
+                change_sender_randomness: None,
+                authority_signatures: vec![],
+            };
+            data.authority_signatures = vec![sign(data.settlement_digest(NETWORK))];
+            data.to_announcement()
+        }
+
+        fn block_with(parent: &Block, announcements: Vec<Announcement>) -> Block {
+            let mut tx = make_mock_transaction_with_mutator_set_hash(
+                vec![],
+                vec![],
+                parent.mutator_set_accumulator_after().unwrap().hash(),
+            );
+            tx.kernel = TransactionKernelModifier::default()
+                .announcements(announcements)
+                .modify(tx.kernel);
+            invalid_block_with_transaction(parent, tx)
+        }
+
+        async fn regtest_state() -> GlobalStateLock {
+            mock_genesis_global_state(
+                2,
+                WalletEntropy::new_random(),
+                cli_args::Args::default_with_network(NETWORK),
+            )
+            .await
+        }
+
+        fn rejected_with<E: std::error::Error + Send + Sync + 'static>(
+            result: Result<impl Sized>,
+        ) -> bool {
+            result.is_err_and(|e| e.downcast_ref::<E>().is_some())
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn settlements_need_the_registered_faucet_from_an_earlier_block() {
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let after_genesis = Digest::new([BFieldElement::new(5); 5]);
+            let settle = settlement(reg.genesis_state_commitment, after_genesis, reg.faucet_id);
+
+            let unregistered = block_with(&genesis, vec![settle.clone()]);
+            assert!(rejected_with::<UnregisteredBridgeSettlement>(
+                state.set_new_tip(unregistered).await
+            ));
+            let same_block = block_with(
+                &genesis,
+                vec![registration_announcement(reg, true), settle.clone()],
+            );
+            assert!(rejected_with::<UnregisteredBridgeSettlement>(
+                state.set_new_tip(same_block).await
+            ));
+
+            let block1 = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            state.set_new_tip(block1.clone()).await.unwrap();
+            let archival = state.chain.archival_state();
+            assert_eq!(archival.bridge_registration_current().await, Some(reg));
+            assert_eq!(
+                archival.bridge_state_commitment().await,
+                Some(reg.genesis_state_commitment)
+            );
+
+            let other_faucet = block_with(
+                &block1,
+                vec![settlement(
+                    reg.genesis_state_commitment,
+                    after_genesis,
+                    registration(2).faucet_id,
+                )],
+            );
+            assert!(rejected_with::<UnregisteredBridgeSettlement>(
+                state.set_new_tip(other_faucet).await
+            ));
+
+            let block2 = block_with(&block1, vec![settle]);
+            state.set_new_tip(block2.clone()).await.unwrap();
+            assert_eq!(
+                state.chain.archival_state().bridge_state_commitment().await,
+                Some(after_genesis)
+            );
+
+            let again = block_with(
+                &block2,
+                vec![registration_announcement(registration(2), true)],
+            );
+            assert!(rejected_with::<InvalidBridgeRegistration>(
+                state.set_new_tip(again).await
+            ));
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn unsigned_registration_is_refused() {
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let block1 = block_with(
+                &Block::genesis(NETWORK),
+                vec![registration_announcement(registration(1), false)],
+            );
+            assert!(rejected_with::<InvalidBridgeRegistration>(
+                state.set_new_tip(block1).await
+            ));
+            assert!(state
+                .chain
+                .archival_state()
+                .bridge_registration_current()
+                .await
+                .is_none());
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn reorg_reverts_registration() {
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let registered = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            state.set_new_tip(registered.clone()).await.unwrap();
+
+            let sibling = invalid_empty_block(&genesis, NETWORK);
+            state.set_new_tip(sibling.clone()).await.unwrap();
+            let archival = state.chain.archival_state();
+            assert!(archival.bridge_registration_current().await.is_none());
+            assert!(archival.bridge_state_commitment().await.is_none());
+            assert_eq!(
+                archival.bridge_registration_as_of(registered.hash()).await,
+                Some(reg)
+            );
+            assert_eq!(
+                archival.bridge_commitment_as_of(registered.hash()).await,
+                Some(reg.genesis_state_commitment)
+            );
+            assert!(archival
+                .bridge_registration_as_of(sibling.hash())
+                .await
+                .is_none());
+
+            // A settlement on the new branch is refused until the faucet is registered again.
+            let settle = block_with(
+                &sibling,
+                vec![settlement(
+                    reg.genesis_state_commitment,
+                    Digest::default(),
+                    reg.faucet_id,
+                )],
+            );
+            assert!(rejected_with::<UnregisteredBridgeSettlement>(
+                state.set_new_tip(settle).await
+            ));
+        }
+
+        fn mempool_tx(parent: &Block, announcements: Vec<Announcement>) -> Transaction {
+            let mut tx = make_mock_transaction_with_mutator_set_hash(
+                vec![],
+                vec![],
+                parent.mutator_set_accumulator_after().unwrap().hash(),
+            );
+            tx.kernel = TransactionKernelModifier::default()
+                .announcements(announcements)
+                .modify(tx.kernel);
+            tx
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn bridge_rules_against_parent_refuse_an_unsigned_registration() {
+            let gsl = regtest_state().await;
+            let state = gsl.lock_guard().await;
+            let genesis = Block::genesis(NETWORK);
+            let signed = block_with(
+                &genesis,
+                vec![registration_announcement(registration(1), true)],
+            );
+            let unsigned = block_with(
+                &genesis,
+                vec![registration_announcement(registration(1), false)],
+            );
+
+            assert!(state
+                .check_bridge_rules_against_parent(&signed)
+                .await
+                .is_ok());
+            assert!(rejected_with::<InvalidBridgeRegistration>(
+                state.check_bridge_rules_against_parent(&unsigned).await
+            ));
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn admission_refuses_a_repeated_deposit_commitment() {
+            use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+
+            let gsl = regtest_state().await;
+            let state = gsl.lock_guard().await;
+            let deposit = BridgeDepositData {
+                account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                amount: NativeCurrencyAmount::coins(2),
+                utxo_commitment: [BFieldElement::new(5); 5],
+                sender_randomness: [BFieldElement::new(7); 5],
+                receiver_preimage: [BFieldElement::new(0); 5],
+            }
+            .to_announcement();
+
+            let check = |anns: Vec<Announcement>| mempool_tx(&Block::genesis(NETWORK), anns).kernel;
+            assert!(state
+                .bridge_admission_check(&check(vec![deposit.clone()]))
+                .await
+                .is_ok());
+            let repeated_err = state
+                .bridge_admission_check(&check(vec![deposit.clone(), deposit]))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                repeated_err.to_string(),
+                "block carries two deposits of the same commitment"
+            );
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn admission_refuses_settlements_failing_the_gate_against_the_tip() {
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let block1 = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            state.set_new_tip(block1.clone()).await.unwrap();
+
+            let after = Digest::new([BFieldElement::new(5); 5]);
+            let fresh = settlement(reg.genesis_state_commitment, after, reg.faucet_id);
+            let stale = settlement(after, after, reg.faucet_id);
+            let mut unsigned = AggregatedAnnouncementData::from_announcement(&fresh).unwrap();
+            unsigned.authority_signatures.clear();
+
+            let check = |anns: Vec<Announcement>| mempool_tx(&block1, anns).kernel;
+            assert!(state
+                .bridge_admission_check(&check(vec![fresh.clone()]))
+                .await
+                .is_ok());
+            assert!(state.bridge_admission_check(&check(vec![])).await.is_ok());
+            let stale_err = state
+                .bridge_admission_check(&check(vec![stale]))
+                .await
+                .unwrap_err();
+            assert!(
+                stale_err.downcast_ref::<StaleBridgeSettlement>().is_some(),
+                "{stale_err:#}"
+            );
+            let unsigned_err = state
+                .bridge_admission_check(&check(vec![unsigned.to_announcement()]))
+                .await
+                .unwrap_err();
+            assert!(
+                unsigned_err
+                    .downcast_ref::<UnauthorizedBridgeSettlement>()
+                    .is_some(),
+                "{unsigned_err:#}"
+            );
+            let double_err = state
+                .bridge_admission_check(&check(vec![fresh.clone(), fresh]))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                double_err.to_string(),
+                "block carries more than one settlement announcement"
+            );
+        }
+
+        /// A link transaction admitted to the mempool is still refused by the block's bridge
+        /// selection, here because the block already carries a registration, and is then not fixed.
+        #[apply(shared_tokio_runtime)]
+        async fn composer_does_not_fix_a_link_tx_its_bridge_selection_refuses() {
+            use crate::application::loops::mine_loop::fix_resolved_link_tx_from_mempool;
+            use crate::application::triton_vm_job_queue::vm_job_queue;
+            use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+            use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+            use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+            use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+            use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
+            use crate::state::bridge_gate::BlockBridgeSelection;
+            use crate::state::bridge_gate::BridgeGate;
+
+            let mut gsl = regtest_state().await;
+            let genesis = Block::genesis(NETWORK);
+            let link = LinkTx {
+                kernel: LinkKernel {
+                    kernel: mempool_tx(
+                        &genesis,
+                        vec![registration_announcement(registration(1), true)],
+                    )
+                    .kernel,
+                    thruputs: vec![],
+                },
+                proof: LinkTxProof::Proof(NeptuneProof::invalid()),
+            };
+            let txid = link.txid();
+            gsl.lock_guard_mut()
+                .await
+                .mempool_insert_link(link, UpgradePriority::Critical, AddReason::Submitted)
+                .await;
+            assert!(gsl.lock_guard().await.mempool.get_link(txid).is_some());
+
+            let gate = BridgeGate::as_of(
+                gsl.lock_guard().await.chain.archival_state(),
+                genesis.hash(),
+            )
+            .await;
+            let mut selection = BlockBridgeSelection::new(gate);
+            let other = mempool_tx(
+                &genesis,
+                vec![registration_announcement(registration(2), true)],
+            );
+            assert!(selection.admit(&other.kernel));
+
+            let rules = ConsensusRuleSet::infer_from(NETWORK, BlockHeight::genesis());
+            let fixed = fix_resolved_link_tx_from_mempool(
+                &mut gsl,
+                &genesis,
+                rules,
+                rules,
+                Some(&mut selection),
+                vm_job_queue(),
+                TritonVmProofJobOptions::default_with_network(NETWORK),
+            )
+            .await
+            .unwrap();
+            assert!(fixed.is_none());
+            assert!(gsl.lock_guard().await.mempool.get_link(txid).is_some());
+
+            let unfiltered = fix_resolved_link_tx_from_mempool(
+                &mut gsl,
+                &genesis,
+                rules,
+                rules,
+                None,
+                vm_job_queue(),
+                TritonVmProofJobOptions::default_with_network(NETWORK),
+            )
+            .await
+            .unwrap();
+            assert_eq!(Some(txid), unfiltered.map(|tx| tx.txid()));
+        }
+
+        /// R4: replaying the tip on restart leaves every bridge table as the tip left it.
+        #[apply(shared_tokio_runtime)]
+        async fn restart_with_bridge_tip_round_trips() {
+            use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+            use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+            use crate::protocol::consensus::transaction::utxo::Utxo;
+            use crate::util_types::mutator_set::commit;
+
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let block1 = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            state.set_new_tip(block1.clone()).await.unwrap();
+
+            let amount = NativeCurrencyAmount::coins(2);
+            let sender_randomness = Digest::new([BFieldElement::new(11); 5]);
+            let utxo = Utxo::new_native_currency(bridge_lock_script().hash(), amount);
+            let output = commit(
+                Tip5::hash(&utxo),
+                sender_randomness,
+                Digest::default().hash(),
+            );
+            let deposit = BridgeDepositData {
+                account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                amount,
+                utxo_commitment: output.canonical_commitment.values(),
+                sender_randomness: sender_randomness.values(),
+                receiver_preimage: Digest::default().values(),
+            }
+            .to_announcement();
+            let mut tx = mempool_tx(
+                &block1,
+                vec![
+                    deposit,
+                    settlement(
+                        reg.genesis_state_commitment,
+                        Digest::new([BFieldElement::new(5); 5]),
+                        reg.faucet_id,
+                    ),
+                ],
+            );
+            tx.kernel = TransactionKernelModifier::default()
+                .outputs(vec![output])
+                .modify(tx.kernel);
+            state
+                .set_new_tip(invalid_block_with_transaction(&block1, tx))
+                .await
+                .unwrap();
+
+            let snapshot = async |global_state: &GlobalState| {
+                let archival = global_state.chain.archival_state();
+                (
+                    archival.bridge_state_commitment().await,
+                    archival.bridge_registration_current().await,
+                    archival
+                        .bridge_authority_set_current()
+                        .await
+                        .map(|authority| authority.commitment()),
+                    archival.bridge_pool_db.iter().collect_vec(),
+                )
+            };
+            let before = snapshot(&state).await;
+            assert_eq!(1, before.3.len(), "test premise: the deposit is pooled");
+
+            // `recover` reverts the tip's bridge delta before replaying it.
+            let tip = state.chain.light_state().hash();
+            state
+                .chain
+                .archival_state_mut()
+                .revert_bridge_delta(tip)
+                .await;
+            let reverted = snapshot(&state).await;
+            assert!(reverted.3.is_empty(), "the deposit leaves the pool");
+            assert_eq!(Some(reg.genesis_state_commitment), reverted.0);
+
+            state.chain.archival_state_mut().recover().await.unwrap();
+            assert_eq!(before, snapshot(&state).await);
+        }
+
+        /// A crash between a block's bridge writes and its sync label; `recover` redoes the block.
+        #[apply(shared_tokio_runtime)]
+        async fn recover_after_a_crash_mid_bridge_apply() {
+            use crate::protocol::consensus::bridge::authority_rotation::AuthorityRotationAnnouncement;
+            use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+            use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+            use crate::protocol::consensus::transaction::utxo::Utxo;
+            use crate::util_types::mutator_set::commit;
+
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let block1 = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            let amount = NativeCurrencyAmount::coins(2);
+            let sender_randomness = Digest::new([BFieldElement::new(11); 5]);
+            let utxo = Utxo::new_native_currency(bridge_lock_script().hash(), amount);
+            let output = commit(
+                Tip5::hash(&utxo),
+                sender_randomness,
+                Digest::default().hash(),
+            );
+            let deposit = BridgeDepositData {
+                account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                amount,
+                utxo_commitment: output.canonical_commitment.values(),
+                sender_randomness: sender_randomness.values(),
+                receiver_preimage: Digest::default().values(),
+            }
+            .to_announcement();
+            let mut tx = mempool_tx(
+                &block1,
+                vec![
+                    deposit,
+                    settlement(
+                        reg.genesis_state_commitment,
+                        Digest::new([BFieldElement::new(5); 5]),
+                        reg.faucet_id,
+                    ),
+                ],
+            );
+            tx.kernel = TransactionKernelModifier::default()
+                .outputs(vec![output])
+                .modify(tx.kernel);
+            let block2 = invalid_block_with_transaction(&block1, tx);
+
+            let mut scalar_two = [0u8; 32];
+            scalar_two[31] = 2;
+            let new_key = SigningKey::from_bytes(&scalar_two.into()).unwrap();
+            let mut rotation = AuthorityRotationAnnouncement {
+                new_keys: vec![new_key
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .to_vec()],
+                new_threshold: 1,
+                signatures: vec![],
+            };
+            let digest = rotation.rotation_digest(
+                NETWORK,
+                NETWORK.bridge_genesis_authority_set().unwrap().commitment(),
+            );
+            let new_key_signature: Signature = new_key
+                .sign_prehash(&settlement_signing_prehash(digest))
+                .unwrap();
+            rotation.signatures = vec![sign(digest), new_key_signature.to_bytes().into()];
+            let block3 = block_with(&block2, vec![rotation.to_announcement()]);
+
+            let snapshot = async |global_state: &GlobalState, crashed: Digest| {
+                let archival = global_state.chain.archival_state();
+                (
+                    archival.bridge_state_commitment().await,
+                    archival.bridge_registration_current().await,
+                    archival
+                        .bridge_authority_set_current()
+                        .await
+                        .map(|authority| authority.commitment()),
+                    archival.bridge_pool_db.iter().collect_vec(),
+                    archival.archival_mutator_set.get_sync_label(),
+                    archival.bridge_delta_db.get(crashed).await,
+                )
+            };
+            let blocks = [genesis, block1, block2, block3];
+            let mut clean_gsl = regtest_state().await;
+            let mut clean = clean_gsl.lock_guard_mut().await;
+            let mut expected = vec![];
+            for block in &blocks[1..] {
+                clean.set_new_tip(block.clone()).await.unwrap();
+                expected.push(snapshot(&clean, block.hash()).await);
+            }
+
+            // (index of the crashed block, whether its deposit's pool write was lost)
+            for (crashed, pool_write_lost) in [(1, false), (2, false), (2, true), (3, false)] {
+                let mut gsl = regtest_state().await;
+                let mut state = gsl.lock_guard_mut().await;
+                for block in &blocks[1..crashed] {
+                    state.set_new_tip(block.clone()).await.unwrap();
+                }
+                let (parent, block) = (&blocks[crashed - 1], &blocks[crashed]);
+                let prev_aocl_len = parent
+                    .mutator_set_accumulator_after()
+                    .unwrap()
+                    .aocl
+                    .num_leafs();
+                let archival = state.chain.archival_state_mut();
+                archival.write_block_as_tip(block).await.unwrap();
+                archival.apply_bridge_deposits(block, prev_aocl_len).await;
+                if pool_write_lost {
+                    let keys = archival
+                        .bridge_pool_db
+                        .iter()
+                        .map(|(key, _)| key)
+                        .collect_vec();
+                    for key in keys {
+                        archival.bridge_pool_db.delete(key).await;
+                    }
+                } else {
+                    archival
+                        .apply_bridge_unlock_pool_updates(block, prev_aocl_len)
+                        .await
+                        .unwrap();
+                    archival.apply_bridge_registration(block).await.unwrap();
+                    archival
+                        .apply_bridge_authority_rotation(block)
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(
+                    parent.hash(),
+                    archival.archival_mutator_set.get_sync_label(),
+                    "test premise: the sync label still lags the crashed block"
+                );
+
+                archival.recover().await.unwrap();
+                assert_eq!(
+                    expected[crashed - 1],
+                    snapshot(&state, block.hash()).await,
+                    "crash at block {crashed}, pool write lost: {pool_write_lost}"
+                );
+            }
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn new_tip_evicts_link_txs_it_made_inadmissible() {
+            use proptest::strategy::Strategy;
+            use proptest::strategy::ValueTree;
+
+            use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+            use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+            use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+            use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            // With inputs: the new tip evicts every zero-input transaction anyway.
+            let inputs: Vec<RemovalRecord> =
+                proptest::collection::vec(proptest_arbitrary_interop::arb::<RemovalRecord>(), 2)
+                    .new_tree(&mut proptest::test_runner::TestRunner::deterministic())
+                    .unwrap()
+                    .current();
+            let link = |input: &RemovalRecord, announcements| LinkTx {
+                kernel: LinkKernel {
+                    kernel: TransactionKernelModifier::default()
+                        .inputs(vec![input.clone()])
+                        .modify(mempool_tx(&genesis, announcements).kernel),
+                    thruputs: vec![],
+                },
+                proof: LinkTxProof::Proof(NeptuneProof::invalid()),
+            };
+            let second_registration = link(
+                &inputs[0],
+                vec![registration_announcement(registration(2), true)],
+            );
+            let plain = link(&inputs[1], vec![]);
+            let (registration_txid, plain_txid) = (second_registration.txid(), plain.txid());
+            for link_tx in [second_registration, plain] {
+                state
+                    .mempool_insert_link(link_tx, UpgradePriority::Irrelevant, AddReason::FromPeer)
+                    .await;
+            }
+            assert!(state.mempool.get_link(registration_txid).is_some());
+
+            let block1 = block_with(
+                &genesis,
+                vec![registration_announcement(registration(1), true)],
+            );
+            state.set_new_tip(block1).await.unwrap();
+            assert!(state.mempool.get_link(registration_txid).is_none());
+            assert!(state.mempool.get_link(plain_txid).is_some());
+        }
+
+        /// Every mempool insert goes through one of these funnels, so every caller (peers, RPC,
+        /// the proof upgrader, the composer's fixed link) is gated.
+        #[apply(shared_tokio_runtime)]
+        async fn mempool_funnels_refuse_txs_failing_the_bridge_gate() {
+            use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+            use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+            use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+            use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let reg = registration(1);
+            let block1 = block_with(
+                &Block::genesis(NETWORK),
+                vec![registration_announcement(reg, true)],
+            );
+            state.set_new_tip(block1.clone()).await.unwrap();
+
+            let after = Digest::new([BFieldElement::new(5); 5]);
+            let stale = mempool_tx(&block1, vec![settlement(after, after, reg.faucet_id)]);
+            let fresh = mempool_tx(
+                &block1,
+                vec![settlement(
+                    reg.genesis_state_commitment,
+                    after,
+                    reg.faucet_id,
+                )],
+            );
+            assert!(
+                !state
+                    .mempool_insert(stale, UpgradePriority::Critical, AddReason::FromPeer)
+                    .await
+            );
+            assert!(state.mempool.is_empty());
+            assert!(
+                state
+                    .mempool_insert(fresh, UpgradePriority::Critical, AddReason::FromPeer)
+                    .await
+            );
+            assert_eq!(1, state.mempool.len());
+
+            let link = |announcements| LinkTx {
+                kernel: LinkKernel {
+                    kernel: mempool_tx(&block1, announcements).kernel,
+                    thruputs: vec![],
+                },
+                proof: LinkTxProof::Proof(NeptuneProof::invalid()),
+            };
+            let second_registration = link(vec![registration_announcement(registration(2), true)]);
+            let txid = second_registration.txid();
+            state
+                .mempool_insert_link(
+                    second_registration,
+                    UpgradePriority::Critical,
+                    AddReason::FromPeer,
+                )
+                .await;
+            assert!(state.mempool.get_link(txid).is_none());
+
+            let plain = link(vec![]);
+            let plain_txid = plain.txid();
+            state
+                .mempool_insert_link(plain, UpgradePriority::Critical, AddReason::FromPeer)
+                .await;
+            assert!(state.mempool.get_link(plain_txid).is_some());
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn signed_pool_consolidation_merges_pool_entries_and_reorg_restores_them() {
+            use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+            use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+            use crate::protocol::consensus::bridge::pool_consolidation::utxo_input_digest;
+            use crate::protocol::consensus::bridge::pool_consolidation::PoolConsolidationAuthorization;
+            use crate::protocol::consensus::transaction::utxo::Utxo;
+            use crate::util_types::mutator_set::commit;
+            use crate::util_types::mutator_set::removal_record::RemovalRecord;
+
+            fn block_spending(
+                parent: &Block,
+                inputs: Vec<RemovalRecord>,
+                outputs: Vec<AdditionRecord>,
+                announcements: Vec<Announcement>,
+            ) -> Block {
+                let mut tx = make_mock_transaction_with_mutator_set_hash(
+                    inputs,
+                    outputs,
+                    parent.mutator_set_accumulator_after().unwrap().hash(),
+                );
+                tx.kernel = TransactionKernelModifier::default()
+                    .announcements(announcements)
+                    .modify(tx.kernel);
+                invalid_block_with_transaction(parent, tx)
+            }
+            let pool = |state: &GlobalState| {
+                let mut entries = state
+                    .chain
+                    .archival_state()
+                    .bridge_pool_db
+                    .iter()
+                    .map(|(_, entry)| (entry.amount, entry.aocl_leaf_index))
+                    .collect_vec();
+                entries.sort_by_key(|(_, aocl)| *aocl);
+                entries
+            };
+
+            let mut gsl = regtest_state().await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let block1 = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            state.set_new_tip(block1.clone()).await.unwrap();
+
+            let lock_script_hash = bridge_lock_script().hash();
+            let receiver_preimage = Digest::default();
+            let deposits = (1..=3u64)
+                .map(|i| {
+                    let amount = NativeCurrencyAmount::coins(u32::try_from(i).unwrap());
+                    let sender_randomness = Digest::new([BFieldElement::new(10 + i); 5]);
+                    let utxo = Utxo::new_native_currency(lock_script_hash, amount);
+                    let output = commit(
+                        Tip5::hash(&utxo),
+                        sender_randomness,
+                        receiver_preimage.hash(),
+                    );
+                    let announcement = BridgeDepositData {
+                        account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                        amount,
+                        utxo_commitment: output.canonical_commitment.values(),
+                        sender_randomness: sender_randomness.values(),
+                        receiver_preimage: receiver_preimage.values(),
+                    }
+                    .to_announcement();
+                    (utxo, sender_randomness, output, announcement)
+                })
+                .collect_vec();
+            let block2 = block_spending(
+                &block1,
+                vec![],
+                deposits.iter().map(|d| d.2).collect(),
+                deposits.iter().map(|d| d.3.clone()).collect(),
+            );
+            state.set_new_tip(block2.clone()).await.unwrap();
+            let deposited = pool(&state);
+            assert_eq!(deposited.len(), 3);
+
+            let spend_deposits = async |global_state: &GlobalState| {
+                let msa = global_state
+                    .chain
+                    .light_state()
+                    .mutator_set_accumulator_after()
+                    .unwrap();
+                let mut removal_records = vec![];
+                for ((utxo, sender_randomness, _, _), (_, aocl)) in deposits.iter().zip(&deposited)
+                {
+                    let item = Tip5::hash(utxo);
+                    let membership_proof = global_state
+                        .chain
+                        .archival_state()
+                        .archival_mutator_set
+                        .ams()
+                        .restore_membership_proof(
+                            item,
+                            *sender_randomness,
+                            receiver_preimage,
+                            *aocl,
+                        )
+                        .await
+                        .unwrap();
+                    removal_records.push(msa.drop(item, &membership_proof));
+                }
+                removal_records
+            };
+            let inputs = spend_deposits(&state).await;
+            let change_sr = Digest::new([BFieldElement::new(20); 5]);
+            let change = commit(
+                Tip5::hash(&Utxo::new_native_currency(
+                    lock_script_hash,
+                    NativeCurrencyAmount::coins(6),
+                )),
+                change_sr,
+                Digest::default().hash(),
+            );
+            let authorization = PoolConsolidationAuthorization::new(
+                change.canonical_commitment,
+                deposits
+                    .iter()
+                    .zip(&deposited)
+                    .map(|((utxo, sr, _, _), (_, aocl))| {
+                        utxo_input_digest(utxo, *sr, receiver_preimage, *aocl)
+                    })
+                    .collect(),
+            );
+            let mut settlement = AggregatedAnnouncementData {
+                prev_state_commitment: reg.genesis_state_commitment,
+                new_state_commitment: reg.genesis_state_commitment,
+                exit_root: Digest::default(),
+                faucet_id: reg.faucet_id,
+                prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+                burns: vec![],
+                change_sender_randomness: Some(change_sr),
+                authority_signatures: vec![],
+            };
+            settlement.authority_signatures = vec![sign(authorization.digest(
+                NETWORK,
+                reg.faucet_id,
+                reg.genesis_state_commitment,
+            ))];
+            let undercounted = commit(
+                Tip5::hash(&Utxo::new_native_currency(
+                    lock_script_hash,
+                    NativeCurrencyAmount::coins(5),
+                )),
+                change_sr,
+                Digest::default().hash(),
+            );
+            let undercounted_auth = PoolConsolidationAuthorization::new(
+                undercounted.canonical_commitment,
+                authorization.input_digests.clone(),
+            );
+            let short_auth = PoolConsolidationAuthorization::new(
+                change.canonical_commitment,
+                authorization.input_digests[1..].to_vec(),
+            );
+            let mut other_sr = settlement.clone();
+            other_sr.change_sender_randomness = Some(Digest::new([BFieldElement::new(21); 5]));
+            for (mut announced, auth, output) in [
+                (settlement.clone(), &undercounted_auth, undercounted),
+                (settlement.clone(), &short_auth, change),
+                (other_sr, &authorization, change),
+            ] {
+                announced.authority_signatures = vec![sign(auth.digest(
+                    NETWORK,
+                    reg.faucet_id,
+                    reg.genesis_state_commitment,
+                ))];
+                let bad = block_spending(
+                    &block2,
+                    inputs.clone(),
+                    vec![output],
+                    vec![announced.to_announcement(), auth.to_announcement()],
+                );
+                assert!(rejected_with::<InvalidBridgeChange>(
+                    state.set_new_tip(bad).await
+                ));
+                assert_eq!(
+                    pool(&state),
+                    deposited,
+                    "a rejected block leaves the pool alone"
+                );
+            }
+
+            // A deposit copying the change's commitment, a block ahead of it: both stay tracked.
+            let collider = BridgeDepositData {
+                account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                amount: NativeCurrencyAmount::coins(6),
+                utxo_commitment: change.canonical_commitment.values(),
+                sender_randomness: change_sr.values(),
+                receiver_preimage: Digest::default().values(),
+            }
+            .to_announcement();
+            let block3 = block_spending(&block2, vec![], vec![change], vec![collider]);
+            state.set_new_tip(block3.clone()).await.unwrap();
+            let with_collider = pool(&state);
+            assert_eq!(with_collider.len(), 4);
+
+            let announcements = vec![
+                settlement.to_announcement(),
+                authorization.to_announcement(),
+            ];
+            let inputs_at_block3 = spend_deposits(&state).await;
+            let block4 = block_spending(&block3, inputs_at_block3, vec![change], announcements);
+            state.set_new_tip(block4.clone()).await.unwrap();
+            let consolidated = pool(&state);
+            assert_eq!(
+                consolidated.iter().map(|(amount, _)| *amount).collect_vec(),
+                vec![NativeCurrencyAmount::coins(6); 2],
+                "the change and the colliding deposit are both tracked"
+            );
+
+            state
+                .set_new_tip(block_with(&block3, vec![]))
+                .await
+                .unwrap();
+            assert_eq!(
+                pool(&state),
+                with_collider,
+                "reorg restores the consolidated entries"
+            );
+            state
+                .set_new_tip(block_with(&block2, vec![]))
+                .await
+                .unwrap();
+            assert_eq!(pool(&state), deposited, "and drops the colliding deposit");
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn new_tip_evicts_settlements_it_made_stale() {
+            // Pinned so the node makes update jobs for its SingleProof txs.
+            let cli = cli_args::Args {
+                tx_proving_capability: Some(TxProvingCapability::SingleProof),
+                ..cli_args::Args::default_with_network(NETWORK)
+            };
+            let mut gsl = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+            let mut state = gsl.lock_guard_mut().await;
+            let genesis = Block::genesis(NETWORK);
+            let reg = registration(1);
+            let block1 = block_with(&genesis, vec![registration_announcement(reg, true)]);
+            state.set_new_tip(block1.clone()).await.unwrap();
+
+            let mined = settlement(
+                reg.genesis_state_commitment,
+                Digest::new([BFieldElement::new(5); 5]),
+                reg.faucet_id,
+            );
+            // With inputs: the new tip evicts every zero-input transaction anyway.
+            let inputs: Vec<RemovalRecord> = {
+                use proptest::strategy::Strategy;
+                use proptest::strategy::ValueTree;
+                proptest::collection::vec(proptest_arbitrary_interop::arb::<RemovalRecord>(), 2)
+                    .new_tree(&mut proptest::test_runner::TestRunner::deterministic())
+                    .unwrap()
+                    .current()
+            };
+            let spending = |input: &RemovalRecord, tx: Transaction| Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .inputs(vec![input.clone()])
+                    .modify(tx.kernel),
+                proof: tx.proof,
+            };
+            let sibling = spending(
+                &inputs[0],
+                mempool_tx(
+                    &block1,
+                    vec![settlement(
+                        reg.genesis_state_commitment,
+                        Digest::new([BFieldElement::new(6); 5]),
+                        reg.faucet_id,
+                    )],
+                ),
+            );
+            let normal = spending(&inputs[1], mempool_tx(&block1, vec![]));
+            state
+                .mempool_insert(
+                    sibling.clone(),
+                    UpgradePriority::Critical,
+                    AddReason::Submitted,
+                )
+                .await;
+            state
+                .mempool_insert(
+                    normal.clone(),
+                    UpgradePriority::Critical,
+                    AddReason::Submitted,
+                )
+                .await;
+            assert!(state.mempool.contains(sibling.kernel.txid()));
+
+            let jobs = state
+                .set_new_tip(block_with(&block1, vec![mined]))
+                .await
+                .unwrap();
+            assert!(!state.mempool.contains(sibling.kernel.txid()));
+            assert!(jobs.iter().all(|job| job.txid() != sibling.kernel.txid()));
+            assert!(state.mempool.contains(normal.kernel.txid()));
         }
     }
 

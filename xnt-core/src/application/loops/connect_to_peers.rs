@@ -122,7 +122,9 @@ fn min_version_following(consensus_rule_set: ConsensusRuleSet) -> Option<semver:
         | ConsensusRuleSet::UpgradeVMv4
         | ConsensusRuleSet::UpgradeVMv5
         | ConsensusRuleSet::UpgradeVMv7 => None,
-        ConsensusRuleSet::UpgradeVMv8 => Some(semver::Version::new(0, 3, 0)),
+        ConsensusRuleSet::UpgradeVMv8 | ConsensusRuleSet::LeviathanSettlement => {
+            Some(semver::Version::new(0, 3, 0))
+        }
     }
 }
 
@@ -895,6 +897,11 @@ mod tests {
                 version_follows_rule_set(version, ConsensusRuleSet::UpgradeVMv8),
                 "version {version}"
             );
+            assert_eq!(
+                follows,
+                version_follows_rule_set(version, ConsensusRuleSet::LeviathanSettlement),
+                "version {version}"
+            );
             assert!(
                 version_follows_rule_set(version, ConsensusRuleSet::UpgradeVMv7),
                 "before the fork, version {version} is not refused for its rule set"
@@ -905,7 +912,7 @@ mod tests {
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn refuse_connection_from_version_not_following_the_tip_rule_set() -> Result<()> {
-        // Main's genesis tip precedes the fork; regtest follows `UpgradeVMv8`
+        // Main's genesis tip precedes the fork; regtest follows `LeviathanSettlement`
         // from genesis.
         for (network, refused) in [(Network::Main, false), (Network::RegTest, true)] {
             let cli = cli_args::Args {

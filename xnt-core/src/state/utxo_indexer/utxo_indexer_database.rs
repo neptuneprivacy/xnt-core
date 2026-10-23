@@ -75,12 +75,22 @@ impl UtxoIndexerDatabase {
                 }
                 Ordering::Less => {
                     if migrate {
-                        // Future: implement migrations here
-                        // For now, just update version since no migration logic needed yet
+                        // v1 → v2: IndexedUtxo changed from struct to enum.
+                        // Old data can't deserialize. Clear all tables and re-index.
+                        tracing::warn!(
+                            "Migrating UTXO indexer v{} → v{}: clearing stale data for re-index",
+                            schema_version,
+                            UTXO_INDEXER_SCHEMA_VERSION
+                        );
+                        tables.utxos.clear().await;
+                        tables.commitment_index.clear().await;
+                        tables.removal_index.clear().await;
+                        tables.orphaned_blocks.clear().await;
+                        tables.sync_height.set(BlockHeight::genesis()).await;
                         tables.schema_version.set(UTXO_INDEXER_SCHEMA_VERSION).await;
                         storage.persist().await;
                         tracing::info!(
-                            "Updated UTXO indexer schema version to v{}",
+                            "UTXO indexer migrated to v{}. Will re-index from genesis.",
                             UTXO_INDEXER_SCHEMA_VERSION
                         );
                     } else {
@@ -119,9 +129,9 @@ impl UtxoIndexerDatabase {
             if let Some(utxos) = self.tables.utxos.get(&(*receiver_id_hash, bucket)).await {
                 for utxo in utxos {
                     // Filter by exact height range AND not orphaned
-                    if utxo.block_height >= from_height
-                        && utxo.block_height <= to_height
-                        && !orphaned.contains(&utxo.block_digest)
+                    if utxo.block_height() >= from_height
+                        && utxo.block_height() <= to_height
+                        && !orphaned.contains(&utxo.block_digest())
                     {
                         result.push(utxo);
                     }
@@ -140,7 +150,7 @@ impl UtxoIndexerDatabase {
         for bucket in 0..=max_bucket {
             if let Some(utxos) = self.tables.utxos.get(&(*receiver_id_hash, bucket)).await {
                 for utxo in utxos {
-                    if !orphaned.contains(&utxo.block_digest) {
+                    if !orphaned.contains(&utxo.block_digest()) {
                         result.push(utxo);
                     }
                 }
@@ -150,7 +160,7 @@ impl UtxoIndexerDatabase {
     }
 
     pub async fn add_utxo(&mut self, receiver_id_hash: Digest, utxo: IndexedUtxo) {
-        let bucket = height_to_bucket(utxo.block_height);
+        let bucket = height_to_bucket(utxo.block_height());
         let key = (receiver_id_hash, bucket);
 
         let mut utxos = self.tables.utxos.get(&key).await.unwrap_or_default();
@@ -166,7 +176,7 @@ impl UtxoIndexerDatabase {
         let mut by_bucket: std::collections::HashMap<u64, Vec<IndexedUtxo>> =
             std::collections::HashMap::new();
         for utxo in new_utxos {
-            let bucket = height_to_bucket(utxo.block_height);
+            let bucket = height_to_bucket(utxo.block_height());
             by_bucket.entry(bucket).or_default().push(utxo);
         }
 
@@ -211,14 +221,30 @@ impl UtxoIndexerDatabase {
         results
     }
 
-    pub async fn add_removal(&mut self, absolute_index_set_hash: Digest, height: BlockHeight, block_digest: Digest) {
-        self.tables.removal_index.insert(absolute_index_set_hash, (height, block_digest)).await;
+    pub async fn add_removal(
+        &mut self,
+        absolute_index_set_hash: Digest,
+        height: BlockHeight,
+        block_digest: Digest,
+    ) {
+        self.tables
+            .removal_index
+            .insert(absolute_index_set_hash, (height, block_digest))
+            .await;
     }
 
     /// Returns spent_at_height if UTXO is spent (and not orphaned), None otherwise
     pub async fn get_spent_status(&self, absolute_index_set_hash: &Digest) -> Option<BlockHeight> {
-        if let Some((height, block_digest)) = self.tables.removal_index.get(absolute_index_set_hash).await {
-            if !self.tables.orphaned_blocks.get(&block_digest).await.is_some() {
+        if let Some((height, block_digest)) =
+            self.tables.removal_index.get(absolute_index_set_hash).await
+        {
+            if !self
+                .tables
+                .orphaned_blocks
+                .get(&block_digest)
+                .await
+                .is_some()
+            {
                 return Some(height);
             }
         }
@@ -263,17 +289,47 @@ impl UtxoIndexerDatabase {
         self.index_block_internal(block, prev_aocl_len, false).await
     }
 
-    async fn index_block_internal(&mut self, block: &Block, prev_aocl_len: u64, update_sync: bool) -> u64 {
+    async fn index_block_internal(
+        &mut self,
+        block: &Block,
+        prev_aocl_len: u64,
+        update_sync: bool,
+    ) -> u64 {
         let height = block.kernel.header.height;
         let block_digest = block.hash();
 
-        // Index announcements (UTXOs)
+        // Index encrypted announcements (normal UTXOs)
         for announcement in block.kernel.body.transaction_kernel.announcements.iter() {
             if let Ok(receiver_id) = receiver_identifier_from_announcement(announcement) {
                 if let Ok(ciphertext) = ciphertext_from_announcement(announcement) {
                     let receiver_id_hash = Tip5::hash_varlen(&[receiver_id]);
-                    let indexed_utxo = IndexedUtxo::new(height, block_digest, ciphertext);
+                    let indexed_utxo = IndexedUtxo::new_encrypted(height, block_digest, ciphertext);
                     self.add_utxo(receiver_id_hash, indexed_utxo).await;
+                }
+            }
+        }
+
+        // Index bridge burn UTXOs (public, non-encrypted)
+        {
+            use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+
+            let announcements = &block.kernel.body.transaction_kernel.announcements;
+            if let Some(ann) = AggregatedAnnouncementData::find_in_announcements(announcements) {
+                for burn in &ann.burns {
+                    // An overflowing payout cannot be in a valid block.
+                    let Some(amount) = burn.payout() else {
+                        continue;
+                    };
+                    let receiver_id_hash = Tip5::hash_varlen(&[burn.receiver_identifier]);
+                    let indexed = IndexedUtxo::new_public(
+                        height,
+                        block_digest,
+                        receiver_id_hash,
+                        burn.lock_script_hash,
+                        amount,
+                        burn.sender_randomness(),
+                    );
+                    self.add_utxo(receiver_id_hash, indexed).await;
                 }
             }
         }
@@ -282,7 +338,8 @@ impl UtxoIndexerDatabase {
         let outputs = &block.kernel.body.transaction_kernel.outputs;
         for (i, output) in outputs.iter().enumerate() {
             let aocl_leaf_index = prev_aocl_len + i as u64;
-            self.add_commitment(output.canonical_commitment, aocl_leaf_index).await;
+            self.add_commitment(output.canonical_commitment, aocl_leaf_index)
+                .await;
         }
 
         // Index inputs (removal records)
@@ -351,12 +408,12 @@ mod tests {
 
         // Create test data
         let receiver_id_hash = Digest::default();
-        let utxo1 = IndexedUtxo::new(
+        let utxo1 = IndexedUtxo::new_encrypted(
             BlockHeight::from(100u64),
             Digest::default(),
             vec![BFieldElement::new(1)],
         );
-        let utxo2 = IndexedUtxo::new(
+        let utxo2 = IndexedUtxo::new_encrypted(
             BlockHeight::from(1500u64), // Different bucket (bucket 1)
             Digest::default(),
             vec![BFieldElement::new(2)],
@@ -380,18 +437,18 @@ mod tests {
             )
             .await;
         assert_eq!(range_utxos.len(), 1);
-        assert_eq!(range_utxos[0].block_height, BlockHeight::from(100u64));
+        assert_eq!(range_utxos[0].block_height(), BlockHeight::from(100u64));
 
         // Test range query - only bucket 1
-        let range_utxos = indexer
+        let bucket1_utxos = indexer
             .get_utxos_in_range(
                 &receiver_id_hash,
                 BlockHeight::from(1000u64),
                 BlockHeight::from(1999u64),
             )
             .await;
-        assert_eq!(range_utxos.len(), 1);
-        assert_eq!(range_utxos[0].block_height, BlockHeight::from(1500u64));
+        assert_eq!(bucket1_utxos.len(), 1);
+        assert_eq!(bucket1_utxos[0].block_height(), BlockHeight::from(1500u64));
 
         // Test sync height
         assert_eq!(indexer.get_sync_height(), BlockHeight::from(1500u64));
@@ -415,12 +472,12 @@ mod tests {
             BFieldElement::new(999),
         ]);
 
-        let utxo1 = IndexedUtxo::new(
+        let utxo1 = IndexedUtxo::new_encrypted(
             BlockHeight::from(100u64),
             Digest::default(), // canonical block
             vec![],
         );
-        let utxo2 = IndexedUtxo::new(
+        let utxo2 = IndexedUtxo::new_encrypted(
             BlockHeight::from(200u64),
             orphaned_block_digest, // will be orphaned
             vec![],
@@ -442,7 +499,7 @@ mod tests {
         // After reorg - only canonical UTXO visible
         let remaining = indexer.get_all_utxos(&receiver_id_hash).await;
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].block_height, BlockHeight::from(100u64));
+        assert_eq!(remaining[0].block_height(), BlockHeight::from(100u64));
 
         // Check is_block_orphaned
         assert!(indexer.is_block_orphaned(&orphaned_block_digest).await);
@@ -463,7 +520,7 @@ mod tests {
         // Add UTXOs across multiple buckets
         for i in 0..5 {
             let height = i * 500; // 0, 500, 1000, 1500, 2000
-            let utxo = IndexedUtxo::new(
+            let utxo = IndexedUtxo::new_encrypted(
                 BlockHeight::from(height),
                 Digest::default(),
                 vec![BFieldElement::new(i)], // Use ciphertext to identify
@@ -484,7 +541,10 @@ mod tests {
 
         // Should get: 500, 1000 (not 0, 1500, 2000)
         assert_eq!(range_utxos.len(), 2);
-        let heights: Vec<u64> = range_utxos.iter().map(|u| u64::from(u.block_height)).collect();
+        let heights: Vec<u64> = range_utxos
+            .iter()
+            .map(|u| u64::from(u.block_height()))
+            .collect();
         assert!(heights.contains(&500)); // height 500
         assert!(heights.contains(&1000)); // height 1000
     }
@@ -529,10 +589,7 @@ mod tests {
         // Test single lookup
         assert_eq!(indexer.get_aocl_leaf_index(&commitment1).await, Some(100));
         assert_eq!(indexer.get_aocl_leaf_index(&commitment2).await, Some(200));
-        assert_eq!(
-            indexer.get_aocl_leaf_index(&unknown_commitment).await,
-            None
-        );
+        assert_eq!(indexer.get_aocl_leaf_index(&unknown_commitment).await, None);
 
         // Test batch lookup
         let results = indexer

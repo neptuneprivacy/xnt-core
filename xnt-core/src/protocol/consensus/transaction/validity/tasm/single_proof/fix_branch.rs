@@ -23,7 +23,6 @@ use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::DISCRIMINANT_FOR_FIX;
 use crate::protocol::consensus::transaction::TransactionKernel;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 
 /// The witness consumed by [`FixBranch`].
 ///
@@ -97,7 +96,7 @@ impl FixWitness {
     /// doing the instantiating, which the outer verifier has already pinned.
     pub(crate) fn link_proof_claim(&self, single_proof_digest: Digest) -> Claim {
         let input = link_proof_public_input(self.link_kernel_mast_hash(), single_proof_digest);
-        Claim::new(LinkProof.hash())
+        Claim::new(LinkProof::digest_paired_with(single_proof_digest))
             .with_input(input.individual_tokens)
             .with_output(link_proof_public_output(single_proof_digest))
     }
@@ -174,12 +173,19 @@ pub struct FixBranch {
     /// so a slot this size has two addresses and every use has to pick the
     /// right one.
     single_proof_digest_alloc: StaticAllocation,
+
+    /// The digest of the era's link-proof program, which this branch verifies.
+    link_proof_digest: Digest,
 }
 
 impl FixBranch {
-    pub(crate) fn new(single_proof_digest_alloc: StaticAllocation) -> Self {
+    pub(crate) fn new(
+        single_proof_digest_alloc: StaticAllocation,
+        link_proof_digest: Digest,
+    ) -> Self {
         Self {
             single_proof_digest_alloc,
+            link_proof_digest,
         }
     }
 
@@ -267,7 +273,7 @@ impl BasicSnippet for FixBranch {
             // _ [own_program_digest] disc [txk_digest] *witness [lkmh]
             // (lkmh = hash_pair(txkmh, no_thruputs)
 
-            {&push_digest(LinkProof.hash())}
+            {&push_digest(self.link_proof_digest)}
             // _ .. *witness [lkmh] [link_proof_digest]
 
             call {generate_link_proof_claim}
@@ -332,6 +338,7 @@ pub(crate) mod tests {
     use crate::protocol::proof_abstractions::tasm::program::prove_consensus_program;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
     use crate::protocol::proof_abstractions::tasm::program::ConsensusError;
+    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
     use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
     use crate::protocol::proof_abstractions::SecretWitness;
 
@@ -349,7 +356,7 @@ pub(crate) mod tests {
             /* recursively verify the link proof, naming this very program as the
             `D` the whole `LinkProof` derivation was indexed by */
             let input = link_proof_public_input(lkmh, single_proof_program_digest);
-            let claim = Claim::new(LinkProof.hash())
+            let claim = Claim::new(LinkProof::digest_paired_with(single_proof_program_digest))
                 .with_input(input.individual_tokens)
                 .with_output(link_proof_public_output(single_proof_program_digest));
             tasm::verify_stark(Stark::default(), &claim, &self.link_proof);

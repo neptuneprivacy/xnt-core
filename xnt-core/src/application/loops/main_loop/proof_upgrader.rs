@@ -11,7 +11,6 @@ use tracing::info;
 use tracing::warn;
 
 use crate::api::tx_initiation::builder::transaction_proof_builder::TransactionProofBuilder;
-use crate::state::mempool::mempool_event::AddReason;
 use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
 use crate::api::tx_initiation::legacy_era::prove_legacy_era_proof_collection;
 use crate::api::tx_initiation::legacy_era::prove_legacy_era_single_proof;
@@ -32,8 +31,8 @@ use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
-use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
 use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
@@ -41,6 +40,7 @@ use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::mempool::mempool_event::AddReason;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 use crate::state::transaction::tx_proving_capability::TxProvingCapability;
@@ -209,7 +209,7 @@ impl UpdateLinkJob {
 #[derive(Clone, Debug)]
 pub struct ProofCollectionToSingleProof {
     kernel: TransactionKernel,
-    proof: ProofCollection,
+    proof: AnyProofCollection,
     mutator_set: MutatorSetAccumulator,
     upgrade_incentive: UpgradeIncentive,
 }
@@ -217,7 +217,7 @@ pub struct ProofCollectionToSingleProof {
 impl ProofCollectionToSingleProof {
     pub(crate) fn new(
         kernel: TransactionKernel,
-        proof: ProofCollection,
+        proof: AnyProofCollection,
         mutator_set: MutatorSetAccumulator,
         upgrade_incentive: UpgradeIncentive,
     ) -> Self {
@@ -367,6 +367,10 @@ impl UpdateMutatorSetDataJob {
             upgrade_incentive,
             consensus_rule_set,
         }
+    }
+
+    pub(crate) fn kernel(&self) -> &TransactionKernel {
+        &self.old_kernel
     }
 
     pub(crate) async fn upgrade(
@@ -941,11 +945,22 @@ impl UpgradeJob {
                         return;
                     }
 
+                    if let Err(e) = global_state.bridge_admission_check(&upgraded.kernel).await {
+                        warn!("Upgraded transaction fails the bridge gate, dropping it: {e:#}");
+                        // Or the same inputs, e.g. a merge of two equal deposits, are proven again.
+                        global_state.mempool_record_upgrade_failure(affected_txids);
+                        return;
+                    }
+
                     /* Handle successful upgrade */
                     // Insert tx into mempool before notifying peers, so we're
                     // sure to have it when they ask.
                     global_state
-                        .mempool_insert(upgraded.clone(), upgrade_incentive.into(), AddReason::Upgraded)
+                        .mempool_insert(
+                            upgraded.clone(),
+                            upgrade_incentive.into(),
+                            AddReason::Upgraded,
+                        )
                         .await;
                     drop(global_state); // sooner is better.
 
@@ -1196,6 +1211,12 @@ impl UpgradeJob {
                 proof,
                 ..
             }) => {
+                // A collection of the previous era has the sub-proofs of this one's.
+                let proof = proof
+                    .into_layout_of(consensus_rule_set, &kernel)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("bridge proofs have no place under {consensus_rule_set}")
+                    })?;
                 let single_proof = TransactionProofBuilder::new()
                     .consensus_rule_set(consensus_rule_set)
                     .proof_collection(proof)
@@ -1550,7 +1571,11 @@ mod tests {
                 mock_genesis_global_state(2, WalletEntropy::new_random(), cli_args.clone()).await;
             let mut rando = rando.lock_guard_mut().await;
             rando
-                .mempool_insert(pc_tx_low_fee.clone().into(), upgrade_priority, AddReason::Submitted)
+                .mempool_insert(
+                    pc_tx_low_fee.clone().into(),
+                    upgrade_priority,
+                    AddReason::Submitted,
+                )
                 .await;
             assert!(
                 !upgrade_priority.is_irrelevant()
@@ -1569,7 +1594,11 @@ mod tests {
             )
             .await;
             rando
-                .mempool_insert(pc_tx_high_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted)
+                .mempool_insert(
+                    pc_tx_high_fee.clone().into(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::Submitted,
+                )
                 .await;
             let job = get_upgrade_task_from_mempool(&rando).await.unwrap();
             let UpgradeJob::ProofCollectionToSingleProof(ProofCollectionToSingleProof {
@@ -1708,7 +1737,11 @@ mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*pwtx).clone(), UpgradePriority::Critical, AddReason::Submitted)
+                .mempool_insert(
+                    (*pwtx).clone(),
+                    UpgradePriority::Critical,
+                    AddReason::Submitted,
+                )
                 .await;
             let TransactionProof::Witness(pw) = &pwtx.proof else {
                 panic!("Expected PW-backed tx");
@@ -1800,7 +1833,11 @@ mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*pwtx).clone(), UpgradePriority::Critical, AddReason::Submitted)
+                .mempool_insert(
+                    (*pwtx).clone(),
+                    UpgradePriority::Critical,
+                    AddReason::Submitted,
+                )
                 .await;
             let TransactionProof::Witness(pw) = &pwtx.proof else {
                 panic!("Expected PW-backed tx");
@@ -1907,7 +1944,11 @@ mod tests {
             alice
                 .lock_guard_mut()
                 .await
-                .mempool_insert(single_proof_tx.clone().into(), UpgradePriority::Critical, AddReason::Submitted)
+                .mempool_insert(
+                    single_proof_tx.clone().into(),
+                    UpgradePriority::Critical,
+                    AddReason::Submitted,
+                )
                 .await;
             transactions.push(single_proof_tx);
         }

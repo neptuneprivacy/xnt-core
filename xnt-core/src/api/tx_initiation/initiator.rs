@@ -14,6 +14,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use serde::Deserialize;
+use serde::Serialize;
+
+use super::bridge_deposit::bridge_deposit_tx_details;
+use super::bridge_deposit::MAX_BRIDGE_DEPOSIT_INPUTS;
 use tasm_lib::prelude::Digest;
 
 use super::error;
@@ -35,6 +40,8 @@ use crate::application::loops::main_loop::proof_upgrader::ForgeJob;
 use crate::application::loops::main_loop::proof_upgrader::UpdateLinkJob;
 use crate::application::loops::main_loop::proof_upgrader::SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE;
 use crate::application::triton_vm_job_queue::vm_job_queue;
+use crate::protocol::consensus::bridge::deposit_announcement::MIN_BRIDGE_AMOUNT;
+use crate::protocol::consensus::bridge::has_proof_bound_tag;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::lock_script::LockScript;
@@ -73,6 +80,23 @@ use crate::GlobalStateLock;
 enum ChainPredecessor {
     Standard(Box<Transaction>),
     Link(Box<LinkTx>),
+}
+
+/// Whether a standard mempool transaction can be cast and chained onto. Under the bridge rules a
+/// bridge transaction never is: link admission refuses its announcements.
+fn standard_predecessor_is_chainable(
+    predecessor: &Transaction,
+    tip_mutator_set_hash: Digest,
+    bridge_rules_apply: bool,
+) -> bool {
+    matches!(predecessor.proof, TransactionProof::SingleProof(_))
+        && predecessor.kernel.mutator_set_hash == tip_mutator_set_hash
+        && !(bridge_rules_apply
+            && predecessor
+                .kernel
+                .announcements
+                .iter()
+                .any(has_proof_bound_tag))
 }
 
 /// The proof-backed link transaction a chained send builds, together with what
@@ -279,14 +303,12 @@ impl TransactionInitiator {
             let cli = self.global_state_lock.cli();
             let state = self.global_state_lock.lock_guard().await;
             let tip_height = state.chain.light_state().header().height;
-            if state.next_block_consensus_rule_set().is_legacy_era()
-                && !legacy_era::submitted_transaction_meets_terms(
-                    &tx.transaction,
-                    cli.network,
-                    tip_height,
-                    cli.fork_tx_cutoff_margin,
-                )
-            {
+            if !legacy_era::submitted_transaction_meets_terms(
+                &tx.transaction,
+                cli.network,
+                tip_height,
+                cli.fork_tx_cutoff_margin,
+            ) {
                 return Err(error::SendError::BelowLegacyEraTerms);
             }
         }
@@ -490,6 +512,17 @@ impl TransactionInitiator {
             let tip = gsm.chain.light_state_clone();
             let block_height = tip.header().height;
             let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+            // A link is proven for the tip's rule set, which must still be the next block's.
+            let next_block_rule_set = legacy_era::rule_set_for_new_transaction(
+                network,
+                block_height,
+                gsm.cli().fork_tx_cutoff_margin,
+            )?;
+            if next_block_rule_set != consensus_rule_set {
+                return Err(error::SendError::Chained(format!(
+                    "the next block follows consensus rule set {next_block_rule_set}"
+                )));
+            }
             if !consensus_rule_set.has_chain_branches() {
                 return Err(error::SendError::Chained(format!(
                     "consensus rule set {consensus_rule_set} has no chain branches"
@@ -516,10 +549,11 @@ impl TransactionInitiator {
                     continue;
                 }
                 let predecessor_is_chainable = match gsm.mempool.get(predecessor_txid) {
-                    Some(predecessor) => {
-                        matches!(predecessor.proof, TransactionProof::SingleProof(_))
-                            && predecessor.kernel.mutator_set_hash == tip_mutator_set_hash
-                    }
+                    Some(predecessor) => standard_predecessor_is_chainable(
+                        predecessor,
+                        tip_mutator_set_hash,
+                        gsm.bridge_rules_apply_to_next_block(),
+                    ),
                     None => gsm.mempool.get_link(predecessor_txid).is_some_and(|link| {
                         link.proof.is_proof()
                             && link.kernel.kernel.mutator_set_hash == tip_mutator_set_hash
@@ -920,8 +954,530 @@ impl TransactionInitiator {
         Ok(tx_creation_artifacts)
     }
 
+    /// Build and broadcast a bridge lock (deposit) transaction.
+    ///
+    /// Locks XNT into the bridge pool and emits a deposit announcement
+    /// that relayers use to mint WXNT on Leviathan.
+    /// Before the bridge era a deposit would only lock funds in the pool.
+    async fn check_bridge_active(&self) -> Result<(), error::CreateTxError> {
+        let consensus_rule_set = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .next_block_consensus_rule_set();
+        if consensus_rule_set.bav_active() {
+            Ok(())
+        } else {
+            Err(error::CreateTxError::BridgeNotActive(consensus_rule_set))
+        }
+    }
+
+    pub async fn bridge_deposit(
+        &mut self,
+        leviathan_account_id: [u64; 2],
+        amount: NativeCurrencyAmount,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> Result<TxCreationArtifacts, error::SendError> {
+        self.check_bridge_active().await?;
+        self.private().check_proceed_with_send(fee).await?;
+        if amount < MIN_BRIDGE_AMOUNT {
+            return Err(error::CreateTxError::BelowBridgeMinimum {
+                amount,
+                min: MIN_BRIDGE_AMOUNT,
+            }
+            .into());
+        }
+
+        tracing::debug!("bridge_deposit initiated.");
+
+        let target_proof_type = TransactionProofType::PrimitiveWitness;
+
+        let spend_amount = amount + fee;
+        let tx_inputs: TxInputList = select_bridge_deposit_inputs(
+            self.spendable_inputs(timestamp, exclude_recent_blocks)
+                .await
+                .into(),
+            spend_amount,
+            max_inputs,
+        )?
+        .into();
+
+        // Get change address, MSA, network from global state
+        let (change_address, msa, block_height) = {
+            let mut gsm = self.global_state_lock.lock_guard_mut().await;
+            let tip = gsm.chain.light_state();
+            let msa = tip
+                .mutator_set_accumulator_after()
+                .map_err(|_| error::CreateTxError::NoMutatorSetAccumulatorAfter)?;
+            let height = tip.header().height;
+            let key = gsm
+                .wallet_state
+                .next_unused_spending_key(crate::state::wallet::address::KeyType::Generation)
+                .await;
+            let addr = key.to_address();
+            (addr, msa, height)
+        };
+
+        let cli_args = self.global_state_lock.cli();
+        let network = cli_args.network;
+        let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, block_height);
+
+        let (tx_details, _) = bridge_deposit_tx_details(
+            tx_inputs,
+            leviathan_account_id,
+            amount,
+            fee,
+            change_address,
+            timestamp,
+            msa,
+            network,
+        )?;
+
+        tracing::info!("bridge_deposit: proving tx:\n{}", tx_details);
+
+        let options = TritonVmProofJobOptionsBuilder::new()
+            .template(&cli_args.as_proof_job_options())
+            .proof_type(target_proof_type)
+            .build();
+
+        let proof = TransactionProofBuilder::new()
+            .consensus_rule_set(consensus_rule_set)
+            .transaction_details(&tx_details)
+            .job_queue(vm_job_queue())
+            .proof_job_options(options)
+            .build()
+            .await?;
+
+        tracing::info!("bridge_deposit: assembling tx");
+
+        let transaction = self.assemble_transaction(&tx_details, proof)?;
+
+        let tx_creation_artifacts = TxCreationArtifactsBuilder::new()
+            .transaction_details(tx_details)
+            .transaction(transaction)
+            .build()?;
+
+        tracing::info!("bridge_deposit: recording tx");
+
+        self.record_and_broadcast_transaction(&tx_creation_artifacts)
+            .await?;
+
+        tracing::info!("bridge_deposit: all done!");
+
+        Ok(tx_creation_artifacts)
+    }
+
+    /// Locks what the largest inputs (capped at 8) hold, minus `fee`, leaving at least `keep`.
+    pub async fn bridge_deposit_all(
+        &mut self,
+        leviathan_account_id: [u64; 2],
+        fee: NativeCurrencyAmount,
+        keep: NativeCurrencyAmount,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> Result<BridgeDepositAll, error::SendError> {
+        self.check_bridge_active().await?;
+        let amounts = self
+            .spendable_inputs(timestamp, exclude_recent_blocks)
+            .await
+            .iter()
+            .map(|input| input.native_currency_amount())
+            .collect();
+        let cap = bridge_deposit_input_cap(max_inputs);
+        let amount = match bridge_all_amount(amounts, fee, keep, cap) {
+            Ok(amount) => amount,
+            Err(available) => return Ok(BridgeDepositAll::NothingToBridge { available }),
+        };
+        let artifacts = self
+            .bridge_deposit(
+                leviathan_account_id,
+                amount,
+                fee,
+                timestamp,
+                exclude_recent_blocks,
+                max_inputs,
+            )
+            .await?;
+        Ok(BridgeDepositAll::Locked(artifacts))
+    }
+
+    /// Build and broadcast an authority-set rotation transaction.
+    ///
+    /// Carries an [`AuthorityRotationAnnouncement`] on a self-paying carrier tx.
+    /// Submission is untrusted transport: validity comes from the signatures,
+    /// re-verified at tip-install. `fee` must select at least one carrier input.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn submit_authority_rotation(
+        &mut self,
+        new_keys: Vec<Vec<u8>>,
+        new_threshold: usize,
+        signatures: Vec<[u8; 64]>,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> Result<TxCreationArtifacts, error::SendError> {
+        use crate::protocol::consensus::bridge::authority_rotation::AuthorityRotationAnnouncement;
+
+        let rotation = AuthorityRotationAnnouncement {
+            new_keys,
+            new_threshold,
+            signatures,
+        };
+        self.submit_carrier_announcement(
+            rotation.to_announcement(),
+            fee,
+            timestamp,
+            exclude_recent_blocks,
+            max_inputs,
+        )
+        .await
+    }
+
+    /// Carries a bridge registration announcement, like [`Self::submit_authority_rotation`].
+    pub async fn submit_bridge_registration(
+        &mut self,
+        registration: crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration,
+        signatures: Vec<[u8; 64]>,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> Result<TxCreationArtifacts, error::SendError> {
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetRegistrationAnnouncement;
+
+        let announcement = FaucetRegistrationAnnouncement {
+            registration,
+            signatures,
+        };
+        self.submit_carrier_announcement(
+            announcement.to_announcement(),
+            fee,
+            timestamp,
+            exclude_recent_blocks,
+            max_inputs,
+        )
+        .await
+    }
+
+    /// A tx whose only meaning is `announcement`: the whole input value returns as change.
+    async fn submit_carrier_announcement(
+        &mut self,
+        announcement: crate::protocol::consensus::transaction::announcement::Announcement,
+        fee: NativeCurrencyAmount,
+        timestamp: Timestamp,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> Result<TxCreationArtifacts, error::SendError> {
+        use crate::state::wallet::transaction_output::TxOutput;
+        use num_traits::{CheckedSub, Zero};
+        use rand::RngExt;
+        use tasm_lib::prelude::Digest;
+
+        self.private().check_proceed_with_send(fee).await?;
+
+        let target_proof_type = TransactionProofType::PrimitiveWitness;
+
+        // The tx needs >=1 input to carry the announcement; at fee 0 the selector
+        // would stop at zero inputs, so force a minimal carrier.
+        let carrier = if fee.is_zero() {
+            NativeCurrencyAmount::from_nau(1)
+        } else {
+            fee
+        };
+        let policy = InputSelectionPolicy::ByNativeCoinAmount(SortOrder::Ascending);
+        let selected: Vec<TxInput> = self
+            .select_spendable_inputs(
+                policy,
+                carrier,
+                timestamp,
+                exclude_recent_blocks,
+                max_inputs,
+            )
+            .await
+            .into_iter()
+            .collect();
+        if selected.is_empty() {
+            return Err(error::CreateTxError::InsufficientFunds {
+                requested: carrier,
+                available: NativeCurrencyAmount::from_nau(0),
+            }
+            .into());
+        }
+        let tx_inputs: TxInputList = selected.into();
+
+        let (change_address, msa, block_height) = {
+            let mut gsm = self.global_state_lock.lock_guard_mut().await;
+            let tip = gsm.chain.light_state();
+            let msa = tip
+                .mutator_set_accumulator_after()
+                .map_err(|_| error::CreateTxError::NoMutatorSetAccumulatorAfter)?;
+            let height = tip.header().height;
+            let key = gsm
+                .wallet_state
+                .next_unused_spending_key(crate::state::wallet::address::KeyType::Generation)
+                .await;
+            (key.to_address(), msa, height)
+        };
+
+        let cli_args = self.global_state_lock.cli();
+        let network = cli_args.network;
+        let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, block_height);
+
+        // Carrier tx: the whole input value returns as change; only the
+        // announcement carries meaning.
+        let total_input = tx_inputs.total_native_coins();
+        let change_amount =
+            total_input
+                .checked_sub(&fee)
+                .ok_or(error::CreateTxError::InsufficientFunds {
+                    requested: fee,
+                    available: total_input,
+                })?;
+        let mut outputs = Vec::new();
+        if !change_amount.is_zero() {
+            outputs.push(TxOutput::onchain_native_currency_as_change(
+                change_amount,
+                Digest::new(rand::rng().random()),
+                change_address,
+            ));
+        }
+
+        let tx_details =
+            TransactionDetails::new(tx_inputs, outputs, fee, None, timestamp, msa, network)
+                .with_announcements(vec![announcement]);
+
+        let options = TritonVmProofJobOptionsBuilder::new()
+            .template(&cli_args.as_proof_job_options())
+            .proof_type(target_proof_type)
+            .build();
+
+        let proof = TransactionProofBuilder::new()
+            .consensus_rule_set(consensus_rule_set)
+            .transaction_details(&tx_details)
+            .job_queue(vm_job_queue())
+            .proof_job_options(options)
+            .build()
+            .await?;
+
+        let transaction = self.assemble_transaction(&tx_details, proof)?;
+
+        let tx_creation_artifacts = TxCreationArtifactsBuilder::new()
+            .transaction_details(tx_details)
+            .transaction(transaction)
+            .build()?;
+
+        self.record_and_broadcast_transaction(&tx_creation_artifacts)
+            .await?;
+
+        Ok(tx_creation_artifacts)
+    }
+
     pub(super) fn private(&self) -> super::private::TransactionInitiatorPrivate {
         super::private::TransactionInitiatorPrivate::new(self.global_state_lock.clone())
+    }
+}
+
+fn bridge_deposit_input_cap(max_inputs: Option<usize>) -> usize {
+    max_inputs.map_or(MAX_BRIDGE_DEPOSIT_INPUTS, |m| {
+        m.min(MAX_BRIDGE_DEPOSIT_INPUTS)
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BridgeDepositAll {
+    Locked(TxCreationArtifacts),
+    /// `available` cannot pay the fee plus the minimum deposit.
+    NothingToBridge {
+        available: NativeCurrencyAmount,
+    },
+}
+
+/// `min(cap largest, total - keep) - fee` if at least the bridge minimum, else `Err(min(..))`.
+fn bridge_all_amount(
+    mut amounts: Vec<NativeCurrencyAmount>,
+    fee: NativeCurrencyAmount,
+    keep: NativeCurrencyAmount,
+    cap: usize,
+) -> Result<NativeCurrencyAmount, NativeCurrencyAmount> {
+    let total: NativeCurrencyAmount = amounts.iter().copied().sum();
+    amounts.sort_unstable_by(|a, b| b.cmp(a));
+    let largest: NativeCurrencyAmount = amounts.into_iter().take(cap).sum();
+    let available = total
+        .checked_sub(&keep)
+        .map_or(NativeCurrencyAmount::zero(), |unkept| unkept.min(largest));
+    available
+        .checked_sub(&fee)
+        .filter(|amount| *amount >= MIN_BRIDGE_AMOUNT)
+        .ok_or(available)
+}
+
+/// The fewest inputs covering `spend_amount`, largest first.
+fn select_bridge_deposit_inputs(
+    spendable_inputs: Vec<TxInput>,
+    spend_amount: NativeCurrencyAmount,
+    max_inputs: Option<usize>,
+) -> Result<Vec<TxInput>, error::CreateTxError> {
+    let available: NativeCurrencyAmount = spendable_inputs
+        .iter()
+        .map(|input| input.native_currency_amount())
+        .sum();
+    if available < spend_amount {
+        return Err(error::CreateTxError::InsufficientFunds {
+            requested: spend_amount,
+            available,
+        });
+    }
+
+    let max = bridge_deposit_input_cap(max_inputs);
+    let inputs = TxInputListBuilder::new()
+        .spendable_inputs(spendable_inputs)
+        .policy(InputSelectionPolicy::ByNativeCoinAmount(
+            SortOrder::Descending,
+        ))
+        .spend_amount(spend_amount)
+        .build();
+    if inputs.len() > max {
+        return Err(error::CreateTxError::TooManyInputs {
+            needed: inputs.len(),
+            max,
+        });
+    }
+    Ok(inputs)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod bridge_deposit_tests {
+    use arbitrary::Arbitrary;
+    use arbitrary::Unstructured;
+    use tasm_lib::prelude::Digest;
+
+    use super::*;
+    use crate::protocol::consensus::transaction::lock_script::LockScriptAndWitness;
+    use crate::protocol::consensus::transaction::utxo::Utxo;
+    use crate::state::wallet::unlocked_utxo::UnlockedUtxo;
+    use crate::util_types::mutator_set::ms_membership_proof::MsMembershipProof;
+
+    fn inputs(coins: &[u32]) -> Vec<TxInput> {
+        let membership_proof =
+            MsMembershipProof::arbitrary(&mut Unstructured::new(&[0; 4096])).unwrap();
+        coins
+            .iter()
+            .map(|&c| {
+                UnlockedUtxo::unlock(
+                    Utxo::new_native_currency(Digest::default(), NativeCurrencyAmount::coins(c)),
+                    LockScriptAndWitness::standard_hash_lock_from_preimage(Digest::default()),
+                    membership_proof.clone(),
+                )
+                .into()
+            })
+            .collect()
+    }
+
+    fn picked(selected: &[TxInput]) -> Vec<NativeCurrencyAmount> {
+        selected
+            .iter()
+            .map(|i| i.native_currency_amount())
+            .collect()
+    }
+
+    #[test]
+    fn picks_the_fewest_largest_inputs() {
+        let selected = select_bridge_deposit_inputs(
+            inputs(&[1, 5, 2, 9, 3]),
+            NativeCurrencyAmount::coins(12),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            picked(&selected),
+            vec![
+                NativeCurrencyAmount::coins(9),
+                NativeCurrencyAmount::coins(5)
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_more_than_eight_inputs() {
+        let ten_ones = inputs(&[1; 10]);
+        let nine = NativeCurrencyAmount::coins(9);
+        assert!(matches!(
+            select_bridge_deposit_inputs(ten_ones.clone(), nine, None),
+            Err(error::CreateTxError::TooManyInputs { needed: 9, max: 8 })
+        ));
+        assert_eq!(
+            select_bridge_deposit_inputs(ten_ones, NativeCurrencyAmount::coins(8), None)
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn a_lower_caller_cap_wins_and_a_higher_one_does_not() {
+        let amount = NativeCurrencyAmount::coins(3);
+        assert!(matches!(
+            select_bridge_deposit_inputs(inputs(&[1; 5]), amount, Some(2)),
+            Err(error::CreateTxError::TooManyInputs { needed: 3, max: 2 })
+        ));
+        assert!(matches!(
+            select_bridge_deposit_inputs(
+                inputs(&[1; 12]),
+                NativeCurrencyAmount::coins(9),
+                Some(20)
+            ),
+            Err(error::CreateTxError::TooManyInputs { needed: 9, max: 8 })
+        ));
+    }
+
+    #[test]
+    fn insufficient_funds_reports_what_is_available() {
+        assert!(matches!(
+            select_bridge_deposit_inputs(inputs(&[1, 2]), NativeCurrencyAmount::coins(4), None),
+            Err(error::CreateTxError::InsufficientFunds { requested, available })
+                if requested == NativeCurrencyAmount::coins(4)
+                    && available == NativeCurrencyAmount::coins(3)
+        ));
+    }
+
+    #[test]
+    fn bridge_all_locks_the_largest_inputs_minus_fee_and_keep() {
+        let coins = |cs: &[u32]| cs.iter().map(|&c| NativeCurrencyAmount::coins(c)).collect();
+        let fee = NativeCurrencyAmount::coins(1);
+        let zero = NativeCurrencyAmount::zero();
+        assert_eq!(
+            bridge_all_amount(coins(&[1, 9, 5, 2]), fee, zero, 2),
+            Ok(NativeCurrencyAmount::coins(13))
+        );
+        assert_eq!(
+            bridge_all_amount(coins(&[1; 12]), fee, zero, 8),
+            Ok(NativeCurrencyAmount::coins(7))
+        );
+        // keep binds before the cap: 17 total, keep 10 leaves 7 of the 14 the cap allows
+        assert_eq!(
+            bridge_all_amount(
+                coins(&[1, 9, 5, 2]),
+                fee,
+                NativeCurrencyAmount::coins(10),
+                2
+            ),
+            Ok(NativeCurrencyAmount::coins(6))
+        );
+        assert_eq!(
+            bridge_all_amount(coins(&[1]), fee, zero, 8),
+            Err(NativeCurrencyAmount::coins(1))
+        );
+        assert_eq!(
+            bridge_all_amount(coins(&[3]), fee, NativeCurrencyAmount::coins(5), 8),
+            Err(zero)
+        );
+        assert_eq!(bridge_all_amount(vec![], fee, zero, 8), Err(zero));
     }
 }
 
@@ -947,6 +1503,48 @@ mod tests {
     use crate::tests::shared::globalstate::single_proof_payment;
     use crate::tests::shared::wait_until;
     use crate::tests::shared_tokio_runtime;
+
+    #[test]
+    fn chained_send_skips_bridge_tagged_predecessors() {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::bridge::PROOF_BOUND_TAGS;
+        use crate::protocol::consensus::transaction::announcement::Announcement;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash_and_timestamp;
+
+        let tip_mutator_set_hash = Digest::default();
+        let plain = make_mock_transaction_with_mutator_set_hash_and_timestamp(
+            vec![],
+            vec![],
+            tip_mutator_set_hash,
+            Timestamp::now(),
+        );
+        for bridge_rules_apply in [false, true] {
+            assert!(standard_predecessor_is_chainable(
+                &plain,
+                tip_mutator_set_hash,
+                bridge_rules_apply
+            ));
+        }
+
+        for tag in PROOF_BOUND_TAGS {
+            let tagged = Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .announcements(vec![Announcement::new(vec![BFieldElement::new(tag)])])
+                    .modify(plain.kernel.clone()),
+                proof: plain.proof.clone(),
+            };
+            assert!(
+                !standard_predecessor_is_chainable(&tagged, tip_mutator_set_hash, true),
+                "tag {tag:#x}"
+            );
+            assert!(
+                standard_predecessor_is_chainable(&tagged, tip_mutator_set_hash, false),
+                "tag {tag:#x}"
+            );
+        }
+    }
 
     /// A chained send stops, and records nothing, once a predecessor leaves
     /// the mempool while the chain pipeline proves -- whether it was mined,

@@ -28,7 +28,6 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
-use crate::state::wallet::address::dctidh_address;
 use super::address::generation_address;
 use super::address::symmetric_key;
 use super::address::KeyType;
@@ -65,6 +64,7 @@ use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurr
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::MempoolEvent;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
+use crate::state::wallet::address::dctidh_address;
 use crate::state::wallet::monitored_utxo::MonitoredUtxo;
 use crate::state::wallet::rusty_wallet_database::MonitoredUtxoInsertResult;
 use crate::state::wallet::rusty_wallet_database::WalletDbConnectError;
@@ -408,9 +408,7 @@ impl WalletState {
         // Ensure CTIDH key index 0 is known
         // This allows wallet to scan CTIDH UTXOs sent to index 0
         if wallet_state.known_dctidh_keys.is_empty() {
-            let _ = wallet_state
-                .next_unused_spending_key(KeyType::dCTIDH)
-                .await;
+            let _ = wallet_state.next_unused_spending_key(KeyType::dCTIDH).await;
         }
 
         // For premine UTXOs there is an additional complication: we do not know
@@ -611,7 +609,9 @@ impl WalletState {
     }
 
     /// Iterator over mempool unspent UTXOs with payment_id included
-    pub fn mempool_unspent_utxos_with_payment_id_iter(&self) -> impl Iterator<Item = (&Utxo, AdditionRecord, u64)> {
+    pub fn mempool_unspent_utxos_with_payment_id_iter(
+        &self,
+    ) -> impl Iterator<Item = (&Utxo, AdditionRecord, u64)> {
         self.mempool_unspent_utxos
             .values()
             .flatten()
@@ -964,6 +964,52 @@ impl WalletState {
             vec![]
         };
         incoming_utxos.into_iter()
+    }
+
+    /// Scan for bridge unlock UTXOs in aggregated announcements.
+    ///
+    /// Checks each burn's `receiver_digest` against our spending keys.
+    /// If a match is found, the UTXO is ours — we know the `receiver_preimage`
+    /// and `sender_randomness` (= block_hash), so we can spend it.
+    pub(crate) fn scan_for_bridge_unlock_utxos(
+        &self,
+        block: &Block,
+    ) -> Vec<super::incoming_utxo::IncomingUtxo> {
+        use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+
+        let announcements = &block.kernel.body.transaction_kernel.announcements;
+        let Some(ann) = AggregatedAnnouncementData::find_in_announcements(announcements) else {
+            return vec![];
+        };
+
+        let spending_keys: Vec<_> = self.get_all_known_spending_keys().collect();
+
+        let mut incoming = Vec::new();
+        for burn in &ann.burns {
+            let sender_randomness = burn.sender_randomness();
+            // Check if any of our spending keys matches this burn's receiver_identifier
+            for key in &spending_keys {
+                let preimage = key.privacy_preimage();
+                if key.receiver_identifier() == burn.receiver_identifier {
+                    // An overflowing payout cannot be in a valid block.
+                    let Some(xnt_amount) = burn.payout() else {
+                        continue;
+                    };
+                    let utxo = Utxo::new_native_currency(burn.lock_script_hash, xnt_amount);
+                    incoming.push(super::incoming_utxo::IncomingUtxo {
+                        utxo,
+                        sender_randomness,
+                        receiver_preimage: preimage,
+                        is_guesser_fee: false,
+                        payment_id: BFieldElement::ZERO,
+                    });
+                    break; // found the matching key, no need to check others
+                }
+            }
+        }
+
+        incoming
     }
 
     /// check if wallet already has the provided `expected_utxo`
@@ -1981,6 +2027,7 @@ impl WalletState {
 
         let offchain_received_outputs = self.scan_for_expected_utxos(&additions).await;
         let guesser_fee_outputs = self.scan_for_guesser_fee_utxos(block);
+        let bridge_unlock_outputs = self.scan_for_bridge_unlock_utxos(block);
 
         debug!(
             "Scanned block for incoming UTXOs; received {} onchain \
@@ -2001,6 +2048,7 @@ impl WalletState {
             .chain(outputs_recovered_through_scan_mode)
             .chain(offchain_received_outputs.iter().cloned())
             .chain(guesser_fee_outputs)
+            .chain(bridge_unlock_outputs)
             .filter(|incoming_utxo| incoming_utxo.utxo.all_type_script_states_are_valid())
             .filter(|incoming_utxo| {
                 !unrecognized_locks.contains(&incoming_utxo.utxo.lock_script_hash())

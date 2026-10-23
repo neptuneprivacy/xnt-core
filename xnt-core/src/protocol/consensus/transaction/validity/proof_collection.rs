@@ -15,9 +15,11 @@ use tracing::trace;
 use super::collect_type_scripts::CollectTypeScriptsWitness;
 use super::kernel_to_outputs::KernelToOutputsWitness;
 use super::removal_records_integrity::RemovalRecordsIntegrity;
+use crate::api::tx_initiation::builder::proof_builder::ProofBuilder;
 use crate::api::tx_initiation::error::CreateProofError;
 use crate::application::config::network::Network;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
+use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
@@ -57,6 +59,53 @@ pub struct ProofCollection {
     pub salted_inputs_hash: Digest,
     pub salted_outputs_hash: Digest,
     pub merge_bit_mast_path: Vec<Digest>,
+}
+
+/// Where a proof collection's sub-proofs are proven.
+#[derive(Debug)]
+pub(crate) enum SubProver {
+    Queue {
+        queue: Arc<TritonVmJobQueue>,
+        options: TritonVmProofJobOptions,
+    },
+    InProcess {
+        network: Network,
+    },
+}
+
+impl SubProver {
+    /// `nondeterminism` is only called for a real proof: mock networks can't always produce it.
+    pub(crate) async fn prove<'a>(
+        &self,
+        program: Program,
+        claim: Claim,
+        nondeterminism: impl FnOnce() -> NonDeterminism + Send + Sync + 'a,
+    ) -> Result<Proof, CreateProofError> {
+        match self {
+            Self::Queue { queue, options } => {
+                ProofBuilder::new()
+                    .program(program)
+                    .claim(claim)
+                    .nondeterminism(nondeterminism)
+                    .job_queue(queue.clone())
+                    .proof_job_options(options.clone())
+                    .build()
+                    .await
+            }
+            Self::InProcess { network } => {
+                if network.use_mock_proof() {
+                    return Ok(Proof::mock(true));
+                }
+                let nondeterminism = nondeterminism();
+                let proof = tokio::task::spawn_blocking(move || {
+                    tasm_lib::triton_vm::prove(Stark::default(), &claim, program, nondeterminism)
+                })
+                .await
+                .map_err(CreateProofError::InProcessTask)??;
+                Ok(proof.into())
+            }
+        }
+    }
 }
 
 impl ProofCollection {
@@ -243,11 +292,42 @@ impl ProofCollection {
         proof_job_options: TritonVmProofJobOptions,
         consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Self, CreateProofError> {
+        let prover = SubProver::Queue {
+            queue: triton_vm_job_queue,
+            options: proof_job_options,
+        };
+        Self::produce_with(primitive_witness, &prover, consensus_rule_set).await
+    }
+
+    /// [`Self::produce_v2`] proven in this process, without the job queue or prover binary.
+    pub async fn produce_in_process(
+        primitive_witness: &PrimitiveWitness,
+        network: Network,
+        block_height: BlockHeight,
+    ) -> Result<Self, CreateProofError> {
+        let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+        if consensus_rule_set.is_legacy_era() {
+            return Err(CreateProofError::NotProducible {
+                proof: "an in-process proof collection",
+                consensus_rule_set,
+            });
+        }
+        Self::produce_with(
+            primitive_witness,
+            &SubProver::InProcess { network },
+            consensus_rule_set,
+        )
+        .await
+    }
+
+    pub(crate) async fn produce_with(
+        primitive_witness: &PrimitiveWitness,
+        prover: &SubProver,
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> Result<Self, CreateProofError> {
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
         use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2Witness;
         use crate::protocol::consensus::type_scripts::known_type_scripts::match_type_script_and_generate_witness_v2;
-        use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
-        use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
 
         // The nodes of the era before the fork take a v7 collection only of
         // the programs they know.
@@ -267,50 +347,46 @@ impl ProofCollection {
         let claim_version = Self::claim_version_for(consensus_rule_set);
 
         debug!("proving RemovalRecordsIntegrity (V2)");
-        let removal_records_integrity = RemovalRecordsIntegrity
+        let removal_records_integrity = prover
             .prove(
+                RemovalRecordsIntegrity.program(),
                 removal_records_integrity_witness
                     .claim()
                     .about_version(claim_version),
-                removal_records_integrity_witness.nondeterminism(),
-                triton_vm_job_queue.clone(),
-                proof_job_options.clone(),
+                || removal_records_integrity_witness.nondeterminism(),
             )
             .await?;
 
         debug!("proving CollectLockScripts (V2)");
-        let collect_lock_scripts = CollectLockScripts
+        let collect_lock_scripts = prover
             .prove(
+                CollectLockScripts.program(),
                 collect_lock_scripts_witness
                     .claim()
                     .about_version(claim_version),
-                collect_lock_scripts_witness.nondeterminism(),
-                triton_vm_job_queue.clone(),
-                proof_job_options.clone(),
+                || collect_lock_scripts_witness.nondeterminism(),
             )
             .await?;
 
         debug!("proving KernelToOutputs (V2)");
-        let kernel_to_outputs = KernelToOutputs
+        let kernel_to_outputs = prover
             .prove(
+                KernelToOutputs.program(),
                 kernel_to_outputs_witness
                     .claim()
                     .about_version(claim_version),
-                kernel_to_outputs_witness.nondeterminism(),
-                triton_vm_job_queue.clone(),
-                proof_job_options.clone(),
+                || kernel_to_outputs_witness.nondeterminism(),
             )
             .await?;
 
         debug!("proving CollectTypeScriptsV2");
-        let collect_type_scripts = CollectTypeScriptsV2
+        let collect_type_scripts = prover
             .prove(
+                CollectTypeScriptsV2.program(),
                 collect_type_scripts_witness
                     .claim()
                     .about_version(claim_version),
-                collect_type_scripts_witness.nondeterminism(),
-                triton_vm_job_queue.clone(),
-                proof_job_options.clone(),
+                || collect_type_scripts_witness.nondeterminism(),
             )
             .await?;
 
@@ -318,12 +394,12 @@ impl ProofCollection {
         let mut lock_scripts_halt = vec![];
         for lock_script_and_witness in &primitive_witness.lock_scripts_and_witnesses {
             lock_scripts_halt.push(
-                lock_script_and_witness
+                prover
                     .prove(
-                        txk_mast_hash_as_input.clone(),
-                        claim_version,
-                        triton_vm_job_queue.clone(),
-                        proof_job_options.clone(),
+                        lock_script_and_witness.program.clone(),
+                        lock_script_and_witness
+                            .claim(txk_mast_hash_as_input.clone(), claim_version),
+                        || lock_script_and_witness.nondeterminism(),
                     )
                     .await?,
             );
@@ -332,25 +408,9 @@ impl ProofCollection {
         // Rebuild type-script witnesses using the V2 dispatch so OLD_HASH
         // coins are proved by TimeLockV2.
         debug!("proving type scripts (V2)");
+        let type_script_hashes = Self::remapped_type_script_hashes(primitive_witness);
         let mut type_scripts_halt = vec![];
-        let old_timelock_hash = TimeLock.hash();
-        let new_timelock_hash = TimeLockV2.hash();
-        // Collect the post-remap, deduplicated set of type-script hashes
-        // (same set CollectTypeScriptsV2 emits).
-        let mut remapped_hashes: Vec<Digest> = vec![];
-        for tsaw in &primitive_witness.type_scripts_and_witnesses {
-            let h = tsaw.program.hash();
-            let remapped = if h == old_timelock_hash {
-                new_timelock_hash
-            } else {
-                h
-            };
-            if !remapped_hashes.contains(&remapped) {
-                remapped_hashes.push(remapped);
-            }
-        }
-        // Build a V2 witness for every distinct remapped hash and prove it.
-        for type_script_hash in &remapped_hashes {
+        for type_script_hash in &type_script_hashes {
             let v2_tsaw = match_type_script_and_generate_witness_v2(
                 *type_script_hash,
                 primitive_witness.kernel.clone(),
@@ -361,14 +421,16 @@ impl ProofCollection {
                 panic!("unknown type script hash post-remap: {type_script_hash}")
             });
             type_scripts_halt.push(
-                v2_tsaw
+                prover
                     .prove(
-                        txk_mast_hash,
-                        salted_inputs_hash,
-                        salted_outputs_hash,
-                        claim_version,
-                        triton_vm_job_queue.clone(),
-                        proof_job_options.clone(),
+                        v2_tsaw.program.clone(),
+                        v2_tsaw.claim(
+                            txk_mast_hash,
+                            salted_inputs_hash,
+                            salted_outputs_hash,
+                            claim_version,
+                        ),
+                        || v2_tsaw.nondeterminism(),
                     )
                     .await?,
             );
@@ -380,8 +442,6 @@ impl ProofCollection {
             .iter()
             .map(|lsaw| lsaw.program.hash())
             .collect_vec();
-        let type_script_hashes = remapped_hashes;
-
         let merge_bit_mast_path = primitive_witness
             .kernel
             .mast_path(TransactionKernelField::MergeBit);
@@ -400,6 +460,54 @@ impl ProofCollection {
             salted_outputs_hash,
             merge_bit_mast_path,
         })
+    }
+
+    /// The post-remap, deduplicated type-script hashes, the set `CollectTypeScriptsV2` emits.
+    fn remapped_type_script_hashes(primitive_witness: &PrimitiveWitness) -> Vec<Digest> {
+        use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
+        use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
+
+        let old_timelock_hash = TimeLock.hash();
+        let new_timelock_hash = TimeLockV2.hash();
+        let mut remapped_hashes: Vec<Digest> = vec![];
+        for tsaw in &primitive_witness.type_scripts_and_witnesses {
+            let h = tsaw.program.hash();
+            let remapped = if h == old_timelock_hash {
+                new_timelock_hash
+            } else {
+                h
+            };
+            if !remapped_hashes.contains(&remapped) {
+                remapped_hashes.push(remapped);
+            }
+        }
+        remapped_hashes
+    }
+
+    /// The collection of a settlement, whose BAAV proof covers the sub-proofs: dummy proofs, no
+    /// halting proofs, and the script hashes of [`Self::produce_v2`].
+    pub(crate) fn with_dummy_sub_proofs(primitive_witness: &PrimitiveWitness) -> Self {
+        let dummy_proof = Proof::valid_mock(Claim::new(Digest::default()));
+        ProofCollection {
+            removal_records_integrity: dummy_proof.clone(),
+            collect_lock_scripts: dummy_proof.clone(),
+            lock_scripts_halt: vec![],
+            kernel_to_outputs: dummy_proof.clone(),
+            collect_type_scripts: dummy_proof,
+            type_scripts_halt: vec![],
+            lock_script_hashes: primitive_witness
+                .lock_scripts_and_witnesses
+                .iter()
+                .map(|lsaw| lsaw.program.hash())
+                .collect_vec(),
+            type_script_hashes: Self::remapped_type_script_hashes(primitive_witness),
+            kernel_mast_hash: primitive_witness.kernel.mast_hash(),
+            salted_inputs_hash: Tip5::hash(&primitive_witness.input_utxos),
+            salted_outputs_hash: Tip5::hash(&primitive_witness.output_utxos),
+            merge_bit_mast_path: primitive_witness
+                .kernel
+                .mast_path(TransactionKernelField::MergeBit),
+        }
     }
 
     // produce ProofCollection with mock proofs
@@ -472,7 +580,7 @@ impl ProofCollection {
     /// while verification still returns `true`. Reject the
     /// (attacker-controlled) length mismatch as invalid here rather than via
     /// `zip_eq`, which would panic on untrusted input.
-    fn halt_proof_counts_match(&self) -> bool {
+    pub(crate) fn halt_proof_counts_match(&self) -> bool {
         self.lock_scripts_halt.len() == self.lock_script_hashes.len()
             && self.type_scripts_halt.len() == self.type_script_hashes.len()
     }
@@ -484,7 +592,7 @@ impl ProofCollection {
     /// authentication path for the merge-bit field, and the leaf value checked
     /// here is hardcoded to `false`, so a collection whose kernel has the merge
     /// bit set cannot authenticate — regardless of the path it supplies.
-    fn proves_unset_merge_bit(&self, txk_mast_hash: Digest) -> bool {
+    pub(crate) fn proves_unset_merge_bit(&self, txk_mast_hash: Digest) -> bool {
         MerkleTreeInclusionProof {
             tree_height: TransactionKernel::MAST_HEIGHT.try_into().unwrap(),
             indexed_leafs: vec![(
@@ -516,7 +624,8 @@ impl ProofCollection {
             | ConsensusRuleSet::UpgradeVM
             | ConsensusRuleSet::UpgradeVMv4
             | ConsensusRuleSet::UpgradeVMv5
-            | ConsensusRuleSet::UpgradeVMv8 => TritonProofVersion::V8.claim_version(),
+            | ConsensusRuleSet::UpgradeVMv8
+            | ConsensusRuleSet::LeviathanSettlement => TritonProofVersion::V8.claim_version(),
         }
     }
 

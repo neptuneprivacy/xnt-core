@@ -65,13 +65,17 @@
 // Let's keep it that way!   Please no commits in this module without review!!
 
 // these represent the public tx_initiator API
+pub mod bridge_deposit;
 pub mod builder;
 pub mod consolidate;
 pub mod error;
 pub mod initiator;
 pub mod legacy_era;
 pub mod migrate_dctidh;
+pub mod pool_consolidation;
 pub mod send;
+pub mod settlement;
+pub mod settlement_fee;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

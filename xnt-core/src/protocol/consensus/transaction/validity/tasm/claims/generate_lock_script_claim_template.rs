@@ -1,15 +1,28 @@
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use tasm_lib::data_type::DataType;
 use tasm_lib::field;
 use tasm_lib::prelude::BasicSnippet;
 use tasm_lib::prelude::Library;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::triton_vm::prelude::*;
 
 use super::new_claim::NewClaim;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 
-pub(crate) struct GenerateLockScriptClaimTemplate;
+pub(crate) struct GenerateLockScriptClaimTemplateFor<P>(pub(crate) PhantomData<P>);
 
-impl BasicSnippet for GenerateLockScriptClaimTemplate {
+/// [`GenerateLockScriptClaimTemplateFor`] of upstream's [`ProofCollection`].
+pub(crate) type GenerateLockScriptClaimTemplate =
+    GenerateLockScriptClaimTemplateFor<ProofCollection>;
+#[allow(non_upper_case_globals)]
+pub(crate) const GenerateLockScriptClaimTemplate: GenerateLockScriptClaimTemplate =
+    GenerateLockScriptClaimTemplateFor(PhantomData);
+
+impl<P: TasmStruct + Clone + Debug + 'static> BasicSnippet
+    for GenerateLockScriptClaimTemplateFor<P>
+{
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![(DataType::VoidPointer, "*proof_collection".to_string())]
     }
@@ -42,7 +55,7 @@ impl BasicSnippet for GenerateLockScriptClaimTemplate {
                 // _ *proof_collection *claim *program_digest *output *input
 
                 pick 4
-                {&field!(ProofCollection::kernel_mast_hash)}
+                {&field!(P::kernel_mast_hash)}
                 // _ *claim *program_digest *output *input *txkmh
 
                 addi {Digest::LEN - 1}

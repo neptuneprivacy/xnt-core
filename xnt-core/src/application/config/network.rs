@@ -7,7 +7,26 @@ use serde::Serialize;
 use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
+use crate::protocol::consensus::bridge::authority::BridgeAuthoritySet;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+
+/// Dev bridge authority key for test networks: the SEC1-compressed secp256k1
+/// public key for secret scalar 1 (i.e. the generator point). The signer holds
+/// scalar 1; the guard test `dev_authority_pubkey_is_generator` pins this.
+/// Hex: 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+const DEV_BRIDGE_AUTHORITY_PUBKEY: [u8; 33] = [
+    0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+    0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17,
+    0x98,
+];
+
+/// Main net bridge authority key (SEC1-compressed secp256k1).
+/// Hex: 03e3e2534597374254bc9ba0f4bce775b1e354e7fe61b3222c4df0ef1baf9156a6
+const MAIN_BRIDGE_AUTHORITY_PUBKEY: [u8; 33] = [
+    0x03, 0xE3, 0xE2, 0x53, 0x45, 0x97, 0x37, 0x42, 0x54, 0xBC, 0x9B, 0xA0, 0xF4, 0xBC, 0xE7, 0x75,
+    0xB1, 0xE3, 0x54, 0xE7, 0xFE, 0x61, 0xB3, 0x22, 0x2C, 0x4D, 0xF0, 0xEF, 0x1B, 0xAF, 0x91, 0x56,
+    0xA6,
+];
 
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, strum::EnumIs, GetSize,
@@ -98,6 +117,21 @@ impl Network {
             Self::Testnet(_) => Difficulty::MINIMUM,
             Self::TestnetMock => Difficulty::new([100_000, 0, 0, 0, 0]),
             Self::Main => Difficulty::new([100_000_000, 0, 0, 0, 0]),
+        }
+    }
+
+    /// Genesis seed for the bridge authority set; the live value is read from
+    /// chain state (rotatable without re-genesis).
+    pub fn bridge_genesis_authority_set(&self) -> Option<BridgeAuthoritySet> {
+        match *self {
+            Self::RegTest | Self::TestnetMock | Self::Testnet(_) => Some(
+                BridgeAuthoritySet::from_compressed(&[&DEV_BRIDGE_AUTHORITY_PUBKEY], 1)
+                    .expect("pinned dev bridge authority key must be valid"),
+            ),
+            Self::Main => Some(
+                BridgeAuthoritySet::from_compressed(&[&MAIN_BRIDGE_AUTHORITY_PUBKEY], 1)
+                    .expect("pinned main bridge authority key must be valid"),
+            ),
         }
     }
 
@@ -241,5 +275,37 @@ mod tests {
                 "All IDs must be unique. network {network} has non-unique ID."
             );
         }
+    }
+
+    #[test]
+    fn dev_authority_pubkey_is_generator() {
+        let mut scalar_one = [0u8; 32];
+        scalar_one[31] = 1;
+        let signing_key = k256::ecdsa::SigningKey::from_bytes(&scalar_one.into()).unwrap();
+        let compressed = signing_key.verifying_key().to_encoded_point(true);
+        assert_eq!(compressed.as_bytes(), DEV_BRIDGE_AUTHORITY_PUBKEY);
+    }
+
+    #[test]
+    fn test_networks_seed_the_dev_authority() {
+        for network in [Network::RegTest, Network::TestnetMock, Network::Testnet(0)] {
+            let stored = network.bridge_genesis_authority_set().unwrap().to_stored();
+            assert_eq!(stored.keys, vec![DEV_BRIDGE_AUTHORITY_PUBKEY.to_vec()]);
+            assert_eq!(stored.threshold, 1);
+        }
+    }
+
+    #[test]
+    fn main_seeds_the_main_authority() {
+        let stored = Network::Main
+            .bridge_genesis_authority_set()
+            .unwrap()
+            .to_stored();
+        let main_key =
+            hex::decode("03e3e2534597374254bc9ba0f4bce775b1e354e7fe61b3222c4df0ef1baf9156a6")
+                .unwrap();
+        assert_eq!(stored.keys, vec![main_key]);
+        assert_eq!(stored.threshold, 1);
+        assert_eq!(stored.generation, 0);
     }
 }

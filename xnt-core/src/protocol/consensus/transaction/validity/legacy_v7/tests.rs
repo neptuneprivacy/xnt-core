@@ -37,6 +37,7 @@ use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness
 use crate::protocol::consensus::transaction::validity::collect_lock_scripts::CollectLockScripts;
 use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
 use crate::protocol::consensus::transaction::validity::kernel_to_outputs::KernelToOutputs;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions;
 use crate::protocol::consensus::transaction::validity::removal_records_integrity::RemovalRecordsIntegrity;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
@@ -155,8 +156,10 @@ fn v7_single_proof_program_has_the_pinned_digest() {
 fn v8_single_proof_programs_are_unchanged_by_the_v7_program() {
     let _ = single_proof_v2_v7_code();
 
-    let (_, with_chain_branches) = SingleProofV2.assemble_into(Library::new(), true);
-    let (_, without_chain_branches) = SingleProofV2.assemble_into(Library::new(), false);
+    let (_, with_chain_branches) =
+        SingleProofV2.assemble_into::<ProofCollection>(Library::new(), true, false);
+    let (_, without_chain_branches) =
+        SingleProofV2.assemble_into::<ProofCollection>(Library::new(), false, false);
     assert_eq!(
         V8_SINGLE_PROOF_DIGEST,
         Program::new(&with_chain_branches).hash().to_hex()
@@ -257,16 +260,26 @@ async fn collections_are_verified_with_the_claim_version_of_the_rule_set() {
         cache_true_claim(claim).await;
     }
 
-    let proof = TransactionProof::ProofCollection(proof_collection);
+    let proof = TransactionProof::ProofCollection(proof_collection.into());
     let network = Network::Main;
     assert!(
         proof
-            .verify(txk_mast_hash, network, ConsensusRuleSet::UpgradeVMv7)
+            .verify(
+                txk_mast_hash,
+                network,
+                ConsensusRuleSet::UpgradeVMv7,
+                VerifyOptions::default()
+            )
             .await
     );
     assert!(
         !proof
-            .verify(txk_mast_hash, network, ConsensusRuleSet::UpgradeVMv8)
+            .verify(
+                txk_mast_hash,
+                network,
+                ConsensusRuleSet::UpgradeVMv8,
+                VerifyOptions::default()
+            )
             .await
     );
 }
@@ -459,15 +472,25 @@ async fn v7_proof_collection_end_to_end() {
     }
 
     let network = Network::Main;
-    let proof = TransactionProof::ProofCollection(proof_collection);
+    let proof = TransactionProof::ProofCollection(proof_collection.into());
     assert!(
         proof
-            .verify(txk_mast_hash, network, ConsensusRuleSet::UpgradeVMv7)
+            .verify(
+                txk_mast_hash,
+                network,
+                ConsensusRuleSet::UpgradeVMv7,
+                VerifyOptions::default()
+            )
             .await
     );
     assert!(
         !proof
-            .verify(txk_mast_hash, network, ConsensusRuleSet::UpgradeVMv8)
+            .verify(
+                txk_mast_hash,
+                network,
+                ConsensusRuleSet::UpgradeVMv8,
+                VerifyOptions::default()
+            )
             .await
     );
 
@@ -543,12 +566,22 @@ async fn v7_single_proof_end_to_end() {
     let proof = TransactionProof::SingleProof(single_proof);
     assert!(
         proof
-            .verify(txk_mast_hash, network, ConsensusRuleSet::UpgradeVMv7)
+            .verify(
+                txk_mast_hash,
+                network,
+                ConsensusRuleSet::UpgradeVMv7,
+                VerifyOptions::default()
+            )
             .await
     );
     assert!(
         !proof
-            .verify(txk_mast_hash, network, ConsensusRuleSet::UpgradeVMv8)
+            .verify(
+                txk_mast_hash,
+                network,
+                ConsensusRuleSet::UpgradeVMv8,
+                VerifyOptions::default()
+            )
             .await
     );
 

@@ -1,4 +1,5 @@
 pub mod address_screen;
+pub mod bridge_screen;
 pub mod dashboard_app;
 pub mod history_screen;
 pub mod mempool_screen;

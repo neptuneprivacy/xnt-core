@@ -62,7 +62,12 @@ use crate::protocol::consensus::block::difficulty_control::difficulty_control;
 use crate::protocol::consensus::block::pow::GuesserBuffer;
 use crate::protocol::consensus::block::pow::Pow;
 use crate::protocol::consensus::block::pow::PowMastPaths;
+use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+use crate::protocol::consensus::bridge::faucet_registration::FaucetRegistrationAnnouncement;
+use crate::protocol::consensus::bridge::pool_consolidation::PoolConsolidationAuthorization;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::transaction::announcement::Announcement;
 use crate::protocol::consensus::transaction::utxo::Coin;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::type_scripts::native_currency::NativeCurrency;
@@ -809,6 +814,31 @@ impl Block {
             return Err(BlockValidationError::TooManyAnnouncements);
         }
 
+        // 2.o) at most one settlement announcement, and it parses. BAAV binds the first one in its
+        // tx; with this, it is the one the authority gate and apply read.
+        if consensus_rule_set.bav_active() {
+            validate_bridge_settlements(&self.body().transaction_kernel.announcements)?;
+
+            // 2.p) at most one bridge registration, and it parses.
+            validate_bridge_registrations(&self.body().transaction_kernel.announcements)?;
+
+            // 2.q) no deposit claims a settlement's change output.
+            validate_bridge_deposits_against_settlement_change(
+                &self.body().transaction_kernel.announcements,
+            )?;
+
+            // 2.r) at most one pool consolidation authorization, on a no-op settlement.
+            pool_consolidation_authorization(&self.body().transaction_kernel.announcements)?;
+
+            // 2.t) no deposit commitment is announced twice.
+            validate_unique_bridge_deposits(&self.body().transaction_kernel.announcements)?;
+        }
+
+        // Bridge settlement authority (F1) + prev_state anti-replay (A0) are
+        // verified in `GlobalState::set_new_tip_internal` (and pre-checked in
+        // peer_loop), because both read the authority set / commitment from
+        // chain state, which this stateless `validate` cannot access.
+
         Ok(())
     }
 
@@ -1069,6 +1099,101 @@ impl Block {
 
         Ok(mutator_set_update)
     }
+}
+
+pub(crate) fn validate_bridge_settlements(
+    announcements: &[Announcement],
+) -> Result<(), BlockValidationError> {
+    let mut settlements = announcements
+        .iter()
+        .filter(|a| AggregatedAnnouncementData::is_settlement_tagged(a));
+    if let Some(settlement) = settlements.next() {
+        if settlements.next().is_some() {
+            return Err(BlockValidationError::TooManySettlements);
+        }
+        if AggregatedAnnouncementData::from_announcement(settlement).is_none() {
+            return Err(BlockValidationError::MalformedSettlement);
+        }
+    }
+    Ok(())
+}
+
+/// Rule 2.o: a deposit claiming a settlement's change output would mint WXNT twice for pool XNT.
+pub(crate) fn validate_bridge_deposits_against_settlement_change(
+    announcements: &[Announcement],
+) -> Result<(), BlockValidationError> {
+    let change_randomness: Vec<Digest> = announcements
+        .iter()
+        .filter_map(AggregatedAnnouncementData::from_announcement)
+        .filter_map(|settlement| settlement.change_sender_randomness)
+        .collect();
+    let change_commitment = PoolConsolidationAuthorization::find_in_announcements(announcements)
+        .map(|auth| auth.change_commitment);
+    let reused = BridgeDepositData::find_all_in_announcements(announcements)
+        .iter()
+        .any(|deposit| {
+            change_randomness.contains(&Digest::new(deposit.sender_randomness))
+                || change_commitment == Some(Digest::new(deposit.utxo_commitment))
+        });
+    if reused {
+        return Err(BlockValidationError::DepositReusesSettlementChange);
+    }
+    Ok(())
+}
+
+/// Rule 2.t: a commitment is minted once, so a repeated one would strand its other deposit.
+pub(crate) fn validate_unique_bridge_deposits(
+    announcements: &[Announcement],
+) -> Result<(), BlockValidationError> {
+    if !BridgeDepositData::find_all_in_announcements(announcements)
+        .iter()
+        .map(|deposit| deposit.utxo_commitment)
+        .all_unique()
+    {
+        return Err(BlockValidationError::DuplicateDeposit);
+    }
+    Ok(())
+}
+
+/// At most one authorization, it parses, and it rides a no-op settlement.
+pub(crate) fn pool_consolidation_authorization(
+    announcements: &[Announcement],
+) -> Result<Option<PoolConsolidationAuthorization>, BlockValidationError> {
+    let mut tagged = announcements
+        .iter()
+        .filter(|a| PoolConsolidationAuthorization::is_tagged(a));
+    let Some(first) = tagged.next() else {
+        return Ok(None);
+    };
+    if tagged.next().is_some() {
+        return Err(BlockValidationError::TooManyPoolConsolidations);
+    }
+    let auth = PoolConsolidationAuthorization::from_announcement(first)
+        .ok_or(BlockValidationError::MalformedPoolConsolidation)?;
+    if !AggregatedAnnouncementData::find_in_announcements(announcements)
+        .is_some_and(|settlement| settlement.is_pool_consolidation())
+    {
+        return Err(BlockValidationError::PoolConsolidationWithoutNoOpSettlement);
+    }
+    Ok(Some(auth))
+}
+
+/// Rule 2.n: the set-once gate and apply read the first registration, so allow only one.
+pub(crate) fn validate_bridge_registrations(
+    announcements: &[Announcement],
+) -> Result<(), BlockValidationError> {
+    let mut registrations = announcements
+        .iter()
+        .filter(|a| FaucetRegistrationAnnouncement::is_registration_tagged(a));
+    if let Some(registration) = registrations.next() {
+        if registrations.next().is_some() {
+            return Err(BlockValidationError::TooManyBridgeRegistrations);
+        }
+        if FaucetRegistrationAnnouncement::from_announcement(registration).is_none() {
+            return Err(BlockValidationError::MalformedBridgeRegistration);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1677,7 +1802,8 @@ pub(crate) mod tests {
         use crate::tests::shared::blocks::fake_valid_successor_for_tests;
 
         async fn deterministic_empty_block1_proposal() -> (Block, Timestamp, Network, Block) {
-            let network = Network::Main;
+            // Main's block 1 is pre-v8, which this program set cannot prove.
+            let network = Network::Testnet(0);
             let genesis = Block::genesis(network);
             let plus_one_hour = genesis.kernel.header.timestamp + Timestamp::hours(1);
 
@@ -1695,7 +1821,7 @@ pub(crate) mod tests {
             )
             .await;
 
-            let job_options = TritonVmProofJobOptions::default();
+            let job_options = TritonVmProofJobOptions::default_with_network(network);
             let (transaction, _) = create_block_transaction_from(
                 &genesis,
                 alice.clone(),
@@ -2537,6 +2663,230 @@ pub(crate) mod tests {
             alice.set_new_tip(block.clone()).await.unwrap();
 
             blocks.push(block);
+        }
+    }
+
+    mod bridge_registration_rule {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use super::*;
+        use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+
+        fn registration() -> Announcement {
+            FaucetRegistrationAnnouncement {
+                registration: BridgeRegistration {
+                    faucet_id: FaucetId {
+                        suffix: BFieldElement::new(1),
+                        prefix: BFieldElement::new(2),
+                    },
+                    genesis_state_commitment: Digest::default(),
+                },
+                signatures: vec![],
+            }
+            .to_announcement()
+        }
+
+        #[test]
+        fn one_registration_is_allowed() {
+            let other = Announcement::new(vec![BFieldElement::new(9)]);
+            assert!(validate_bridge_registrations(&[other, registration()]).is_ok());
+            assert!(validate_bridge_registrations(&[]).is_ok());
+        }
+
+        #[test]
+        fn two_registrations_are_rejected() {
+            assert!(matches!(
+                validate_bridge_registrations(&[registration(), registration()]),
+                Err(BlockValidationError::TooManyBridgeRegistrations)
+            ));
+        }
+
+        #[test]
+        fn malformed_registration_is_rejected() {
+            let mut truncated = registration();
+            truncated.message.pop();
+            assert!(matches!(
+                validate_bridge_registrations(&[truncated]),
+                Err(BlockValidationError::MalformedBridgeRegistration)
+            ));
+        }
+    }
+
+    mod bridge_deposit_duplicate_rule {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use super::*;
+
+        fn deposit(randomness: u64) -> Announcement {
+            BridgeDepositData {
+                account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                amount: NativeCurrencyAmount::coins(2),
+                utxo_commitment: [BFieldElement::new(randomness); 5],
+                sender_randomness: [BFieldElement::new(randomness); 5],
+                receiver_preimage: [BFieldElement::new(0); 5],
+            }
+            .to_announcement()
+        }
+
+        #[test]
+        fn distinct_deposits_pass() {
+            assert!(validate_unique_bridge_deposits(&[deposit(1), deposit(2)]).is_ok());
+        }
+
+        #[test]
+        fn a_repeated_commitment_is_rejected() {
+            assert!(matches!(
+                validate_unique_bridge_deposits(&[deposit(1), deposit(1)]),
+                Err(BlockValidationError::DuplicateDeposit)
+            ));
+        }
+    }
+
+    mod bridge_deposit_change_rule {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use super::*;
+        use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+        use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+
+        fn settlement_with_change(change: Option<Digest>) -> Announcement {
+            AggregatedAnnouncementData {
+                prev_state_commitment: Digest::default(),
+                new_state_commitment: Digest::default(),
+                exit_root: Digest::default(),
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(1),
+                    prefix: BFieldElement::new(2),
+                },
+                prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+                burns: vec![],
+                change_sender_randomness: change,
+                authority_signatures: vec![],
+            }
+            .to_announcement()
+        }
+
+        fn deposit(sender_randomness: Digest) -> Announcement {
+            BridgeDepositData {
+                account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+                amount: NativeCurrencyAmount::coins(2),
+                utxo_commitment: [BFieldElement::new(5); 5],
+                sender_randomness: sender_randomness.values(),
+                receiver_preimage: [BFieldElement::new(0); 5],
+            }
+            .to_announcement()
+        }
+
+        #[test]
+        fn deposit_reusing_the_settlement_change_randomness_is_rejected() {
+            let sr = Digest::new([BFieldElement::new(7); 5]);
+            assert!(matches!(
+                validate_bridge_deposits_against_settlement_change(&[
+                    settlement_with_change(Some(sr)),
+                    deposit(sr)
+                ]),
+                Err(BlockValidationError::DepositReusesSettlementChange)
+            ));
+        }
+
+        #[test]
+        fn unrelated_deposits_and_settlements_pass() {
+            let sr = Digest::new([BFieldElement::new(7); 5]);
+            let other = Digest::new([BFieldElement::new(8); 5]);
+            for announcements in [
+                vec![settlement_with_change(Some(sr)), deposit(other)],
+                vec![settlement_with_change(None), deposit(sr)],
+                vec![deposit(sr)],
+                vec![settlement_with_change(Some(sr))],
+            ] {
+                assert!(validate_bridge_deposits_against_settlement_change(&announcements).is_ok());
+            }
+        }
+
+        #[test]
+        fn deposit_claiming_the_consolidation_change_commitment_is_rejected() {
+            let change = Digest::new([BFieldElement::new(5); 5]);
+            let auth = PoolConsolidationAuthorization::new(change, vec![]).to_announcement();
+            assert!(matches!(
+                validate_bridge_deposits_against_settlement_change(&[
+                    settlement_with_change(Some(Digest::new([BFieldElement::new(7); 5]))),
+                    auth,
+                    deposit(Digest::new([BFieldElement::new(8); 5]))
+                ]),
+                Err(BlockValidationError::DepositReusesSettlementChange)
+            ));
+        }
+    }
+
+    mod pool_consolidation_rule {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use super::*;
+        use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+        use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+        use crate::protocol::consensus::bridge::pool_consolidation::POOL_CONSOLIDATION_TAG;
+
+        fn settlement(new_state: Digest) -> Announcement {
+            AggregatedAnnouncementData {
+                prev_state_commitment: Digest::default(),
+                new_state_commitment: new_state,
+                exit_root: Digest::default(),
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(1),
+                    prefix: BFieldElement::new(2),
+                },
+                prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+                burns: vec![],
+                change_sender_randomness: Some(Digest::new([BFieldElement::new(7); 5])),
+                authority_signatures: vec![],
+            }
+            .to_announcement()
+        }
+
+        fn authorization() -> Announcement {
+            PoolConsolidationAuthorization::new(
+                Digest::new([BFieldElement::new(9); 5]),
+                vec![Digest::new([BFieldElement::new(3); 5])],
+            )
+            .to_announcement()
+        }
+
+        #[test]
+        fn authorization_needs_one_parsable_copy_on_a_no_op_settlement() {
+            let no_op = settlement(Digest::default());
+            assert!(matches!(
+                pool_consolidation_authorization(&[no_op.clone(), authorization()]),
+                Ok(Some(_))
+            ));
+            assert!(matches!(
+                pool_consolidation_authorization(&[authorization()]),
+                Err(BlockValidationError::PoolConsolidationWithoutNoOpSettlement)
+            ));
+            assert!(matches!(
+                pool_consolidation_authorization(&[
+                    settlement(Digest::new([BFieldElement::new(3); 5])),
+                    authorization()
+                ]),
+                Err(BlockValidationError::PoolConsolidationWithoutNoOpSettlement)
+            ));
+            assert!(matches!(
+                pool_consolidation_authorization(&[
+                    no_op.clone(),
+                    authorization(),
+                    authorization()
+                ]),
+                Err(BlockValidationError::TooManyPoolConsolidations)
+            ));
+            assert!(matches!(
+                pool_consolidation_authorization(&[
+                    no_op,
+                    Announcement::new(vec![BFieldElement::new(POOL_CONSOLIDATION_TAG)])
+                ]),
+                Err(BlockValidationError::MalformedPoolConsolidation)
+            ));
         }
     }
 }

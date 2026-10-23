@@ -4,8 +4,9 @@
 
 use crate::core::{
     check_spent, compute_absolute_index_set_hash, compute_commitment,
-    compute_commitment_for_output, decrypt_indexed_utxo_for_network, fetch_utxos_with_skipped,
-    get_aocl_indices, get_membership_proofs, get_mutator_set, MembershipProof, MutatorSet, Network,
+    compute_commitment_for_output, decrypt_indexed_utxo_for_network, fetch_public_utxos,
+    fetch_utxos_with_skipped, get_aocl_indices, get_membership_proofs, get_mutator_set,
+    MembershipProof, MutatorSet, Network,
 };
 
 use super::address::network_from_raw;
@@ -33,6 +34,29 @@ pub struct XntIndexedUtxoArray {
 }
 
 impl XntIndexedUtxoArray {
+    fn null() -> Self {
+        Self { data: std::ptr::null_mut(), len: 0 }
+    }
+}
+
+/// Bridge payout from sync: a public UTXO, found by its receiver identifier
+#[repr(C)]
+pub struct XntPublicIndexedUtxo {
+    pub block_height: u64,
+    pub block_digest: XntDigest,
+    pub lock_script_hash: XntDigest,
+    pub amount_nau: i128,
+    pub sender_randomness: XntDigest,
+}
+
+/// Array of bridge payouts
+#[repr(C)]
+pub struct XntPublicIndexedUtxoArray {
+    pub data: *mut XntPublicIndexedUtxo,
+    pub len: usize,
+}
+
+impl XntPublicIndexedUtxoArray {
     fn null() -> Self {
         Self { data: std::ptr::null_mut(), len: 0 }
     }
@@ -167,6 +191,69 @@ pub extern "C" fn xnt_sync_indexed_utxos_free(arr: *mut XntIndexedUtxoArray) {
                         ));
                     }
                 }
+                drop(Vec::from_raw_parts(arr.data, arr.len, arr.len));
+            }
+            arr.data = std::ptr::null_mut();
+            arr.len = 0;
+        }
+    })
+}
+
+/// Fetch bridge payouts by receiver_id_hash from indexer
+#[no_mangle]
+pub extern "C" fn xnt_sync_fetch_public_utxos(
+    client: *const RpcClientHandle,
+    receiver_id_hash: *const XntDigest,
+    from_height: u64,
+    to_height: u64,
+) -> XntPublicIndexedUtxoArray {
+    ffi_guard(XntPublicIndexedUtxoArray::null(), || {
+        ffi_begin!();
+        if client.is_null() || receiver_id_hash.is_null() {
+            set_last_error("null pointer");
+            return XntPublicIndexedUtxoArray::null();
+        }
+
+        let client = ffi_ref!(client);
+        let digest = ffi_ref!(receiver_id_hash);
+        let core_digest = crate::core::Digest::from_bytes(digest.bytes);
+
+        match fetch_public_utxos(&client.0, &core_digest, from_height, to_height) {
+            Ok(payouts) => {
+                let payouts: Vec<XntPublicIndexedUtxo> = payouts
+                    .into_iter()
+                    .map(|p| XntPublicIndexedUtxo {
+                        block_height: p.block_height,
+                        block_digest: XntDigest::from_bytes(p.block_digest.bytes),
+                        lock_script_hash: XntDigest::from_bytes(p.lock_script_hash.bytes),
+                        amount_nau: p.amount_nau,
+                        sender_randomness: XntDigest::from_bytes(p.sender_randomness.bytes),
+                    })
+                    .collect();
+                let len = payouts.len();
+                XntPublicIndexedUtxoArray {
+                    data: vec_to_ptr(payouts),
+                    len,
+                }
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                XntPublicIndexedUtxoArray::null()
+            }
+        }
+    })
+}
+
+/// Free bridge payout array
+#[no_mangle]
+pub extern "C" fn xnt_sync_public_utxos_free(arr: *mut XntPublicIndexedUtxoArray) {
+    ffi_guard((), || {
+        if arr.is_null() {
+            return;
+        }
+        unsafe {
+            let arr = &mut *arr;
+            if !arr.data.is_null() && arr.len > 0 {
                 drop(Vec::from_raw_parts(arr.data, arr.len, arr.len));
             }
             arr.data = std::ptr::null_mut();

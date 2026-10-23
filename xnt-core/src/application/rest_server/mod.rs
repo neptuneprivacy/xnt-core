@@ -39,6 +39,7 @@ use crate::api::export::TransactionProof;
 use crate::api::export::Utxo;
 use crate::api::export::UtxoTriple;
 use crate::api::tx_initiation::legacy_era;
+use crate::application::json_rpc::core::model::common::RpcNativeCurrencyAmount;
 use crate::application::loops::main_loop::proof_upgrader::UpgradeJob;
 use crate::application::loops::main_loop::upgrade_incentive::UpgradeIncentive;
 use crate::application::rpc::server::NeptuneRPCServer;
@@ -49,6 +50,8 @@ use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::BlockProof;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::LeviathanProofCollection;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::peer::transfer_transaction::TransferTransaction;
@@ -266,6 +269,18 @@ pub(crate) async fn run_rpc_server(
             .route(
                 "/rpc/generate_membership_proof",
                 axum::routing::post(restore_membership_proof_privacy_preserving),
+            )
+            .route("/", axum::routing::get(health_check))
+            // Bridge endpoints
+            .route("/rpc/bridge/status", axum::routing::get(bridge_status))
+            .route("/rpc/bridge/pool", axum::routing::get(bridge_pool))
+            .route(
+                "/rpc/bridge/deposits/{*block_selector}",
+                axum::routing::get(bridge_deposits),
+            )
+            .route(
+                "/rpc/bridge/withdrawals/{*block_selector}",
+                axum::routing::get(bridge_withdrawals),
             );
 
         routes
@@ -285,6 +300,10 @@ pub(crate) async fn run_rpc_server(
     )
     .await?;
     Ok(())
+}
+
+async fn health_check() -> &'static str {
+    "ok"
 }
 
 async fn get_block(
@@ -555,7 +574,7 @@ async fn get_nonces(
 struct SimpleBlock {
     height: u64,
     hash: String,
-    fee: String,
+    fee_nau: RpcNativeCurrencyAmount,
     timestamp: u64,
 }
 
@@ -588,7 +607,7 @@ async fn get_last_blocks(
         block_time_list.push(SimpleBlock {
             height: block.header().height.into(),
             hash: block.hash().to_hex(),
-            fee: block.body().transaction_kernel.fee.to_string(),
+            fee_nau: block.body().transaction_kernel.fee.into(),
             timestamp: block.header().timestamp.to_millis(),
         });
     }
@@ -683,26 +702,23 @@ async fn broadcast_transaction(
     // is mined?
     let cli = rpcstate.state.cli();
     let network = cli.network;
-    let (consensus_rule_set, tip_height) = {
-        let state = rpcstate.state.lock_guard().await;
-        (
-            state.next_block_consensus_rule_set(),
-            state.chain.light_state().header().height,
-        )
-    };
-    if !tx.is_valid(network, consensus_rule_set).await {
+    let (consensus_rule_set, tip_height, verify_options) = bridge_verify_context(&rpcstate).await;
+    // A collection made for the previous era has the sub-proofs of this one's.
+    let tx = tx.with_proof_collection_layout_of(consensus_rule_set);
+    if !tx
+        .is_valid_with_options(network, consensus_rule_set, verify_options)
+        .await
+    {
         return Err(RestError("Received transaction is not valid".to_owned()));
     }
 
     // Before the fork, the terms of that era apply, as for every submission.
-    if consensus_rule_set.is_legacy_era()
-        && !legacy_era::submitted_transaction_meets_terms(
-            &tx,
-            network,
-            tip_height,
-            cli.fork_tx_cutoff_margin,
-        )
-    {
+    if !legacy_era::submitted_transaction_meets_terms(
+        &tx,
+        network,
+        tip_height,
+        cli.fork_tx_cutoff_margin,
+    ) {
         return Err(RestError(
             "Transaction does not meet the terms of the era before the next hard fork".to_owned(),
         ));
@@ -739,6 +755,11 @@ async fn broadcast_transaction(
         return Err(RestError("Transaction is not confirmable".to_owned()));
     }
 
+    state
+        .bridge_admission_check(&tx.kernel)
+        .await
+        .map_err(|e| RestError(e.to_string()))?;
+
     info!("broadcasted insert tx: {}", tx.kernel.txid().to_string());
 
     // Held only while the rule set it was verified under is the next block's.
@@ -768,15 +789,31 @@ async fn broadcast_transaction(
 /// Data type for a transaction that rewards the RPC server for upgrading the
 /// proof type from ProofCollection to SingleProof.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct IncentivizedProofCollectionTransaction {
+pub struct IncentivizedProofCollectionTransaction<P = ProofCollection> {
     kernel: TransactionKernel,
-    proof_collection: ProofCollection,
+    proof_collection: P,
     incentive_amount: NativeCurrencyAmount,
     sender_randomness: Digest,
     incentive_address: String,
 }
 
-impl IncentivizedProofCollectionTransaction {
+impl<P> IncentivizedProofCollectionTransaction<P> {
+    /// Decode a body whose collection has layout `P`.
+    fn decode<Q>(body: &axum::body::Bytes) -> Result<Self, RestError>
+    where
+        Q: serde::de::DeserializeOwned + Into<P>,
+    {
+        let tx: IncentivizedProofCollectionTransaction<Q> =
+            bincode::deserialize_from(body.as_ref()).context("deserialize error")?;
+        Ok(Self {
+            kernel: tx.kernel,
+            proof_collection: tx.proof_collection.into(),
+            incentive_amount: tx.incentive_amount,
+            sender_randomness: tx.sender_randomness,
+            incentive_address: tx.incentive_address,
+        })
+    }
+
     /// Returns true if the transaction contains the advertised output, returs
     /// false otherwise.
     fn contains_advertised_output(&self, network: Network) -> bool {
@@ -805,8 +842,14 @@ async fn incentivized_proof_collection_transaction(
     State(mut rpcstate): State<NeptuneRPCServer>,
     body: axum::body::Bytes,
 ) -> Result<ErasedJson, RestError> {
-    let tx: IncentivizedProofCollectionTransaction =
-        bincode::deserialize_from(body.reader()).context("deserialize error")?;
+    // The collection is in the layout of the next block's rule set.
+    let (consensus_rule_set, _, verify_options) = bridge_verify_context(&rpcstate).await;
+    let tx: IncentivizedProofCollectionTransaction<AnyProofCollection> =
+        if consensus_rule_set.bav_active() {
+            IncentivizedProofCollectionTransaction::decode::<LeviathanProofCollection>(&body)?
+        } else {
+            IncentivizedProofCollectionTransaction::decode::<ProofCollection>(&body)?
+        };
 
     // Does transaction have advertised output?
     let cli = rpcstate.state.cli();
@@ -854,11 +897,6 @@ async fn incentivized_proof_collection_transaction(
     // Is transaction valid under the rule set of the next block? Before the
     // next hard fork, this node does not upgrade proof collections; the nodes
     // of the previous release do.
-    let consensus_rule_set = rpcstate
-        .state
-        .lock_guard()
-        .await
-        .next_block_consensus_rule_set();
     if consensus_rule_set.is_legacy_era() {
         return Err(RestError(format!(
             "This node does not upgrade proof collections of consensus rule set \
@@ -869,7 +907,10 @@ async fn incentivized_proof_collection_transaction(
         kernel: tx.kernel.clone(),
         proof: TransactionProof::ProofCollection(tx.proof_collection.clone()),
     };
-    if !transaction.is_valid(network, consensus_rule_set).await {
+    if !transaction
+        .is_valid_with_options(network, consensus_rule_set, verify_options)
+        .await
+    {
         return Err(RestError("Received transaction is not valid".to_owned()));
     }
 
@@ -903,6 +944,11 @@ async fn incentivized_proof_collection_transaction(
             "Received tx too far into the future. Got timestamp {timestamp}"
         )));
     }
+
+    state
+        .bridge_admission_check(&tx.kernel)
+        .await
+        .map_err(|e| RestError(e.to_string()))?;
 
     // All checks passed. Notify wallet of expected upgrade reward.
     let upgrade_reward =
@@ -940,6 +986,194 @@ async fn incentivized_proof_collection_transaction(
 pub struct ResponseSendTx {
     pub(crate) status: u64,
     pub(crate) message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Bridge endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct BridgeStatusResponse {
+    /// Current Leviathan state commitment (hex), null if no epoch processed yet.
+    state_commitment: Option<String>,
+    /// Number of unspent pool UTXOs.
+    pool_size: usize,
+    /// Total locked in the bridge pool, in nau.
+    pool_balance_nau: RpcNativeCurrencyAmount,
+}
+
+async fn bridge_status(State(rpcstate): State<NeptuneRPCServer>) -> Result<ErasedJson, RestError> {
+    let state = rpcstate.state.lock_guard().await;
+    let archival_state = state.chain.archival_state();
+
+    let state_commitment = archival_state.bridge_state_commitment().await;
+    let pool_entries: Vec<_> = archival_state.bridge_pool_db.iter().collect();
+    let pool_size = pool_entries.len();
+    let pool_balance: NativeCurrencyAmount = pool_entries
+        .iter()
+        .map(|(_, entry)| entry.amount)
+        .fold(NativeCurrencyAmount::from_nau(0), |acc, a| acc + a);
+
+    Ok(ErasedJson::pretty(BridgeStatusResponse {
+        state_commitment: state_commitment.map(|d| d.to_hex()),
+        pool_size,
+        pool_balance_nau: pool_balance.into(),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct PoolEntryResponse {
+    /// Canonical commitment (hex).
+    commitment: String,
+    input_digest: String,
+    /// Amount locked, in nau.
+    amount_nau: RpcNativeCurrencyAmount,
+    /// AOCL leaf index in the mutator set.
+    aocl_leaf_index: u64,
+}
+
+async fn bridge_pool(State(rpcstate): State<NeptuneRPCServer>) -> Result<ErasedJson, RestError> {
+    let state = rpcstate.state.lock_guard().await;
+    let archival_state = state.chain.archival_state();
+
+    let entries: Vec<PoolEntryResponse> = archival_state
+        .bridge_pool_db
+        .iter()
+        .map(|(key, entry)| PoolEntryResponse {
+            commitment: entry.commitment().to_hex(),
+            input_digest: key.to_hex(),
+            amount_nau: entry.amount.into(),
+            aocl_leaf_index: entry.aocl_leaf_index,
+        })
+        .collect();
+
+    Ok(ErasedJson::pretty(entries))
+}
+
+#[derive(Debug, Serialize)]
+struct DepositResponse {
+    /// Leviathan account ID elements [suffix, prefix].
+    account_id: [u64; 2],
+    /// Amount locked, in nau.
+    amount_nau: RpcNativeCurrencyAmount,
+    /// Pool UTXO commitment (hex).
+    utxo_commitment: String,
+}
+
+async fn bridge_deposits(
+    State(rpcstate): State<NeptuneRPCServer>,
+    Path(block_selector): Path<BlockSelectorExtended>,
+) -> Result<ErasedJson, RestError> {
+    use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+
+    let block_selector = BlockSelector::from(block_selector);
+    let state = rpcstate.state.lock_guard().await;
+    let Some(digest) = block_selector.as_digest(&state).await else {
+        return Ok(ErasedJson::pretty(Vec::<DepositResponse>::new()));
+    };
+    let archival_state = state.chain.archival_state();
+    let Some(block) = archival_state.get_block(digest).await? else {
+        return Ok(ErasedJson::pretty(Vec::<DepositResponse>::new()));
+    };
+
+    let announcements = &block.kernel.body.transaction_kernel.announcements;
+    let deposits: Vec<DepositResponse> =
+        BridgeDepositData::find_all_in_announcements(announcements)
+            .into_iter()
+            .map(|d| DepositResponse {
+                account_id: [d.account_id[0].value(), d.account_id[1].value()],
+                amount_nau: d.amount.into(),
+                utxo_commitment: Digest::new(d.utxo_commitment).to_hex(),
+            })
+            .collect();
+
+    Ok(ErasedJson::pretty(deposits))
+}
+
+async fn bridge_verify_context(
+    rpcstate: &NeptuneRPCServer,
+) -> (
+    crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet,
+    crate::protocol::consensus::block::block_height::BlockHeight,
+    crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions,
+) {
+    let state = rpcstate.state.lock_guard().await;
+    let prev_state_commitment = state.chain.archival_state().bridge_state_commitment().await;
+    (
+        state.next_block_consensus_rule_set(),
+        state.chain.light_state().header().height,
+        crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions {
+            prev_state_commitment,
+        },
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct WithdrawalResponse {
+    /// Previous Leviathan state commitment (hex).
+    prev_state_commitment: String,
+    /// New Leviathan state commitment (hex).
+    new_state_commitment: String,
+    /// Exit root (hex).
+    exit_root: String,
+    /// Leviathan faucet id: suffix, prefix.
+    faucet_id: [u64; 2],
+    /// Individual burn records.
+    burns: Vec<BurnResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct BurnResponse {
+    /// Recipient receiver identifier.
+    receiver_identifier: u64,
+    /// Recipient privacy digest for AdditionRecord commitment (hex).
+    privacy_digest: String,
+    /// Recipient lock script hash (hex).
+    lock_script_hash: String,
+    /// Amount in Leviathan units (6 decimals).
+    amount: u64,
+    /// Sender randomness for UTXO discovery (hex).
+    sender_randomness: String,
+}
+
+async fn bridge_withdrawals(
+    State(rpcstate): State<NeptuneRPCServer>,
+    Path(block_selector): Path<BlockSelectorExtended>,
+) -> Result<ErasedJson, RestError> {
+    use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+
+    let block_selector = BlockSelector::from(block_selector);
+    let state = rpcstate.state.lock_guard().await;
+    let Some(digest) = block_selector.as_digest(&state).await else {
+        return Ok(ErasedJson::pretty(Option::<WithdrawalResponse>::None));
+    };
+    let archival_state = state.chain.archival_state();
+    let Some(block) = archival_state.get_block(digest).await? else {
+        return Ok(ErasedJson::pretty(Option::<WithdrawalResponse>::None));
+    };
+
+    let announcements = &block.kernel.body.transaction_kernel.announcements;
+    let response = AggregatedAnnouncementData::find_in_announcements(announcements).map(|ann| {
+        WithdrawalResponse {
+            prev_state_commitment: ann.prev_state_commitment.to_hex(),
+            new_state_commitment: ann.new_state_commitment.to_hex(),
+            exit_root: ann.exit_root.to_hex(),
+            faucet_id: [ann.faucet_id.suffix.value(), ann.faucet_id.prefix.value()],
+            burns: ann
+                .burns
+                .iter()
+                .map(|b| BurnResponse {
+                    receiver_identifier: b.receiver_identifier.value(),
+                    privacy_digest: b.privacy_digest.to_hex(),
+                    lock_script_hash: b.lock_script_hash.to_hex(),
+                    amount: b.amount,
+                    sender_randomness: b.sender_randomness().to_hex(),
+                })
+                .collect(),
+        }
+    });
+
+    Ok(ErasedJson::pretty(response))
 }
 
 mod block_selector {

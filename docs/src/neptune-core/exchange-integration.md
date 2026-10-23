@@ -94,7 +94,7 @@ Response:
         "receivingAddress": "xntnwm1...",
         "utxo": {
           "lockScriptHash": "...",
-          "amount": "100.0"
+          "amountNau": "400000000000000000000000000000000"
         }
       }
     ]
@@ -107,7 +107,7 @@ Response:
 - `height` - Block height for calculating confirmations
 - `utxoDigest` - Unique identifier for this deposit
 - `receivingAddress` - Match against your deposit addresses
-- `amount` - Deposit amount
+- `amountNau` - Deposit amount in nau (base units, 1 coin = 4·10^30 nau), as an integer string
 
 ### 3. Check Confirmations
 
@@ -177,7 +177,7 @@ Response:
       {
         "utxo": {
           "lockScriptHash": "...",
-          "amount": "10.0"
+          "amountNau": "40000000000000000000000000000000"
         },
         "utxoDigest": "d4e5f6a1b2c3...",
         "senderRandomness": "e5f6a1b2c3d4...",

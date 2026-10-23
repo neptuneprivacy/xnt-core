@@ -81,6 +81,7 @@ use crate::api::tx_initiation;
 use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
 use crate::api::tx_initiation::consolidate::NUM_RECENT_BLOCKS_EXCLUDED;
+use crate::api::tx_initiation::initiator::BridgeDepositAll;
 use crate::api::tx_initiation::migrate_dctidh::is_own_address;
 use crate::api::tx_initiation::migrate_dctidh::DctidhMigrationReport;
 use crate::api::tx_initiation::migrate_dctidh::MigrationDestination;
@@ -113,6 +114,10 @@ use crate::protocol::consensus::block::block_kernel::BlockKernel;
 use crate::protocol::consensus::block::block_selector::BlockSelector;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::bridge::authority::BridgeAuthoritySet;
+use crate::protocol::consensus::bridge::authority_rotation::AuthorityRotationAnnouncement;
+use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
+use crate::protocol::consensus::bridge::faucet_registration::FaucetRegistrationAnnouncement;
 use crate::protocol::consensus::transaction::announcement::Announcement;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
@@ -1721,6 +1726,47 @@ pub trait RPC {
         max_inputs: Option<usize>,
     ) -> RpcResult<TxCreationArtifacts>;
 
+    /// Lock XNT into the bridge pool and emit a deposit announcement.
+    ///
+    /// Relayers watch for these announcements to mint WXNT on Leviathan.
+    async fn bridge_deposit(
+        token: auth::Token,
+        leviathan_account_id: [u64; 2],
+        amount: NativeCurrencyAmount,
+        fee: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> RpcResult<TxCreationArtifacts>;
+
+    /// Locks what the largest inputs (capped at 8) hold, minus `fee`, leaving at least `keep`.
+    async fn bridge_deposit_all(
+        token: auth::Token,
+        leviathan_account_id: [u64; 2],
+        fee: NativeCurrencyAmount,
+        keep: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> RpcResult<BridgeDepositAll>;
+
+    /// Rotate the bridge authority set, paying the carrier tx from this node's wallet.
+    /// `signatures` (64 bytes each) are by the current set's threshold and every new key.
+    async fn bridge_submit_authority_rotation(
+        token: auth::Token,
+        new_keys: Vec<Vec<u8>>,
+        new_threshold: usize,
+        signatures: Vec<Vec<u8>>,
+        fee: NativeCurrencyAmount,
+    ) -> RpcResult<TxCreationArtifacts>;
+
+    /// Register the bridge faucet, paying the carrier tx from this node's wallet.
+    /// `signatures` (64 bytes each) are by the current authority set's threshold.
+    async fn bridge_submit_registration(
+        token: auth::Token,
+        registration: BridgeRegistration,
+        signatures: Vec<Vec<u8>>,
+        fee: NativeCurrencyAmount,
+    ) -> RpcResult<TxCreationArtifacts>;
+
     /// Like `send` but the resulting transaction is *transparent*. No privacy.
     ///
     /// Specifically, the resulting transaction contains announcements that
@@ -2001,10 +2047,7 @@ pub trait RPC {
     /// key as the base address, so all payments can be scanned with a single key.
     ///
     /// Returns the subaddress as a bech32m-encoded string.
-    async fn generate_subaddress(
-        token: auth::Token,
-        payment_id: u64,
-    ) -> RpcResult<String>;
+    async fn generate_subaddress(token: auth::Token, payment_id: u64) -> RpcResult<String>;
 
     /// Gracious shutdown.
     ///
@@ -2176,6 +2219,23 @@ pub(crate) struct NeptuneRPCServer {
 }
 
 impl NeptuneRPCServer {
+    async fn bridge_authority_set_for_submission(
+        &self,
+    ) -> Result<BridgeAuthoritySet, error::RpcError> {
+        let state = self.state.lock_guard().await;
+        if !state.bridge_rules_apply_to_next_block() {
+            return Err(error::RpcError::Failed(
+                "the bridge is not active before its activation height".to_string(),
+            ));
+        }
+        state
+            .chain
+            .archival_state()
+            .bridge_authority_set_current()
+            .await
+            .ok_or_else(|| error::RpcError::Failed("no bridge authority set".to_string()))
+    }
+
     /// instantiate a new [NeptuneRPCServer]
     pub fn new(
         state: GlobalStateLock,
@@ -3425,6 +3485,171 @@ impl RPC for NeptuneRPCServer {
             .await?)
     }
 
+    // documented in trait. do not add doc-comment.
+    async fn bridge_deposit(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        leviathan_account_id: [u64; 2],
+        amount: NativeCurrencyAmount,
+        fee: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> RpcResult<TxCreationArtifacts> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_sender_mut()
+            .bridge_deposit(
+                leviathan_account_id,
+                amount,
+                fee,
+                Timestamp::now(),
+                exclude_recent_blocks,
+                max_inputs,
+            )
+            .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn bridge_deposit_all(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        leviathan_account_id: [u64; 2],
+        fee: NativeCurrencyAmount,
+        keep: NativeCurrencyAmount,
+        exclude_recent_blocks: usize,
+        max_inputs: Option<usize>,
+    ) -> RpcResult<BridgeDepositAll> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_sender_mut()
+            .bridge_deposit_all(
+                leviathan_account_id,
+                fee,
+                keep,
+                Timestamp::now(),
+                exclude_recent_blocks,
+                max_inputs,
+            )
+            .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn bridge_submit_authority_rotation(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        new_keys: Vec<Vec<u8>>,
+        new_threshold: usize,
+        signatures: Vec<Vec<u8>>,
+        fee: NativeCurrencyAmount,
+    ) -> RpcResult<TxCreationArtifacts> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let rotation = AuthorityRotationAnnouncement {
+            new_keys,
+            new_threshold,
+            signatures: bridge_signatures(signatures)?,
+        };
+        let current = self.bridge_authority_set_for_submission().await?;
+        // Before proving, so a bad request costs no prover time.
+        rotation
+            .verify_and_build(&current, self.state.cli().network)
+            .map_err(|e| error::RpcError::Failed(format!("invalid rotation: {e}")))?;
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_sender_mut()
+            .submit_authority_rotation(
+                rotation.new_keys,
+                rotation.new_threshold,
+                rotation.signatures,
+                fee,
+                Timestamp::now(),
+                0,
+                None,
+            )
+            .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn bridge_submit_registration(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        registration: BridgeRegistration,
+        signatures: Vec<Vec<u8>>,
+        fee: NativeCurrencyAmount,
+    ) -> RpcResult<TxCreationArtifacts> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let announcement = FaucetRegistrationAnnouncement {
+            registration,
+            signatures: bridge_signatures(signatures)?,
+        };
+        let current = self.bridge_authority_set_for_submission().await?;
+        {
+            let state = self.state.lock_guard().await;
+            if state
+                .chain
+                .archival_state()
+                .bridge_registration_current()
+                .await
+                .is_some()
+            {
+                return Err(error::RpcError::Failed(
+                    "a bridge registration is already in effect".to_string(),
+                ));
+            }
+            // A second one could only produce blocks the gates reject.
+            if state
+                .mempool
+                .fee_density_iter()
+                .filter_map(|(txid, _)| state.mempool.get(txid))
+                .any(|tx| {
+                    tx.kernel
+                        .announcements
+                        .iter()
+                        .any(FaucetRegistrationAnnouncement::is_registration_tagged)
+                })
+            {
+                return Err(error::RpcError::Failed(
+                    "a bridge registration is already pending in the mempool".to_string(),
+                ));
+            }
+        }
+        // Before proving, so a bad request costs no prover time.
+        announcement
+            .verify(&current, self.state.cli().network)
+            .map_err(|e| error::RpcError::Failed(format!("invalid registration: {e}")))?;
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_sender_mut()
+            .submit_bridge_registration(
+                announcement.registration,
+                announcement.signatures,
+                fee,
+                Timestamp::now(),
+                0,
+                None,
+            )
+            .await?)
+    }
+
     // documented in trait. do not add doc-commtn.
     async fn send_transparent(
         mut self,
@@ -3960,7 +4185,10 @@ impl RPC for NeptuneRPCServer {
         }
 
         // get unconfirmed incoming UTXOs
-        for (incoming_utxo, addition_record, payment_id) in state.wallet_state.mempool_unspent_utxos_with_payment_id_iter() {
+        for (incoming_utxo, addition_record, payment_id) in state
+            .wallet_state
+            .mempool_unspent_utxos_with_payment_id_iter()
+        {
             if present_addition_records.insert(addition_record) {
                 ui_utxos.push(UiUtxo {
                     received: UtxoStatusEvent::Pending,
@@ -4483,14 +4711,17 @@ impl RPC for NeptuneRPCServer {
         let index = current_counter
             .checked_sub(1)
             .ok_or(RpcError::WalletKeyCounterIsZero)?;
-        let spending_key = state.wallet_state.nth_spending_key(KeyType::Generation, index);
+        let spending_key = state
+            .wallet_state
+            .nth_spending_key(KeyType::Generation, index);
 
         // Get the receiving address and create the subaddress (only Generation addresses supported)
         let receiving_address = spending_key.to_address();
         let encoded = match receiving_address {
             ReceivingAddress::Generation(gen_addr) => {
-                let subaddress = GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id))
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let subaddress =
+                    GenerationSubAddress::new(*gen_addr, BFieldElement::new(payment_id))
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
                 subaddress.to_bech32m(network)
             }
             _ => {
@@ -4753,6 +4984,16 @@ impl RPC for NeptuneRPCServer {
     }
 }
 
+fn bridge_signatures(signatures: Vec<Vec<u8>>) -> Result<Vec<[u8; 64]>, error::RpcError> {
+    signatures
+        .into_iter()
+        .map(|signature| {
+            <[u8; 64]>::try_from(signature)
+                .map_err(|_| error::RpcError::Failed("a signature must be 64 bytes".to_string()))
+        })
+        .collect()
+}
+
 pub mod error {
     use super::*;
 
@@ -4968,6 +5209,68 @@ mod tests {
             .await
             .unwrap()
             .into()
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn bridge_submissions_refuse_before_activation_or_without_signatures() {
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+
+        let registration = BridgeRegistration {
+            faucet_id: FaucetId {
+                suffix: BFieldElement::new(1),
+                prefix: BFieldElement::new(2),
+            },
+            genesis_state_commitment: Digest::default(),
+        };
+        let new_key = k256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        // Main's genesis is before the bridge era; RegTest's is in it.
+        for (network, refusal) in [
+            (Network::Main, "the bridge is not active"),
+            (Network::RegTest, "not signed by a threshold"),
+        ] {
+            let rpc_server = test_rpc_server(
+                WalletEntropy::devnet_wallet(),
+                2,
+                cli_args::Args::default_with_network(network),
+            )
+            .await;
+            let token = cookie_token(&rpc_server).await;
+            let registration_err = rpc_server
+                .clone()
+                .bridge_submit_registration(
+                    context::current(),
+                    token,
+                    registration,
+                    vec![],
+                    NativeCurrencyAmount::zero(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                registration_err.to_string().contains(refusal),
+                "{network}: {registration_err}"
+            );
+            let rotation_err = rpc_server
+                .bridge_submit_authority_rotation(
+                    context::current(),
+                    token,
+                    vec![new_key.clone()],
+                    1,
+                    vec![],
+                    NativeCurrencyAmount::zero(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                rotation_err.to_string().contains(refusal),
+                "{network}: {rotation_err}"
+            );
+        }
     }
 
     #[apply(shared_tokio_runtime)]
@@ -7649,7 +7952,15 @@ mod tests {
             for i in 0..10 {
                 let result = rpc_server
                     .clone()
-                    .send(ctx, token, outputs.clone(), ChangePolicy::Burn, fee, 0, None)
+                    .send(
+                        ctx,
+                        token,
+                        outputs.clone(),
+                        ChangePolicy::Burn,
+                        fee,
+                        0,
+                        None,
+                    )
                     .await;
 
                 // any attempts after the 2nd send should result in RateLimit error.
@@ -7765,7 +8076,9 @@ mod tests {
                         if payment_id.is_zero() {
                             payment_id = BFieldElement::new(1);
                         }
-                        GenerationSubAddress::new(gen_addr, payment_id).unwrap().into()
+                        GenerationSubAddress::new(gen_addr, payment_id)
+                            .unwrap()
+                            .into()
                     }
                     KeyType::dCTIDH => dCTIDHSpendingKey::keygen().to_address().into(),
                     KeyType::dCTIDHSubAddr => {

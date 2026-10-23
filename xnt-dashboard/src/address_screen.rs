@@ -196,9 +196,14 @@ impl AddressScreen {
                                 let body_index = selected.saturating_sub(Events::TABLE_HEADER_ROWS);
                                 if body_index < len {
                                     let key = keys[len - 1 - body_index].clone();
-                                    let full = key.to_address().to_bech32m(self.network).unwrap();
+                                    let addr = key.to_address();
+                                    let full = addr.to_bech32m(self.network).unwrap();
+                                    let lsh = addr.lock_script_hash().to_hex();
+                                    let pd = addr.privacy_digest().to_hex();
                                     escalate_event = Some(DashboardEvent::ConsoleMode(
-                                        ConsoleIO::InputRequested(format!("{}\n\n", full)),
+                                        ConsoleIO::InputRequested(format!(
+                                            "{full}\n\nlock_script_hash: {lsh}\nprivacy_digest:   {pd}\n\n"
+                                        )),
                                     ));
                                 } else {
                                     escalate_event = Some(event);
@@ -285,7 +290,12 @@ impl Widget for AddressScreen {
         // table
         let style = Style::default().fg(self.fg).bg(self.bg);
         let selected_style = style.add_modifier(Modifier::REVERSED);
-        let header = vec!["type", "address (abbreviated)"];
+        let header = vec![
+            "type",
+            "address (abbreviated)",
+            "lock_script_hash",
+            "privacy_digest",
+        ];
 
         let matrix = self
             .data
@@ -294,11 +304,12 @@ impl Widget for AddressScreen {
             .iter()
             .rev()
             .map(|key| {
+                let addr = key.clone().to_address();
                 vec![
                     KeyType::from(key).to_string(),
-                    key.clone().to_address()
-                        .to_display_bech32m_abbreviated(self.network)
-                        .unwrap(),
+                    addr.to_display_bech32m_abbreviated(self.network).unwrap(),
+                    addr.lock_script_hash().to_hex(),
+                    addr.privacy_digest().to_hex(),
                 ]
             })
             .collect_vec();

@@ -781,7 +781,7 @@ mod tests {
             tip = block;
         }
         let consensus_rule_set = ConsensusRuleSet::infer_from(network, tip.header().height.next());
-        assert_eq!(ConsensusRuleSet::UpgradeVMv8, consensus_rule_set);
+        assert_eq!(ConsensusRuleSet::LeviathanSettlement, consensus_rule_set);
 
         let spendable_before = spendable_aocl_indices(&alice).await;
         assert_eq!(2, run_consolidation(&alice, 2, None).await.unwrap());
