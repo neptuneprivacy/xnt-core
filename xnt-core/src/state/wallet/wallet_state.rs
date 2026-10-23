@@ -94,6 +94,13 @@ pub struct WalletState {
     known_symmetric_keys: Vec<SpendingKey>,
     /// CTIDH key
     known_dctidh_keys: Vec<SpendingKey>,
+    /// Legacy-derivation CTIDH keys, one per known index below the legacy key
+    /// bound (see [RustyWalletDatabase::get_legacy_dctidh_key_bound]), in
+    /// derivation order, so `known_legacy_dctidh_keys[i]` is the counterpart of
+    /// `known_dctidh_keys[i]`. Cached so scanning and input selection do not
+    /// repeat the key derivation. Used for scanning and spending only, never
+    /// surfaced as receiving addresses.
+    known_legacy_dctidh_keys: Vec<SpendingKey>,
 
     /// Tunable options for configuring how the wallet state operates.
     pub(crate) configuration: WalletConfiguration,
@@ -302,7 +309,7 @@ impl WalletState {
         DataDirectory::create_dir_if_not_exists(&wallet_database_path).await?;
         let wallet_db = Self::open_wallet_db(&wallet_database_path).await?;
 
-        let rusty_wallet_database = match RustyWalletDatabase::try_connect(wallet_db).await {
+        let mut rusty_wallet_database = match RustyWalletDatabase::try_connect(wallet_db).await {
             Err(WalletDbConnectError::SchemaVersionTooLow { found, expected: _ }) => {
                 // DB schema version is too low, so we need to migrate it.
                 // note: wallet_db was moved into try_connect() and is now dropped/closed.
@@ -329,10 +336,27 @@ impl WalletState {
             .map(|idx| wallet_entropy.nth_symmetric_key(idx).into())
             .collect_vec();
 
+        // CTIDH indices handed out before this version first opened the wallet
+        // may hold funds at legacy-format locks; indices handed out later never
+        // do, so no legacy-format key is derived for them.
         let dctidh_counter = rusty_wallet_database.get_dctidh_key_counter();
-        let known_dctidh_keys: Vec<SpendingKey> = (0..dctidh_counter)
-            .map(|idx| wallet_entropy.nth_dctidh_spending_key(idx).into())
-            .collect_vec();
+        let legacy_dctidh_key_bound = match rusty_wallet_database.get_legacy_dctidh_key_bound() {
+            Some(bound) => bound,
+            None => {
+                rusty_wallet_database
+                    .set_legacy_dctidh_key_bound(dctidh_counter)
+                    .await;
+                dctidh_counter
+            }
+        };
+        let mut known_dctidh_keys = vec![];
+        let mut known_legacy_dctidh_keys = vec![];
+        for idx in 0..dctidh_counter {
+            let (key, legacy) =
+                Self::nth_dctidh_key_and_legacy(&wallet_entropy, idx, legacy_dctidh_key_bound);
+            known_dctidh_keys.push(key);
+            known_legacy_dctidh_keys.extend(legacy);
+        }
 
         let mut wallet_state = Self {
             wallet_db: rusty_wallet_database,
@@ -342,6 +366,7 @@ impl WalletState {
             known_generation_keys,
             known_symmetric_keys,
             known_dctidh_keys,
+            known_legacy_dctidh_keys,
             configuration: configuration.clone(),
         };
 
@@ -407,7 +432,7 @@ impl WalletState {
             // Check if we are premine recipients, and add expected UTXOs if so.
             for premine_key in &premine_keys {
                 let own_receiving_address = premine_key.clone().to_address();
-                for utxo in Block::premine_utxos() {
+                for utxo in Block::premine_utxos(configuration.network()) {
                     if utxo.lock_script_hash() == own_receiving_address.lock_script_hash() {
                         wallet_state
                             .add_expected_utxo(ExpectedUtxo::new(
@@ -508,12 +533,16 @@ impl WalletState {
     }
 
     /// handles a list of mempool events
+    ///
+    /// `next_block_height` is the height of the block that would confirm the
+    /// mempool transactions, i.e., the tip height plus one.
     pub(in crate::state) async fn handle_mempool_events(
         &mut self,
         events: impl IntoIterator<Item = MempoolEvent>,
+        next_block_height: BlockHeight,
     ) {
         for event in events {
-            self.handle_mempool_event(event).await;
+            self.handle_mempool_event(event, next_block_height).await;
         }
     }
 
@@ -523,7 +552,11 @@ impl WalletState {
     /// unconfirmed utxos sent from or to the wallet. This enables calculation
     /// of unconfirmed balance and prevents UTXOs in the mempool from being
     /// double spent.
-    pub(in crate::state) async fn handle_mempool_event(&mut self, event: MempoolEvent) {
+    pub(in crate::state) async fn handle_mempool_event(
+        &mut self,
+        event: MempoolEvent,
+        next_block_height: BlockHeight,
+    ) {
         match event {
             MempoolEvent::AddTx(tx_kernel, _reason) => {
                 debug!(r"handling mempool AddTx event.  details:\n{}", tx_kernel);
@@ -536,10 +569,12 @@ impl WalletState {
 
                 // scan tx for utxo with announcements we can claim
                 let announced_utxos_from_announcements =
-                    self.scan_for_utxos_announced_to_known_keys(&tx_kernel);
+                    self.scan_for_utxos_announced_to_known_keys(&tx_kernel, next_block_height);
 
+                let unrecognized_locks = self.unrecognized_legacy_dctidh_locks(next_block_height);
                 let own_utxos = announced_utxos_from_announcements
                     .chain(own_utxos_from_expected_utxos)
+                    .filter(|iu| !unrecognized_locks.contains(&iu.utxo.lock_script_hash()))
                     .unique_by(|iu| iu.addition_record())
                     .collect_vec();
 
@@ -583,6 +618,17 @@ impl WalletState {
             .map(|iu| (&iu.utxo, iu.addition_record(), iu.payment_id.value()))
     }
 
+    /// Get an iterator over the unconfirmed incoming UTXOs, corresponding to
+    /// outputs of transactions that live in the mempool, along with the id of
+    /// the transaction that creates each.
+    pub(crate) fn mempool_incoming_utxos_with_txid(
+        &self,
+    ) -> impl Iterator<Item = (TransactionKernelId, &IncomingUtxo)> {
+        self.mempool_unspent_utxos
+            .iter()
+            .flat_map(|(txid, incoming)| incoming.iter().map(|iu| (*txid, iu)))
+    }
+
     pub(crate) fn mempool_balance_updates(
         &self,
     ) -> (
@@ -615,18 +661,24 @@ impl WalletState {
         (incoming, outgoing)
     }
 
-    /// returns unconfirmed, available balance (excludes timelocked utxos)
+    /// returns unconfirmed, available balance (excludes timelocked utxos and
+    /// funds at legacy-format dCTIDH locks)
     pub fn unconfirmed_available_balance(
         &self,
         wallet_status: &WalletStatus,
         timestamp: Timestamp,
     ) -> NativeCurrencyAmount {
+        // Funds at legacy-format locks are not part of the available balance,
+        // neither when received nor when spent.
+        let legacy_locks = self.legacy_dctidh_lock_hashes();
         let amount_spent_by_mempool_transactions = self
             .mempool_spent_utxos_iter()
+            .filter(|(utxo, _)| !legacy_locks.contains(&utxo.lock_script_hash()))
             .map(|(u, _)| u.get_native_currency_amount())
             .sum();
         let amount_received_from_mempool_transactions = self
             .mempool_unspent_utxos_iter()
+            .filter(|(utxo, _)| !legacy_locks.contains(&utxo.lock_script_hash()))
             .filter(|(utxo, _)| utxo.can_spend_at(timestamp))
             .map(|(u, _)| u.get_native_currency_amount())
             .sum();
@@ -770,14 +822,32 @@ impl WalletState {
     /// [SpendingKey]s and then verify those announced UTXOs are actually
     /// present.
     ///
+    /// `height` is the height of the block that confirms the transaction (or
+    /// would confirm it, for a mempool transaction). UTXOs at legacy-format
+    /// dCTIDH locks are recognized only if that height is below the legacy
+    /// cutoff.
+    ///
     /// Only announced UTXOs actually present in the transaction are returned
     /// here, it's not sufficient that they are announced.
     pub(crate) fn scan_for_utxos_announced_to_known_keys<'a>(
         &'a self,
         tx_kernel: &'a TransactionKernel,
+        height: BlockHeight,
     ) -> impl Iterator<Item = IncomingUtxo> + 'a {
-        // scan for announced utxos for every known key of every key type.
-        self.get_all_known_spending_keys()
+        let legacy_dctidh_keys: &[SpendingKey] = if self.legacy_dctidh_lock_recognized_at(height) {
+            &self.known_legacy_dctidh_keys
+        } else {
+            &[]
+        };
+
+        // scan for announced utxos once with every known key. Keys have
+        // distinct receiver identifiers, so each announcement is decrypted by
+        // at most one key.
+        self.known_generation_keys
+            .iter()
+            .chain(&self.known_symmetric_keys)
+            .chain(&self.known_dctidh_keys)
+            .chain(legacy_dctidh_keys)
             .flat_map(|key| key.scan_for_announced_utxos(tx_kernel))
             .filter(|au| {
                 let transaction_contains_addition_record =
@@ -795,7 +865,11 @@ impl WalletState {
 
     /// Scan the given transaction for announced UTXOs as recognized by *future*
     /// keys, *i.e.*, keys that will be derived by the next n derivation
-    /// indices.
+    /// indices. With `with_legacy`, also by the legacy-format counterparts of
+    /// future dCTIDH keys.
+    ///
+    /// Returns, per UTXO, the key type and derivation index of the key that
+    /// recognized it, and whether that is a legacy-format key.
     ///
     /// Only announced UTXOs actually present in the transaction are returned
     /// here, it's not sufficient that they are announced.
@@ -803,12 +877,22 @@ impl WalletState {
         &'a self,
         num_future_keys: usize,
         tx_kernel: &'a TransactionKernel,
-    ) -> impl Iterator<Item = (KeyType, u64, IncomingUtxo)> + 'a {
-        self.get_future_spending_keys(num_future_keys).flat_map(
-            |(key_type, derivation_index, key)| {
-                key.scan_for_announced_utxos(tx_kernel)
+        with_legacy: bool,
+    ) -> impl Iterator<Item = (KeyType, u64, bool, IncomingUtxo)> + 'a {
+        self.get_future_spending_keys(num_future_keys, with_legacy)
+            .flat_map(|(key_type, derivation_index, key, legacy)| {
+                let scanned = key
+                    .scan_for_announced_utxos(tx_kernel)
                     .into_iter()
-                    .filter(|au| {
+                    .map(|au| (false, au));
+                let scanned_by_legacy = legacy
+                    .iter()
+                    .flat_map(|legacy| legacy.scan_for_announced_utxos(tx_kernel))
+                    .map(|au| (true, au))
+                    .collect_vec();
+                scanned
+                    .chain(scanned_by_legacy)
+                    .filter(|(_, au)| {
                         let transaction_contains_addition_record =
                             tx_kernel.outputs.contains(&au.addition_record());
                         if !transaction_contains_addition_record {
@@ -820,9 +904,8 @@ impl WalletState {
                         }
                         transaction_contains_addition_record
                     })
-                    .map(move |au| (key_type, derivation_index, au))
-            },
-        )
+                    .map(move |(is_legacy, au)| (key_type, derivation_index, is_legacy, au))
+            })
     }
 
     /// Scan the given list of addition records for items that match with list
@@ -1007,22 +1090,31 @@ impl WalletState {
     /// types, with derivation info.
     ///
     /// Specifically, return an iterator over tuples (key type, derivation
-    /// index, spending key) for the next `num_future_keys` to be derived, for
-    /// key types "Generation" and "Symmetric Key". This function does **not**
-    /// increment the derivation counter.
+    /// index, spending key, legacy-format counterpart) for the next
+    /// `num_future_keys` to be derived, for key types "Generation", "Symmetric
+    /// Key" and "dCTIDH". This function does **not** increment the derivation
+    /// counter.
+    ///
+    /// With `with_legacy`, each future dCTIDH key comes with its legacy-format
+    /// counterpart, so that a wallet restored from seed recovers funds received
+    /// at legacy-format addresses before the legacy cutoff.
     pub(crate) fn get_future_spending_keys(
         &self,
         num_future_keys: usize,
-    ) -> impl Iterator<Item = (KeyType, u64, SpendingKey)> + '_ {
+        with_legacy: bool,
+    ) -> impl Iterator<Item = (KeyType, u64, SpendingKey, Option<SpendingKey>)> + '_ {
         let future_generation_keys = self
             .get_future_generation_spending_keys(num_future_keys)
-            .map(|(i, gsk)| (KeyType::Generation, i, SpendingKey::from(gsk)));
+            .map(|(i, gsk)| (KeyType::Generation, i, SpendingKey::from(gsk), None));
         let future_symmetric_keys = self
             .get_future_symmetric_keys(num_future_keys)
-            .map(|(i, sk)| (KeyType::Symmetric, i, SpendingKey::from(sk)));
-        let future_dctidh_keys = self
-            .get_future_dctidh_spending_keys(num_future_keys)
-            .map(|(i, csk)| (KeyType::dCTIDH, i, SpendingKey::from(csk)));
+            .map(|(i, sk)| (KeyType::Symmetric, i, SpendingKey::from(sk), None));
+        let future_dctidh_keys =
+            self.get_future_dctidh_spending_keys(num_future_keys)
+                .map(move |(i, csk, legacy)| {
+                    let legacy = with_legacy.then(|| SpendingKey::from(legacy));
+                    (KeyType::dCTIDH, i, SpendingKey::from(csk), legacy)
+                });
         future_generation_keys
             .chain(future_symmetric_keys)
             .chain(future_dctidh_keys)
@@ -1038,7 +1130,11 @@ impl WalletState {
                 Box::new(self.get_known_generation_spending_keys())
             }
             KeyType::Symmetric => Box::new(self.get_known_symmetric_keys()),
-            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => Box::new(self.get_known_dctidh_keys()),
+            // Include legacy-format keys so scanning and input selection can
+            // recognise and sweep funds received at legacy dCTIDH addresses.
+            KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
+                Box::new(self.get_known_dctidh_keys_with_legacy())
+            }
         }
     }
 
@@ -1084,6 +1180,99 @@ impl WalletState {
         self.known_dctidh_keys.iter().cloned()
     }
 
+    /// The known dCTIDH keys, plus a legacy-derivation key per used index for
+    /// recognising and sweeping funds received at legacy-format addresses. Used
+    /// for scanning and input selection only, never for deriving new addresses.
+    fn get_known_dctidh_keys_with_legacy(&self) -> impl Iterator<Item = SpendingKey> + '_ {
+        self.known_dctidh_keys
+            .iter()
+            .chain(self.known_legacy_dctidh_keys.iter())
+            .cloned()
+    }
+
+    /// The legacy-derivation dCTIDH keys only (one per used index below the
+    /// legacy key bound), for recognising and sweeping funds received at
+    /// legacy-format addresses.
+    pub(crate) fn get_known_legacy_dctidh_keys(&self) -> impl Iterator<Item = SpendingKey> + '_ {
+        self.known_legacy_dctidh_keys.iter().cloned()
+    }
+
+    /// Lock-script hashes of the known legacy-format dCTIDH keys.
+    pub(crate) fn legacy_dctidh_lock_hashes(&self) -> HashSet<Digest> {
+        self.known_legacy_dctidh_keys
+            .iter()
+            .map(|key| key.lock_script_hash())
+            .collect()
+    }
+
+    /// Whether a UTXO at a legacy-format dCTIDH lock, confirmed in a block of
+    /// the given height, is recognized by the wallet. See
+    /// [dctidh_address::legacy_dctidh_cutoff].
+    pub(crate) fn legacy_dctidh_lock_recognized_at(&self, height: BlockHeight) -> bool {
+        self.configuration
+            .legacy_dctidh_cutoff
+            .is_none_or(|cutoff| height < cutoff)
+    }
+
+    /// Lock-script hashes of the known legacy-format dCTIDH keys if UTXOs at
+    /// these locks are not recognized at the given height; empty otherwise.
+    fn unrecognized_legacy_dctidh_locks(&self, height: BlockHeight) -> HashSet<Digest> {
+        if self.legacy_dctidh_lock_recognized_at(height) {
+            HashSet::new()
+        } else {
+            self.legacy_dctidh_lock_hashes()
+        }
+    }
+
+    /// The CTIDH derivation indices below this bound may hold funds at
+    /// legacy-format locks.
+    fn legacy_dctidh_key_bound(&self) -> u64 {
+        self.wallet_db
+            .get_legacy_dctidh_key_bound()
+            .unwrap_or_default()
+    }
+
+    /// Derive the CTIDH spending key at `index`, together with its
+    /// legacy-format counterpart if `index` is below `legacy_key_bound`.
+    fn nth_dctidh_key_and_legacy(
+        wallet_entropy: &WalletEntropy,
+        index: u64,
+        legacy_key_bound: u64,
+    ) -> (SpendingKey, Option<SpendingKey>) {
+        if index < legacy_key_bound {
+            let (key, legacy) = wallet_entropy.nth_dctidh_spending_key_with_legacy(index);
+            (key.into(), Some(legacy.into()))
+        } else {
+            (wallet_entropy.nth_dctidh_spending_key(index).into(), None)
+        }
+    }
+
+    /// Raise the bound below which CTIDH derivation indices may hold funds at
+    /// legacy-format locks, and derive the legacy-format keys of the known
+    /// indices below the new bound. Does nothing if the bound is not raised.
+    async fn raise_legacy_dctidh_key_bound(&mut self, bound: u64) {
+        if bound <= self.legacy_dctidh_key_bound() {
+            return;
+        }
+        self.wallet_db.set_legacy_dctidh_key_bound(bound).await;
+
+        let first_index = self.known_legacy_dctidh_keys.len() as u64;
+        let end_index = bound.min(self.wallet_db.get_dctidh_key_counter());
+        for idx in first_index..end_index {
+            let legacy = self.wallet_entropy.nth_legacy_dctidh_spending_key(idx);
+            self.known_legacy_dctidh_keys.push(legacy.into());
+        }
+    }
+
+    /// Set the legacy key bound, as if the wallet had been opened by this
+    /// version for the first time with the CTIDH key counter at `bound`.
+    #[cfg(test)]
+    pub(crate) async fn set_legacy_dctidh_key_bound(&mut self, bound: u64) {
+        self.wallet_db.set_legacy_dctidh_key_bound(0).await;
+        self.known_legacy_dctidh_keys.clear();
+        self.raise_legacy_dctidh_key_bound(bound).await;
+    }
+
     /// Get the next unused spending key of a given type.
     ///
     /// returns key at present counter (for key_type), and increments the
@@ -1125,9 +1314,15 @@ impl WalletState {
                 }
                 KeyType::dCTIDH | KeyType::dCTIDHSubAddr => {
                     self.wallet_db.set_dctidh_key_counter(new_counter).await;
+                    let legacy_key_bound = self.legacy_dctidh_key_bound();
                     for idx in current_counter..new_counter {
-                        let key = self.wallet_entropy.nth_dctidh_spending_key(idx).into();
+                        let (key, legacy) = Self::nth_dctidh_key_and_legacy(
+                            &self.wallet_entropy,
+                            idx,
+                            legacy_key_bound,
+                        );
                         self.known_dctidh_keys.push(key);
+                        self.known_legacy_dctidh_keys.extend(legacy);
                     }
                 }
             }
@@ -1192,13 +1387,25 @@ impl WalletState {
     }
 
     /// Get the next unused CTIDH key
+    ///
+    /// Indices handed out by this version are at or above the legacy key
+    /// bound and never hold funds at a legacy-format lock, so no legacy-format
+    /// key is derived for them.
     pub async fn next_unused_dctidh_key(
         &mut self,
     ) -> crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey {
         let index = self.wallet_db.get_dctidh_key_counter();
-        let key = self.wallet_entropy.nth_dctidh_spending_key(index);
+        let key = if index < self.legacy_dctidh_key_bound() {
+            let (key, legacy) = self
+                .wallet_entropy
+                .nth_dctidh_spending_key_with_legacy(index);
+            self.known_legacy_dctidh_keys.push(legacy.into());
+            key
+        } else {
+            self.wallet_entropy.nth_dctidh_spending_key(index)
+        };
         self.wallet_db.set_dctidh_key_counter(index + 1).await;
-        self.known_dctidh_keys.push(key.clone().into());
+        self.known_dctidh_keys.push(key.into());
         key
     }
 
@@ -1224,15 +1431,23 @@ impl WalletState {
             .map(|i| (i, self.wallet_entropy.nth_symmetric_key(i)))
     }
 
-    /// Get the next n CTIDH spending keys (with derivation indices)
-    /// without modifying the counter.
+    /// Get the next n CTIDH spending keys, each with its legacy-derivation
+    /// counterpart (with derivation indices), without modifying the counter.
     pub(crate) fn get_future_dctidh_spending_keys(
         &self,
         num_future_keys: usize,
-    ) -> impl Iterator<Item = (u64, dctidh_address::dCTIDHSpendingKey)> + use<'_> {
+    ) -> impl Iterator<
+        Item = (
+            u64,
+            dctidh_address::dCTIDHSpendingKey,
+            dctidh_address::dCTIDHSpendingKey,
+        ),
+    > + use<'_> {
         let index = self.wallet_db.get_dctidh_key_counter();
-        (index..index + (num_future_keys as u64))
-            .map(|i| (i, self.wallet_entropy.nth_dctidh_spending_key(i)))
+        (index..index + (num_future_keys as u64)).map(|i| {
+            let (key, legacy) = self.wallet_entropy.nth_dctidh_spending_key_with_legacy(i);
+            (i, key, legacy)
+        })
     }
 
     pub(crate) async fn claim_utxo(&mut self, utxo_claim_data: ClaimUtxoData) -> Result<()> {
@@ -1274,12 +1489,16 @@ impl WalletState {
 
         let mut recovered_outputs = vec![];
 
-        // try to recover UTXOs spent to future keys
+        // try to recover UTXOs spent to future keys, including legacy-format
+        // dCTIDH keys if UTXOs at their locks are recognized at this height
+        let with_legacy = self.legacy_dctidh_lock_recognized_at(new_block.header().height);
         let mut max_counters = HashMap::<KeyType, u64>::new();
-        for (key_type, derivation_index, incoming_utxo) in self
+        let mut max_legacy_derivation_index = None;
+        for (key_type, derivation_index, is_legacy, incoming_utxo) in self
             .scan_for_utxos_announced_to_future_keys(
                 scan_mode_configuration.num_future_keys(),
                 &new_block.body().transaction_kernel,
+                with_legacy,
             )
         {
             if max_counters
@@ -1289,6 +1508,10 @@ impl WalletState {
                 })
             {
                 max_counters.insert(key_type, derivation_index);
+            }
+            if is_legacy {
+                max_legacy_derivation_index =
+                    max_legacy_derivation_index.max(Some(derivation_index));
             }
             recovered_outputs.push(incoming_utxo);
         }
@@ -1350,6 +1573,13 @@ impl WalletState {
             new_block.header().height
         );
 
+        // An index that received funds at its legacy-format lock existed
+        // before the upgrade, so its legacy-format key is kept from now on.
+        // Raise the bound before the counter, so the new keys get theirs.
+        if let Some(derivation_index) = max_legacy_derivation_index {
+            self.raise_legacy_dctidh_key_bound(derivation_index + 1)
+                .await;
+        }
         for (key_type, derivation_index) in max_counters {
             self.bump_derivation_counter(key_type, derivation_index)
                 .await;
@@ -1440,7 +1670,7 @@ impl WalletState {
             additions: addition_records,
             removals: removal_records,
         } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
         let mut removal_records = removal_records;
         removal_records.reverse();
@@ -1651,7 +1881,7 @@ impl WalletState {
         let mut recovery_data = vec![];
 
         let MutatorSetUpdate { additions, .. } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
 
         for addition_record in additions {
@@ -1735,17 +1965,18 @@ impl WalletState {
         maintain_membership_proofs_in_wallet: bool,
     ) -> anyhow::Result<()> {
         let tx_kernel = &block.kernel.body.transaction_kernel;
+        let height = block.kernel.header.height;
 
         let spent_inputs = self.scan_for_spent_utxos(tx_kernel).await;
 
         let onchain_received_outputs = self
-            .scan_for_utxos_announced_to_known_keys(tx_kernel)
+            .scan_for_utxos_announced_to_known_keys(tx_kernel, height)
             .collect_vec();
 
         let outputs_recovered_through_scan_mode = self.recover_by_scanning(block).await;
 
         let MutatorSetUpdate { additions, .. } = block
-            .mutator_set_update()
+            .mutator_set_update(self.configuration.network())
             .expect("Block received as argument must have mutator set update");
 
         let offchain_received_outputs = self.scan_for_expected_utxos(&additions).await;
@@ -1761,13 +1992,19 @@ impl WalletState {
         );
 
         // These UTXOs are guaranteed to be present in the block and guaranteed
-        // to be spendable by the wallet.
+        // to be spendable by the wallet. UTXOs at legacy-format dCTIDH locks
+        // are recognized only below the legacy cutoff, whichever way they were
+        // found.
+        let unrecognized_locks = self.unrecognized_legacy_dctidh_locks(height);
         let incoming = onchain_received_outputs
             .into_iter()
             .chain(outputs_recovered_through_scan_mode)
             .chain(offchain_received_outputs.iter().cloned())
             .chain(guesser_fee_outputs)
-            .filter(|incoming_utxo| incoming_utxo.utxo.all_type_script_states_are_valid());
+            .filter(|incoming_utxo| incoming_utxo.utxo.all_type_script_states_are_valid())
+            .filter(|incoming_utxo| {
+                !unrecognized_locks.contains(&incoming_utxo.utxo.lock_script_hash())
+            });
         let incoming: HashMap<AdditionRecord, IncomingUtxo> = incoming
             .map(|incoming_utxo| (incoming_utxo.addition_record(), incoming_utxo))
             .collect();
@@ -1886,36 +2123,37 @@ impl WalletState {
         //     it json serializes `WalletStatus` to stdout.
         let mut unsynced = vec![];
 
+        // UTXOs at legacy-format dCTIDH locks are flagged, and left out if
+        // they were confirmed at or above the legacy cutoff.
+        let legacy_locks = self.legacy_dctidh_lock_hashes();
+
         let stream = monitored_utxos.stream().await;
         pin_mut!(stream); // needed for iteration
 
         while let Some((_i, mutxo)) = stream.next().await {
-            let utxo = mutxo.utxo.clone();
+            let is_legacy = legacy_locks.contains(&mutxo.utxo.lock_script_hash());
+            let (_, _, confirmed_height) = mutxo.confirmed_in_block;
+            if is_legacy && !self.legacy_dctidh_lock_recognized_at(confirmed_height) {
+                continue;
+            }
+
             let payment_id = mutxo.payment_id;
+            let element = |aocl_leaf_index| WalletStatusElement {
+                is_legacy,
+                ..WalletStatusElement::new(aocl_leaf_index, mutxo.utxo.clone(), payment_id)
+            };
             if let Some(mp) = mutxo.get_membership_proof_for_block(tip_digest) {
                 // To determine whether the UTXO was spent, we cannot rely on
                 // the `spent_in_block` which might be set to blocks that have
                 // since been reorganized away.
                 let spent = !mutator_set_accumulator.verify(Tip5::hash(&mutxo.utxo), &mp);
                 if spent {
-                    synced_spent.push(WalletStatusElement::new(
-                        mp.aocl_leaf_index,
-                        utxo,
-                        payment_id,
-                    ));
+                    synced_spent.push(element(mp.aocl_leaf_index));
                 } else {
-                    synced_unspent.push((
-                        WalletStatusElement::new(mp.aocl_leaf_index, utxo, payment_id),
-                        mp.clone(),
-                    ));
+                    synced_unspent.push((element(mp.aocl_leaf_index), mp.clone()));
                 }
             } else {
-                let any_mp = &mutxo.blockhash_to_membership_proof.iter().next().unwrap().1;
-                unsynced.push(WalletStatusElement::new(
-                    any_mp.aocl_leaf_index,
-                    utxo,
-                    payment_id,
-                ));
+                unsynced.push(element(mutxo.aocl_leaf_index));
             }
         }
 
@@ -1924,6 +2162,29 @@ impl WalletState {
             synced_spent,
             unsynced,
         }
+    }
+
+    /// Height of the block in which each monitored UTXO was confirmed, keyed
+    /// by AOCL leaf index.
+    ///
+    /// If the same AOCL leaf index is monitored more than once, e.g. after a
+    /// reorganization, the highest confirmation height is kept, so that the
+    /// number of confirmations is never overestimated.
+    pub(crate) async fn confirmation_heights(&self) -> HashMap<u64, BlockHeight> {
+        let monitored_utxos = self.wallet_db.monitored_utxos();
+        let stream = monitored_utxos.stream().await;
+        pin_mut!(stream); // needed for iteration
+
+        let mut heights: HashMap<u64, BlockHeight> = HashMap::new();
+        while let Some((_i, mutxo)) = stream.next().await {
+            let (_, _, height) = mutxo.confirmed_in_block;
+            heights
+                .entry(mutxo.aocl_leaf_index)
+                .and_modify(|known| *known = std::cmp::max(*known, height))
+                .or_insert(height);
+        }
+
+        heights
     }
 
     /// Returns all spendable inputs.
@@ -2228,7 +2489,7 @@ pub(crate) mod tests {
 
         let premine_utxo = {
             let wallet = &alice_global_lock.lock_guard().await.wallet_state;
-            Block::premine_utxos()
+            Block::premine_utxos(network)
                 .into_iter()
                 .find(|premine_utxo| wallet.can_unlock(premine_utxo))
                 .or_else(|| panic!())
@@ -3250,7 +3511,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads: Some(2),
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
             )
@@ -4730,7 +4991,8 @@ pub(crate) mod tests {
                     UtxoNotificationPayload::new(utxo.clone(), sender_randomness);
                 let announcement = key
                     .to_address()
-                    .generate_announcement(utxo_notification_payload);
+                    .generate_announcement(utxo_notification_payload)
+                    .unwrap();
                 announcements.push(announcement);
 
                 let incoming_utxo = IncomingUtxo {
@@ -4766,7 +5028,7 @@ pub(crate) mod tests {
 
             // scan
             let caught_utxos = wallet_state
-                .scan_for_utxos_announced_to_future_keys(NUM_FUTURE_KEYS, &new_kernel)
+                .scan_for_utxos_announced_to_future_keys(NUM_FUTURE_KEYS, &new_kernel, false)
                 .collect_vec();
 
             // filter master list according to expectation
@@ -4790,7 +5052,7 @@ pub(crate) mod tests {
                     );
                     continue;
                 }
-                let filtered_utxo = (uc.key_type, uc.absolute_index, uc.incoming_utxo);
+                let filtered_utxo = (uc.key_type, uc.absolute_index, false, uc.incoming_utxo);
                 filtered_utxos.push(filtered_utxo);
             }
 
@@ -4836,7 +5098,7 @@ pub(crate) mod tests {
             let mut outputs = kernel.outputs.clone();
             for utxo in [&foreign_utxo, &own_utxo] {
                 let payload = UtxoNotificationPayload::new(utxo.clone(), sender_randomness);
-                announcements.push(address.generate_announcement(payload));
+                announcements.push(address.generate_announcement(payload).unwrap());
                 let incoming = IncomingUtxo {
                     utxo: utxo.clone(),
                     sender_randomness,
@@ -5013,7 +5275,7 @@ pub(crate) mod tests {
             let mut outputs = kernel.outputs.clone();
             for utxo in [&foreign_utxo, &own_utxo] {
                 let payload = UtxoNotificationPayload::new(utxo.clone(), sender_randomness);
-                announcements.push(address.generate_announcement(payload));
+                announcements.push(address.generate_announcement(payload).unwrap());
                 let incoming = IncomingUtxo {
                     utxo: utxo.clone(),
                     sender_randomness,
@@ -5029,7 +5291,7 @@ pub(crate) mod tests {
                 .modify(kernel);
 
             let caught = wallet_state
-                .scan_for_utxos_announced_to_known_keys(&kernel)
+                .scan_for_utxos_announced_to_known_keys(&kernel, BlockHeight::genesis())
                 .collect_vec();
 
             // The generation key is listed under both the `Generation` and
@@ -5311,7 +5573,7 @@ pub(crate) mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(1_000_000_000, None)[0]
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), 1_000_000_000, None)[0]
                 .clone();
 
             // create block ignoring that transaction. Rando has upgraded tx
@@ -5353,7 +5615,7 @@ pub(crate) mod tests {
                 single_proof_transaction.kernel,
                 single_proof_transaction.proof.into_single_proof(),
                 genesis_mutator_set,
-                block_one.mutator_set_update().unwrap(),
+                block_one.mutator_set_update(network).unwrap(),
                 upgrade_incentive,
                 consensus_rule_set,
             ));
@@ -5369,7 +5631,7 @@ pub(crate) mod tests {
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(10_000_000, None);
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), 10_000_000, None);
             assert_eq!(1, transactions_for_block.len());
             let upgraded_transaction = transactions_for_block[0].clone();
             let new_num_announcements = upgraded_transaction.kernel.announcements.len();
@@ -5514,6 +5776,302 @@ pub(crate) mod tests {
             assert_eq!(schema_version, schema_version_from_backup);
 
             Ok(())
+        }
+    }
+
+    mod legacy_dctidh_locks {
+        use super::*;
+        use crate::application::database::storage::storage_schema::traits::StorageWriter;
+        use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+        use crate::protocol::consensus::transaction::TransactionProof;
+        use crate::state::wallet::address::dctidh_address::legacy_dctidh_cutoff;
+        use crate::state::wallet::address::ReceivingAddress;
+        use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
+        use crate::tests::shared::files::unit_test_data_directory;
+
+        const NETWORK: Network = Network::RegTest;
+
+        /// A wallet whose CTIDH indices `0..num_indices` were in use when this
+        /// version first opened it.
+        async fn wallet_with_legacy_indices(num_indices: u64) -> WalletState {
+            let data_dir = unit_test_data_directory(NETWORK).unwrap();
+            let cli = cli_args::Args::default_with_network(NETWORK);
+            let mut wallet_state =
+                WalletState::new_from_wallet_entropy(&data_dir, WalletEntropy::new_random(), &cli)
+                    .await;
+            wallet_state
+                .bump_derivation_counter(KeyType::dCTIDH, num_indices - 1)
+                .await;
+            wallet_state.set_legacy_dctidh_key_bound(num_indices).await;
+            wallet_state
+        }
+
+        /// A transaction kernel paying `amount` to the legacy-format lock of
+        /// the wallet's CTIDH key at `index`, announced on-chain the way a
+        /// sender using the legacy-format address would announce it. Also
+        /// returns the UTXO.
+        fn payment_to_legacy_lock(
+            wallet_state: &WalletState,
+            index: u64,
+            amount: NativeCurrencyAmount,
+        ) -> (TransactionKernel, Utxo) {
+            let (_, legacy) = wallet_state
+                .wallet_entropy
+                .nth_dctidh_spending_key_with_legacy(index);
+            let legacy_address = legacy.pre_v0_3_address();
+            let legacy = SpendingKey::from(legacy);
+            let utxo = Utxo::new_native_currency(legacy.lock_script_hash(), amount);
+            let sender_randomness: Digest = random();
+
+            // A sender using the legacy-format address encrypts to the public
+            // key of the legacy key.
+            let payload = UtxoNotificationPayload::new(utxo.clone(), sender_randomness);
+            let announcement = ReceivingAddress::from(legacy_address)
+                .generate_announcement(payload)
+                .unwrap();
+            let incoming = IncomingUtxo {
+                utxo: utxo.clone(),
+                sender_randomness,
+                receiver_preimage: legacy.privacy_preimage(),
+                is_guesser_fee: false,
+                payment_id: BFieldElement::ZERO,
+            };
+            let kernel = TransactionKernelProxy {
+                inputs: vec![],
+                outputs: vec![incoming.addition_record()],
+                announcements: vec![announcement],
+                fee: NativeCurrencyAmount::zero(),
+                coinbase: None,
+                timestamp: Block::genesis(NETWORK).header().timestamp + Timestamp::hours(1),
+                mutator_set_hash: Digest::default(),
+                merge_bit: false,
+            }
+            .into_kernel();
+
+            (kernel, utxo)
+        }
+
+        /// Process the block at height 1 that holds `kernel`, and return the
+        /// wallet status as of that block.
+        async fn process_block(
+            wallet_state: &mut WalletState,
+            kernel: TransactionKernel,
+        ) -> WalletStatus {
+            let genesis = Block::genesis(NETWORK);
+            let transaction = Transaction {
+                kernel,
+                proof: TransactionProof::invalid(),
+            };
+            let block = invalid_block_with_transaction(&genesis, transaction);
+            assert_eq!(BlockHeight::from(1u64), block.header().height);
+
+            let maintain_mps = true;
+            wallet_state
+                .update_wallet_state_with_new_block(
+                    &genesis.mutator_set_accumulator_after().unwrap(),
+                    &block,
+                    maintain_mps,
+                )
+                .await
+                .unwrap();
+            wallet_state
+                .get_wallet_status(
+                    block.hash(),
+                    &block.mutator_set_accumulator_after().unwrap(),
+                )
+                .await
+        }
+
+        #[test]
+        fn legacy_dctidh_cutoff_is_the_v8_activation_height_on_main_net_only() {
+            assert_eq!(
+                Some(BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET),
+                legacy_dctidh_cutoff(Network::Main)
+            );
+            for network in [Network::RegTest, Network::TestnetMock, Network::Testnet(0)] {
+                assert_eq!(None, legacy_dctidh_cutoff(network), "{network:?}");
+            }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn legacy_lock_utxo_in_block_is_recognized_only_below_cutoff() {
+            let amount = NativeCurrencyAmount::coins(3);
+            let block_height = BlockHeight::from(1u64);
+            for (cutoff, is_recognized) in [
+                (None, true),
+                (Some(block_height.next()), true),
+                (Some(block_height), false),
+                (Some(BlockHeight::genesis()), false),
+            ] {
+                let mut wallet_state = wallet_with_legacy_indices(1).await;
+                wallet_state.configuration.legacy_dctidh_cutoff = cutoff;
+                let (kernel, utxo) = payment_to_legacy_lock(&wallet_state, 0, amount);
+
+                let wallet_status = process_block(&mut wallet_state, kernel).await;
+
+                let num_mutxos = wallet_state.wallet_db.monitored_utxos().len().await;
+                let now = Timestamp::now();
+                if is_recognized {
+                    assert_eq!(1, num_mutxos, "cutoff {cutoff:?}");
+                    assert_eq!(1, wallet_status.synced_unspent.len());
+                    let (element, _) = &wallet_status.synced_unspent[0];
+                    assert_eq!(utxo, element.utxo);
+                    assert!(element.is_legacy);
+
+                    // reported separately from the available balance
+                    assert_eq!(amount, wallet_status.legacy_confirmed());
+                    assert_eq!(amount, wallet_status.total_confirmed());
+                    assert!(wallet_status.available_confirmed(now).is_zero());
+                    assert!(wallet_state
+                        .unconfirmed_available_balance(&wallet_status, now)
+                        .is_zero());
+
+                    // and spendable with the legacy-format key
+                    assert!(wallet_state.can_unlock(&utxo));
+                } else {
+                    assert_eq!(0, num_mutxos, "cutoff {cutoff:?}");
+                    assert!(wallet_status.synced_unspent.is_empty());
+                    assert!(wallet_status.legacy_confirmed().is_zero());
+                    assert!(wallet_status.total_confirmed().is_zero());
+                }
+            }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn legacy_lock_utxo_in_mempool_is_recognized_only_below_cutoff() {
+            let amount = NativeCurrencyAmount::coins(3);
+            let next_block_height = BlockHeight::from(1u64);
+            for (cutoff, is_recognized) in [
+                (None, true),
+                (Some(next_block_height.next()), true),
+                (Some(next_block_height), false),
+            ] {
+                let mut wallet_state = wallet_with_legacy_indices(1).await;
+                wallet_state.configuration.legacy_dctidh_cutoff = cutoff;
+                let (kernel, utxo) = payment_to_legacy_lock(&wallet_state, 0, amount);
+
+                wallet_state
+                    .handle_mempool_event(
+                        MempoolEvent::AddTx(kernel, AddReason::FromPeer),
+                        next_block_height,
+                    )
+                    .await;
+
+                let unconfirmed = wallet_state
+                    .mempool_unspent_utxos_iter()
+                    .map(|(unconfirmed_utxo, _)| unconfirmed_utxo.clone())
+                    .collect_vec();
+                if is_recognized {
+                    assert_eq!(vec![utxo], unconfirmed, "cutoff {cutoff:?}");
+
+                    // not part of the unconfirmed available balance
+                    let wallet_status = wallet_state
+                        .get_wallet_status(Digest::default(), &MutatorSetAccumulator::default())
+                        .await;
+                    assert!(wallet_state
+                        .unconfirmed_available_balance(&wallet_status, Timestamp::now())
+                        .is_zero());
+                    assert_eq!(
+                        amount,
+                        wallet_state.unconfirmed_total_balance(&wallet_status)
+                    );
+                } else {
+                    assert!(unconfirmed.is_empty(), "cutoff {cutoff:?}");
+                }
+            }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn wallet_opened_by_this_version_keeps_legacy_keys_of_existing_indices_only() {
+            let cli = cli_args::Args::default_with_network(NETWORK);
+            let data_dir = unit_test_data_directory(NETWORK).unwrap();
+            let configuration = WalletConfiguration::new(&data_dir).absorb_options(&cli);
+            let wallet_entropy = WalletEntropy::new_random();
+            let genesis = Block::genesis(NETWORK);
+
+            // A wallet database last written by an earlier version, with two
+            // CTIDH indices in use.
+            {
+                let mut wallet_state =
+                    WalletState::try_new(configuration.clone(), wallet_entropy.clone(), &genesis)
+                        .await
+                        .unwrap();
+                wallet_state.wallet_db.set_dctidh_key_counter(2).await;
+                wallet_state.wallet_db.clear_legacy_dctidh_key_bound().await;
+                wallet_state.wallet_db.persist().await;
+            }
+
+            // Opened by this version: the indices in use keep their
+            // legacy-format keys, and new indices get none.
+            let mut wallet_state = WalletState::try_new(configuration, wallet_entropy, &genesis)
+                .await
+                .unwrap();
+            assert_eq!(
+                Some(2),
+                wallet_state.wallet_db.get_legacy_dctidh_key_bound()
+            );
+            assert_eq!(2, wallet_state.get_known_legacy_dctidh_keys().count());
+            assert!(wallet_state
+                .get_known_legacy_dctidh_keys()
+                .all(|key| key.is_legacy()));
+
+            let new_key = wallet_state.next_unused_spending_key(KeyType::dCTIDH).await;
+            assert!(!new_key.is_legacy());
+            assert_eq!(3, wallet_state.spending_key_counter(KeyType::dCTIDH));
+            assert_eq!(2, wallet_state.get_known_legacy_dctidh_keys().count());
+
+            // Funds at the legacy-format lock of an existing index are
+            // recognized, those at the legacy-format lock of the new index are
+            // not, even without a cutoff.
+            assert_eq!(None, wallet_state.configuration.legacy_dctidh_cutoff);
+            let amount = NativeCurrencyAmount::coins(2);
+            let (old_index_payment, old_index_utxo) =
+                payment_to_legacy_lock(&wallet_state, 1, amount);
+            let (new_index_payment, _) = payment_to_legacy_lock(&wallet_state, 2, amount);
+            let kernel = TransactionKernelModifier::default()
+                .outputs(
+                    [&old_index_payment, &new_index_payment]
+                        .map(|k| k.outputs.clone())
+                        .concat(),
+                )
+                .announcements(
+                    [&old_index_payment, &new_index_payment]
+                        .map(|k| k.announcements.clone())
+                        .concat(),
+                )
+                .modify(old_index_payment);
+
+            let wallet_status = process_block(&mut wallet_state, kernel).await;
+            assert_eq!(1, wallet_status.synced_unspent.len());
+            assert_eq!(old_index_utxo, wallet_status.synced_unspent[0].0.utxo);
+            assert_eq!(amount, wallet_status.legacy_confirmed());
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn new_wallet_derives_no_legacy_keys() {
+            let data_dir = unit_test_data_directory(NETWORK).unwrap();
+            let cli = cli_args::Args::default_with_network(NETWORK);
+            let mut wallet_state =
+                WalletState::new_from_wallet_entropy(&data_dir, WalletEntropy::new_random(), &cli)
+                    .await;
+            for _ in 0..3 {
+                wallet_state.next_unused_spending_key(KeyType::dCTIDH).await;
+            }
+            assert_eq!(
+                Some(0),
+                wallet_state.wallet_db.get_legacy_dctidh_key_bound()
+            );
+            assert_eq!(0, wallet_state.get_known_legacy_dctidh_keys().count());
+
+            let (kernel, _) =
+                payment_to_legacy_lock(&wallet_state, 1, NativeCurrencyAmount::coins(1));
+            let wallet_status = process_block(&mut wallet_state, kernel).await;
+            assert!(wallet_status.synced_unspent.is_empty());
         }
     }
 }

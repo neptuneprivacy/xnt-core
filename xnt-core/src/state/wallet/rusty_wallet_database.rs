@@ -478,6 +478,25 @@ impl RustyWalletDatabase {
         self.tables.dctidh_key_counter.set(counter).await;
     }
 
+    /// retrieve the bound below which CTIDH derivation indices may hold funds
+    /// at legacy-format locks, if recorded
+    pub fn get_legacy_dctidh_key_bound(&self) -> Option<u64> {
+        self.tables.legacy_dctidh_key_bound.get()
+    }
+
+    /// set the bound below which CTIDH derivation indices may hold funds at
+    /// legacy-format locks
+    pub async fn set_legacy_dctidh_key_bound(&mut self, bound: u64) {
+        self.tables.legacy_dctidh_key_bound.set(Some(bound)).await;
+    }
+
+    /// forget the legacy CTIDH key bound, as in a database last written by an
+    /// earlier version
+    #[cfg(test)]
+    pub(crate) async fn clear_legacy_dctidh_key_bound(&mut self) {
+        self.tables.legacy_dctidh_key_bound.set(None).await;
+    }
+
     /// retrieve the database schema version
     pub fn schema_version(&self) -> u16 {
         self.tables.schema_version.get()

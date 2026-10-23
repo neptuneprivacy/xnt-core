@@ -38,17 +38,13 @@ pub trait SubAddress: Sized {
     fn flag() -> BFieldElement;
 
     /// Encrypt a payload with payment_id included
-    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Vec<BFieldElement>;
+    fn encrypt(&self, payload: &UtxoNotificationPayload) -> Result<Vec<BFieldElement>>;
 
     /// Generate an announcement for this subaddress (default implementation)
-    fn generate_announcement(&self, payload: &UtxoNotificationPayload) -> Announcement {
-        let ciphertext = self.encrypt(payload);
-        let message = [
-            vec![Self::flag(), self.receiver_identifier()],
-            ciphertext,
-        ]
-        .concat();
-        Announcement::new(message)
+    fn generate_announcement(&self, payload: &UtxoNotificationPayload) -> Result<Announcement> {
+        let ciphertext = self.encrypt(payload)?;
+        let message = [vec![Self::flag(), self.receiver_identifier()], ciphertext].concat();
+        Ok(Announcement::new(message))
     }
 }
 
@@ -116,7 +112,12 @@ pub fn derive_receiver_id(seed: Digest) -> BFieldElement {
 pub fn deterministically_derive_seed_and_nonce(
     payload: &UtxoNotificationPayload,
 ) -> ([u8; 32], BFieldElement) {
-    let combined = Tip5::hash_pair(payload.sender_randomness, payload.utxo.lock_script_hash());
+    // Derive from the entire payload, so that payloads differing in amount,
+    // time-lock, or payment id yield distinct seeds and nonces even when the
+    // recipient and sender randomness are the same.
+    let payload_digest =
+        Tip5::hash_varlen(&[payload.utxo.encode(), vec![payload.payment_id]].concat());
+    let combined = Tip5::hash_pair(payload.sender_randomness, payload_digest);
     let [e0, e1, e2, e3, e4] = combined.values();
     let e0: [u8; 8] = e0.into();
     let e1: [u8; 8] = e1.into();
@@ -184,18 +185,26 @@ pub fn bytes_to_bfes(bytes: &[u8]) -> Vec<BFieldElement> {
 
 /// Decodes a slice of BFieldElements to a vec of bytes. This method
 /// computes the inverse of `bytes_to_bfes`.
+///
+/// Fails if the number of bytes exceed 8*10^6.
 pub fn bfes_to_bytes(bfes: &[BFieldElement]) -> Result<Vec<u8>> {
+    const MAX_DECODED_LENGTH: usize = BFieldElement::BYTES * 1_000_000;
     ensure!(!bfes.is_empty(), "Cannot decode empty byte stream");
 
-    let length = bfes[0].value() as usize;
+    let claimed_length = bfes[0].value() as usize;
     ensure!(
-        length <= size_of_val(bfes),
+        claimed_length <= size_of_val(bfes),
         "Cannot decode byte stream shorter than length indicated. \
-        BFE slice length: {}, indicated byte stream length: {length}",
+        BFE slice length: {}, indicated byte stream length: {claimed_length}",
         bfes.len(),
     );
 
-    let mut bytes: Vec<u8> = Vec::with_capacity(length);
+    ensure!(
+        claimed_length <= MAX_DECODED_LENGTH,
+        "Claimed length must not exceed {MAX_DECODED_LENGTH}"
+    );
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(claimed_length);
     let mut skip_top = false;
     for bfe in bfes.iter().skip(1) {
         let bfe_bytes = bfe.value().to_be_bytes();
@@ -212,7 +221,12 @@ pub fn bfes_to_bytes(bfes: &[BFieldElement]) -> Result<Vec<u8>> {
         }
     }
 
-    Ok(bytes[0..length].to_vec())
+    ensure!(
+        claimed_length <= bytes.len(),
+        "Claimed length cannot exceed actual length when decoding bytes"
+    );
+
+    Ok(bytes[0..claimed_length].to_vec())
 }
 
 // note: copied from twenty_first::math::lattice::kem::shake256()
@@ -229,8 +243,8 @@ pub fn shake256<const NUM_OUT_BYTES: usize>(randomness: impl AsRef<[u8]>) -> [u8
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) mod tests {
-    use rand::Rng;
-    use rand::TryRngCore;
+    use rand::RngExt;
+    use rand::TryRng;
 
     use super::*;
 
@@ -259,6 +273,16 @@ pub(super) mod tests {
 
             assert_eq!(byte_vec, bytes_again);
         }
+    }
+
+    #[test]
+    fn too_long_msg() {
+        let byte_vec: Vec<u8> = vec![0; 10_000_000];
+        let bfes = bytes_to_bfes(&byte_vec);
+        assert!(
+            bfes_to_bytes(&bfes).is_err(),
+            "Must fail if trying to decode too many bytes."
+        );
     }
 
     #[test]

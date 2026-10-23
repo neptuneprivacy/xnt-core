@@ -2,7 +2,7 @@
  * XNT-SDK TypeScript Test
  *
  * Usage: npx ts-node examples/xnt-sdk-test.ts [command] [arg]
- * Commands: version, seed, address [payment-id], shortaddress [payment-id], rpc, sync, utils, tx <recipient> <amount> <fee>
+ * Commands: version, seed, address [payment-id], shortaddress [payment-id], rpc, sync, utils, tx <recipient> <amount> <fee>, migrate [dry_run=yes|no]
  */
 
 import * as fs from "fs";
@@ -16,6 +16,7 @@ import {
   XntMembershipProof,
   XntDecryptedUtxo,
   XntPendingUtxo,
+  XntTransaction,
   xntVersion,
   xntTimestampNow,
   xntFetchUtxos,
@@ -32,6 +33,7 @@ import {
   xntMempoolIncoming,
   xntComputeCommitmentForOutput,
 } from "../src/napi/output";
+import { migrateLegacyFunds } from "../src/ts/helpers";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -48,13 +50,23 @@ interface SyncResult {
 }
 
 // Outcome of a single tx build→prove→submit attempt. "stale" is retryable
-// (re-prove); everything else is terminal.
+// (build and prove again); "unavailable" means that an input of the
+// transaction being sent again is no longer free (watch that transaction
+// again); everything else is terminal.
 type AttemptResult =
-  | { status: "submitted"; success: boolean }
-  | { status: "stale"; where: "preflight" | "submit" }
+  | { status: "submitted"; inputs: string[]; buildTip: number }
+  | { status: "stale"; where: "build" | "preflight" | "submit" }
+  | { status: "unavailable" }
   | { status: "empty" }
   | { status: "insufficient"; need: bigint; have: bigint }
   | { status: "rejected"; error: string };
+
+// Outcome of watching the inputs of a submitted transaction, see watchInputs.
+type WatchResult =
+  | { status: "confirmed"; height: number }
+  | { status: "dropped" }
+  | { status: "conflicted"; spentAt: number[] }
+  | { status: "timeout" };
 
 // ── Logger ─────────────────────────────────────────────────────────────────
 
@@ -107,6 +119,82 @@ function ensureProverPath(log: Logger): void {
   }
 }
 
+// ── Submitting and watching ───────────────────────────────────────────────────
+
+const WATCH_INTERVAL_MS = 30_000;
+const WATCH_TIMEOUT_MS = 60 * 60 * 1000;
+// Polls in a row that must find a transaction dropped before it is sent again.
+const DROPPED_POLLS = 2;
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+// Whether `tx`, built on the mutator set of the tip at `buildTip`, may be
+// submitted now: only while that tip is still the tip and `tx` is confirmable.
+// Confirmability alone is not enough. Before the UpgradeVMv8 fork, the nodes
+// that upgrade proof collections to single proofs, which is how they get
+// mined, take only those built on the mutator set of their own tip: they
+// cannot update someone else's proof collection to a new block. A proof
+// collection built on an earlier tip is often still confirmable, so nodes
+// accept it into their mempools, but none upgrades or mines it.
+async function syncedToTip(
+  client: XntRpcClient,
+  tx: XntTransaction,
+  buildTip: number,
+): Promise<{ synced: boolean; tip: number | null }> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const current = xntGetMutatorSet(client);
+      return { synced: current.tipHeight() === buildTip && tx.isConfirmable(current), tip: current.tipHeight() };
+    } catch {
+      if (attempt < 3) await sleep(3_000);
+    }
+  }
+  return { synced: false, tip: null }; // the tip is not known: do not submit
+}
+
+// Watch the inputs (absolute index set hashes) of a transaction built on the
+// tip at `buildTip` until it is confirmed (all inputs spent on chain, at one
+// height), conflicted (some spent on chain otherwise) or dropped: after a
+// block, its inputs are neither spent on chain nor by a mempool transaction,
+// as nodes drop the proof collections they cannot update to the new block.
+async function watchInputs(
+  client: XntRpcClient,
+  inputs: string[],
+  buildTip: number,
+  log: Logger,
+): Promise<WatchResult> {
+  const started = Date.now();
+  let droppedPolls = 0;
+  for (;;) {
+    await sleep(WATCH_INTERVAL_MS);
+    try {
+      // The mempool is read before the spent status: a transaction mined in
+      // between is then seen as confirmed, not as dropped.
+      const tip = client.chainHeight();
+      const inMempool = xntMempoolSpending(client, inputs).length;
+      const spentAt = xntCheckSpent(client, inputs);
+      const onChain = spentAt.filter(h => h >= 0);
+      if (onChain.length > 0) {
+        if (onChain.length === inputs.length && onChain.every(h => h === onChain[0])) {
+          return { status: "confirmed", height: onChain[0] };
+        }
+        return { status: "conflicted", spentAt };
+      }
+      if (inMempool > 0 || tip <= buildTip) {
+        droppedPolls = 0;
+        log.info("pending", { tip, buildTip, inputsInMempool: inMempool });
+      } else {
+        droppedPolls++;
+        log.info("neither mined nor in the mempool", { tip, buildTip, polls: droppedPolls });
+        if (droppedPolls >= DROPPED_POLLS) return { status: "dropped" };
+      }
+    } catch (e) {
+      log.info("watch: RPC error, trying again", { error: String(e) });
+    }
+    if (Date.now() - started > WATCH_TIMEOUT_MS) return { status: "timeout" };
+  }
+}
+
 // ── AmountUtil ─────────────────────────────────────────────────────────────
 
 class AmountUtil {
@@ -149,7 +237,10 @@ class WalletHelper {
     const genAddr = genKey.toAddress();
     const key = wallet.derivedCTIDHKey(index);
     const addr = key.toAddress();
-    return { wallet, genKey, genAddr, key, addr };
+    // The key the pre-v0.3 release derived for this index; its UTXOs sit at
+    // legacy-format locks and are only moved, never counted as balance.
+    const legacyKey = wallet.deriveLegacydCTIDHKey(index);
+    return { wallet, genKey, genAddr, key, addr, legacyKey };
   }
 
   sync(client: XntRpcClient, key: ReturnType<XntWalletEntropy["derivedCTIDHKey"]>): SyncResult | null {
@@ -211,10 +302,10 @@ class WalletHelper {
 class TestRunner {
   private log = new Logger();
   private wallet = new WalletHelper(this.log);
-  private tests: Map<string, (args: string[]) => boolean>;
+  private tests: Map<string, (args: string[]) => boolean | Promise<boolean>>;
 
   constructor() {
-    this.tests = new Map([
+    this.tests = new Map<string, (args: string[]) => boolean | Promise<boolean>>([
       ["version", (_) => this.testVersion()],
       ["seed", (_) => this.testSeed()],
       ["address", (a) => this.testAddress(a)],
@@ -223,6 +314,7 @@ class TestRunner {
       ["rpc", (_) => this.testRpc()],
       ["sync", (_) => this.testSync()],
       ["tx", (a) => this.testTx(a)],
+      ["migrate", (a) => this.testMigrate(a)],
     ]);
   }
 
@@ -234,6 +326,7 @@ class TestRunner {
         address: "[payment-id]",
         shortaddress: "[payment-id]",
         tx: "<recipient> <amount> <fee>",
+        migrate: "[dry_run=yes|no]",
       };
       for (const name of this.tests.keys()) {
         const hint = argHints[name];
@@ -325,7 +418,7 @@ class TestRunner {
     const client = this.wallet.connectRpc();
     if (!client) return false;
 
-    const { genKey, genAddr, key, addr } = this.wallet.loadTestWallet();
+    const { genKey, genAddr, key, addr, legacyKey } = this.wallet.loadTestWallet();
     // Funds can land on either the Generation or the dCTIDH address; scan both.
     const accounts = [
       { kind: "generation", key: genKey, addr: genAddr },
@@ -379,17 +472,75 @@ class TestRunner {
       }
     }
 
+    // Funds at legacy-format dCTIDH locks (sent to a pre-v0.3 address) are
+    // reported apart: they are only moved, see the migrate command.
+    let legacyTotal = 0n;
+    const legacy = this.wallet.sync(client, legacyKey);
+    for (const u of legacy?.unspent ?? []) {
+      legacyTotal += u.decrypted.amount;
+      this.log.info("utxo", {
+        kind: "legacy-dctidh",
+        aocl: u.aoclIndex, height: u.decrypted.blockHeight,
+        amount: AmountUtil.format(u.decrypted.amount),
+        ...(u.decrypted.paymentId ? { pid: u.decrypted.paymentId } : {}),
+        legacy: u.decrypted.isLegacy,
+      });
+    }
+
     const available = total - spendingTotal;
     const unconfirmed = available + incomingTotal;
     this.log.ok("balance", {
       unspent: unspentCount,
       confirmed: AmountUtil.format(total),
       ...(incomingTotal > 0n || spendingTotal > 0n ? { unconfirmed: AmountUtil.format(unconfirmed) } : {}),
+      ...(legacyTotal > 0n ? { legacyToMigrate: AmountUtil.format(legacyTotal) } : {}),
     });
     return true;
   }
 
-  private testTx(args: string[]): boolean {
+  // Move the funds at legacy-format dCTIDH locks of index 0 to the wallet's
+  // current-format dCTIDH address 0. A dry run, which only builds and lists
+  // the transactions, unless "dry_run=no".
+  private async testMigrate(args: string[]): Promise<boolean> {
+    const dryRunArg = args[0] ?? "dry_run=yes";
+    if (dryRunArg !== "dry_run=yes" && dryRunArg !== "dry_run=no") {
+      return this.log.fail("migrate takes dry_run=yes or dry_run=no", { arg: dryRunArg });
+    }
+    const dryRun = dryRunArg === "dry_run=yes";
+    const client = this.wallet.connectRpc();
+    if (!client) return false;
+    const { wallet } = this.wallet.loadTestWallet();
+    try {
+      const report = await migrateLegacyFunds(client, wallet, {
+        indices: [0],
+        dryRun,
+        log: (message) => this.log.info("migrate", { message }),
+      });
+      this.log.ok("migrate", {
+        submitted: report.submitted,
+        moved: AmountUtil.format(report.moved),
+        fees: AmountUtil.format(report.fees),
+        dropped: report.dropped,
+        dustInputs: report.dustInputs,
+        timeLocked: report.timeLocked,
+        remaining: report.remaining,
+        // Before fees; over the plan in a dry run, else over the submitted
+        // transactions. Record these per payment id before crediting.
+        byPaymentId: report.byPaymentId.map(total => ({
+          keyIndex: total.keyIndex,
+          paymentId: total.paymentId,
+          amount: AmountUtil.format(total.amount),
+          inputs: total.inputs,
+        })),
+        ...(dryRun ? { note: "dry run; pass dry_run=no to prove and submit" } : {}),
+      });
+      return true;
+    } catch (e) {
+      return this.log.fail("migrate failed", { error: String(e) });
+    }
+  }
+
+  private async testTx(args: string[]): Promise<boolean> {
     const [recipientBech32, amountStr, feeStr] = args;
     if (!recipientBech32 || !amountStr || !feeStr) {
       return this.log.fail("tx requires: recipient amount fee");
@@ -401,18 +552,26 @@ class TestRunner {
     const fee = AmountUtil.toNau(parseFloat(feeStr));
     const sendAmount = AmountUtil.toNau(parseFloat(amountStr));
 
-    // Proving takes minutes, so the chain can advance and make the proof stale.
-    // Auto re-prove: rebuild from a fresh sync + proofs and retry. Override the
+    // Proving takes minutes, so the chain can advance and make the proof stale
+    // before it is submitted, and a submitted transaction can be dropped. In
+    // both cases build again from a fresh sync and prove again. Override the
     // attempt cap via XNT_TX_MAX_ATTEMPTS (default 5).
     const maxAttempts = Math.max(1, parseInt(process.env.XNT_TX_MAX_ATTEMPTS ?? "5", 10));
+    // The transaction last submitted. A dropped one is sent again with the
+    // same inputs, so that it and the one sent again cannot both be mined.
+    let sent: { inputs: string[]; buildTip: number } | undefined;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (attempt > 1) this.log.info("re-proving (previous attempt went stale)", { attempt, maxAttempts });
+      if (attempt > 1) this.log.info("building again", { attempt, maxAttempts });
 
-      const r = this.attemptTx(client, recipientBech32, sendAmount, fee);
+      const r = await this.attemptTx(client, recipientBech32, sendAmount, fee, sent?.inputs);
       switch (r.status) {
         case "submitted":
-          this.log.ok("submit result", { success: r.success, attempt, note: "accepted + queued by node" });
-          return r.success;
+          this.log.ok("submitted", { attempt, buildTip: r.buildTip, note: "queued by the node; watching its inputs" });
+          sent = { inputs: r.inputs, buildTip: r.buildTip };
+          break;
+        case "unavailable":
+          this.log.info("an input of the dropped transaction is no longer free; watching it again");
+          break;
         case "empty":
           return this.log.skip("no spendable UTXOs");
         case "insufficient":
@@ -429,21 +588,42 @@ class TestRunner {
               where: r.where,
             });
           }
-          // loop and re-prove
+          continue; // build and prove again
+      }
+      if (!sent) continue; // "unavailable" only comes when sending again
+
+      const w = await watchInputs(client, sent.inputs, sent.buildTip, this.log);
+      switch (w.status) {
+        case "confirmed":
+          this.log.ok("confirmed", { height: w.height, attempt });
+          return true;
+        case "conflicted":
+          return this.log.fail("an input was spent on chain by another transaction", { spentAt: w.spentAt });
+        case "timeout":
+          return this.log.fail("not mined in time; look its inputs up before sending again", {
+            minutes: WATCH_TIMEOUT_MS / 60_000,
+          });
+        case "dropped":
+          this.log.info("dropped: neither mined nor in the mempool after a block; sending it again", {
+            buildTip: sent.buildTip,
+          });
           break;
       }
     }
-    return false;
+    return this.log.fail("gave up after max attempts", { attempts: maxAttempts });
   }
 
   // One build→prove→submit attempt. Returns a status the caller uses to decide
-  // whether to re-prove (on "stale") or stop.
-  private attemptTx(
+  // whether to prove again (on "stale") or stop. With `resendInputs` (absolute
+  // index set hashes), it spends exactly those inputs, or returns
+  // "unavailable" if one of them is no longer free.
+  private async attemptTx(
     client: XntRpcClient,
     recipientBech32: string,
     sendAmount: bigint,
     fee: bigint,
-  ): AttemptResult {
+    resendInputs?: string[],
+  ): Promise<AttemptResult> {
     const { genKey, genAddr, key, addr } = this.wallet.loadTestWallet();
     // Spend across both account types; tag each UTXO with its owning key so we
     // add inputs and restore membership proofs with the correct receiver_preimage.
@@ -461,18 +641,28 @@ class TestRunner {
       const receiverPreimage = acct.key.receiverPreimageHex();
       for (const u of avail) available.push({ u, key: acct.key, receiverPreimage });
     }
-    if (available.length === 0) return { status: "empty" };
-    this.log.ok("synced", { available: available.length });
 
-    const totalAmount = sendAmount + fee;
-    const amounts = available.map(o => o.u.decrypted.amount);
-    const selected = xntSelectInputs(amounts, totalAmount, 10);
-    if (selected.length === 0) {
-      return { status: "insufficient", need: totalAmount, have: amounts.reduce((s, a) => s + a, 0n) };
+    let selectedUtxos: OwnedUtxo[];
+    if (resendInputs) {
+      // Sending again: spend exactly the inputs of the dropped transaction.
+      const byHash = new Map(available.map(o => [o.u.absHash, o] as const));
+      const again = resendInputs.map(h => byHash.get(h));
+      if (again.some(o => o === undefined)) return { status: "unavailable" };
+      selectedUtxos = again as OwnedUtxo[];
+      this.log.ok("inputs of the dropped transaction", { count: selectedUtxos.length });
+    } else {
+      if (available.length === 0) return { status: "empty" };
+      this.log.ok("synced", { available: available.length });
+
+      const totalAmount = sendAmount + fee;
+      const amounts = available.map(o => o.u.decrypted.amount);
+      const selected = xntSelectInputs(amounts, totalAmount, 10);
+      if (selected.length === 0) {
+        return { status: "insufficient", need: totalAmount, have: amounts.reduce((s, a) => s + a, 0n) };
+      }
+      this.log.ok("inputs selected", { count: selected.length, total: AmountUtil.format(totalAmount) });
+      selectedUtxos = selected.map(i => available[i]);
     }
-    this.log.ok("inputs selected", { count: selected.length, total: AmountUtil.format(totalAmount) });
-
-    const selectedUtxos = selected.map(i => available[i]);
 
     // Restore membership proofs per receiver_preimage group (one RPC batch per owning key).
     const proofBuffers: Buffer[] = new Array(selectedUtxos.length);
@@ -495,6 +685,8 @@ class TestRunner {
     this.log.ok("membership proofs", { count: proofBuffers.length });
 
     const mutatorSet = xntGetMutatorSet(client);
+    const buildTip = mutatorSet.tipHeight();
+    if (buildTip === null) return { status: "rejected", error: "the mutator set has no tip height" };
     const builder = new XntTransactionBuilder();
 
     for (let i = 0; i < selectedUtxos.length; i++) {
@@ -522,32 +714,52 @@ class TestRunner {
         commitment: out.commitmentHex,
       });
     }
-    this.log.ok("built", { bytes: builtTx.toBytes().length, fee: AmountUtil.format(fee) });
+    this.log.ok("built", { bytes: builtTx.toBytes().length, fee: AmountUtil.format(fee), buildTip });
+    // The membership proofs may be of an earlier tip than the mutator set.
+    if (!builtTx.isConfirmable(mutatorSet)) {
+      this.log.info("tx not confirmable (stale) — a block arrived while syncing");
+      return { status: "stale", where: "build" };
+    }
 
     this.log.info("proving (this takes several minutes)");
     const start = Date.now();
-    const provenTx = builtTx.prove();
+    let provenTx: ReturnType<typeof builtTx.prove>;
+    try {
+      // Picks the rule set from the tip the mutator set belongs to; before the
+      // UpgradeVMv8 fork it refuses terms that nodes of that era do not relay
+      // (fee below 0.017 XNT, more than 10 inputs, within 10 blocks of the fork).
+      provenTx = builtTx.prove();
+    } catch (e) {
+      return { status: "rejected", error: `prove: ${e}` };
+    }
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     this.log.ok("proven", { seconds: elapsed, hasProofCollection: provenTx.hasProofCollection() });
 
-    // Confirmable check against the current tip — proving can take minutes, so a
-    // block may have landed (or an input got spent) meanwhile, making it stale.
-    if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
-      this.log.info("tx not confirmable (stale) — chain advanced while proving");
+    // Submit only while the tip the transaction was built on is still the tip
+    // (see syncedToTip): proving can take minutes, so a block may have landed
+    // (or an input got spent) meanwhile.
+    const preflight = await syncedToTip(client, provenTx, buildTip);
+    if (!preflight.synced) {
+      this.log.info("tx not synced to the tip (stale) — chain advanced while proving", {
+        buildTip,
+        tip: preflight.tip,
+      });
       return { status: "stale", where: "preflight" };
     }
 
     // NOTE: the node rejects a tx via a JSON-RPC *error* (carrying the reason in
     // error.data), not via success:false — so submit() returns true on accept and
     // throws on rejection. We diagnose the throw below.
-    this.log.info("submitting");
+    this.log.info("submitting", { buildTip });
     try {
-      const success = provenTx.submit(client);
-      return { status: "submitted", success };
+      if (!provenTx.submit(client)) {
+        return { status: "rejected", error: "the node did not queue the transaction (success=false)" };
+      }
+      return { status: "submitted", inputs: selectedUtxos.map(o => o.u.absHash), buildTip };
     } catch (e) {
       // Re-check against the current tip: a block landing mid-submit is stale
       // (retryable); anything else is a real rejection (stop).
-      if (!provenTx.isConfirmable(xntGetMutatorSet(client))) {
+      if (!(await syncedToTip(client, provenTx, buildTip)).synced) {
         this.log.info("submit went stale — chain advanced", { error: String(e) });
         return { status: "stale", where: "submit" };
       }
@@ -560,7 +772,7 @@ class TestRunner {
 // ── Entry Point ────────────────────────────────────────────────────────────
 
 const command = process.argv[2] || "help";
-// Resolve the prover binary up-front for the only command that proves.
-if (command === "tx") ensureProverPath(new Logger());
+// Resolve the prover binary up-front for the commands that prove.
+if (command === "tx" || command === "migrate") ensureProverPath(new Logger());
 const runner = new TestRunner();
 runner.run(command, process.argv.slice(3));

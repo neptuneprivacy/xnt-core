@@ -13,7 +13,7 @@ use num_traits::CheckedSub;
 use num_traits::Zero;
 use primitive_witness::PrimitiveWitness;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPoolBuilder;
@@ -48,13 +48,19 @@ use crate::protocol::consensus::block::pow::GuesserBuffer;
 use crate::protocol::consensus::block::pow::Pow;
 use crate::protocol::consensus::block::pow::PowMastPaths;
 use crate::protocol::consensus::block::*;
+use crate::protocol::consensus::consensus_rule_set::upgrade_vm_v8_activation_height;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
 use crate::protocol::consensus::transaction::*;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+#[cfg(test)]
 use crate::protocol::shared::SIZE_20MB_IN_BYTES;
+use crate::state::mempool::mempool_event::AddReason;
+use crate::state::mempool::upgrade_priority::UpgradePriority;
+use crate::state::mempool::Mempool;
 use crate::state::transaction::transaction_details::TransactionDetails;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
 use crate::state::wallet::transaction_output::TxOutputList;
@@ -66,7 +72,8 @@ use crate::COMPOSITION_FAILED_EXIT_CODE;
 pub(crate) struct GuessingConfiguration {
     pub(crate) num_guesser_threads: Option<usize>,
     pub(crate) address: ReceivingAddress,
-    pub(crate) override_rng: Option<StdRng>,
+    /// Seeds every guesser thread's RNG identically, for deterministic tests.
+    pub(crate) override_rng_seed: Option<u64>,
     pub(crate) override_timestamp: Option<Timestamp>,
 }
 
@@ -179,7 +186,7 @@ fn guess_worker(
     let GuessingConfiguration {
         num_guesser_threads,
         address: guesser_address,
-        override_rng: rng,
+        override_rng_seed: rng_seed,
         override_timestamp: now,
     } = guessing_configuration;
 
@@ -259,7 +266,7 @@ fn guess_worker(
     let guess_result = pool.install(|| {
         rayon::iter::repeat(0)
             .map_init(
-                || rng.clone().unwrap_or(std_rng_from_thread_rng()),
+                || rng_seed.map_or_else(std_rng_from_thread_rng, StdRng::seed_from_u64),
                 |rng, _i| {
                     guess_nonce_iteration(
                         &guesser_buffer,
@@ -486,6 +493,88 @@ pub(crate) async fn create_block_transaction(
     .await
 }
 
+/// Fix the mempool's preferred resolved link transaction into a
+/// `SingleProof`-backed transaction for the block being composed, if there is
+/// one. Only if the block keeps the rule set of its predecessor, under which
+/// the link transaction was admitted, and that rule set has the `Fix` branch.
+///
+/// The fixed transaction is inserted into the mempool, so it need not be fixed
+/// again for another block proposal. It replaces the link transaction under the
+/// same txid.
+///
+/// A failure to fix is not a failure to compose: it is recorded as an upgrade
+/// failure, so the link transaction is passed over until the next block, and
+/// the composer falls back to a nop.
+async fn fix_resolved_link_tx_from_mempool(
+    global_state_lock: &mut GlobalStateLock,
+    predecessor_block: &Block,
+    predecessor_rule_set: ConsensusRuleSet,
+    consensus_rule_set: ConsensusRuleSet,
+    vm_job_queue: Arc<TritonVmJobQueue>,
+    proof_job_options: TritonVmProofJobOptions,
+) -> Result<Option<Transaction>> {
+    if predecessor_rule_set != consensus_rule_set || !consensus_rule_set.has_chain_branches() {
+        return Ok(None);
+    }
+
+    let link_to_fix = global_state_lock
+        .lock_guard()
+        .await
+        .mempool
+        .preferred_link_fix(TxUpgradeFilter::match_all())
+        .map(|(link_tx, _)| link_tx.to_owned());
+    let Some(link_tx) = link_to_fix else {
+        return Ok(None);
+    };
+
+    // The fixed transaction keeps the link transaction's kernel. That kernel
+    // must be synced to the block's predecessor, which may no longer be the
+    // tip, and it must fit the block next to the coinbase transaction.
+    let kernel = &link_tx.kernel.kernel;
+    let predecessor_mutator_set_hash = predecessor_block.mutator_set_accumulator_after()?.hash();
+    let max_kernel_len = consensus_rule_set.max_recommended_block_tx_kernel_size();
+    if kernel.mutator_set_hash != predecessor_mutator_set_hash
+        || !Mempool::fits_block_composition(kernel, consensus_rule_set, max_kernel_len)
+    {
+        return Ok(None);
+    }
+
+    info!("Fixing resolved link transaction from mempool instead of building a nop");
+    let txid = link_tx.txid();
+    let fixed =
+        match fix_link_tx(link_tx, consensus_rule_set, vm_job_queue, proof_job_options).await {
+            Ok(fixed) => fixed,
+            Err(error) => {
+                warn!("Failed to fix link transaction {txid} for composition: {error}");
+                global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .mempool_record_upgrade_failure([txid]);
+                return Ok(None);
+            }
+        };
+
+    // Insert only if a block did not arrive while fixing: the fixed
+    // transaction must still be synced to the tip and confirmable.
+    {
+        let mut state = global_state_lock.lock_guard_mut().await;
+        let tip_mutator_set = state.chain.light_state().mutator_set_accumulator_after()?;
+        if fixed.kernel.mutator_set_hash == tip_mutator_set.hash()
+            && fixed.is_confirmable_relative_to(&tip_mutator_set)
+        {
+            state
+                .mempool_insert(
+                    fixed.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::Upgraded,
+                )
+                .await;
+        }
+    }
+
+    Ok(Some(fixed))
+}
+
 /// # Panics
 ///  - If predecessor has a negative transaction fee
 pub(crate) async fn create_block_transaction_from(
@@ -495,8 +584,6 @@ pub(crate) async fn create_block_transaction_from(
     job_options: TritonVmProofJobOptions,
     tx_merge_origin: TxMergeOrigin,
 ) -> Result<(BlockTransaction, Vec<ExpectedUtxo>)> {
-    let block_capacity_for_transactions = SIZE_20MB_IN_BYTES;
-
     let predecessor_block_ms = predecessor_block
         .mutator_set_accumulator_after()
         .expect("predecessor should be valid");
@@ -513,6 +600,7 @@ pub(crate) async fn create_block_transaction_from(
     let block_height = predecessor_block.header().height.next();
     let network = global_state_lock.cli().network;
     let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
+    let block_capacity_for_transactions = consensus_rule_set.max_recommended_block_tx_kernel_size();
 
     // A coinbase transaction implies mining. So you *must*
     // be able to create a SingleProof.
@@ -534,6 +622,7 @@ pub(crate) async fn create_block_transaction_from(
             .await
             .mempool
             .get_transactions_for_block_composition(
+                consensus_rule_set,
                 block_capacity_for_transactions,
                 Some(max_num_mergers),
             ),
@@ -552,7 +641,7 @@ pub(crate) async fn create_block_transaction_from(
         info!("No synced single-proof tx found for merge looking for one to update");
         let min_gobbling_fee = NativeCurrencyAmount::zero();
         let update_job = global_state_lock
-            .lock_guard_mut()
+            .lock_guard()
             .await
             .preferred_update_job_from_mempool(min_gobbling_fee, TxUpgradeFilter::match_all())
             .await;
@@ -580,6 +669,26 @@ pub(crate) async fn create_block_transaction_from(
             }
         } else {
             info!("No suitable transaction found for updating.");
+        }
+    }
+
+    // Before falling back to a nop, check for a synced link transaction with
+    // no thruputs in the mempool: fix + merge is much cheaper than nop
+    // proof-collection + raise + merge, and it confirms a real transaction.
+    if transactions_to_merge.is_empty() && tx_merge_origin == TxMergeOrigin::Mempool {
+        let predecessor_rule_set =
+            ConsensusRuleSet::infer_from(network, predecessor_block.header().height);
+        if let Some(fixed) = fix_resolved_link_tx_from_mempool(
+            &mut global_state_lock,
+            predecessor_block,
+            predecessor_rule_set,
+            consensus_rule_set,
+            vm_job_queue.clone(),
+            proof_job_options.clone(),
+        )
+        .await?
+        {
+            transactions_to_merge = vec![fixed];
         }
     }
 
@@ -613,6 +722,7 @@ pub(crate) async fn create_block_transaction_from(
                 .await
                 .mempool
                 .get_transactions_for_block_composition(
+                    consensus_rule_set,
                     block_capacity_for_transactions,
                     Some(max_num_mergers),
                 ),
@@ -701,6 +811,7 @@ pub(crate) async fn mine(
 
     let mut pause_mine = false;
     let mut wait_for_confirmation = false;
+    let mut legacy_era_notice_height = None;
     loop {
         // Ensure restart timer doesn't resolve again, without guesser
         // task actually being spawned.
@@ -769,7 +880,7 @@ pub(crate) async fn mine(
                 GuessingConfiguration {
                     num_guesser_threads: cli_args.guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
             );
@@ -788,8 +899,33 @@ pub(crate) async fn mine(
         let (cancel_compose_tx, cancel_compose_rx) = tokio::sync::watch::channel(());
 
         let compose = cli_args.compose;
+
+        // Blocks of the legacy era need proofs this version cannot produce.
+        // Composing one would fail at the first proof and shut the node down,
+        // so wait for the fork instead; composing resumes on its own once the
+        // next block belongs to the current era.
+        let next_block_height = global_state_lock
+            .lock(|s| s.chain.light_state().header().height.next())
+            .await;
+        let next_block_is_legacy_era =
+            ConsensusRuleSet::infer_from(network, next_block_height).is_legacy_era();
+        if compose && next_block_is_legacy_era {
+            if legacy_era_notice_height != Some(next_block_height) {
+                info!(
+                    "Not composing block {next_block_height}: this version cannot prove blocks \
+                     before the hard fork at block {}. Composing starts automatically at the fork.",
+                    upgrade_vm_v8_activation_height(network)
+                );
+                legacy_era_notice_height = Some(next_block_height);
+            }
+            if guesser_task.is_none() {
+                global_state_lock.set_mining_status_to_inactive().await;
+            }
+        }
+
         let mut composer_task = if !wait_for_confirmation
             && compose
+            && !next_block_is_legacy_era
             && guesser_task.is_none()
             && !is_syncing
             && !pause_mine
@@ -1013,7 +1149,7 @@ pub(crate) mod tests {
     use num_traits::One;
     use num_traits::Pow;
     use num_traits::Zero;
-    use rand::RngCore;
+    use rand::Rng;
     use tracing_test::traced_test;
 
     use super::*;
@@ -1027,6 +1163,7 @@ pub(crate) mod tests {
     use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseOutput;
     use crate::application::triton_vm_job_queue::TritonVmJobQueue;
     use crate::protocol::consensus::block::mock_block_generator::MockBlockGenerator;
+    use crate::protocol::consensus::consensus_rule_set::BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
     use crate::protocol::consensus::transaction::validity::single_proof::single_proof_claim;
     use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -1043,8 +1180,12 @@ pub(crate) mod tests {
     use crate::state::wallet::transaction_output::TxOutput;
     use crate::state::wallet::wallet_entropy::WalletEntropy;
     use crate::tests::shared::blocks::fake_valid_deterministic_successor;
+    use crate::tests::shared::blocks::invalid_empty_block;
+    use crate::tests::shared::blocks::make_mock_block;
     use crate::tests::shared::dummy_expected_utxo;
     use crate::tests::shared::globalstate::mock_genesis_global_state;
+    use crate::tests::shared::globalstate::mock_genesis_global_state_with_block;
+    use crate::tests::shared::globalstate::single_proof_payment;
     use crate::tests::shared::mock_tx::make_mock_block_transaction_with_mutator_set_hash;
     use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
     use crate::tests::shared::wait_until;
@@ -1281,7 +1422,7 @@ pub(crate) mod tests {
                 .lock_guard_mut()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(SIZE_20MB_IN_BYTES, None)
+                .get_transactions_for_block_composition(ConsensusRuleSet::default(), SIZE_20MB_IN_BYTES, None)
                 .is_empty(),
             "May not have synced tx in mempool"
         );
@@ -1312,6 +1453,564 @@ pub(crate) mod tests {
             1,
             block2_tx.kernel.inputs.len(),
             "Block tx must have exactly one input from Alice's tx"
+        );
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn composer_fixes_a_resolved_link_transaction_from_the_mempool() {
+        use crate::protocol::consensus::chaintx::cast::cast;
+        use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
+
+        let network = Network::RegTest;
+        let mut alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let genesis_block = Block::genesis(network);
+        let now = genesis_block.kernel.header.timestamp + Timestamp::months(7);
+        let tx = make_transaction(NativeCurrencyAmount::coins(4), &alice, now).await;
+
+        // Only the link transaction is in the mempool, not the transaction it
+        // is cast from.
+        let rules = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let proof_job_options = TritonVmProofJobOptions::default_with_network(network);
+        let link_tx = cast(
+            tx.clone(),
+            single_proof_program_digest(rules),
+            rules,
+            vm_job_queue(),
+            proof_job_options.clone(),
+        )
+        .await
+        .unwrap();
+        let txid = link_tx.txid();
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(link_tx, UpgradePriority::Critical, AddReason::Submitted)
+            .await;
+        assert!(alice.lock_guard().await.mempool.get_link(txid).is_some());
+
+        // Not across a change of rule set.
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            &genesis_block,
+            ConsensusRuleSet::UpgradeVMv7,
+            rules,
+            vm_job_queue(),
+            proof_job_options.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(fixed.is_none());
+
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            &genesis_block,
+            rules,
+            rules,
+            vm_job_queue(),
+            proof_job_options,
+        )
+        .await
+        .unwrap()
+        .expect("a resolved, synced link transaction must be fixed");
+        assert_eq!(txid, fixed.txid());
+        assert_eq!(tx.kernel, fixed.kernel);
+        assert!(fixed.proof.is_single_proof());
+
+        let state = alice.lock_guard().await;
+        assert!(
+            state.mempool.get_link(txid).is_none(),
+            "the fixed transaction replaces its link transaction"
+        );
+        assert_eq!(Some(&fixed), state.mempool.get(txid));
+        assert_eq!(1, state.mempool.num_own_txs(), "and inherits its priority");
+    }
+
+    /// A resolved link transaction, synced to `block`, with a proof that does
+    /// not verify.
+    fn resolved_link_tx_synced_to(
+        block: &Block,
+    ) -> crate::protocol::consensus::chaintx::link_tx::LinkTx {
+        use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::NeptuneProof;
+
+        let mutator_set_hash = block.mutator_set_accumulator_after().unwrap().hash();
+        LinkTx {
+            kernel: LinkKernel {
+                kernel: make_mock_transaction_with_mutator_set_hash(
+                    vec![],
+                    vec![],
+                    mutator_set_hash,
+                )
+                .kernel,
+                thruputs: vec![],
+            },
+            proof: LinkTxProof::Proof(NeptuneProof::invalid()),
+        }
+    }
+
+    /// The composer fixes a link transaction only if it is synced to the
+    /// predecessor of the block being composed, which is not the tip if a block
+    /// arrived meanwhile. Such a link transaction is not recorded as an upgrade
+    /// failure.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn composer_does_not_fix_a_link_transaction_synced_to_another_block() {
+        let network = Network::RegTest;
+        let mut alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let genesis_block = Block::genesis(network);
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(
+                resolved_link_tx_synced_to(&genesis_block),
+                UpgradePriority::Critical,
+                AddReason::Submitted,
+            )
+            .await;
+
+        let composer_key = GenerationSpendingKey::derive_from_seed(rand::random());
+        let (other_block, _) =
+            make_mock_block(&genesis_block, None, composer_key, rand::random(), network).await;
+        let rules = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            &other_block,
+            rules,
+            rules,
+            vm_job_queue(),
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        assert!(fixed.is_none());
+        assert!(alice
+            .lock_guard()
+            .await
+            .mempool
+            .preferred_link_fix(TxUpgradeFilter::match_all())
+            .is_some());
+    }
+
+    /// A link transaction that cannot be fixed does not fail the composition:
+    /// it is recorded as an upgrade failure and passed over, and the composer
+    /// falls back to a nop.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn composer_passes_over_a_link_transaction_that_cannot_be_fixed() {
+        let network = Network::Testnet(0);
+        let mut alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let genesis_block = Block::genesis(network);
+        let link_tx = resolved_link_tx_synced_to(&genesis_block);
+        let txid = link_tx.txid();
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(link_tx, UpgradePriority::Critical, AddReason::Submitted)
+            .await;
+
+        let rules = ConsensusRuleSet::infer_from(network, BlockHeight::genesis().next());
+        let fixed = fix_resolved_link_tx_from_mempool(
+            &mut alice,
+            &genesis_block,
+            rules,
+            rules,
+            vm_job_queue(),
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        assert!(fixed.is_none());
+
+        let state = alice.lock_guard().await;
+        assert!(state.mempool.get_link(txid).is_some());
+        assert!(
+            state
+                .mempool
+                .preferred_link_fix(TxUpgradeFilter::match_all())
+                .is_none(),
+            "the failure to fix must be recorded"
+        );
+    }
+
+    /// A chained payment, proven for real from send to block under the v8
+    /// rule set.
+    ///
+    /// On mock networks the chain steps produce no proofs, so this is where
+    /// `Forge`, `Cast`, `Chain`, and `Fix` run end to end: alice pays bob with
+    /// a single-proof transaction; before it is mined, bob pays most of it on
+    /// in a link transaction, which reaches alice; alice's composer fixes the
+    /// link transaction and merges it into the next block. That block must be
+    /// valid, and it must pay bob his change. Testnet follows the v8 rule set
+    /// from genesis, and its devnet wallet holds a premine.
+    ///
+    /// This test produces many proofs and might take a while to complete if
+    /// there is no proof cache.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn chained_payment_is_proven_and_mined_under_upgrade_vm_v8() {
+        use crate::api::export::KeyType;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+
+        let network = Network::Testnet(0);
+        let genesis_block = Block::genesis(network);
+        let consensus_rule_set =
+            ConsensusRuleSet::infer_from(network, genesis_block.header().height.next());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, consensus_rule_set);
+        assert!(consensus_rule_set.has_chain_branches());
+
+        let cli = cli_args::Args {
+            network,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        let mut alice =
+            mock_genesis_global_state(2, WalletEntropy::devnet_wallet(), cli.clone()).await;
+        let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let now = max(
+            Timestamp::now(),
+            genesis_block.header().timestamp + network.minimum_block_time(),
+        );
+
+        // alice pays bob 5 coins, in a single-proof transaction.
+        let bob_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let fee = NativeCurrencyAmount::coins(1);
+        let alice_artifacts = single_proof_payment(
+            &alice,
+            bob_address,
+            NativeCurrencyAmount::coins(5),
+            fee,
+            now,
+        )
+        .await;
+        let alice_tx: Transaction = alice_artifacts.transaction.clone().into();
+        assert!(alice_tx.proof.is_single_proof());
+        alice
+            .record_own_transaction(&alice_artifacts)
+            .await
+            .unwrap();
+        bob.lock_guard_mut()
+            .await
+            .mempool_insert(
+                alice_tx.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            )
+            .await;
+
+        // before any block, bob pays 3 of those coins to alice in a link
+        // transaction, which cuts through alice's transaction.
+        let alice_address = alice
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let link_tx = bob
+            .api_mut()
+            .tx_sender_mut()
+            .send_chained_link(
+                vec![(alice_address, NativeCurrencyAmount::coins(3))],
+                Default::default(),
+                fee,
+                now,
+            )
+            .await
+            .unwrap()
+            .link_tx()
+            .clone();
+        assert!(link_tx.kernel.thruputs.is_empty());
+        assert!(matches!(link_tx.proof, LinkTxProof::Proof(_)));
+        let txid = link_tx.txid();
+        assert!(bob.lock_guard().await.mempool.get_link(txid).is_some());
+
+        // the link transaction reaches alice, and replaces alice's own
+        // transaction there.
+        alice
+            .lock_guard_mut()
+            .await
+            .mempool_insert_link(
+                link_tx.clone(),
+                UpgradePriority::Irrelevant,
+                AddReason::FromPeer,
+            )
+            .await;
+        {
+            let state = alice.lock_guard().await;
+            assert!(state.mempool.get_link(txid).is_some());
+            assert!(!state.mempool.contains(alice_tx.txid()));
+        }
+
+        // alice's composer fixes the link transaction, and the block carrying
+        // it is valid.
+        let (block, _) = compose_block_helper(
+            genesis_block.clone(),
+            alice.clone(),
+            now,
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        // The block stores its inputs packed, so compare their index sets.
+        let block_kernel = &block.body().transaction_kernel;
+        for input in &link_tx.kernel.kernel.inputs {
+            assert!(block_kernel
+                .inputs
+                .iter()
+                .any(|rr| rr.absolute_indices == input.absolute_indices));
+        }
+        for output in &link_tx.kernel.kernel.outputs {
+            assert!(block_kernel.outputs.contains(output));
+        }
+        assert!(
+            block
+                .is_valid(&genesis_block, block.header().timestamp, network)
+                .await,
+            "block carrying the fixed link transaction must be valid"
+        );
+
+        // the block pays bob his change, and leaves no transaction behind.
+        for state in [&mut alice, &mut bob] {
+            state.set_new_tip(block.clone()).await.unwrap();
+            assert!(state.lock_guard().await.mempool.is_empty());
+        }
+        assert_eq!(
+            NativeCurrencyAmount::coins(1),
+            bob.api()
+                .wallet()
+                .balances(block.header().timestamp)
+                .await
+                .confirmed_available
+        );
+    }
+
+    /// Chained payments between dCTIDH addresses, proven for real, two hops
+    /// deep, and mined under the v8 rule set.
+    ///
+    /// `Forge` proves the lock script of every thruput it spends, so here the
+    /// dCTIDH lock script runs, which mock networks skip. Each hop runs the
+    /// whole pipeline on the sender's node -- `Forge`, `Cast`, `Chain`, and
+    /// `Fix` -- and the second hop casts the transaction the first hop fixed:
+    /// alice pays bob's dCTIDH address; bob pays on to charlie's dCTIDH
+    /// address; charlie pays some back to bob. One block confirms all three
+    /// payments.
+    ///
+    /// This test produces many proofs and might take a while to complete if
+    /// there is no proof cache.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn chained_payments_between_dctidh_addresses_are_proven_and_mined_under_upgrade_vm_v8() {
+        use crate::api::export::ChainedTxArtifacts;
+        use crate::api::export::KeyType;
+
+        let network = Network::Testnet(0);
+        let genesis_block = Block::genesis(network);
+        assert!(
+            ConsensusRuleSet::infer_from(network, genesis_block.header().height.next())
+                .has_chain_branches()
+        );
+        let cli = cli_args::Args {
+            network,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        let mut alice =
+            mock_genesis_global_state(2, WalletEntropy::devnet_wallet(), cli.clone()).await;
+        let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli.clone()).await;
+        let mut charlie = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let now = max(
+            Timestamp::now(),
+            genesis_block.header().timestamp + network.minimum_block_time(),
+        );
+        let fee = NativeCurrencyAmount::coins(1);
+
+        let bob_dctidh_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::dCTIDH)
+            .await
+            .unwrap();
+        let bob_generation_address = bob
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::Generation)
+            .await
+            .unwrap();
+        let charlie_dctidh_address = charlie
+            .api_mut()
+            .wallet_mut()
+            .next_receiving_address(KeyType::dCTIDH)
+            .await
+            .unwrap();
+
+        // Every thruput of a chained send must be locked to the sender's
+        // dCTIDH address, so that `Forge` proves the dCTIDH lock script.
+        let bob_dctidh_lock_script_hash = bob_dctidh_address.lock_script_hash();
+        let charlie_dctidh_lock_script_hash = charlie_dctidh_address.lock_script_hash();
+        let assert_spends_utxos_locked_to =
+            |artifacts: &ChainedTxArtifacts, lock_script_hash: Digest| {
+                assert!(!artifacts.details().thruput_inputs.is_empty());
+                for thruput in &artifacts.details().thruput_inputs {
+                    assert_eq!(
+                        lock_script_hash,
+                        thruput.incoming_utxo.utxo.lock_script_hash()
+                    );
+                }
+            };
+
+        // alice pays bob's dCTIDH address 5 coins.
+        let alice_tx: Transaction = single_proof_payment(
+            &alice,
+            bob_dctidh_address,
+            NativeCurrencyAmount::coins(5),
+            fee,
+            now,
+        )
+        .await
+        .transaction
+        .as_ref()
+        .clone();
+        for state in [&mut bob, &mut charlie] {
+            state
+                .lock_guard_mut()
+                .await
+                .mempool_insert(
+                    alice_tx.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+        }
+
+        // before any block, bob pays 3 of those coins on to charlie.
+        let bob_artifacts = bob
+            .api_mut()
+            .tx_sender_mut()
+            .send_chained(
+                vec![(charlie_dctidh_address, NativeCurrencyAmount::coins(3))],
+                Default::default(),
+                fee,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_spends_utxos_locked_to(&bob_artifacts, bob_dctidh_lock_script_hash);
+        let bob_tx = bob_artifacts.transaction().clone();
+        assert!(bob_tx.proof.is_single_proof());
+        for state in [&mut alice, &mut charlie] {
+            let mut state = state.lock_guard_mut().await;
+            state
+                .mempool_insert(
+                    bob_tx.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+            assert!(state.mempool.contains(bob_tx.txid()));
+            assert!(!state.mempool.contains(alice_tx.txid()));
+        }
+
+        // still before any block, charlie pays 1 coin back to bob, chaining
+        // onto bob's chained transaction.
+        let charlie_artifacts = charlie
+            .api_mut()
+            .tx_sender_mut()
+            .send_chained(
+                vec![(bob_generation_address, NativeCurrencyAmount::coins(1))],
+                Default::default(),
+                fee,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_spends_utxos_locked_to(&charlie_artifacts, charlie_dctidh_lock_script_hash);
+        let charlie_tx = charlie_artifacts.transaction().clone();
+        {
+            let mut state = alice.lock_guard_mut().await;
+            state
+                .mempool_insert(
+                    charlie_tx.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+            assert!(state.mempool.contains(charlie_tx.txid()));
+            assert_eq!(1, state.mempool.len());
+        }
+
+        // alice's composer mines the whole chain into a valid block.
+        let (block, _) = compose_block_helper(
+            genesis_block.clone(),
+            alice.clone(),
+            now,
+            TritonVmProofJobOptions::default_with_network(network),
+        )
+        .await
+        .unwrap();
+        // The block stores its inputs packed, so compare their index sets.
+        let block_kernel = &block.body().transaction_kernel;
+        for input in &charlie_tx.kernel.inputs {
+            assert!(block_kernel
+                .inputs
+                .iter()
+                .any(|rr| rr.absolute_indices == input.absolute_indices));
+        }
+        for output in &charlie_tx.kernel.outputs {
+            assert!(block_kernel.outputs.contains(output));
+        }
+        assert!(
+            block
+                .is_valid(&genesis_block, block.header().timestamp, network)
+                .await,
+            "block carrying the chained dCTIDH payments must be valid"
+        );
+
+        for state in [&mut alice, &mut bob, &mut charlie] {
+            state.set_new_tip(block.clone()).await.unwrap();
+            assert!(state.lock_guard().await.mempool.is_empty());
+        }
+
+        // bob holds 1 coin of change and the 1 coin from charlie; charlie
+        // holds 1 coin of change.
+        let timestamp = block.header().timestamp;
+        assert_eq!(
+            NativeCurrencyAmount::coins(2),
+            bob.api()
+                .wallet()
+                .balances(timestamp)
+                .await
+                .confirmed_available
+        );
+        assert_eq!(
+            NativeCurrencyAmount::coins(1),
+            charlie
+                .api()
+                .wallet()
+                .balances(timestamp)
+                .await
+                .confirmed_available
         );
     }
 
@@ -1635,7 +2334,7 @@ pub(crate) mod tests {
             GuessingConfiguration {
                 num_guesser_threads,
                 address: guesser_key.to_address().into(),
-                override_rng: None,
+                override_rng_seed: None,
                 override_timestamp: None,
             },
             None,
@@ -1719,7 +2418,7 @@ pub(crate) mod tests {
             GuessingConfiguration {
                 num_guesser_threads,
                 address: guesser_key.to_address().into(),
-                override_rng: None,
+                override_rng_seed: None,
                 override_timestamp: None,
             },
             None,
@@ -1871,7 +2570,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: None,
                 },
                 Some(target_block_interval),
@@ -2023,7 +2722,10 @@ pub(crate) mod tests {
                     .lock_guard()
                     .await
                     .wallet_state
-                    .scan_for_utxos_announced_to_known_keys(&transaction.kernel)
+                    .scan_for_utxos_announced_to_known_keys(
+                        &transaction.kernel,
+                        BlockHeight::genesis(),
+                    )
                     .collect_vec();
                 assert_eq!(1, announced_outputs.len());
                 assert_eq!(
@@ -2439,6 +3141,111 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Runs the real mining loop across the UpgradeVMv8 fork on main net.
+    ///
+    /// While the next block is pre-fork the composer must wait: it must neither
+    /// start proving nor ask main to shut the node down. As soon as the tip is
+    /// the last pre-fork block, the same loop must compose the first v8 block,
+    /// and that block must be valid on top of the pre-fork tip.
+    #[apply(shared_tokio_runtime)]
+    async fn composer_waits_for_the_v8_fork_and_composes_its_first_block() {
+        let network = Network::Main;
+
+        // Tip two blocks before the fork, and the last pre-fork block on top
+        // of it. This version cannot prove pre-fork blocks, so both carry
+        // placeholder proofs where real ones would carry v7 proofs. Validating
+        // the fork block does not re-verify its parent's proof.
+        let genesis = Block::genesis(network);
+        let mut tip_header = *genesis.header();
+        tip_header.height = BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET
+            .previous()
+            .and_then(|h| h.previous())
+            .unwrap();
+        let tip = Block::new(
+            tip_header,
+            genesis.body().clone(),
+            genesis.appendix().clone(),
+            BlockProof::Genesis,
+        );
+        let last_pre_fork_block = invalid_empty_block(&tip, network);
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET.previous(),
+            Some(last_pre_fork_block.header().height)
+        );
+        assert!(
+            ConsensusRuleSet::infer_from(network, last_pre_fork_block.header().height)
+                .is_legacy_era()
+        );
+
+        let cli = cli_args::Args {
+            network,
+            compose: true,
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..Default::default()
+        };
+        // Two peers: main net never mines in isolation.
+        let mut state =
+            mock_genesis_global_state_with_block(2, WalletEntropy::devnet_wallet(), cli, tip).await;
+
+        let (miner_to_main_tx, mut miner_to_main_rx) =
+            mpsc::channel::<MinerToMain>(MINER_CHANNEL_CAPACITY);
+        let (main_to_miner_tx, main_to_miner_rx) =
+            mpsc::channel::<MainToMiner>(MINER_CHANNEL_CAPACITY);
+        let miner = tokio::task::spawn(mine(main_to_miner_rx, miner_to_main_tx, state.clone()));
+
+        // 1. Next block is pre-fork: the composer waits. Without the guard it
+        //    would be composing within milliseconds and then fail.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!miner.is_finished(), "mining loop must keep running");
+        assert!(
+            miner_to_main_rx.try_recv().is_err(),
+            "composer must neither propose nor request a shutdown before the fork"
+        );
+        assert!(matches!(
+            state.lock_guard().await.mining_state.mining_status,
+            MiningStatus::Inactive
+        ));
+
+        // 2. The last pre-fork block arrives: the composer starts on its own.
+        state
+            .set_new_tip(last_pre_fork_block.clone())
+            .await
+            .unwrap();
+        main_to_miner_tx.send(MainToMiner::NewBlock).await.unwrap();
+
+        let (fork_block, _) = loop {
+            match tokio::time::timeout(Duration::from_secs(3 * 3600), miner_to_main_rx.recv())
+                .await
+                .expect("composer must finish the fork block")
+            {
+                Some(MinerToMain::BlockProposal(proposal)) => break *proposal,
+                Some(MinerToMain::Shutdown(exit_code)) => {
+                    panic!("composer requested shutdown with exit code {exit_code}")
+                }
+                Some(MinerToMain::NewBlockFound(_)) => continue,
+                None => panic!("mining loop stopped"),
+            }
+        };
+
+        assert_eq!(
+            BLOCK_HEIGHT_HARDFORK_UPGRADE_VM_V8_MAIN_NET,
+            fork_block.header().height
+        );
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            ConsensusRuleSet::infer_from(network, fork_block.header().height)
+        );
+        assert!(
+            fork_block
+                .is_valid(&last_pre_fork_block, fork_block.header().timestamp, network)
+                .await,
+            "first v8 block must be valid on top of the last pre-fork block"
+        );
+
+        miner.abort();
+        let _ = miner.await;
+    }
+
     /// A test for difficulty reset logic, which occurs for the TestnetMock
     /// network.
     ///
@@ -2540,7 +3347,7 @@ pub(crate) mod tests {
                 GuessingConfiguration {
                     num_guesser_threads,
                     address: guesser_key.to_address().into(),
-                    override_rng: None,
+                    override_rng_seed: None,
                     override_timestamp: Some(block_time),
                 },
                 None,

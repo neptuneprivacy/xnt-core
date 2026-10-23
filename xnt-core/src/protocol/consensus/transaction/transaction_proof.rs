@@ -146,6 +146,14 @@ impl TransactionProof {
                 let claim = single_proof_claim(kernel_mast_hash, consensus_rule_set);
                 verify_transaction_proof(claim, single_proof.clone(), network).await
             }
+            // A proof collection is checked against the claims of its era: the
+            // `UpgradeVMv7` era's are verified by the legacy triton-vm v7, the
+            // `UpgradeVMv8` era's by the linked triton-vm. The eras from
+            // `TimelockExtension` to `UpgradeVMv5` are checkpointed, and no
+            // verifier of this version checks their proofs: they are rejected,
+            // also where a claim version coincides with that of a verified era
+            // (`UpgradeVMv5` and `UpgradeVMv7` share claim version 5). The
+            // eras before keep the first-generation check.
             TransactionProof::ProofCollection(proof_collection) => match consensus_rule_set {
                 ConsensusRuleSet::Reboot
                 | ConsensusRuleSet::HardforkAlpha
@@ -155,11 +163,36 @@ impl TransactionProof {
                 ConsensusRuleSet::TimelockExtension
                 | ConsensusRuleSet::UpgradeVM
                 | ConsensusRuleSet::UpgradeVMv4
-                | ConsensusRuleSet::UpgradeVMv5
-                | ConsensusRuleSet::UpgradeVMv7 => {
-                    proof_collection.verify_v2(kernel_mast_hash, network).await
+                | ConsensusRuleSet::UpgradeVMv5 => false,
+                ConsensusRuleSet::UpgradeVMv7 | ConsensusRuleSet::UpgradeVMv8 => {
+                    let claim_version = consensus_rule_set.triton_proof_version().claim_version();
+                    proof_collection
+                        .verify_v2(kernel_mast_hash, network, claim_version)
+                        .await
                 }
             },
+        }
+    }
+
+    /// Whether a proof that [`Self::verify`] refuses under `UpgradeVMv7` is
+    /// valid as the previous release checks it, which runs that era's
+    /// composers and proof upgraders: a proof collection without the checks
+    /// this version adds (see
+    /// [`ProofCollection::verify_v2_as_previous_release`]). That release checks
+    /// a single proof as this version does, so a single proof is not valid
+    /// here, and neither is a primitive witness, which is never relayed.
+    pub(crate) async fn verify_as_previous_release(
+        &self,
+        kernel_mast_hash: Digest,
+        network: Network,
+    ) -> bool {
+        match self {
+            TransactionProof::Witness(_) | TransactionProof::SingleProof(_) => false,
+            TransactionProof::ProofCollection(proof_collection) => {
+                proof_collection
+                    .verify_v2_as_previous_release(kernel_mast_hash, network)
+                    .await
+            }
         }
     }
 }

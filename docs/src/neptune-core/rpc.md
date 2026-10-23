@@ -35,6 +35,7 @@ The RPC server provides several methods that allow clients to interact with the 
 | mining | Block template and submission | [mining.md](rpc/mining.md) |
 | mempool | Pending transactions | [mempool.md](rpc/mempool.md) |
 | wallet | Wallet operations | [wallet.md](rpc/wallet.md) |
+| networking | libp2p network stack (off by default) | [networking.md](rpc/networking.md) |
 
 Methods follow the pattern: `{namespace}_{methodName}` (e.g., `chain_height`, `wallet_sendTx`).
 

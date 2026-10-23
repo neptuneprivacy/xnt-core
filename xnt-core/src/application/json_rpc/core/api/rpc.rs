@@ -23,6 +23,9 @@ pub enum RestoreMembershipProofError {
 
     #[error("Exceeds the allowed limit")]
     ExceedsAllowed,
+
+    #[error("A new tip arrived while the membership proofs were being derived")]
+    TipMoved,
 }
 
 #[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,6 +44,25 @@ pub enum SubmitTransactionError {
 
     #[error("Transaction not confirmable relative to the mutator set")]
     NotConfirmable,
+
+    /// The transaction is valid under the rule set of a neighboring era, but
+    /// not under that of the next block: it was made for the other side of a
+    /// hard fork.
+    #[error("Transaction is valid in another era than that of the next block")]
+    OtherEra,
+
+    /// Before the next hard fork: a transaction backed by a proof collection
+    /// that does not meet the terms on which the nodes of that era relay it and
+    /// upgrade it to a single proof, a minimum fee and at most 16 proofs; or
+    /// any transaction submitted within the cutoff margin before the fork
+    /// (`--fork-tx-cutoff-margin`), which might not be mined before it. The
+    /// name of the variant is kept for clients that match on it.
+    #[error(
+        "Transaction does not meet the terms of the era before the next hard fork: it comes \
+         within the cutoff margin of the fork, or its proof collection pays too low a fee or has \
+         too many proofs"
+    )]
+    BelowLegacyEraTerms,
 }
 
 #[derive(Debug, Clone, Copy, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +89,9 @@ pub enum RpcError {
     #[error("Failed to submit block: {0}")]
     SubmitBlock(SubmitBlockError),
 
+    #[error("Too many absolute index sets requested: maximum is {max}, got {got}")]
+    TooManyAbsoluteIndexSets { max: usize, got: usize },
+
     // Common case errors
     #[error("Invalid address provided in arguments")]
     InvalidAddress,
@@ -79,6 +104,15 @@ pub enum RpcError {
 }
 
 pub type RpcResult<T> = Result<T, RpcError>;
+
+/// The hard limit on how many membership proofs one request may ask for.
+/// Applies to every caller, including those allowed to exceed
+/// [`MAX_RESTRICTED_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS`].
+pub const MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS: usize = 1000;
+
+/// The limit on how many membership proofs one request may ask for, for
+/// callers that are not granted unrestricted access.
+pub const MAX_RESTRICTED_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS: usize = 256;
 
 #[async_trait]
 pub trait RpcApi: Sync + Send {
@@ -516,4 +550,14 @@ pub trait RpcApi: Sync + Send {
         &self,
         request: GetArchivalMutatorSetRequest,
     ) -> RpcResult<GetArchivalMutatorSetResponse>;
+
+    /* Networking */
+
+    async fn network_overview(&self) -> RpcResult<NetworkOverviewResponse> {
+        self.network_overview_call(NetworkOverviewRequest {}).await
+    }
+    async fn network_overview_call(
+        &self,
+        request: NetworkOverviewRequest,
+    ) -> RpcResult<NetworkOverviewResponse>;
 }

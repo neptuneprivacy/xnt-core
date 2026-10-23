@@ -1,4 +1,5 @@
 pub mod block;
+pub mod chaintx;
 pub mod consensus_rule_set;
 pub mod transaction;
 pub mod type_scripts;

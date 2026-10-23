@@ -571,7 +571,7 @@ pub mod tests {
     use rand::rngs::StdRng;
     use rand::seq::IndexedRandom;
     use rand::Rng;
-    use rand::RngCore;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tasm_lib::twenty_first::math::other::random_elements;
     use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;

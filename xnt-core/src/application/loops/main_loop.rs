@@ -1,5 +1,12 @@
+pub(crate) mod network_actor_link;
+mod network_event_handler;
 pub mod proof_upgrader;
 pub(crate) mod upgrade_incentive;
+mod wallet_maintenance;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod fork_switch_tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -11,6 +18,10 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use itertools::Itertools;
+use network_actor_link::next_network_event;
+use network_actor_link::NetworkActorLink;
+use network_event_handler::cli_peer_addresses;
+use network_event_handler::is_cli_peer;
 use proof_upgrader::get_upgrade_task_from_mempool;
 use proof_upgrader::UpgradeJob;
 use rand::prelude::IteratorRandom;
@@ -31,7 +42,10 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use wallet_maintenance::WalletMaintenance;
 
+use crate::application::config::auto_consolidation::ConsolidationTarget;
+use crate::application::config::parser::multiaddr::canonical_socket_addr;
 use crate::application::loops::channel::MainToMiner;
 use crate::application::loops::channel::MainToPeerTask;
 use crate::application::loops::channel::MainToPeerTaskBatchBlockRequest;
@@ -53,13 +67,16 @@ use crate::protocol::consensus::block::block_header::BlockHeader;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::handshake_data::HandshakeData;
+use crate::protocol::peer::link_tx_notification::LinkTxNotification;
 use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::peer::PeerSynchronizationState;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
+use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_update_job::MempoolUpdateJob;
 use crate::state::mempool::mempool_update_job_result::MempoolUpdateJobResult;
@@ -77,6 +94,14 @@ const MEMPOOL_PRUNE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const MP_RESYNC_INTERVAL: Duration = Duration::from_secs(59);
 const PROOF_UPGRADE_INTERVAL: Duration = Duration::from_secs(10);
 const EXPECTED_UTXOS_PRUNE_INTERVAL: Duration = Duration::from_secs(19 * 60);
+
+/// Time after startup at which the wallet maintenance runs once, if the tip is
+/// recent by then. See [`MainLoopHandler::spawn_wallet_maintenance`].
+const STARTUP_WALLET_MAINTENANCE_DELAY: Duration = Duration::from_secs(60);
+
+/// A tip at most this many target block intervals old counts as recent for
+/// the wallet maintenance after startup.
+const STARTUP_WALLET_MAINTENANCE_MAX_TIP_AGE: usize = 6;
 
 const SANCTION_PEER_TIMEOUT_FACTOR: u64 = 40;
 
@@ -137,6 +162,13 @@ pub struct MainLoopHandler {
     miner_to_main_rx: mpsc::Receiver<MinerToMain>,
     rpc_server_to_main_rx: mpsc::Receiver<RPCServerToMain>,
     task_handles: Vec<JoinHandle<()>>,
+
+    /// The channels to the libp2p network actor, if it runs.
+    network_actor: Option<NetworkActorLink>,
+
+    /// Held by the task that migrates and consolidates wallet funds after a
+    /// new block, so that two such tasks never select the same inputs.
+    wallet_maintenance: Arc<tokio::sync::Mutex<WalletMaintenance>>,
 
     #[cfg(test)]
     mock_now: Option<SystemTime>,
@@ -349,15 +381,18 @@ impl PotentialPeersState {
         // Prefer candidates with IPs that we are not already connected to but
         // connect to repeated IPs in case we don't have other options, as
         // repeated IPs may just be multiple machines on the same NAT'ed IPv4
-        // address.
-        let mut connected_ips = peers_listen_addresses.into_iter().map(|x| x.ip());
+        // address. An IPv4 address counts as the same in either form.
+        let connected_ips = peers_listen_addresses
+            .into_iter()
+            .map(|x| x.ip().to_canonical())
+            .collect_vec();
         let candidates = if candidates
             .iter()
-            .any(|candidate| !connected_ips.contains(&candidate.0.ip()))
+            .any(|candidate| !connected_ips.contains(&candidate.0.ip().to_canonical()))
         {
             candidates
                 .into_iter()
-                .filter(|candidate| !connected_ips.contains(&candidate.0.ip()))
+                .filter(|candidate| !connected_ips.contains(&candidate.0.ip().to_canonical()))
                 .collect()
         } else {
             candidates
@@ -412,6 +447,7 @@ impl MainLoopHandler {
         miner_to_main_rx: mpsc::Receiver<MinerToMain>,
         rpc_server_to_main_rx: mpsc::Receiver<RPCServerToMain>,
         task_handles: Vec<JoinHandle<()>>,
+        network_actor: Option<NetworkActorLink>,
     ) -> Self {
         let maybe_main_to_miner_tx = if global_state_lock.cli().mine() {
             Some(main_to_miner_tx)
@@ -429,6 +465,8 @@ impl MainLoopHandler {
             miner_to_main_rx,
             rpc_server_to_main_rx,
             task_handles,
+            network_actor,
+            wallet_maintenance: Arc::new(tokio::sync::Mutex::new(WalletMaintenance::default())),
 
             #[cfg(test)]
             mock_now: None,
@@ -469,7 +507,7 @@ impl MainLoopHandler {
     ///
     /// Sends the result back through the provided channel.
     async fn update_mempool_jobs(
-        mut global_state_lock: GlobalStateLock,
+        global_state_lock: GlobalStateLock,
         update_jobs: Vec<MempoolUpdateJob>,
         job_queue: Arc<TritonVmJobQueue>,
         transaction_update_sender: mpsc::Sender<Vec<MempoolUpdateJobResult>>,
@@ -487,17 +525,20 @@ impl MainLoopHandler {
                 | MempoolUpdateJob::ProofCollection(pw_update) => {
                     let old_msa = &pw_update.old_primitive_witness.mutator_set_accumulator;
 
-                    // Acquire lock, and drop it immediately.
-                    let msa_update = global_state_lock
-                        .lock_guard_mut()
-                        .await
-                        .chain
-                        .archival_state_mut()
-                        .get_mutator_set_update_to_tip(
-                            old_msa,
-                            SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
-                        )
-                        .await;
+                    // Acquire lock, and drop it immediately. The transaction
+                    // is proven for the rule set of the next block.
+                    let (msa_update, consensus_rule_set) = {
+                        let state = global_state_lock.lock_guard().await;
+                        let msa_update = state
+                            .chain
+                            .archival_state()
+                            .get_mutator_set_update_to_tip(
+                                old_msa,
+                                SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
+                            )
+                            .await;
+                        (msa_update, state.next_block_consensus_rule_set())
+                    };
                     let Some(msa_update) = msa_update else {
                         result.push(MempoolUpdateJobResult::Failure(txid));
                         continue;
@@ -512,13 +553,17 @@ impl MainLoopHandler {
                             proof: TransactionProof::Witness(new_pw.clone()),
                         },
                         MempoolUpdateJob::ProofCollection(_) => {
-                            let pc_job = PrimitiveWitnessToProofCollection {
-                                primitive_witness: new_pw.clone(),
-                            };
-
+                            // Also a transaction of the legacy era, which this
+                            // version cannot update, is proven again as a proof
+                            // collection: a v7 single proof takes minutes and a
+                            // large machine, and would hold up every other job
+                            // of the block.
                             // No locks may be held here!
-                            let upgrade_result =
-                                pc_job.upgrade(job_queue.clone(), &proof_job_options).await;
+                            let upgrade_result = PrimitiveWitnessToProofCollection {
+                                primitive_witness: new_pw.clone(),
+                            }
+                            .upgrade(job_queue.clone(), &proof_job_options, consensus_rule_set)
+                            .await;
                             match upgrade_result {
                                 Ok(upgraded) => upgraded,
                                 Err(_) => {
@@ -527,12 +572,57 @@ impl MainLoopHandler {
                                 }
                             }
                         }
-                        MempoolUpdateJob::SingleProof { .. } => unreachable!(),
+                        MempoolUpdateJob::Link { .. } | MempoolUpdateJob::SingleProof { .. } => {
+                            unreachable!()
+                        }
                     };
 
                     result.push(MempoolUpdateJobResult::Success {
                         new_primitive_witness: Some(Box::new(new_pw)),
                         new_transaction: Box::new(upgraded_tx),
+                        consensus_rule_set,
+                    });
+                }
+                MempoolUpdateJob::Link { old_link_tx } => {
+                    // Acquire lock, and drop it immediately.
+                    let (msa_lookup_result, consensus_rule_set) = {
+                        let state = global_state_lock.lock_guard().await;
+                        let msa_lookup_result = state
+                            .chain
+                            .archival_state()
+                            .old_mutator_set_and_mutator_set_update_to_tip(
+                                old_link_tx.kernel.kernel.mutator_set_hash,
+                                SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
+                            )
+                            .await;
+                        (msa_lookup_result, state.consensus_rule_set())
+                    };
+                    let Some((old_msa, mutator_set_update)) = msa_lookup_result else {
+                        result.push(MempoolUpdateJobResult::LinkFailure(txid));
+                        continue;
+                    };
+                    let single_proof_digest = single_proof_program_digest(consensus_rule_set);
+
+                    // No locks may be held here!
+                    let update_result = old_link_tx
+                        .as_ref()
+                        .clone()
+                        .new_with_updated_mutator_set_records(
+                            &old_msa,
+                            &mutator_set_update,
+                            single_proof_digest,
+                            job_queue.clone(),
+                            proof_job_options.clone(),
+                        )
+                        .await;
+                    let Ok(new_link_tx) = update_result else {
+                        result.push(MempoolUpdateJobResult::LinkFailure(txid));
+                        continue;
+                    };
+
+                    result.push(MempoolUpdateJobResult::SuccessLink {
+                        new_link_tx: Box::new(new_link_tx),
+                        single_proof_digest,
                     });
                 }
                 MempoolUpdateJob::SingleProof {
@@ -540,16 +630,18 @@ impl MainLoopHandler {
                     old_single_proof,
                 } => {
                     let upgrade_incentive = UpgradeIncentive::Critical;
-                    let Ok(update_job) = global_state_lock
-                        .lock_guard_mut()
-                        .await
-                        .update_single_proof_job(
-                            old_kernel.to_owned(),
-                            old_single_proof.to_owned(),
-                            upgrade_incentive,
-                        )
-                        .await
-                    else {
+                    let (update_job, consensus_rule_set) = {
+                        let state = global_state_lock.lock_guard().await;
+                        let update_job = state
+                            .update_single_proof_job(
+                                old_kernel.to_owned(),
+                                old_single_proof.to_owned(),
+                                upgrade_incentive,
+                            )
+                            .await;
+                        (update_job, state.next_block_consensus_rule_set())
+                    };
+                    let Ok(update_job) = update_job else {
                         result.push(MempoolUpdateJobResult::Failure(txid));
                         continue;
                     };
@@ -566,6 +658,7 @@ impl MainLoopHandler {
                     result.push(MempoolUpdateJobResult::Success {
                         new_primitive_witness: None,
                         new_transaction: Box::new(updated_tx),
+                        consensus_rule_set,
                     });
                 }
             }
@@ -580,6 +673,8 @@ impl MainLoopHandler {
     /// Handles a list of transactions whose witness data has been updated to be
     /// valid under a new mutator set.
     async fn handle_updated_mempool_txs(&mut self, update_results: Vec<MempoolUpdateJobResult>) {
+        let mut link_tx_notifications = vec![];
+        let mut transaction_notifications = vec![];
         {
             let mut state = self.global_state_lock.lock_guard_mut().await;
             for update_result in &update_results {
@@ -589,13 +684,59 @@ impl MainLoopHandler {
                             "Failed to update transaction {txkid} to be valid under new mutator \
                         set. Removing from the mempool."
                         );
-                        state.mempool_remove(*txkid).await
+                        state.mempool_remove_keeping_parked(*txkid).await
                     }
                     MempoolUpdateJobResult::Success {
                         new_primitive_witness,
                         new_transaction,
+                        consensus_rule_set,
                     } => {
                         let txid = new_transaction.kernel.txid();
+
+                        // A block may have changed the next block's rule set
+                        // while proving; the proof is then for the wrong era.
+                        let next_block_rule_set = state.next_block_consensus_rule_set();
+                        if *consensus_rule_set != next_block_rule_set {
+                            warn!(
+                                "Discarding update of transaction {txid}: it was made for \
+                                 {consensus_rule_set}, but the next block follows \
+                                 {next_block_rule_set}."
+                            );
+                            continue;
+                        }
+
+                        // In the legacy era, only this node's own transactions
+                        // are updated, and only while the legacy relay pool
+                        // still holds them as such: a block may have mined
+                        // one, or it may have been removed, while proving.
+                        if consensus_rule_set.is_legacy_era()
+                            && !state.legacy_relay_pool.is_own(txid)
+                        {
+                            info!(
+                                "Discarding update of transaction {txid}: the legacy relay \
+                                 pool no longer holds it."
+                            );
+                            continue;
+                        }
+
+                        // A transaction synced to the tip whose inputs the
+                        // tip spends can never be mined.
+                        let tip_mutator_set = state
+                            .chain
+                            .light_state()
+                            .mutator_set_accumulator_after()
+                            .expect("Block from state must have mutator set after");
+                        if new_transaction.kernel.mutator_set_hash == tip_mutator_set.hash()
+                            && !new_transaction.is_confirmable_relative_to(&tip_mutator_set)
+                        {
+                            warn!(
+                                "Discarding update of transaction {txid}: an input is spent \
+                                 already. Removing it."
+                            );
+                            state.mempool_remove(txid).await;
+                            continue;
+                        }
+
                         info!("Updated transaction {txid} to be valid under new mutator set");
 
                         // First update the primitive-witness data associated with the transaction,
@@ -608,24 +749,75 @@ impl MainLoopHandler {
                                 .await;
                         }
                         state
-                            .mempool_insert(*new_transaction.to_owned(), UpgradePriority::Critical, AddReason::Updated)
+                            .mempool_insert(
+                                *new_transaction.to_owned(),
+                                UpgradePriority::Critical,
+                                AddReason::Updated,
+                            )
                             .await;
+                        if let Ok(notification) = new_transaction.as_ref().try_into() {
+                            transaction_notifications
+                                .push(MainToPeerTask::TransactionNotification(notification));
+                        }
+                    }
+                    MempoolUpdateJobResult::LinkFailure(txid) => {
+                        // Only remove the link transaction, not a transaction
+                        // that replaced it under the same id while updating.
+                        if state.mempool.get_link(*txid).is_some() {
+                            warn!(
+                                "Failed to update link transaction {txid} to be valid under new \
+                                 mutator set. Removing from the mempool."
+                            );
+                            state.mempool_remove(*txid).await
+                        }
+                    }
+                    MempoolUpdateJobResult::SuccessLink {
+                        new_link_tx,
+                        single_proof_digest,
+                    } => {
+                        let txid = new_link_tx.txid();
+
+                        // The update may have been proving while a block
+                        // changed the `SingleProof` program.
+                        let current_digest =
+                            single_proof_program_digest(state.consensus_rule_set());
+                        if *single_proof_digest != current_digest {
+                            warn!(
+                                "Discarding update of link transaction {txid}: it was made for \
+                                 another SingleProof program."
+                            );
+                            continue;
+                        }
+
+                        info!("Updated link transaction {txid} to be valid under new mutator set");
+                        state
+                            .mempool_insert_link(
+                                new_link_tx.as_ref().to_owned(),
+                                UpgradePriority::Critical,
+                                AddReason::Updated,
+                            )
+                            .await;
+
+                        // Only announce what the mempool now holds.
+                        if let Some(notification) = state
+                            .mempool
+                            .get_link(txid)
+                            .filter(|held| **held == **new_link_tx)
+                            .and_then(|held| LinkTxNotification::try_from(held).ok())
+                        {
+                            link_tx_notifications.push(notification);
+                        }
                     }
                 }
             }
         }
 
         // Then notify all peers about shareable transactions.
-        for updated in update_results {
-            if let MempoolUpdateJobResult::Success {
-                new_transaction, ..
-            } = updated
-            {
-                if let Ok(pmsg) = new_transaction.as_ref().try_into() {
-                    let pmsg = MainToPeerTask::TransactionNotification(pmsg);
-                    self.main_to_peer_broadcast(pmsg);
-                }
-            }
+        for notification in transaction_notifications {
+            self.main_to_peer_broadcast(notification);
+        }
+        for notification in link_tx_notifications {
+            self.main_to_peer_broadcast(MainToPeerTask::LinkTxNotification(notification));
         }
 
         // Tell miner that it can now continue either composing or guessing.
@@ -725,6 +917,7 @@ impl MainLoopHandler {
         info!("broadcasting new block to peers");
 
         self.spawn_mempool_txs_update_job(main_loop_state, update_jobs);
+        self.spawn_wallet_maintenance().await;
 
         Ok(())
     }
@@ -870,6 +1063,17 @@ impl MainLoopHandler {
                     // Ask miner to stop work until state update is completed
                     self.main_to_miner_tx.send(MainToMiner::WaitForContinue);
 
+                    // Register sync progress on the healthy (canonical) path
+                    // too. The global synchronization timeout measures time
+                    // since the anchor was last updated; without this refresh
+                    // it fires a fixed 480 s after sync-mode entry no matter
+                    // how well the sync is going, and the forced re-entry gap
+                    // pushes catch-up onto the unbounded fork-reconciliation
+                    // path.
+                    if let Some(sync_anchor) = global_state_mut.net.sync_anchor.as_mut() {
+                        sync_anchor.catch_up(last_block.header().height, last_block.hash());
+                    }
+
                     // Get out of sync mode if needed
                     if global_state_mut.net.sync_anchor.is_some() {
                         let stay_in_sync_mode = stay_in_sync_mode(
@@ -884,7 +1088,11 @@ impl MainLoopHandler {
                         }
                     }
 
-                    let mut update_jobs: Vec<MempoolUpdateJob> = vec![];
+                    // Track the "update" jobs that should be performed after a
+                    // new tip is set. Keyed by transaction ID, so that multiple
+                    // incoming blocks do not schedule the same mempool
+                    // transaction to be updated more than once.
+                    let mut update_jobs: HashMap<_, _> = HashMap::new();
                     for new_block in blocks {
                         debug!(
                             "Storing block {:x} in database. Height: {}, Mined: {}",
@@ -904,12 +1112,16 @@ impl MainLoopHandler {
 
                         let update_jobs_ = global_state_mut.set_new_tip(new_block).await?;
 
-                        update_jobs.extend(update_jobs_);
+                        update_jobs.extend(
+                            update_jobs_
+                                .into_iter()
+                                .map(|update_job| (update_job.txid(), update_job)),
+                        );
                     }
 
                     global_state_mut.flush_databases().await?;
 
-                    update_jobs
+                    update_jobs.into_values().collect_vec()
                 };
 
                 // Inform all peers about new block
@@ -927,6 +1139,8 @@ impl MainLoopHandler {
                 // TODO: Do clever trick to collapse all jobs relating to the same transaction,
                 //       identified by transaction-ID, into *one* update job.
                 self.spawn_mempool_txs_update_job(main_loop_state, update_jobs);
+
+                self.spawn_wallet_maintenance().await;
 
                 // Inform miner about new block.
                 self.main_to_miner_tx.send(MainToMiner::NewBlock);
@@ -1049,6 +1263,49 @@ impl MainLoopHandler {
                     self.main_to_peer_broadcast(pmsg);
                 }
             }
+            PeerTaskToMain::LinkTx(pt2m_link_tx) => {
+                log_slow_scope!(fn_name!() + "::PeerTaskToMain::LinkTx");
+
+                let link_tx = pt2m_link_tx.link_tx;
+                let txid = link_tx.txid();
+                debug!(
+                    "`peer_loop` received link transaction {txid} from peer. {} inputs, {} \
+                     thruputs, {} outputs.",
+                    link_tx.kernel.kernel.inputs.len(),
+                    link_tx.kernel.thruputs.len(),
+                    link_tx.kernel.kernel.outputs.len(),
+                );
+
+                let notification = {
+                    let mut global_state_mut = self.global_state_lock.lock_guard_mut().await;
+                    if pt2m_link_tx.confirmable_for_block
+                        != global_state_mut.chain.light_state().hash()
+                    {
+                        warn!("main loop got link transaction with bad mutator set data, discarding it");
+                        return Ok(());
+                    }
+
+                    global_state_mut
+                        .mempool_insert_link(
+                            link_tx.clone(),
+                            UpgradePriority::Irrelevant,
+                            AddReason::FromPeer,
+                        )
+                        .await;
+
+                    // Only announce what the mempool now holds, so that peers
+                    // asking for it get it.
+                    global_state_mut
+                        .mempool
+                        .get_link(txid)
+                        .filter(|held| **held == link_tx)
+                        .and_then(|held| LinkTxNotification::try_from(held).ok())
+                };
+
+                if let Some(notification) = notification {
+                    self.main_to_peer_broadcast(MainToPeerTask::LinkTxNotification(notification));
+                }
+            }
             PeerTaskToMain::BlockProposal(block) => {
                 log_slow_scope!(fn_name!() + "::PeerTaskToMain::BlockProposal");
 
@@ -1104,8 +1361,10 @@ impl MainLoopHandler {
                 let all_peers = global_state.net.peer_map.iter();
 
                 // filter out CLI peers
+                let cli_args = global_state.cli();
+                let cli_peers = cli_peer_addresses(cli_args);
                 let disconnect_candidates =
-                    all_peers.filter(|p| !global_state.cli().peers.contains(p.0));
+                    all_peers.filter(|p| !is_cli_peer(cli_args, &cli_peers, p.1));
 
                 // find the one with the oldest connection
                 let longest_lived_peer = disconnect_candidates.min_by(
@@ -1122,6 +1381,11 @@ impl MainLoopHandler {
                     let pmsg = MainToPeerTask::Disconnect(peer_socket.to_owned());
                     self.main_to_peer_broadcast(pmsg);
                 }
+            }
+            PeerTaskToMain::Ban(peer_address) => {
+                log_slow_scope!(fn_name!() + "::PeerTaskToMain::Ban");
+
+                self.ban_peer_in_bad_standing(peer_address).await;
             }
         }
 
@@ -1167,10 +1431,11 @@ impl MainLoopHandler {
         }
 
         let num_peers_to_disconnect = num_peers - max_num_peers;
+        let cli_peers = cli_peer_addresses(cli_args);
         let peers_to_disconnect = connected_peers
             .into_iter()
-            .filter(|peer| !cli_args.peers.contains(&peer.connected_address()))
-            .choose_multiple(&mut rand::rng(), num_peers_to_disconnect);
+            .filter(|peer| !is_cli_peer(cli_args, &cli_peers, peer))
+            .sample(&mut rand::rng(), num_peers_to_disconnect);
         match peers_to_disconnect.len() {
             0 => warn!("Not disconnecting from any peer because of manual override."),
             i => info!("Disconnecting from {i} peers."),
@@ -1194,15 +1459,20 @@ impl MainLoopHandler {
             .await
             .net
             .peer_map
-            .keys()
-            .copied()
+            .values()
+            .cloned()
             .collect_vec();
-        let peers_with_lost_connection = self
-            .global_state_lock
-            .cli()
-            .peers
-            .iter()
-            .filter(|peer| !connected_peers.contains(peer));
+        let cli_args = self.global_state_lock.cli();
+        let cli_peers = cli_args.legacy_peers();
+
+        // A peer that is connected over libp2p, or that dialed in from another
+        // port, is connected all the same; see `is_cli_peer`. Dialing it again
+        // would only be refused as a duplicate.
+        let peers_with_lost_connection = cli_peers.iter().filter(|&&cli_peer| {
+            !connected_peers
+                .iter()
+                .any(|peer| is_cli_peer(cli_args, &[cli_peer], peer))
+        });
 
         // If no connection was lost, there's nothing to do.
         if peers_with_lost_connection.clone().count() == 0 {
@@ -1320,8 +1590,10 @@ impl MainLoopHandler {
 
         // Immediately request the new peer's peer list. This allows
         // incorporating the new peer's peers into the list of potential peers,
-        // to be used in the next round of peer discovery.
-        let m2pmsg = MainToPeerTask::MakeSpecificPeerDiscoveryRequest(peer_candidate);
+        // to be used in the next round of peer discovery. The peer loop knows
+        // the peer by the canonical form of its address; see `call_peer`.
+        let m2pmsg =
+            MainToPeerTask::MakeSpecificPeerDiscoveryRequest(canonical_socket_addr(peer_candidate));
         self.main_to_peer_broadcast(m2pmsg);
 
         Ok(())
@@ -1500,7 +1772,11 @@ impl MainLoopHandler {
                 .proof_upgrader_task
                 .as_ref()
                 .is_some_and(|x| !x.is_finished());
+            let vm_job_queue = vm_job_queue();
+            let busy = vm_job_queue.num_queued_jobs() > 0;
+
             global_state.cli().tx_proof_upgrading
+                && !busy
                 && global_state.net.sync_anchor.is_none()
                 && global_state.proving_capability() == TxProvingCapability::SingleProof
                 && !previous_upgrade_task_is_still_running
@@ -1511,7 +1787,7 @@ impl MainLoopHandler {
         // Check if it's time to run the proof-upgrader, and if we're capable
         // of upgrading a transaction proof.
         let upgrade_candidate = {
-            let mut global_state = self.global_state_lock.lock_guard_mut().await;
+            let global_state = self.global_state_lock.lock_guard().await;
             if !attempt_upgrade(&global_state, main_loop_state) {
                 trace!("Not attempting upgrade.");
                 return Ok(());
@@ -1520,8 +1796,7 @@ impl MainLoopHandler {
             debug!("Attempting to run transaction-proof-upgrade");
 
             // Find a candidate for proof upgrade
-            let Some(upgrade_candidate) = get_upgrade_task_from_mempool(&mut global_state).await
-            else {
+            let Some(upgrade_candidate) = get_upgrade_task_from_mempool(&global_state).await else {
                 debug!("Found no transaction-proof to upgrade");
                 return Ok(());
             };
@@ -1557,6 +1832,65 @@ impl MainLoopHandler {
         Ok(())
     }
 
+    /// Move funds held at legacy-format dCTIDH locks and consolidate UTXOs, as
+    /// configured, in a spawned task. Runs for every new tip, whether it comes
+    /// from a peer or from this node, and once after startup.
+    ///
+    /// Skipped while syncing, since the tip is not current, and while the task
+    /// started for an earlier tip still runs, so that two such tasks never
+    /// select the same inputs.
+    async fn spawn_wallet_maintenance(&self) {
+        let migration = self.global_state_lock.cli().dctidh_migration();
+        let consolidation = {
+            let settings = self.global_state_lock.cli().auto_consolidate();
+            let num_inputs = usize::from(settings.num_inputs);
+            match settings.policy {
+                ConsolidationTarget::Inactive => None,
+                ConsolidationTarget::ActiveDynamic => Some((num_inputs, None)),
+                ConsolidationTarget::ActiveFixed { address } => Some((num_inputs, Some(*address))),
+            }
+        };
+
+        let syncing = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .net
+            .sync_anchor
+            .is_some();
+        if syncing {
+            return;
+        }
+
+        let global_state_lock = self.global_state_lock.clone();
+        let wallet_maintenance = self.wallet_maintenance.clone();
+        tokio::task::spawn(async move {
+            let Ok(mut maintenance) = wallet_maintenance.try_lock_owned() else {
+                debug!("wallet maintenance for an earlier block still running");
+                return;
+            };
+            maintenance
+                .run(global_state_lock, migration, consolidation)
+                .await;
+        });
+    }
+
+    /// Whether the tip is recent enough for the wallet maintenance after
+    /// startup, see [`STARTUP_WALLET_MAINTENANCE_MAX_TIP_AGE`].
+    async fn tip_is_recent(&self) -> bool {
+        let tip_timestamp = self
+            .global_state_lock
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .timestamp;
+        let max_age = self.global_state_lock.cli().network.target_block_interval()
+            * STARTUP_WALLET_MAINTENANCE_MAX_TIP_AGE;
+        tip_timestamp + max_age >= Timestamp::now()
+    }
+
     /// Post-processing when new block has arrived. Spawn a task to update
     /// transactions in the mempool. Only when the spawned task has completed,
     /// should the miner continue.
@@ -1565,12 +1899,24 @@ impl MainLoopHandler {
         main_loop_state: &mut MutableMainLoopState,
         update_jobs: Vec<MempoolUpdateJob>,
     ) {
-        // job completion of the spawned task is communicated through the
-        // `update_mempool_txs_handle` channel.
         let vm_job_queue = vm_job_queue();
-        if let Some(handle) = main_loop_state.update_mempool_txs_handle.as_ref() {
+        let num_queued_job = vm_job_queue.num_queued_jobs();
+
+        // Don't do anything if there are already too many jobs in the queue.
+        // A later block will hopefully update the transaction in question, or
+        // the current-running job will self correct.
+        if num_queued_job > 2 {
+            warn!(
+                "Not updating mempool txs since job queue \
+                   already contains {num_queued_job} jobs"
+            );
+            return;
+        }
+
+        if let Some(handle) = main_loop_state.update_mempool_txs_handle.take() {
             handle.abort();
         }
+
         let (update_sender, update_receiver) =
             mpsc::channel::<Vec<MempoolUpdateJobResult>>(TX_UPDATER_CHANNEL_CAPACITY);
 
@@ -1634,6 +1980,19 @@ impl MainLoopHandler {
 
         let mut tx_proof_upgrade_interval = time::interval(PROOF_UPGRADE_INTERVAL);
         tx_proof_upgrade_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        // Report funds held at legacy-format dCTIDH locks that are not moved,
+        // and run the wallet maintenance once shortly after startup.
+        if self.global_state_lock.cli().dctidh_migration().is_none() {
+            self.wallet_maintenance
+                .lock()
+                .await
+                .report_unmoved_legacy_funds(&self.global_state_lock)
+                .await;
+        }
+        let startup_wallet_maintenance = time::sleep(STARTUP_WALLET_MAINTENANCE_DELAY);
+        tokio::pin!(startup_wallet_maintenance);
+        let mut startup_wallet_maintenance_pending = true;
 
         // Spawn tasks to monitor for SIGTERM, SIGINT, and SIGQUIT. These
         // signals are only used on Unix systems.
@@ -1709,13 +2068,18 @@ impl MainLoopHandler {
 
                 // Handle incoming connections from peer
                 Ok((stream, peer_address)) = self.incoming_peer_listener.accept() => {
+                    // A listener on `::` reports IPv4 peers in IPv4-mapped
+                    // form. Key them by their IPv4 address, as the libp2p
+                    // stack does, so that standings, bans, and caps apply to
+                    // an IP address in either form.
+                    let peer_address = canonical_socket_addr(peer_address);
                     let ip = peer_address.ip();
                     if !precheck_incoming_connection_is_allowed(self.global_state_lock.cli(), ip) {
                         continue;
                     }
 
                     // Is this IP banned through database entry?
-                    let peer_banned = self.global_state_lock.lock_guard().await.net.peer_databases.peer_standings.get(ip).await.is_some_and(|x| x.is_bad());
+                    let peer_banned = self.global_state_lock.lock_guard().await.net.get_peer_standing_from_database(ip).await.is_some_and(|x| x.is_bad());
                     if peer_banned {
                         debug!("Banned peer {ip} attempted incoming connection. Hanging up.");
                         continue;
@@ -1779,6 +2143,19 @@ impl MainLoopHandler {
 
                 }
 
+                // Handle events from the libp2p network actor. Never ready if
+                // the actor does not run.
+                maybe_network_event = next_network_event(&mut self.network_actor) => {
+                    let Some(network_event) = maybe_network_event else {
+                        // The event sender lives in the network actor, so the
+                        // actor has stopped. The legacy stack keeps running.
+                        self.handle_network_actor_stopped();
+                        continue;
+                    };
+
+                    self.handle_network_event(network_event, &mut main_loop_state);
+                }
+
                 // Handle the completion of mempool tx-update jobs after new block.
                 Some(ms_updated_transactions) = main_loop_state.update_mempool_receiver.recv() => {
                     self.handle_updated_mempool_txs(ms_updated_transactions).await;
@@ -1786,7 +2163,7 @@ impl MainLoopHandler {
 
                 // Handle messages from rpc server task
                 Some(rpc_server_message) = self.rpc_server_to_main_rx.recv() => {
-                    let shutdown_after_execution = self.handle_rpc_server_message(rpc_server_message.clone(), &mut main_loop_state).await?;
+                    let shutdown_after_execution = self.handle_rpc_server_message(rpc_server_message, &mut main_loop_state).await?;
                     if shutdown_after_execution {
                         break SUCCESS_EXIT_CODE
                     }
@@ -1876,6 +2253,15 @@ impl MainLoopHandler {
                     self.proof_upgrader(&mut main_loop_state).await?;
                 }
 
+                // Run the wallet maintenance once after startup if the tip is
+                // recent by then. Otherwise, the next tip runs it.
+                _ = &mut startup_wallet_maintenance, if startup_wallet_maintenance_pending => {
+                    startup_wallet_maintenance_pending = false;
+                    if self.tip_is_recent().await {
+                        self.spawn_wallet_maintenance().await;
+                    }
+                }
+
             }
         };
 
@@ -1948,6 +2334,34 @@ impl MainLoopHandler {
                 // do not shut down
                 Ok(false)
             }
+            RPCServerToMain::BroadcastOwnLinkTx(link_tx) => {
+                debug!(
+                    "`main` received link transaction from RPC server. {} confirmed inputs, \
+                     {} thruputs, {} outputs. Synced to mutator set hash: {}",
+                    link_tx.kernel.kernel.inputs.len(),
+                    link_tx.kernel.thruputs.len(),
+                    link_tx.kernel.kernel.outputs.len(),
+                    link_tx.kernel.kernel.mutator_set_hash
+                );
+
+                // note: this link transaction must already have been added to
+                // the mempool by the sender.
+
+                // Only proof-backed link transactions can be shared; the
+                // conversion fails for witness-backed ones, which must never
+                // leave the node.
+                match LinkTxNotification::try_from(link_tx.as_ref()) {
+                    Ok(notification) => {
+                        let pmsg = MainToPeerTask::LinkTxNotification(notification);
+                        self.main_to_peer_broadcast(pmsg);
+                    }
+                    Err(e) => {
+                        warn!("Refusing to broadcast link transaction: {e}");
+                    }
+                }
+
+                Ok(false)
+            }
             RPCServerToMain::PerformTxProofUpgrade(upgrade_job) => {
                 let vm_job_queue = vm_job_queue();
                 let global_state_lock_clone = self.global_state_lock.clone();
@@ -1975,13 +2389,29 @@ impl MainLoopHandler {
                 let mut notifications = vec![];
                 {
                     let state = self.global_state_lock.lock_guard().await;
+                    for txid in state.legacy_relay_pool.txids_by_fee_density() {
+                        let transaction = state
+                            .legacy_relay_pool
+                            .get(txid)
+                            .expect("listed transaction must be in the legacy relay pool");
+                        if let Ok(notification) = TransactionNotification::try_from(transaction) {
+                            notifications
+                                .push(MainToPeerTask::TransactionNotification(notification));
+                        }
+                    }
                     for (txid, _) in state.mempool.fee_density_iter() {
                         // Since a read-lock is held over global state, the
-                        // transaction must exist in the mempool.
-                        let tx = state
-                            .mempool
-                            .get(txid)
-                            .expect("Transaction from iter must exist in mempool");
+                        // transaction must exist in the mempool. It is on the
+                        // link pipeline if it is not on the standard one.
+                        let Some(tx) = state.mempool.get(txid) else {
+                            if let Some(link_tx) = state.mempool.get_link(txid) {
+                                if let Ok(notification) = LinkTxNotification::try_from(link_tx) {
+                                    notifications
+                                        .push(MainToPeerTask::LinkTxNotification(notification));
+                                }
+                            }
+                            continue;
+                        };
                         let notification = TransactionNotification::try_from(tx);
                         match notification {
                             Ok(notification) => {
@@ -2069,28 +2499,71 @@ impl MainLoopHandler {
                 // shut down
                 Ok(true)
             }
-            RPCServerToMain::SubmitTx(transaction) => {
+            RPCServerToMain::SubmitTx(transaction, consensus_rule_set) => {
                 // Technically RPC is not supposed/capable to handle ProofWitness but just in case
                 // Until a decision is made. (As this might get used by api too.)
                 let notification: Option<TransactionNotification> =
                     transaction.as_ref().try_into().ok();
 
-                {
+                // The transaction was verified under the given rule set, and
+                // is held only while that is the next block's.
+                let inserted = {
                     let mut state = self.global_state_lock.lock_guard_mut().await;
 
                     state
-                        .mempool_insert(*transaction, UpgradePriority::Critical, AddReason::Submitted)
-                        .await;
-                }
+                        .mempool_insert_for_rule_set(
+                            *transaction,
+                            consensus_rule_set,
+                            UpgradePriority::Critical,
+                            AddReason::Submitted,
+                        )
+                        .await
+                };
 
                 // If transaction can be sent thru P2P, submit instantly.
                 // This might be mempools responsibility but for now...
                 // We know upgraded transactions gets announced but not sure about new entries, might get moved into mempool too.
-                if let Some(notification) = notification {
+                if let Some(notification) = notification.filter(|_| inserted) {
                     let pmsg = MainToPeerTask::TransactionNotification(notification);
                     self.main_to_peer_broadcast(pmsg);
                 }
 
+                Ok(false)
+            }
+            RPCServerToMain::Ban(ip) => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::Ban");
+
+                self.ban_ip(ip).await;
+                Ok(false)
+            }
+            RPCServerToMain::Unban(ip) => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::Unban");
+
+                self.unban_ip(ip).await;
+                Ok(false)
+            }
+            RPCServerToMain::UnbanAll => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::UnbanAll");
+
+                self.unban_all().await;
+                Ok(false)
+            }
+            RPCServerToMain::Dial(address) => {
+                log_slow_scope!(fn_name!() + "::RPCServerToMain::Dial");
+
+                self.dial(address).await;
+                Ok(false)
+            }
+            RPCServerToMain::ProbeNat => {
+                self.probe_nat().await;
+                Ok(false)
+            }
+            RPCServerToMain::ResetRelayReservations => {
+                self.reset_relay_reservations().await;
+                Ok(false)
+            }
+            RPCServerToMain::GetNetworkOverview(reply) => {
+                self.request_network_overview(reply).await;
                 Ok(false)
             }
         }
@@ -2106,6 +2579,12 @@ impl MainLoopHandler {
         let pmsg = MainToPeerTask::DisconnectAll();
         self.main_to_peer_broadcast(pmsg);
         debug!("sent bye");
+
+        // Stop the libp2p network actor, which closes its connections and
+        // stores its address book and ban list.
+        if let Some(network_actor) = self.network_actor.take() {
+            network_actor.shutdown().await;
+        }
 
         // Flush all databases
         self.global_state_lock.flush_databases().await?;
@@ -2179,7 +2658,7 @@ mod tests {
     ) -> TestSetup {
         const CHANNEL_CAPACITY_MINER_TO_MAIN: usize = 10;
 
-        let network = Network::Main;
+        let network = cli.network;
         let (
             main_to_peer_tx,
             main_to_peer_rx,
@@ -2232,6 +2711,7 @@ mod tests {
             miner_to_main_rx,
             rpc_server_to_main_rx,
             task_join_handles,
+            None,
         );
         TestSetup {
             main_loop_handler,
@@ -2345,10 +2825,18 @@ mod tests {
                 let tx = genesis_tx_with_proof_type(tx_proving_capability, network, fee).await;
                 let update_jobs = {
                     let mut gsl = main_loop_handler.global_state_lock.lock_guard_mut().await;
-                    gsl.mempool_insert(pw_tx.into(), UpgradePriority::Critical, AddReason::Submitted)
-                        .await;
-                    gsl.mempool_insert(tx.clone().into(), UpgradePriority::Critical, AddReason::Submitted)
-                        .await;
+                    gsl.mempool_insert(
+                        pw_tx.into(),
+                        UpgradePriority::Critical,
+                        AddReason::Submitted,
+                    )
+                    .await;
+                    gsl.mempool_insert(
+                        tx.clone().into(),
+                        UpgradePriority::Critical,
+                        AddReason::Submitted,
+                    )
+                    .await;
                     gsl.set_new_tip(block1.clone()).await.unwrap()
                 };
 
@@ -2599,6 +3087,11 @@ mod tests {
             let num_outgoing_connections = 0;
             let num_incoming_connections = 0;
 
+            // Use a network whose premine funds the devnet wallet; on mainnet
+            // this fork's premine leaves the test wallet without funds. Not
+            // RegTest: that network mocks proofs, and the merge performed by
+            // the upgrade under test requires real single proofs as input.
+            let network = Network::Testnet(0);
             let TestSetup {
                 mut main_loop_handler,
                 mut main_to_peer_rx,
@@ -2606,7 +3099,7 @@ mod tests {
             } = setup(
                 num_outgoing_connections,
                 num_incoming_connections,
-                cli_args::Args::default(),
+                cli_args::Args::default_with_network(network),
             )
             .await;
 
@@ -2615,7 +3108,7 @@ mod tests {
             let mocked_cli = cli_args::Args {
                 tx_proving_capability: Some(TxProvingCapability::SingleProof),
                 tx_proof_upgrading: true,
-                ..Default::default()
+                ..cli_args::Args::default_with_network(network)
             };
 
             main_loop_handler
@@ -2648,7 +3141,11 @@ mod tests {
                 .global_state_lock
                 .lock_guard_mut()
                 .await
-                .mempool_insert((*proof_collection_tx).clone(), UpgradePriority::Irrelevant, AddReason::Submitted)
+                .mempool_insert(
+                    (*proof_collection_tx).clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::Submitted,
+                )
                 .await;
             assert!(
                 main_loop_handler
@@ -2706,6 +3203,27 @@ mod tests {
 
     mod peer_discovery {
         use super::*;
+
+        #[test]
+        fn candidate_at_connected_ip_in_ipv4_mapped_form_is_not_preferred() {
+            let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+            let connected = get_dummy_peer_incoming(SocketAddr::new(ipv4.into(), 9898));
+            let at_connected_ip = SocketAddr::new(ipv4.to_ipv6_mapped().into(), 9899);
+            let elsewhere = SocketAddr::from_str("198.51.100.8:9898").unwrap();
+
+            let reported_by = SocketAddr::from_str("198.51.100.9:9898").unwrap();
+            let now = SystemTime::now();
+            let mut potential_peers = PotentialPeersState::default();
+            potential_peers.add(reported_by, (at_connected_ip, 1), 10, 2, now);
+            potential_peers.add(reported_by, (elsewhere, 2), 10, 2, now);
+
+            for _ in 0..20 {
+                assert_eq!(
+                    Some((elsewhere, 2)),
+                    potential_peers.get_candidate(std::slice::from_ref(&connected), 0)
+                );
+            }
+        }
 
         #[apply(shared_tokio_runtime)]
         #[traced_test]
@@ -2982,7 +3500,7 @@ mod tests {
 
     mod bootstrapper_mode {
 
-        use rand::Rng;
+        use rand::RngExt;
 
         use super::*;
         use crate::protocol::peer::PeerMessage;
@@ -3296,6 +3814,549 @@ mod tests {
                 .await
                 .unwrap();
             let _ = fs::remove_file(&expected_file_location);
+        }
+    }
+
+    /// The main loop's side of the libp2p stack: bans and unbans that reach
+    /// both stacks, and peers given on the command line that are reached over
+    /// either stack.
+    mod network_stacks {
+        use std::net::IpAddr;
+
+        use super::*;
+        use crate::application::config::parser::peer_address::PeerAddress;
+        use crate::protocol::peer::peer_info::PeerConnectionInfo;
+        use crate::tests::shared::globalstate::get_dummy_handshake_data_for_genesis;
+
+        /// Give the main loop a link to a network actor that does not run, and
+        /// return the receiver of the commands sent to it.
+        #[cfg(feature = "libp2p")]
+        fn link_network_actor(
+            main_loop_handler: &mut MainLoopHandler,
+        ) -> mpsc::Receiver<crate::application::network::channel::NetworkActorCommand> {
+            let (command_tx, command_rx) = mpsc::channel(10);
+            let (_event_tx, event_rx) = mpsc::unbounded_channel();
+            let actor_task = tokio::spawn(async {});
+            main_loop_handler.network_actor =
+                Some(NetworkActorLink::new(command_tx, event_rx, actor_task));
+            command_rx
+        }
+
+        async fn standing_in_database(
+            main_loop_handler: &MainLoopHandler,
+            ip: IpAddr,
+        ) -> Option<crate::protocol::peer::PeerStanding> {
+            main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .get_peer_standing_from_database(ip)
+                .await
+        }
+
+        #[cfg(feature = "libp2p")]
+        async fn standing_in_peer_map(
+            main_loop_handler: &MainLoopHandler,
+            peer_address: SocketAddr,
+        ) -> crate::protocol::peer::PeerStanding {
+            main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map[&peer_address]
+                .standing
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn peer_in_bad_standing_is_banned_on_libp2p_stack() {
+            use crate::application::network::channel::NetworkActorCommand;
+
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let mut command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+
+            let peer_address = SocketAddr::from_str("198.51.100.7:9901").unwrap();
+            main_loop_handler
+                .handle_peer_task_message(PeerTaskToMain::Ban(peer_address), &mut main_loop_state)
+                .await
+                .unwrap();
+
+            let Ok(NetworkActorCommand::Ban(itertools::Either::Right(ip))) = command_rx.try_recv()
+            else {
+                panic!("network actor must be told to ban the IP");
+            };
+            assert_eq!(peer_address.ip(), ip);
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn ban_and_unban_reach_both_stacks() {
+            use crate::application::network::channel::NetworkActorCommand;
+
+            let TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            } = setup(0, 1, cli_args::Args::default()).await;
+            let mut command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+            let peer_address = SocketAddr::from_str("255.254.253.0:8080").unwrap();
+            let ip = peer_address.ip();
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Ban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| standing.is_bad()));
+            assert!(standing_in_peer_map(&main_loop_handler, peer_address)
+                .await
+                .is_bad());
+            assert!(matches!(
+                main_to_peer_rx.try_recv(),
+                Ok(MainToPeerTask::Disconnect(address)) if address == peer_address
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Ban(itertools::Either::Right(banned))) if banned == ip
+            ));
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Unban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| !standing.is_bad()));
+            assert!(!standing_in_peer_map(&main_loop_handler, peer_address)
+                .await
+                .is_bad());
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Unban(unbanned)) if unbanned == ip
+            ));
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Ban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::UnbanAll, &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| !standing.is_bad()));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Ban(_))
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::UnbanAll)
+            ));
+        }
+
+        /// An IPv4 peer address, and the same address in IPv4-mapped IPv6
+        /// form.
+        fn ipv4_peer_in_both_forms() -> (SocketAddr, SocketAddr) {
+            let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+            (
+                SocketAddr::new(IpAddr::V4(ipv4), 9898),
+                SocketAddr::new(IpAddr::V6(ipv4.to_ipv6_mapped()), 9898),
+            )
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn ban_of_either_form_of_an_ipv4_address_reaches_both_stacks() {
+            use crate::application::network::channel::NetworkActorCommand;
+            use crate::tests::shared::globalstate::get_dummy_peer_incoming;
+
+            let (ipv4_peer, mapped_peer) = ipv4_peer_in_both_forms();
+            for banned in [ipv4_peer, mapped_peer] {
+                let TestSetup {
+                    mut main_loop_handler,
+                    mut main_to_peer_rx,
+                    ..
+                } = setup(0, 0, cli_args::Args::default()).await;
+                let mut command_rx = link_network_actor(&mut main_loop_handler);
+                let mut main_loop_state = main_loop_handler.mutable();
+
+                // Peers are keyed by the canonical form of their address.
+                main_loop_handler
+                    .global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .peer_map
+                    .insert(ipv4_peer, get_dummy_peer_incoming(ipv4_peer));
+
+                main_loop_handler
+                    .handle_rpc_server_message(
+                        RPCServerToMain::Ban(banned.ip()),
+                        &mut main_loop_state,
+                    )
+                    .await
+                    .unwrap();
+
+                for ip in [ipv4_peer.ip(), mapped_peer.ip()] {
+                    assert!(standing_in_database(&main_loop_handler, ip)
+                        .await
+                        .is_some_and(|standing| standing.is_bad()));
+                }
+                assert!(standing_in_peer_map(&main_loop_handler, ipv4_peer)
+                    .await
+                    .is_bad());
+                assert!(matches!(
+                    main_to_peer_rx.try_recv(),
+                    Ok(MainToPeerTask::Disconnect(address)) if address == ipv4_peer
+                ));
+                assert!(matches!(
+                    command_rx.try_recv(),
+                    Ok(NetworkActorCommand::Ban(itertools::Either::Right(ip)))
+                        if ip == ipv4_peer.ip()
+                ));
+            }
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn lifted_bans_let_peers_reconnect_without_cooldown() {
+            let cli = cli_args::Args {
+                disable_libp2p: true,
+                ..Default::default()
+            };
+            let (ipv4_peer, mapped_peer) = ipv4_peer_in_both_forms();
+            let other_peer = SocketAddr::from_str("203.0.113.9:9898").unwrap();
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli).await;
+            let mut main_loop_state = main_loop_handler.mutable();
+
+            let state_lock = main_loop_handler.global_state_lock.clone();
+            let disconnect = |instance_id, ip| {
+                let mut global_state_lock = state_lock.clone();
+                async move {
+                    global_state_lock
+                        .lock_guard_mut()
+                        .await
+                        .net
+                        .register_peer_disconnection(instance_id, ip, SystemTime::now());
+                }
+            };
+            let disconnected = |instance_id| {
+                let global_state_lock = state_lock.clone();
+                async move {
+                    global_state_lock
+                        .lock_guard()
+                        .await
+                        .net
+                        .last_disconnection_time_of_peer(instance_id)
+                        .is_some()
+                }
+            };
+
+            // Lifting the ban of one form of the IP address lifts the cooldown
+            // of peers seen at the other form, and of no other peers.
+            disconnect(1, ipv4_peer.ip()).await;
+            disconnect(2, other_peer.ip()).await;
+            main_loop_handler
+                .handle_rpc_server_message(
+                    RPCServerToMain::Unban(mapped_peer.ip()),
+                    &mut main_loop_state,
+                )
+                .await
+                .unwrap();
+            assert!(!disconnected(1).await);
+            assert!(disconnected(2).await);
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::UnbanAll, &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(!disconnected(2).await);
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn dial_lets_peers_at_the_ip_reconnect_without_cooldown() {
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let _command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+            let (ipv4_peer, _) = ipv4_peer_in_both_forms();
+            main_loop_handler
+                .global_state_lock
+                .lock_guard_mut()
+                .await
+                .net
+                .register_peer_disconnection(1, ipv4_peer.ip(), SystemTime::now());
+
+            let address =
+                multiaddr::Multiaddr::from_str("/ip4/198.51.100.7/udp/9901/quic-v1").unwrap();
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Dial(address), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(main_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .last_disconnection_time_of_peer(1)
+                .is_none());
+        }
+
+        /// The node keeps running on the legacy stack once the network actor
+        /// stops, and no longer reports the libp2p stack as running.
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn stopped_network_actor_leaves_the_legacy_stack_running() {
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let (command_tx, _command_rx) = mpsc::channel(10);
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let actor_task = tokio::spawn(async {});
+            main_loop_handler.network_actor =
+                Some(NetworkActorLink::new(command_tx, event_rx, actor_task));
+            assert!(main_loop_handler.global_state_lock.libp2p_runs());
+
+            drop(event_tx);
+            assert!(next_network_event(&mut main_loop_handler.network_actor)
+                .await
+                .is_none());
+            main_loop_handler.handle_network_actor_stopped();
+
+            assert!(main_loop_handler.network_actor.is_none());
+            assert!(!main_loop_handler.global_state_lock.libp2p_runs());
+
+            // Network commands are dropped with a warning.
+            let mut main_loop_state = main_loop_handler.mutable();
+            let (overview_tx, overview_rx) = tokio::sync::oneshot::channel();
+            main_loop_handler
+                .handle_rpc_server_message(
+                    RPCServerToMain::GetNetworkOverview(overview_tx),
+                    &mut main_loop_state,
+                )
+                .await
+                .unwrap();
+            assert!(overview_rx.await.is_err());
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn ban_without_network_actor_applies_to_legacy_stack() {
+            let cli = cli_args::Args {
+                disable_libp2p: true,
+                ..Default::default()
+            };
+            let TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            } = setup(0, 1, cli).await;
+            assert!(main_loop_handler.network_actor.is_none());
+            let mut main_loop_state = main_loop_handler.mutable();
+            let peer_address = SocketAddr::from_str("255.254.253.0:8080").unwrap();
+            let ip = peer_address.ip();
+
+            main_loop_handler
+                .handle_rpc_server_message(RPCServerToMain::Ban(ip), &mut main_loop_state)
+                .await
+                .unwrap();
+            assert!(standing_in_database(&main_loop_handler, ip)
+                .await
+                .is_some_and(|standing| standing.is_bad()));
+            assert!(matches!(
+                main_to_peer_rx.try_recv(),
+                Ok(MainToPeerTask::Disconnect(address)) if address == peer_address
+            ));
+        }
+
+        /// A peer given with its legacy address, connected over libp2p and
+        /// therefore keyed by its QUIC address.
+        fn peer_connected_over_libp2p(legacy_address: SocketAddr) -> (SocketAddr, PeerInfo) {
+            let quic_address = SocketAddr::new(legacy_address.ip(), 9901);
+            let peer_info = PeerInfo::new(
+                PeerConnectionInfo::new(Some(legacy_address.port()), quic_address, false),
+                &get_dummy_handshake_data_for_genesis(Network::Main),
+                SystemTime::now(),
+                cli_args::Args::default().peer_tolerance,
+            );
+            (quic_address, peer_info)
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn cli_peer_connected_over_libp2p_is_not_dialed_again() {
+            // A closed port, so that a dial fails at once.
+            let legacy_address = SocketAddr::from_str("127.0.0.1:1").unwrap();
+            for disable_libp2p in [false, true] {
+                let cli = cli_args::Args {
+                    peers: vec![PeerAddress::Socket(legacy_address)],
+                    disable_libp2p,
+                    ..Default::default()
+                };
+                let libp2p_enabled = cli.libp2p_enabled();
+                let TestSetup {
+                    mut main_loop_handler,
+                    ..
+                } = setup(0, 0, cli).await;
+                let (quic_address, peer_info) = peer_connected_over_libp2p(legacy_address);
+                main_loop_handler
+                    .global_state_lock
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .peer_map
+                    .insert(quic_address, peer_info);
+
+                let mut main_loop_state = main_loop_handler.mutable();
+                main_loop_handler
+                    .reconnect(&mut main_loop_state)
+                    .await
+                    .unwrap();
+
+                // Without libp2p, the peer map holds legacy connections only,
+                // and the behavior is as it was: only the connected address
+                // counts.
+                let num_dials = main_loop_state.task_handles.len();
+                if libp2p_enabled {
+                    assert_eq!(0, num_dials);
+                } else {
+                    assert_eq!(1, num_dials);
+                }
+            }
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn cli_peers_connected_over_libp2p_are_not_pruned() {
+            let legacy_cli_peer = SocketAddr::from_str("198.51.100.9:9898").unwrap();
+            let libp2p_cli_peer = SocketAddr::from_str("198.51.100.10:9901").unwrap();
+            let cli = cli_args::Args {
+                peers: vec![
+                    PeerAddress::Socket(legacy_cli_peer),
+                    PeerAddress::Multiaddr("/ip4/198.51.100.10/udp/9901/quic-v1".parse().unwrap()),
+                ],
+                max_num_peers: 1,
+                ..Default::default()
+            };
+            if !cli.libp2p_enabled() {
+                return;
+            }
+
+            // One incoming peer and the two CLI peers, two more than allowed.
+            let TestSetup {
+                mut main_loop_handler,
+                mut main_to_peer_rx,
+                ..
+            } = setup(0, 1, cli).await;
+            let (quic_address, legacy_cli_peer_info) = peer_connected_over_libp2p(legacy_cli_peer);
+            let (_, libp2p_cli_peer_info) = peer_connected_over_libp2p(libp2p_cli_peer);
+            {
+                let mut global_state = main_loop_handler.global_state_lock.lock_guard_mut().await;
+                let peer_map = &mut global_state.net.peer_map;
+                peer_map.insert(quic_address, legacy_cli_peer_info);
+                peer_map.insert(libp2p_cli_peer, libp2p_cli_peer_info);
+            }
+
+            main_loop_handler.prune_peers().await.unwrap();
+            let incoming_peer = SocketAddr::from_str("255.254.253.0:8080").unwrap();
+            assert!(matches!(
+                main_to_peer_rx.try_recv(),
+                Ok(MainToPeerTask::Disconnect(address)) if address == incoming_peer
+            ));
+            assert!(main_to_peer_rx.try_recv().is_err());
+        }
+
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn network_overview_request_is_dropped_without_network_actor() {
+            let cli = cli_args::Args {
+                disable_libp2p: true,
+                ..Default::default()
+            };
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli).await;
+            assert!(main_loop_handler.network_actor.is_none());
+            let mut main_loop_state = main_loop_handler.mutable();
+
+            let (overview_tx, overview_rx) = tokio::sync::oneshot::channel();
+            main_loop_handler
+                .handle_rpc_server_message(
+                    RPCServerToMain::GetNetworkOverview(overview_tx),
+                    &mut main_loop_state,
+                )
+                .await
+                .unwrap();
+            assert!(overview_rx.await.is_err());
+        }
+
+        #[cfg(feature = "libp2p")]
+        #[apply(shared_tokio_runtime)]
+        #[traced_test]
+        async fn libp2p_commands_reach_network_actor() {
+            use crate::application::network::channel::NetworkActorCommand;
+
+            let TestSetup {
+                mut main_loop_handler,
+                ..
+            } = setup(0, 0, cli_args::Args::default()).await;
+            let mut command_rx = link_network_actor(&mut main_loop_handler);
+            let mut main_loop_state = main_loop_handler.mutable();
+            let address =
+                multiaddr::Multiaddr::from_str("/ip4/198.51.100.7/udp/9901/quic-v1").unwrap();
+            let (overview_tx, _overview_rx) = tokio::sync::oneshot::channel();
+
+            for message in [
+                RPCServerToMain::Dial(address.clone()),
+                RPCServerToMain::ProbeNat,
+                RPCServerToMain::ResetRelayReservations,
+                RPCServerToMain::GetNetworkOverview(overview_tx),
+            ] {
+                main_loop_handler
+                    .handle_rpc_server_message(message, &mut main_loop_state)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::Dial(dialed)) if dialed == address
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::ProbeNat)
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::ResetRelayReservations)
+            ));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(NetworkActorCommand::GetNetworkOverview(_))
+            ));
         }
     }
 }

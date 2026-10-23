@@ -22,7 +22,9 @@ use neptune_privacy::state::wallet::wallet_file::WalletFileContext;
 use neptune_privacy::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 use rand::distr::Alphanumeric;
 use rand::distr::SampleString;
+use tasm_lib::prelude::Digest;
 use tokio::net::TcpListener;
+use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 pub struct GenesisNode {
@@ -82,6 +84,26 @@ impl GenesisNode {
                 .expect("Must be able to get socket on local host")
                 .port();
             args.rpc_port = rpc_port;
+
+            // The libp2p stack listens on a UDP port for QUIC and on a TCP
+            // port of its own.
+            let quic_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("Must be able to get socket on local host");
+            let quic_port = quic_socket
+                .local_addr()
+                .expect("Must be able to get socket on local host")
+                .port();
+            args.quic_port = quic_port;
+
+            let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("Must be able to get socket on local host");
+            let tcp_port = tcp_listener
+                .local_addr()
+                .expect("Must be able to get socket on local host")
+                .port();
+            args.tcp_port = tcp_port;
         }
 
         // we default proving capability to primitive-witness as lowest common
@@ -126,7 +148,8 @@ impl GenesisNode {
         cli_args
     }
 
-    /// applies instance specific settings to cli Args: rpc_port and peer_port
+    /// applies instance specific settings to cli Args: rpc_port, peer_port,
+    /// quic_port, and tcp_port
     ///
     /// if starting multiple nodes, each should use a unique instance parameter
     /// in order to prevent port conflicts.
@@ -137,6 +160,10 @@ impl GenesisNode {
             Self::hash_string_to_port_range(&format!("rpc:{}{}", caller, node_instance));
         args.peer_port =
             Self::hash_string_to_port_range(&format!("peer:{}{}", caller, node_instance));
+        args.quic_port =
+            Self::hash_string_to_port_range(&format!("quic:{}{}", caller, node_instance));
+        args.tcp_port =
+            Self::hash_string_to_port_range(&format!("tcp:{}{}", caller, node_instance));
 
         if let Ok(dd) = Self::integration_test_data_directory(args.network) {
             args.data_dir = Some(dd.root_dir_path());
@@ -156,10 +183,10 @@ impl GenesisNode {
     ///
     /// each node will have --peers arguments for every other node.
     ///
-    /// the first node will have rpc port and peer_port based on a hash of cluster_id
-    /// each in the range of 1024..65000.
+    /// the first node will have rpc port, peer_port, quic_port, and tcp_port
+    /// based on a hash of cluster_id each in the range of 1024..65000.
     ///
-    /// subsequent nodes increment the rpc-port and peer-port from previous node by 1.
+    /// subsequent nodes increment each port from previous node by 1.
     pub fn instance_args_for_cluster(
         cluster_id: &str,
         num_nodes: u8,
@@ -170,6 +197,8 @@ impl GenesisNode {
         // fix ports based on the cluster_id
         base_args.rpc_port = Self::hash_string_to_port_range(&format!("rpc:{}{}", cluster_id, 0));
         base_args.peer_port = Self::hash_string_to_port_range(&format!("peer:{}{}", cluster_id, 0));
+        base_args.quic_port = Self::hash_string_to_port_range(&format!("quic:{}{}", cluster_id, 0));
+        base_args.tcp_port = Self::hash_string_to_port_range(&format!("tcp:{}{}", cluster_id, 0));
 
         let peers: Vec<_> = (0..u16::from(num_nodes))
             .map(|v| {
@@ -184,10 +213,12 @@ impl GenesisNode {
                 .into_iter()
                 .enumerate()
                 .filter(|(x, _)| *x != usize::from(i))
-                .map(|(_, s)| s)
+                .map(|(_, s)| s.into())
                 .collect();
             args.peer_port = base_args.peer_port + u16::from(i);
             args.rpc_port = base_args.rpc_port + u16::from(i);
+            args.quic_port = base_args.quic_port + u16::from(i);
+            args.tcp_port = base_args.tcp_port + u16::from(i);
             all_args.push(args)
         }
         tracing::debug!("all_args: {:#?}", all_args);
@@ -462,6 +493,70 @@ impl GenesisNode {
             if start.elapsed() > std::time::Duration::from_secs(timeout_secs.into()) {
                 anyhow::bail!(
                     "confirmed and unconfirmed balance still match after {} seconds",
+                    timeout_secs
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// wait until a chained transaction exists in the mempool, as a link
+    /// transaction or in its fixed form -- `Fix` keeps the txid, so both
+    /// forms answer to `contains`.
+    pub async fn wait_until_chained_tx_in_mempool(
+        &self,
+        txid: TransactionKernelId,
+        timeout_secs: u16,
+    ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+        while !self.gsl.lock_guard().await.mempool.contains(txid) {
+            if start.elapsed() > std::time::Duration::from_secs(timeout_secs.into()) {
+                anyhow::bail!("chained tx not in mempool after {} seconds", timeout_secs);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// wait until a link transaction exists in the mempool, as a link.
+    pub async fn wait_until_link_tx_in_mempool(
+        &self,
+        txid: TransactionKernelId,
+        timeout_secs: u16,
+    ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+        while self.gsl.lock_guard().await.mempool.get_link(txid).is_none() {
+            if start.elapsed() > std::time::Duration::from_secs(timeout_secs.into()) {
+                anyhow::bail!("link tx not in mempool after {} seconds", timeout_secs);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// wait until the link transaction in the mempool is synced to the given
+    /// mutator set. Fails fast if the link leaves the mempool.
+    pub async fn wait_until_link_tx_synced(
+        &self,
+        txid: TransactionKernelId,
+        mutator_set_hash: Digest,
+        timeout_secs: u16,
+    ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+        loop {
+            {
+                let state = self.gsl.lock_guard().await;
+                let Some(link) = state.mempool.get_link(txid) else {
+                    anyhow::bail!("link tx disappeared from mempool");
+                };
+                if link.kernel.kernel.mutator_set_hash == mutator_set_hash {
+                    break;
+                }
+            }
+            if start.elapsed() > std::time::Duration::from_secs(timeout_secs.into()) {
+                anyhow::bail!(
+                    "link tx not synced to mutator set after {} seconds",
                     timeout_secs
                 );
             }

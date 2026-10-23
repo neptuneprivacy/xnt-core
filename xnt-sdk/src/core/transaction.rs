@@ -21,9 +21,24 @@ use super::types::{Digest, Network};
 use super::utxo::Utxo;
 use super::wallet::SpendingKey;
 
+/// Most inputs a transaction built by [TransactionBuilder] may have.
+///
+/// [BuiltTransaction::prove] produces a ProofCollection, and nodes relay
+/// ProofCollection-backed transactions only up to this many inputs.
+pub const MAX_INPUTS: usize = 200;
+
+/// Minimum fee per input, in nau, of a ProofCollection-backed transaction that
+/// nodes with the default `--min-relay-pctx-fee-per-input` (0.0005 coins)
+/// accept into their mempool and relay.
+pub const MIN_RELAY_FEE_PER_INPUT_NAU: i128 = 2 * 10i128.pow(27);
+
 /// Select UTXOs to cover target amount with minimum inputs.
 /// Uses sliding window on sorted amounts to find smallest UTXOs that fit within limit.
+///
+/// `limit` is capped at [MAX_INPUTS].
 pub fn select_inputs(amounts: &[i128], target: i128, limit: usize) -> Result<Vec<usize>> {
+    let limit = limit.min(MAX_INPUTS);
+
     // Filter positive amounts and sort ascending
     let mut indexed: Vec<(usize, i128)> = amounts
         .iter()
@@ -90,6 +105,7 @@ pub struct TransactionBuilder {
     change_address: Option<Address>,
     change_sender_randomness: Option<Digest>,
     fee: i128,
+    allow_low_fee: bool,
 }
 
 impl TransactionBuilder {
@@ -101,6 +117,7 @@ impl TransactionBuilder {
             change_address: None,
             change_sender_randomness: None,
             fee: 0,
+            allow_low_fee: false,
         }
     }
 
@@ -144,8 +161,21 @@ impl TransactionBuilder {
     }
 
     /// Set transaction fee
+    ///
+    /// [Self::build] refuses a fee below [MIN_RELAY_FEE_PER_INPUT_NAU] times
+    /// the number of inputs, including a zero fee, unless
+    /// [Self::set_allow_low_fee] is set.
     pub fn set_fee(&mut self, fee: i128) {
         self.fee = fee;
+    }
+
+    /// Allow a fee below the default minimum relay fee, including a zero fee.
+    ///
+    /// Nodes with the default `--min-relay-pctx-fee-per-input` neither keep
+    /// nor relay such a transaction; use this only with a node configured to
+    /// accept it.
+    pub fn set_allow_low_fee(&mut self, allow: bool) {
+        self.allow_low_fee = allow;
     }
 
     /// Get total input amount
@@ -174,6 +204,12 @@ impl TransactionBuilder {
         if self.inputs.is_empty() {
             return Err(XntError::TransactionError("no inputs".into()));
         }
+        if self.inputs.len() > MAX_INPUTS {
+            return Err(XntError::TransactionError(format!(
+                "too many inputs: {} > {MAX_INPUTS}",
+                self.inputs.len()
+            )));
+        }
 
         // Check for duplicate inputs (same UTXO spent twice).
         // Use AOCL leaf index which is unique per UTXO, matching how the
@@ -188,6 +224,16 @@ impl TransactionBuilder {
         // Validate fee
         if self.fee < 0 {
             return Err(XntError::TransactionError("negative fee".into()));
+        }
+        if !self.allow_low_fee {
+            let min_fee = MIN_RELAY_FEE_PER_INPUT_NAU * self.inputs.len() as i128;
+            if self.fee < min_fee {
+                return Err(XntError::TransactionError(format!(
+                    "fee {} nau is below the minimum relay fee of {min_fee} nau for {} inputs",
+                    self.fee,
+                    self.inputs.len()
+                )));
+            }
         }
 
         // Validate outputs
@@ -272,6 +318,13 @@ impl TransactionBuilder {
             }
         }
 
+        // Every output must be able to carry a UTXO notification for its
+        // recipient: refuses legacy-format dCTIDH locks and invalid dCTIDH
+        // public keys.
+        tx_outputs
+            .validate_recipients()
+            .map_err(|e| XntError::InvalidAddress(e.to_string()))?;
+
         // Create TransactionDetails
         let details = TransactionDetails::new(
             tx_inputs,
@@ -286,7 +339,11 @@ impl TransactionBuilder {
         // Create PrimitiveWitness
         let witness = PrimitiveWitness::from_transaction_details(&details);
 
-        Ok(BuiltTransaction { details, witness })
+        Ok(BuiltTransaction {
+            details,
+            witness,
+            tip_height: mutator_set.tip_height,
+        })
     }
 }
 
@@ -319,9 +376,18 @@ pub struct TxOutputInfo {
 pub struct BuiltTransaction {
     pub(crate) details: TransactionDetails,
     pub(crate) witness: PrimitiveWitness,
+    /// Height of the tip whose mutator set the transaction was built on, if
+    /// known, see [MutatorSet::tip_height].
+    pub(crate) tip_height: Option<u64>,
 }
 
 impl BuiltTransaction {
+    /// Height of the tip whose mutator set the transaction was built on, if
+    /// known: [Self::prove] proves it for the block after that tip.
+    pub fn tip_height(&self) -> Option<u64> {
+        self.tip_height
+    }
+
     /// Get transaction kernel bytes
     pub fn kernel_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(&self.details.transaction_kernel())
@@ -329,11 +395,19 @@ impl BuiltTransaction {
     }
 
     /// Get primitive witness bytes
+    ///
+    /// The witness holds the unlock data of every input, which for dCTIDH
+    /// inputs is the key's spending secret (see
+    /// [SpendingKey::receiver_preimage]). Keep it on the device that holds
+    /// the seed.
     pub fn witness_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(&self.witness).map_err(|e| XntError::EncodingError(e.to_string()))
     }
 
     /// Serialize full transaction with Witness proof
+    ///
+    /// Contains the primitive witness, see [Self::witness_bytes]: keep it on
+    /// the device that holds the seed.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let tx = CoreTransaction {
             kernel: self.witness.kernel.clone(),
@@ -342,7 +416,7 @@ impl BuiltTransaction {
         bincode::serialize(&tx).map_err(|e| XntError::EncodingError(e.to_string()))
     }
 
-    /// Get the primitive witness
+    /// Get the primitive witness, see [Self::witness_bytes]
     pub fn witness(&self) -> &PrimitiveWitness {
         &self.witness
     }
@@ -415,20 +489,92 @@ impl BuiltTransaction {
             .collect()
     }
 
-    /// Prove transaction (creates ProofCollection).
+    /// Prove transaction (creates ProofCollection) for the consensus rule set of
+    /// the block that follows the tip whose mutator set it was built on, as
+    /// [Self::prove_for_tip] does with that tip's height: before the
+    /// UpgradeVMv8 hard fork at main-net block 97000, a v7 proof collection.
+    ///
+    /// Fails if that height is unknown, as for a mutator set restored with
+    /// [MutatorSet::from_bytes]: then pass it with [MutatorSet::with_tip_height]
+    /// before building, or prove with [Self::prove_for_tip].
     pub async fn prove(&self) -> Result<Transaction> {
+        let tip_height = self.known_tip_height()?;
+        self.prove_for_tip(tip_height).await
+    }
+
+    /// [Self::tip_height], or an error saying how to provide it.
+    fn known_tip_height(&self) -> Result<u64> {
+        self.tip_height.ok_or_else(|| {
+            XntError::TransactionError(
+                "the height of the tip whose mutator set the transaction was built on is unknown, \
+                 so the consensus rule set to prove it for is unknown: build it on a mutator set \
+                 from get_mutator_set, or on one given its tip height with \
+                 MutatorSet::with_tip_height, or prove it with prove_for_tip(tip_height)"
+                    .into(),
+            )
+        })
+    }
+
+    /// Prove transaction (creates ProofCollection) for the consensus rule set of
+    /// the block that follows a tip at `tip_height`.
+    ///
+    /// Before the UpgradeVMv8 hard fork on main net, that is the UpgradeVMv7
+    /// rule set, and the result a v7 proof collection, which is verified before
+    /// it is returned. Nodes of that era relay and upgrade it only if it meets
+    /// their terms, a minimum fee and at most 10 inputs (11 without time locks),
+    /// see `legacy_era::check_proof_collection_terms`; this fails if it does not,
+    /// and also within `legacy_era::DEFAULT_FORK_TX_CUTOFF_MARGIN` blocks of the
+    /// fork, when the transaction might not be mined before it.
+    pub async fn prove_for_tip(&self, tip_height: u64) -> Result<Transaction> {
+        let consensus_rule_set = self.rule_set_for_tip(tip_height)?;
+        self.prove_for(consensus_rule_set).await
+    }
+
+    /// The consensus rule set [Self::prove_for_tip] proves for: that of the
+    /// block after a tip at `tip_height`. Fails within the cutoff margin
+    /// before the fork, and for the era before it if the transaction does not
+    /// meet that era's terms.
+    fn rule_set_for_tip(
+        &self,
+        tip_height: u64,
+    ) -> Result<neptune_privacy::api::export::ConsensusRuleSet> {
+        use neptune_privacy::api::export::BlockHeight;
+        use neptune_privacy::api::export::ConsensusRuleSet;
+        use neptune_privacy::api::tx_initiation::legacy_era;
+
+        let consensus_rule_set = legacy_era::rule_set_for_new_transaction(
+            self.details.network,
+            BlockHeight::from(tip_height),
+            legacy_era::DEFAULT_FORK_TX_CUTOFF_MARGIN,
+        )
+        .map_err(|e| XntError::TransactionError(e.to_string()))?;
+        if consensus_rule_set == ConsensusRuleSet::UpgradeVMv7 {
+            legacy_era::check_proof_collection_terms(&self.witness)
+                .map_err(|e| XntError::TransactionError(e.to_string()))?;
+        }
+
+        Ok(consensus_rule_set)
+    }
+
+    /// Prove transaction (creates ProofCollection) for the given consensus rule
+    /// set: UpgradeVMv8, or UpgradeVMv7 before the hard fork, whose proof
+    /// collection is verified before it is returned.
+    async fn prove_for(&self, consensus_rule_set: neptune_privacy::api::export::ConsensusRuleSet) -> Result<Transaction> {
+        use neptune_privacy::api::export::ConsensusRuleSet;
         use neptune_privacy::api::export::ProofCollection;
         use neptune_privacy::api::export::TritonVmJobQueue;
         use neptune_privacy::api::export::TritonVmProofJobOptionsBuilder;
         use neptune_privacy::api::export::TxProvingCapability;
+        use neptune_privacy::protocol::proof_abstractions::mast_hash::MastHash;
 
         let job_queue = TritonVmJobQueue::get_instance();
         let options = TritonVmProofJobOptionsBuilder::new()
             .proving_capability(TxProvingCapability::ProofCollection)
+            .network(self.details.network)
             .build();
 
         let proof_collection =
-            ProofCollection::produce_v2(&self.witness, job_queue, options)
+            ProofCollection::produce_v2(&self.witness, job_queue, options, consensus_rule_set)
                 .await
                 .map_err(|e| XntError::TransactionError(format!("proving failed: {e}")))?;
 
@@ -436,6 +582,16 @@ impl BuiltTransaction {
             kernel: self.witness.kernel.clone(),
             proof: TransactionProof::ProofCollection(proof_collection),
         };
+
+        // Nodes of the era before the fork sanction peers that relay a proof they
+        // reject, so a v7 proof is checked before it leaves the SDK.
+        if consensus_rule_set == ConsensusRuleSet::UpgradeVMv7
+            && !tx.proof.verify(tx.kernel.mast_hash(), self.details.network, consensus_rule_set).await
+        {
+            return Err(XntError::TransactionError(
+                "proving failed: the v7 proof collection does not verify".into(),
+            ));
+        }
 
         Ok(Transaction { inner: tx })
     }
@@ -480,13 +636,16 @@ impl Transaction {
         self.inner.is_confirmable_relative_to(&mutator_set.inner)
     }
 
-    /// Submit to node via RPC
-    /// Submit the transaction to the node mempool.
+    /// Submit the transaction to the node.
     ///
     /// Returns the node's `success` field from the `mempool_submitTransaction`
-    /// response: `true` means the node accepted and queued the tx (validation +
-    /// confirmable checks passed), `false` means it was rejected. RPC/transport
-    /// failures are returned as `Err`.
+    /// response. `true` only means the transaction passed the node's validity
+    /// and confirmability checks and was queued for its mempool: the node can
+    /// still drop it, for example if the fee is below its relay minimum or the
+    /// mempool is full. Confirm by looking the transaction up in the mempool or
+    /// by waiting for its outputs on chain. `false` means the node did not
+    /// queue it. Rejections the node reports as errors (for example
+    /// `NotConfirmable`) and RPC/transport failures are returned as `Err`.
     pub fn submit(&self, client: &super::json_rpc::RpcClient) -> Result<bool> {
         use neptune_privacy::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
 
@@ -515,4 +674,220 @@ impl Transaction {
 /// Get current timestamp in milliseconds
 pub fn timestamp_now() -> u64 {
     Timestamp::now().0.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::wallet::WalletEntropy;
+
+    fn coins(amount: &str) -> i128 {
+        NativeCurrencyAmount::coins_from_str(amount)
+            .unwrap()
+            .to_nau()
+    }
+
+    /// Membership proof with the given AOCL leaf index and no authentication
+    /// data: enough for the checks [TransactionBuilder::build] makes before it
+    /// uses the proofs.
+    fn dummy_membership_proof(aocl_leaf_index: u64) -> MembershipProof {
+        // sender randomness, receiver preimage, AOCL authentication path
+        // length, AOCL leaf index, number of target chunks
+        let mut bytes = vec![0u8; 40 + 40 + 8];
+        bytes.extend_from_slice(&aocl_leaf_index.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        MembershipProof::from_bytes(&bytes).unwrap()
+    }
+
+    /// Builder spending `num_inputs` UTXOs of `amount` nau each, and the
+    /// Generation address they are locked to.
+    fn builder_with_inputs(num_inputs: usize, amount: i128) -> (TransactionBuilder, Address) {
+        let key = WalletEntropy::devnet().derive_spending_key(0);
+        let address = key.to_address().unwrap();
+        let mut builder = TransactionBuilder::new();
+        for i in 0..num_inputs {
+            let utxo = Utxo::new_native(&address, amount);
+            builder.add_input(utxo, key.clone(), dummy_membership_proof(i as u64));
+        }
+        (builder, address)
+    }
+
+    fn build_error(builder: &TransactionBuilder) -> String {
+        let mutator_set = MutatorSet::from_core(Default::default());
+        match builder.build(&mutator_set, 0, Network::RegTest) {
+            Ok(_) => panic!("build must fail"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A main-net payment of 1 coin from two inputs of 1 coin, with the given
+    /// fee, built on a mutator set of the tip at `tip_height`, if given.
+    fn main_net_payment(fee: &str, tip_height: Option<u64>) -> BuiltTransaction {
+        let (mut builder, address) = builder_with_inputs(2, coins("1"));
+        builder.add_output(address.to_receiving_address(), coins("1"), Digest::new());
+        builder.set_change(address, Digest::new());
+        builder.set_fee(coins(fee));
+        let mut mutator_set = MutatorSet::from_core(Default::default());
+        if let Some(tip_height) = tip_height {
+            mutator_set = mutator_set.with_tip_height(tip_height);
+        }
+        builder.build(&mutator_set, 0, Network::Main).unwrap()
+    }
+
+    #[test]
+    fn the_tip_height_of_the_mutator_set_goes_to_the_built_transaction() {
+        assert_eq!(Some(94_000), main_net_payment("0.02", Some(94_000)).tip_height());
+
+        let unknown = main_net_payment("0.02", None);
+        assert_eq!(None, unknown.tip_height());
+        let err = unknown.known_tip_height().unwrap_err().to_string();
+        assert!(err.contains("prove_for_tip"), "{err}");
+        assert!(err.contains("with_tip_height"), "{err}");
+    }
+
+    #[test]
+    fn the_rule_set_follows_the_tip_the_transaction_was_built_on() {
+        use neptune_privacy::api::export::ConsensusRuleSet;
+
+        // With the default cutoff margin of 10 blocks, the last transactions of
+        // the era before the fork at 97000 are made on top of block 96989.
+        let rule_set = |tip_height: u64| {
+            let built = main_net_payment("0.02", Some(tip_height));
+            built.rule_set_for_tip(built.known_tip_height().unwrap())
+        };
+        assert_eq!(ConsensusRuleSet::UpgradeVMv7, rule_set(96_989).unwrap());
+        for tip_height in [96_990, 96_998] {
+            let err = rule_set(tip_height).unwrap_err().to_string();
+            assert!(err.contains("UpgradeVMv7"), "tip {tip_height}: {err}");
+        }
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, rule_set(96_999).unwrap());
+        assert_eq!(ConsensusRuleSet::UpgradeVMv8, rule_set(97_000).unwrap());
+
+        // Before the fork, the terms of that era apply: a fee of 0.017 at least.
+        let low_fee = main_net_payment("0.01", Some(94_000));
+        assert!(low_fee.rule_set_for_tip(94_000).is_err());
+        assert_eq!(
+            ConsensusRuleSet::UpgradeVMv8,
+            low_fee.rule_set_for_tip(97_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn min_relay_fee_per_input_is_the_node_default() {
+        assert_eq!(coins("0.0005"), MIN_RELAY_FEE_PER_INPUT_NAU);
+    }
+
+    #[test]
+    fn build_refuses_more_than_max_inputs() {
+        let (mut builder, _) = builder_with_inputs(MAX_INPUTS + 1, coins("1"));
+        builder.set_fee(coins("1"));
+        let err = build_error(&builder);
+        assert!(err.contains("too many inputs"), "{err}");
+    }
+
+    #[test]
+    fn build_refuses_a_fee_below_the_relay_minimum_unless_allowed() {
+        let (mut builder, address) = builder_with_inputs(2, coins("1"));
+        // More than the inputs hold, so that a build that passes the fee
+        // check fails right after it.
+        builder.add_output(address.to_receiving_address(), coins("3"), Digest::new());
+
+        for fee in [0, 2 * MIN_RELAY_FEE_PER_INPUT_NAU - 1] {
+            builder.set_fee(fee);
+            let err = build_error(&builder);
+            assert!(err.contains("minimum relay fee"), "{err}");
+        }
+
+        builder.set_fee(2 * MIN_RELAY_FEE_PER_INPUT_NAU);
+        let err = build_error(&builder);
+        assert!(err.contains("insufficient funds"), "{err}");
+
+        builder.set_fee(0);
+        builder.set_allow_low_fee(true);
+        let err = build_error(&builder);
+        assert!(err.contains("insufficient funds"), "{err}");
+    }
+
+    /// Bech32m encoding (BIP 350) of `payload`, to build an address string with
+    /// a chosen payload.
+    fn bech32m(hrp: &str, payload: &[u8]) -> String {
+        const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        const GENERATOR: [u32; 5] = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+
+        let mut data = Vec::new();
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for &byte in payload {
+            acc = (acc << 8) | u32::from(byte);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                data.push(((acc >> bits) & 31) as u8);
+            }
+            acc &= (1 << bits) - 1;
+        }
+        if bits > 0 {
+            data.push(((acc << (5 - bits)) & 31) as u8);
+        }
+
+        let mut values: Vec<u8> = hrp.bytes().map(|c| c >> 5).collect();
+        values.push(0);
+        values.extend(hrp.bytes().map(|c| c & 31));
+        values.extend(&data);
+        values.extend([0; 6]);
+        let mut checksum = 1u32;
+        for value in values {
+            let top = checksum >> 25;
+            checksum = ((checksum & 0x1ff_ffff) << 5) ^ u32::from(value);
+            for (i, generator) in GENERATOR.iter().enumerate() {
+                if (top >> i) & 1 == 1 {
+                    checksum ^= generator;
+                }
+            }
+        }
+        checksum ^= 0x2bc8_30a3;
+        data.extend((0..6).map(|i| ((checksum >> (5 * (5 - i))) & 31) as u8));
+
+        let data: String = data
+            .iter()
+            .map(|&d| char::from(CHARSET[usize::from(d)]))
+            .collect();
+        format!("{hrp}1{data}")
+    }
+
+    #[test]
+    fn build_refuses_a_dctidh_recipient_with_an_invalid_public_key() {
+        let network = Network::RegTest;
+        let valid = WalletEntropy::devnet()
+            .derive_dctidh_spending_key(0)
+            .to_address()
+            .unwrap();
+        let hrp = valid.inner.get_hrp(network.into());
+
+        // public key, then a zero lock postimage
+        let mut payload = vec![0x5a; 64];
+        payload.extend([0; 40]);
+        let encoded = bech32m(&hrp, &payload);
+        // Decoding does not check the public key, see
+        // dCTIDHReceivingAddress::validate_encryption_key.
+        let recipient = Address::from_bech32(&encoded, network).unwrap();
+
+        let (mut builder, _) = builder_with_inputs(1, coins("1"));
+        builder.add_output(
+            recipient.to_receiving_address(),
+            coins("0.5"),
+            Digest::new(),
+        );
+        builder.set_fee(coins("0.5"));
+        let err = build_error(&builder);
+        assert!(err.contains("invalid public key"), "{err}");
+    }
+
+    #[test]
+    fn select_inputs_selects_at_most_max_inputs() {
+        let amounts = vec![1; MAX_INPUTS + 50];
+        let limit = amounts.len();
+        assert!(select_inputs(&amounts, MAX_INPUTS as i128 + 1, limit).is_err());
+        let selected = select_inputs(&amounts, MAX_INPUTS as i128, limit).unwrap();
+        assert_eq!(MAX_INPUTS, selected.len());
+    }
 }

@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use super::error;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -15,6 +16,29 @@ pub(super) struct TransactionInitiatorPrivate {
 impl TransactionInitiatorPrivate {
     pub(super) fn new(global_state_lock: GlobalStateLock) -> Self {
         Self { global_state_lock }
+    }
+
+    // note: not pub, as one should never call broadcast without
+    // recording first.
+    pub(super) async fn broadcast_link_transaction(
+        &self,
+        link_tx: Arc<LinkTx>,
+    ) -> Result<(), error::SendError> {
+        let response = self
+            .global_state_lock
+            .rpc_server_to_main_tx()
+            .send(RPCServerToMain::BroadcastOwnLinkTx(link_tx))
+            .await;
+
+        if let Err(e) = response {
+            tracing::error!(
+                "Could not send link tx to main task: error: {}",
+                e.to_string()
+            );
+            return Err(error::SendError::NotBroadcast);
+        }
+
+        Ok(())
     }
 
     // note: not pub, as one should never call broadcast without

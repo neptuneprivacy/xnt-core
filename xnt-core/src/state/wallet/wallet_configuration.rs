@@ -2,11 +2,13 @@ use std::path::PathBuf;
 
 use tracing::info;
 
+use super::address::dctidh_address::legacy_dctidh_cutoff;
 use super::scan_mode_configuration::ScanModeConfiguration;
 use super::wallet_file::WALLET_INCOMING_SECRETS_FILE_NAME;
 use crate::application::config::cli_args;
 use crate::application::config::data_directory::DataDirectory;
 use crate::application::config::network::Network;
+use crate::protocol::consensus::block::block_height::BlockHeight;
 
 /// Configuration options for [`WalletState`](super::wallet_state::WalletState).
 ///
@@ -27,6 +29,11 @@ pub(crate) struct WalletConfiguration {
 
     /// Which network we are on
     network: Network,
+
+    /// Outputs at legacy-format dCTIDH locks are recognized only if confirmed
+    /// below this height; `None` means at any height. Follows the network, see
+    /// [legacy_dctidh_cutoff].
+    pub(crate) legacy_dctidh_cutoff: Option<BlockHeight>,
 }
 
 impl WalletConfiguration {
@@ -40,6 +47,7 @@ impl WalletConfiguration {
             num_mps_per_utxo: 0,
             data_directory: data_dir.clone(),
             network: Network::Main,
+            legacy_dctidh_cutoff: legacy_dctidh_cutoff(Network::Main),
         }
     }
 
@@ -77,6 +85,7 @@ impl WalletConfiguration {
         }
 
         self.network = cli_args.network;
+        self.legacy_dctidh_cutoff = legacy_dctidh_cutoff(cli_args.network);
 
         self
     }

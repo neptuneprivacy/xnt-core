@@ -7,6 +7,7 @@ use tasm_lib::triton_vm::error::InstructionError;
 use tasm_lib::triton_vm::prelude::*;
 use tracing::debug;
 
+use super::legacy_v7;
 use super::prover_job::ProverJob;
 use super::prover_job::ProverJobResult;
 use super::prover_job::ProverJobSettings;
@@ -15,6 +16,7 @@ use crate::api::tx_initiation::error::CreateProofError;
 use crate::application::triton_vm_job_queue::TritonVmJobPriority;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+use crate::protocol::proof_abstractions::verifier::verify_transaction_proof;
 
 #[derive(Debug, Clone)]
 pub enum ConsensusError {
@@ -94,6 +96,10 @@ where
 ///
 /// The proof is executed as a triton-vm-job-queue job which ensures that
 /// no two tasks run the prover simultaneously.
+///
+/// A proof for a claim of the `UpgradeVMv7` era is checked with the legacy
+/// triton-vm v7 verifier, which nodes of that era apply, before it is
+/// returned: no v7 proof leaves this function unless it verifies.
 pub(crate) async fn prove_consensus_program(
     program: Program,
     claim: Claim,
@@ -105,6 +111,9 @@ pub(crate) async fn prove_consensus_program(
     if proof_job_options.job_settings.network.use_mock_proof() {
         return Ok(Proof::valid_mock(claim));
     }
+
+    let network = proof_job_options.job_settings.network;
+    let v7_claim = legacy_v7::is_v7_claim(&claim).then(|| claim.clone());
 
     // create a triton-vm-job-queue job for generating this proof.
     let job = ProverJob::new(
@@ -141,7 +150,16 @@ pub(crate) async fn prove_consensus_program(
     };
 
     // obtain resulting proof.
-    Ok(ProverJobResult::try_from(completion)?.into_inner()?)
+    let proof = ProverJobResult::try_from(completion)?.into_inner()?;
+
+    if let Some(v7_claim) = v7_claim {
+        let program_digest = v7_claim.program_digest;
+        if !verify_transaction_proof(v7_claim, proof.clone(), network).await {
+            return Err(CreateProofError::ProducedProofDoesNotVerify(program_digest));
+        }
+    }
+
+    Ok(proof)
 }
 
 /// Options for executing the triton-vm proving job
@@ -370,6 +388,15 @@ pub mod tests {
         path
     }
 
+    /// Verify with the triton-vm generation that the claim's version names.
+    fn verify_with_matching_generation(claim: &Claim, proof: &Proof) -> bool {
+        if legacy_v7::is_v7_claim(claim) {
+            legacy_v7::verify(claim, proof)
+        } else {
+            triton_vm::verify(Stark::default(), claim, proof)
+        }
+    }
+
     /// Tries to load a proof for the claim from the test data directory
     fn try_load_proof_from_disk(claim: &Claim) -> Option<Proof> {
         let file_path = proof_path(claim);
@@ -402,7 +429,7 @@ pub mod tests {
             Some(proof) => {
                 debug!(" - Loaded proof from disk: {name}.");
                 assert!(
-                    triton_vm::verify(Stark::default(), claim, &proof),
+                    verify_with_matching_generation(claim, &proof),
                     "proof loaded from disk is invalid"
                 );
                 proof
@@ -436,7 +463,7 @@ pub mod tests {
         let filename = proof_filename(claim);
         let (proof, server) = try_fetch_from_server_inner(filename.clone())?;
 
-        if !triton_vm::verify(Stark::default(), claim, &proof) {
+        if !verify_with_matching_generation(claim, &proof) {
             eprintln!("Invalid proof served by {server}. Proof {filename} does not verify.");
             return None;
         }
@@ -544,6 +571,9 @@ pub mod tests {
     }
 
     /// Call Triton VM prover to produce a proof and save it to disk.
+    ///
+    /// Claims of the `UpgradeVMv7` era are proven by triton-vm v7, with
+    /// randomness, like outside of tests.
     fn produce_and_save_proof(
         claim: &Claim,
         program: Program,
@@ -555,7 +585,14 @@ pub mod tests {
             .unwrap_or_else(|_| panic!("cannot create '{}' directory", path.to_string_lossy()));
         path.push(Path::new(&name));
 
-        let proof = produce_non_zk_deterministic_proof_for_test(claim, program, nondeterminism);
+        let proof = if legacy_v7::is_v7_claim(claim) {
+            legacy_v7::LegacyProverPipeline::trace(&program, claim, &nondeterminism)
+                .and_then(|pipeline| pipeline.prove())
+                .expect("cannot produce v7 proof")
+                .into()
+        } else {
+            produce_non_zk_deterministic_proof_for_test(claim, program, nondeterminism)
+        };
 
         save_proof(&path, &proof);
         proof

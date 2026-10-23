@@ -38,6 +38,7 @@ use crate::api::export::Timestamp;
 use crate::api::export::TransactionProof;
 use crate::api::export::Utxo;
 use crate::api::export::UtxoTriple;
+use crate::api::tx_initiation::legacy_era;
 use crate::application::loops::main_loop::proof_upgrader::UpgradeJob;
 use crate::application::loops::main_loop::upgrade_incentive::UpgradeIncentive;
 use crate::application::rpc::server::NeptuneRPCServer;
@@ -177,7 +178,7 @@ impl ExportedBlock {
     /// caused by this block.
     pub fn mutator_set_update(&self) -> MutatorSetUpdate {
         let inputs =
-            RemovalRecordList::try_unpack(self.kernel.body.transaction_kernel.inputs.clone())
+            RemovalRecordList::try_unpack(self.kernel.body.transaction_kernel.inputs.clone(), true)
                 .expect(
                     "Exported blocks are assumed valid, so removal record list unpacking must work",
                 );
@@ -678,12 +679,33 @@ async fn broadcast_transaction(
         bincode::deserialize_from(body.reader()).context("deserialize error")?;
     let tx: Transaction = tx.try_into().context("Failed to convert to transaction")?;
 
-    // Is transaction valid?
+    // Is transaction valid under the rule set of the next block, in which it
+    // is mined?
     let cli = rpcstate.state.cli();
     let network = cli.network;
-    let consensus_rule_set = rpcstate.state.lock_guard().await.consensus_rule_set();
+    let (consensus_rule_set, tip_height) = {
+        let state = rpcstate.state.lock_guard().await;
+        (
+            state.next_block_consensus_rule_set(),
+            state.chain.light_state().header().height,
+        )
+    };
     if !tx.is_valid(network, consensus_rule_set).await {
         return Err(RestError("Received transaction is not valid".to_owned()));
+    }
+
+    // Before the fork, the terms of that era apply, as for every submission.
+    if consensus_rule_set.is_legacy_era()
+        && !legacy_era::submitted_transaction_meets_terms(
+            &tx,
+            network,
+            tip_height,
+            cli.fork_tx_cutoff_margin,
+        )
+    {
+        return Err(RestError(
+            "Transaction does not meet the terms of the era before the next hard fork".to_owned(),
+        ));
     }
 
     if tx.kernel.coinbase.is_some() {
@@ -719,9 +741,20 @@ async fn broadcast_transaction(
 
     info!("broadcasted insert tx: {}", tx.kernel.txid().to_string());
 
-    state
-        .mempool_insert(tx.clone(), UpgradePriority::Critical, AddReason::Submitted)
-        .await;
+    // Held only while the rule set it was verified under is the next block's.
+    if !state
+        .mempool_insert_for_rule_set(
+            tx.clone(),
+            consensus_rule_set,
+            UpgradePriority::Critical,
+            AddReason::Submitted,
+        )
+        .await
+    {
+        return Err(RestError(
+            "The next block follows another consensus rule set now".to_owned(),
+        ));
+    }
     let _ = rpcstate
         .rpc_server_to_main_tx
         .send(RPCServerToMain::BroadcastTx(Arc::new(tx)))
@@ -818,8 +851,20 @@ async fn incentivized_proof_collection_transaction(
         )));
     }
 
-    // Is transaction valid?
-    let consensus_rule_set = rpcstate.state.lock_guard().await.consensus_rule_set();
+    // Is transaction valid under the rule set of the next block? Before the
+    // next hard fork, this node does not upgrade proof collections; the nodes
+    // of the previous release do.
+    let consensus_rule_set = rpcstate
+        .state
+        .lock_guard()
+        .await
+        .next_block_consensus_rule_set();
+    if consensus_rule_set.is_legacy_era() {
+        return Err(RestError(format!(
+            "This node does not upgrade proof collections of consensus rule set \
+             {consensus_rule_set}"
+        )));
+    }
     let transaction: Transaction = Transaction {
         kernel: tx.kernel.clone(),
         proof: TransactionProof::ProofCollection(tx.proof_collection.clone()),

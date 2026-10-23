@@ -20,8 +20,10 @@ use clap::Parser;
 use clap_complete::generate;
 use clap_complete::Shell;
 use itertools::Itertools;
+use multiaddr::Multiaddr;
 use neptune_privacy::api::export::TransactionKernelId;
 use neptune_privacy::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use neptune_privacy::api::tx_initiation::migrate_dctidh::MigrationDestination;
 use neptune_privacy::application::config::data_directory::DataDirectory;
 use neptune_privacy::application::config::network::Network;
 use neptune_privacy::application::rpc::auth;
@@ -45,7 +47,7 @@ use neptune_privacy::state::wallet::wallet_file::WalletFile;
 use neptune_privacy::state::wallet::wallet_file::WalletFileContext;
 use neptune_privacy::state::wallet::wallet_status::WalletStatus;
 use neptune_privacy::state::wallet::wallet_status::WalletStatusExportFormat;
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
 use tarpc::client;
 use tarpc::context;
@@ -55,6 +57,8 @@ use crate::models::claim_utxo::ClaimUtxoFormat;
 use crate::models::utxo_transfer_entry::UtxoTransferEntry;
 use crate::parser::beneficiary::Beneficiary;
 use crate::parser::hex_digest::HexDigest;
+use crate::parser::ip_multiaddr::parse_dial_multiaddr;
+use crate::parser::ip_multiaddr::parse_ip_multiaddr;
 
 const SELF: &str = "self";
 const ANONYMOUS: &str = "anonymous";
@@ -121,6 +125,10 @@ enum Command {
     /// retrieve unconfirmed balance (includes unconfirmed transactions, excludes time-locked utxos)
     UnconfirmedAvailableBalance,
 
+    /// list unspent utxos held at legacy-format dCTIDH locks, which are not
+    /// part of the available balance, and their total
+    LegacyDctidhUtxos,
+
     /// Export wallet status information.
     ///
     /// Available formats:
@@ -184,6 +192,11 @@ enum Command {
     /// list mempool transaction IDs
     ListMempoolTransactionIds,
 
+    /// retrieve count of transactions in the legacy relay pool: those of the
+    /// era before the next hard fork, which the node holds apart from the
+    /// mempool
+    LegacyRelayPoolTxCount,
+
     /******** BLOCKCHAIN STATISTICS ********/
     /// Show block intervals in milliseconds, in reverse chronological order.
     BlockIntervals {
@@ -232,13 +245,76 @@ enum Command {
     /// shutdown xnt-core
     Shutdown,
 
-    /// clear all peer standings
+    /// clear all peer standings, and lift all bans on the libp2p network
+    /// stack, except those given with `--ban`
     ClearAllStandings,
 
-    /// clear standings for peer with a given IP
+    /// clear standings for peer with a given IP, and lift its ban on the
+    /// libp2p network stack, unless it was given with `--ban`
     ClearStandingByIp {
         ip: IpAddr,
     },
+
+    /// Ban one or more peers by IP address.
+    ///
+    /// The peers at each IP address are disconnected, and refused on both
+    /// network stacks: the legacy TCP stack (port 9898) and the libp2p stack
+    /// (QUIC on 9901/udp, TCP on 9902/tcp). Lift the ban with `unban`.
+    Ban {
+        /// IP addresses, socket addresses, or multiaddresses that name an IP
+        /// address, e.g. `1.2.3.4`, `1.2.3.4:9898`, or
+        /// `/ip4/1.2.3.4/udp/9901/quic-v1`. Only the IP address counts.
+        #[clap(required = true, num_args = 1.., value_parser = parse_ip_multiaddr)]
+        addresses: Vec<Multiaddr>,
+    },
+
+    /// Lift the bans of one or more peers, or of all peers.
+    ///
+    /// Clears the standing of each IP address, and lifts its ban on both
+    /// network stacks. Bans given with `--ban` when starting xnt-core stand.
+    /// The peers at the IP addresses can reconnect at once, without waiting
+    /// for the reconnect cooldown.
+    Unban {
+        /// IP addresses, socket addresses, or multiaddresses that name an IP
+        /// address, as for `ban`.
+        #[clap(required_unless_present = "all", value_parser = parse_ip_multiaddr)]
+        addresses: Vec<Multiaddr>,
+
+        /// Lift all bans and clear all standings.
+        #[clap(short, long, conflicts_with = "addresses")]
+        all: bool,
+    },
+
+    /// Dial the given multiaddress over the libp2p network stack.
+    ///
+    /// In other words, attempt to initiate a connection to it, e.g. to
+    /// `/ip4/1.2.3.4/udp/9901/quic-v1` (QUIC) or `/ip4/1.2.3.4/tcp/9902`
+    /// (libp2p over TCP). A bad standing of its IP address is cleared first,
+    /// unless the IP address was banned with `--ban`.
+    Dial {
+        #[clap(value_parser = parse_dial_multiaddr)]
+        address: Multiaddr,
+    },
+
+    /// Probe the NAT status of this node.
+    ///
+    /// xnt-core uses AutoNAT to determine whether it is reachable from the
+    /// outside over libp2p. Run this after changing router settings or port
+    /// forwarding (9901/udp for QUIC, 9902/tcp for libp2p over TCP) to have
+    /// the node update its reachability status at once. The outcome shows in
+    /// `network-overview`.
+    ProbeNat,
+
+    /// Reset the relay reservations of the libp2p network stack.
+    ///
+    /// A node that is not reachable from the outside relies on libp2p relays.
+    /// This drops the current relay reservations and makes new ones, without
+    /// restarting the node.
+    ResetRelayReservations,
+
+    /// Show an overview of the libp2p network stack: peer ID, NAT status,
+    /// reachability, connections, relay reservations, and external addresses.
+    NetworkOverview,
 
     /// claim an off-chain utxo-transfer.
     ClaimUtxo {
@@ -310,6 +386,9 @@ enum Command {
     /// track amounts as well as origins and destinations. Because of the added
     /// announcements, these transactions require a higher fee than
     /// non-transparent transactions.
+    ///
+    /// Only UTXOs held by Generation keys are spent, and change is returned to
+    /// a Generation key.
     SendTransparent {
         #[clap(long, value_parser, required = false)]
         file: Option<PathBuf>,
@@ -320,6 +399,60 @@ enum Command {
         fee: NativeCurrencyAmount,
 
         exclude_recent_blocks: usize,
+    },
+
+    /// Initiate and broadcast a transaction that consolidates UTXOs.
+    ///
+    /// Spends the `batch` oldest UTXOs with at least 10 confirmations to a
+    /// single output owned by the node's wallet, or to the given address,
+    /// resulting in `batch - 1` fewer UTXOs to manage. Fails if fewer UTXOs
+    /// qualify, or if the node is configured to not initiate transactions.
+    Consolidate {
+        /// Number of UTXOs to consolidate. Defaults to the node's
+        /// `--num-consolidation-inputs` setting.
+        #[clap(long)]
+        batch: Option<usize>,
+
+        /// Send the consolidated output to this address instead of the node's
+        /// own wallet.
+        #[clap(long)]
+        address: Option<String>,
+    },
+
+    /// Move a batch of the wallet's funds held at legacy-format dCTIDH locks
+    /// now, as the node's `--migrate-dctidh` does for every new block.
+    ///
+    /// Spends the largest such UTXOs that are worth more than their share of
+    /// the fee to one output at the destination, announced on-chain. Prints
+    /// what was moved and what still waits.
+    MigrateDctidh {
+        /// `generation` (a Generation address of the node's wallet), `dctidh`
+        /// (a current-format dCTIDH address of the node's wallet), or an
+        /// explicit address. Defaults to the node's `--migrate-dctidh`
+        /// setting, or else `generation`.
+        #[clap(long, value_name = "generation|dctidh|ADDRESS")]
+        to: Option<String>,
+
+        /// Derivation index of the destination for `generation` or `dctidh`.
+        /// Defaults to the next unused index.
+        #[clap(long)]
+        index: Option<u64>,
+
+        /// Maximum number of UTXOs to spend, between 1 and 200. Defaults to
+        /// the node's `--migrate-dctidh-batch` setting.
+        #[clap(long)]
+        batch: Option<usize>,
+
+        /// Fee to pay. Defaults to the node's `--migrate-dctidh-fee` setting,
+        /// or else is chosen from the node's proving capability and the
+        /// number of inputs.
+        #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+        fee: Option<NativeCurrencyAmount>,
+
+        /// Allow an explicit destination address that is not owned by the
+        /// node's wallet.
+        #[clap(long)]
+        allow_foreign: bool,
     },
 
     /// Upgrade the specified transaction. Transaction must be either unsynced
@@ -919,6 +1052,18 @@ async fn main() -> Result<()> {
             let val = client.unconfirmed_available_balance(ctx, token).await??;
             println!("{val}");
         }
+        Command::LegacyDctidhUtxos => {
+            let utxos = client.legacy_dctidh_utxos(ctx, token).await??;
+            for element in &utxos {
+                let amount = element.utxo.get_native_currency_amount();
+                println!("aocl leaf index {}: {amount}", element.aocl_leaf_index);
+            }
+            let total = utxos
+                .iter()
+                .map(|element| element.utxo.get_native_currency_amount())
+                .sum::<NativeCurrencyAmount>();
+            println!("total: {total}");
+        }
         Command::WalletStatus { json, table } => {
             let wallet_status: WalletStatus = client.wallet_status(ctx, token).await??;
             let exported_string = if json {
@@ -1003,6 +1148,10 @@ async fn main() -> Result<()> {
         Command::ListMempoolTransactionIds => {
             let txids = client.mempool_tx_ids(ctx, token).await??;
             println!("{}", txids.iter().join("\n"));
+        }
+        Command::LegacyRelayPoolTxCount => {
+            let count: usize = client.legacy_relay_pool_tx_count(ctx, token).await??;
+            println!("{count}");
         }
 
         /******** BLOCKCHAIN STATISTICS ********/
@@ -1163,6 +1312,58 @@ async fn main() -> Result<()> {
             client.clear_standing_by_ip(ctx, token, ip).await??;
             println!("Cleared standing of {ip}");
         }
+        Command::Ban { addresses } => {
+            let listed_addresses = addresses.iter().join(", ");
+            client
+                .ban(ctx, token, addresses)
+                .await
+                .map_err(unsupported_by_node("ban"))??;
+            println!("Banned {listed_addresses}.");
+        }
+        Command::Unban { all: true, .. } => {
+            client
+                .unban_all(ctx, token)
+                .await
+                .map_err(unsupported_by_node("unban --all"))??;
+            println!("Lifted all bans, except those given with `--ban`.");
+        }
+        Command::Unban { addresses, .. } => {
+            let listed_addresses = addresses.iter().join(", ");
+            client
+                .unban(ctx, token, addresses)
+                .await
+                .map_err(unsupported_by_node("unban"))??;
+            println!("Lifted the bans of {listed_addresses}.");
+        }
+        Command::Dial { address } => {
+            client
+                .dial(ctx, token, address.clone())
+                .await
+                .map_err(unsupported_by_node("dial"))??;
+            println!("Dialing {address}.");
+        }
+        Command::ProbeNat => {
+            client
+                .probe_nat(ctx, token)
+                .await
+                .map_err(unsupported_by_node("probe-nat"))??;
+            println!("Probing the NAT status. The outcome shows in `network-overview`.");
+        }
+        Command::ResetRelayReservations => {
+            client
+                .reset_relay_reservations(ctx, token)
+                .await
+                .map_err(unsupported_by_node("reset-relay-reservations"))??;
+            println!("Resetting the relay reservations.");
+        }
+        Command::NetworkOverview => match client
+            .network_overview(ctx, token)
+            .await
+            .map_err(unsupported_by_node("network-overview"))??
+        {
+            Some(network_overview) => print!("{network_overview}"),
+            None => println!("The libp2p network stack does not run on this node."),
+        },
         Command::ClaimUtxo {
             format,
             max_search_depth,
@@ -1399,7 +1600,7 @@ async fn main() -> Result<()> {
                     token,
                     parsed_outputs,
                     ChangePolicy::recover_to_next_unused_key(
-                        KeyType::Symmetric,
+                        KeyType::Generation,
                         UtxoNotificationMedium::OnChain,
                     ),
                     fee,
@@ -1419,6 +1620,53 @@ async fn main() -> Result<()> {
                     // notifications
                 }
                 Err(e) => eprintln!("{e}"),
+            }
+        }
+        Command::Consolidate { batch, address } => {
+            let address = address
+                .map(|address| ReceivingAddress::from_bech32m(&address, network))
+                .transpose()?;
+            let num_utxos_consolidated = client.consolidate(ctx, token, batch, address).await??;
+            println!("Initiating transaction to consolidate {num_utxos_consolidated} UTXOs.");
+        }
+        Command::MigrateDctidh {
+            to,
+            index,
+            batch,
+            fee,
+            allow_foreign,
+        } => {
+            let destination = match (to, index) {
+                (None, None) => None,
+                (to, index) => Some(MigrationDestination::parse(
+                    to.as_deref().unwrap_or("generation"),
+                    index,
+                    network,
+                )?),
+            };
+            let report = client
+                .migrate_dctidh(ctx, token, destination, batch, fee, allow_foreign)
+                .await??;
+            match report.txid {
+                Some(txid) => println!(
+                    "Moving {} UTXOs held at legacy-format dCTIDH locks, {} after a fee of {}, \
+                     in transaction {txid}.",
+                    report.num_inputs, report.amount, report.fee
+                ),
+                None => println!("Nothing to move."),
+            }
+            if report.num_skipped > 0 {
+                println!(
+                    "{} UTXOs were left out because no valid transaction spends them.",
+                    report.num_skipped
+                );
+            }
+            if report.num_waiting > 0 {
+                println!(
+                    "{} UTXOs worth {} still wait to be moved, of which {} worth {} are not \
+                     worth more than their share of the fee and are not moved.",
+                    report.num_waiting, report.amount_waiting, report.num_dust, report.amount_dust
+                );
             }
         }
         Command::Upgrade { tx_kernel_id } => {
@@ -1691,8 +1939,160 @@ fn enter_seed_phrase_dialog() -> Result<SecretKeyMaterial> {
     }
 }
 
+/// Explain a closed connection on a command that older nodes do not know. A
+/// node closes the connection on a request it cannot decode.
+fn unsupported_by_node(command: &str) -> impl FnOnce(client::RpcError) -> anyhow::Error + '_ {
+    move |error| match error {
+        client::RpcError::Shutdown | client::RpcError::Receive(_) => anyhow::anyhow!(
+            "this node does not support `{command}`: it closed the connection on the request. \
+             It may run an older version of xnt-core."
+        ),
+        other => other.into(),
+    }
+}
+
 fn print_seed_phrase_dialog(wallet_secret: SecretKeyMaterial) {
     for (i, word) in wallet_secret.to_phrase().into_iter().enumerate() {
         println!("{}. {word}", i + 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Config::try_parse_from(std::iter::once("xnt-cli").chain(args.iter().copied()))
+            .map(|config| config.command)
+    }
+
+    #[test]
+    fn command_definitions_are_consistent() {
+        Config::command().debug_assert();
+    }
+
+    #[test]
+    fn ban_takes_one_or_more_addresses() {
+        assert!(parse(&["ban"]).is_err());
+
+        let Ok(Command::Ban { addresses }) = parse(&[
+            "ban",
+            "1.2.3.4",
+            "5.6.7.8:9898",
+            "/ip4/9.9.9.9/udp/9901/quic-v1",
+        ]) else {
+            panic!("`ban` must parse");
+        };
+        assert_eq!(
+            vec![
+                "/ip4/1.2.3.4",
+                "/ip4/5.6.7.8/tcp/9898",
+                "/ip4/9.9.9.9/udp/9901/quic-v1",
+            ],
+            addresses.iter().map(ToString::to_string).collect_vec()
+        );
+    }
+
+    #[test]
+    fn ban_refuses_addresses_that_name_no_peer_ip_address() {
+        assert!(parse(&["ban", "/dns4/example.com/tcp/9902"]).is_err());
+        assert!(parse(&["ban", "/ip4/1.2.3.4/udp/9901/quic-v1/p2p-circuit"]).is_err());
+    }
+
+    #[test]
+    fn unban_takes_addresses_or_all() {
+        assert!(parse(&["unban"]).is_err());
+        assert!(parse(&["unban", "--all", "1.2.3.4"]).is_err());
+        assert!(matches!(
+            parse(&["unban", "--all"]),
+            Ok(Command::Unban { all: true, addresses }) if addresses.is_empty()
+        ));
+        assert!(matches!(
+            parse(&["unban", "-a"]),
+            Ok(Command::Unban { all: true, .. })
+        ));
+        assert!(matches!(
+            parse(&["unban", "1.2.3.4", "/ip4/5.6.7.8/tcp/9902"]),
+            Ok(Command::Unban { all: false, addresses }) if addresses.len() == 2
+        ));
+    }
+
+    #[test]
+    fn dial_takes_one_multiaddress() {
+        assert!(parse(&["dial"]).is_err());
+        assert!(parse(&["dial", "1.2.3.4:9901"]).is_err());
+        assert!(parse(&["dial", "/dns4/example.com/udp/9901/quic-v1"]).is_err());
+
+        let Ok(Command::Dial { address }) = parse(&["dial", "/ip4/1.2.3.4/udp/9901/quic-v1"])
+        else {
+            panic!("`dial` must parse");
+        };
+        assert_eq!("/ip4/1.2.3.4/udp/9901/quic-v1", address.to_string());
+    }
+
+    #[test]
+    fn a_closed_connection_is_reported_as_an_unsupported_command() {
+        let message = unsupported_by_node("ban")(client::RpcError::Shutdown).to_string();
+        assert!(message.contains("does not support `ban`"), "{message}");
+
+        let message = unsupported_by_node("dial")(client::RpcError::DeadlineExceeded).to_string();
+        assert!(!message.contains("does not support"), "{message}");
+    }
+
+    #[test]
+    fn network_commands_without_arguments_parse() {
+        assert!(matches!(parse(&["probe-nat"]), Ok(Command::ProbeNat)));
+        assert!(matches!(
+            parse(&["reset-relay-reservations"]),
+            Ok(Command::ResetRelayReservations)
+        ));
+        assert!(matches!(
+            parse(&["network-overview"]),
+            Ok(Command::NetworkOverview)
+        ));
+        assert!(parse(&["probe-nat", "1.2.3.4"]).is_err());
+    }
+
+    #[test]
+    fn migrate_dctidh_options_parse() {
+        assert!(matches!(
+            parse(&["migrate-dctidh"]),
+            Ok(Command::MigrateDctidh {
+                to: None,
+                index: None,
+                batch: None,
+                fee: None,
+                allow_foreign: false,
+            })
+        ));
+
+        let Ok(Command::MigrateDctidh {
+            to,
+            index,
+            batch,
+            fee,
+            allow_foreign,
+        }) = parse(&[
+            "migrate-dctidh",
+            "--to",
+            "dctidh",
+            "--index",
+            "3",
+            "--batch",
+            "20",
+            "--fee",
+            "0.02",
+            "--allow-foreign",
+        ])
+        else {
+            panic!("`migrate-dctidh` must parse");
+        };
+        assert_eq!(Some("dctidh".to_string()), to);
+        assert_eq!(Some(3), index);
+        assert_eq!(Some(20), batch);
+        assert_eq!(NativeCurrencyAmount::coins_from_str("0.02").ok(), fee);
+        assert!(allow_foreign);
+
+        assert!(parse(&["migrate-dctidh", "--fee", "lots"]).is_err());
     }
 }

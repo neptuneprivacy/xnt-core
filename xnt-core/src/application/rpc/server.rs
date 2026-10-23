@@ -45,6 +45,7 @@
 //! [tarpc::Response] by the rpc server.
 pub mod coinbase_output_readable;
 pub mod mempool_transaction_info;
+pub mod network_overview_data;
 pub mod overview_data;
 pub mod proof_of_work_puzzle;
 pub mod ui_utxo;
@@ -59,6 +60,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use get_size2::GetSize;
 use itertools::Itertools;
+use multiaddr::Multiaddr;
 use num_traits::Zero;
 use serde::Deserialize;
 use serde::Serialize;
@@ -78,7 +80,15 @@ use crate::api;
 use crate::api::tx_initiation;
 use crate::api::tx_initiation::builder::tx_input_list_builder::InputSelectionPolicy;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use crate::api::tx_initiation::consolidate::NUM_RECENT_BLOCKS_EXCLUDED;
+use crate::api::tx_initiation::migrate_dctidh::is_own_address;
+use crate::api::tx_initiation::migrate_dctidh::DctidhMigrationReport;
+use crate::api::tx_initiation::migrate_dctidh::MigrationDestination;
+use crate::application::config::dctidh_migration::MAX_NUM_MIGRATION_INPUTS;
 use crate::application::config::network::Network;
+use crate::application::config::parser::multiaddr::ip_of;
+use crate::application::config::parser::multiaddr::is_relayed;
+use crate::application::config::parser::multiaddr::refuse_dns;
 use crate::application::database::storage::storage_vec::traits::StorageVecBase;
 use crate::application::loops::channel::ClaimUtxoData;
 use crate::application::loops::channel::RPCServerToMain;
@@ -87,6 +97,8 @@ use crate::application::loops::mine_loop::coinbase_distribution::CoinbaseDistrib
 use crate::application::rpc::server::coinbase_output_readable::CoinbaseOutputReadable;
 use crate::application::rpc::server::error::RpcError;
 use crate::application::rpc::server::mempool_transaction_info::MempoolTransactionInfo;
+use crate::application::rpc::server::network_overview_data::request_network_overview;
+use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
 use crate::application::rpc::server::overview_data::OverviewData;
 use crate::application::rpc::server::proof_of_work_puzzle::ProofOfWorkPuzzle;
 use crate::application::rpc::server::ui_utxo::UiUtxo;
@@ -128,6 +140,7 @@ use crate::state::wallet::monitored_utxo::MonitoredUtxo;
 use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutputList;
 use crate::state::wallet::wallet_status::WalletStatus;
+use crate::state::wallet::wallet_status::WalletStatusElement;
 use crate::state::GlobalState;
 use crate::state::GlobalStateLock;
 use crate::twenty_first::prelude::Tip5;
@@ -1127,6 +1140,10 @@ pub trait RPC {
 
     /// Determine whether the user-supplied string is a valid address
     ///
+    /// Returns `None` for strings that are not receiving addresses, including
+    /// symmetric keys, for dCTIDH addresses with a legacy-format lock, and for
+    /// dCTIDH addresses whose public key is invalid.
+    ///
     /// ```no_run
     /// # use anyhow::Result;
     /// use neptune_privacy::application::config::network::Network;
@@ -1542,7 +1559,9 @@ pub trait RPC {
     /******** CHANGE THINGS ********/
     // Place all things that change state here
 
-    /// Clears standing for all peers, connected or not
+    /// Clears standing for all peers, connected or not, and lifts all bans on
+    /// the libp2p network stack, except those given with `--ban`. All peers can
+    /// reconnect at once, without waiting for the reconnect cooldown.
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -1575,7 +1594,10 @@ pub trait RPC {
     /// ```
     async fn clear_all_standings(token: auth::Token) -> RpcResult<()>;
 
-    /// Clears standing for ip, whether connected or not
+    /// Clears standing for ip, whether connected or not, and lifts its ban on
+    /// the libp2p network stack, unless it was given with `--ban`. The peers at
+    /// the ip can reconnect at once, without waiting for the reconnect
+    /// cooldown.
     ///
     /// ```no_run
     /// # use anyhow::Result;
@@ -2015,6 +2037,128 @@ pub trait RPC {
     /// # Ok(())
     /// # }
     async fn shutdown(token: auth::Token) -> RpcResult<bool>;
+
+    /// Initiate a transaction that spends a batch of UTXOs to the node's own
+    /// wallet, reducing the total number of UTXOs under management.
+    ///
+    /// Spends the oldest UTXOs with at least 10 confirmations to a single
+    /// on-chain output, for a fixed fee that depends on the node's proving
+    /// capability.
+    ///
+    /// # Parameters
+    ///
+    ///  - `num_inputs` -- the number of inputs to consolidate. Defaults to the
+    ///    node's `--num-consolidation-inputs` setting.
+    ///  - `to_address` -- set to consolidate the UTXOs to the given address as
+    ///    opposed to the node's own Generation address at derivation index 0.
+    ///
+    /// Returns the number of inputs consumed by the consolidation transaction.
+    async fn consolidate(
+        token: auth::Token,
+        num_inputs: Option<usize>,
+        to_address: Option<ReceivingAddress>,
+    ) -> RpcResult<usize>;
+
+    /// Give the IP addresses a bad standing, disconnect the peers at them, and
+    /// refuse connections from them on both network stacks.
+    ///
+    /// Each address is a multiaddress that names an IP address, such as
+    /// `/ip4/1.2.3.4` or `/ip4/1.2.3.4/udp/9901/quic-v1`. Only the IP address
+    /// counts. If an address routes through a relay (`/p2p-circuit`) or names
+    /// no IP address, no address is banned and an error is returned.
+    async fn ban(token: auth::Token, addresses: Vec<Multiaddr>) -> RpcResult<()>;
+
+    /// Clear the standings of the IP addresses, and lift their bans on both
+    /// network stacks. Bans given with `--ban` stand. The peers at the IP
+    /// addresses can reconnect at once, without waiting for the reconnect
+    /// cooldown.
+    ///
+    /// The addresses are given as for `ban`.
+    async fn unban(token: auth::Token, addresses: Vec<Multiaddr>) -> RpcResult<()>;
+
+    /// Clear all standings, and lift all bans on both network stacks, except
+    /// those given with `--ban`. All peers can reconnect at once, without
+    /// waiting for the reconnect cooldown.
+    async fn unban_all(token: auth::Token) -> RpcResult<()>;
+
+    /// Dial the multiaddress over the libp2p network stack, e.g.
+    /// `/ip4/1.2.3.4/udp/9901/quic-v1`. A bad standing of its IP address is
+    /// cleared first, unless the IP address was banned with `--ban`, and so is
+    /// the reconnect cooldown.
+    ///
+    /// Fails if the libp2p network stack does not run on this node, or if the
+    /// multiaddress names a host by DNS name.
+    async fn dial(token: auth::Token, address: Multiaddr) -> RpcResult<()>;
+
+    /// Probe whether this node is reachable from the outside, over the libp2p
+    /// network stack. The outcome shows in `network_overview`.
+    ///
+    /// Fails if the libp2p network stack does not run on this node.
+    async fn probe_nat(token: auth::Token) -> RpcResult<()>;
+
+    /// Drop and renew the relay reservations of the libp2p network stack.
+    ///
+    /// Fails if the libp2p network stack does not run on this node.
+    async fn reset_relay_reservations(token: auth::Token) -> RpcResult<()>;
+
+    /// An overview of the libp2p network stack, or `None` if it does not run
+    /// on this node.
+    async fn network_overview(token: auth::Token) -> RpcResult<Option<NetworkOverviewData>>;
+
+    /// The wallet's synced, unspent UTXOs held at legacy-format dCTIDH locks.
+    ///
+    /// Such UTXOs are recognized only if they were confirmed below the legacy
+    /// cutoff height (on main net, the `UpgradeVMv8` activation height). They
+    /// count towards the total balance but not towards the available balance,
+    /// and should be moved to a current-format address.
+    async fn legacy_dctidh_utxos(token: auth::Token) -> RpcResult<Vec<WalletStatusElement>>;
+
+    /// Move a batch of the wallet's funds held at legacy-format dCTIDH locks
+    /// now, as `--migrate-dctidh` does for every new block.
+    ///
+    /// Spends the largest such UTXOs that are worth more than their share of
+    /// the fee to one output at the destination, announced on-chain. Returns
+    /// what was moved and what still waits. Before the `UpgradeVMv8` hard
+    /// fork, the transaction is made for the era before it, with at most 10
+    /// inputs and at least the proof collection fee, and it fails within
+    /// `--fork-tx-cutoff-margin` blocks of the fork.
+    ///
+    /// # Parameters
+    ///
+    ///  - `destination` -- where the funds go. Defaults to the node's
+    ///    `--migrate-dctidh` setting, or else the next unused Generation
+    ///    address of this wallet.
+    ///  - `max_inputs` -- the maximum number of UTXOs to spend, between 1 and
+    ///    200. Defaults to the node's `--migrate-dctidh-batch` setting.
+    ///  - `fee` -- defaults to the node's `--migrate-dctidh-fee` setting, or
+    ///    else is chosen from the node's proving capability and the number of
+    ///    inputs. Must be at least the node's `--min-relay-pctx-fee-per-input`
+    ///    times `max_inputs`.
+    ///  - `allow_foreign` -- allow an explicit destination address that is not
+    ///    owned by this wallet.
+    async fn migrate_dctidh(
+        token: auth::Token,
+        destination: Option<MigrationDestination>,
+        max_inputs: Option<usize>,
+        fee: Option<NativeCurrencyAmount>,
+        allow_foreign: bool,
+    ) -> RpcResult<DctidhMigrationReport>;
+
+    /// Return the number of transactions in the legacy relay pool: the
+    /// transactions of the era before the next hard fork, which the node holds
+    /// apart from its mempool until the next block belongs to the era after
+    /// the fork. See [`mempool_tx_count`](Self::mempool_tx_count) for the
+    /// mempool.
+    async fn legacy_relay_pool_tx_count(token: auth::Token) -> RpcResult<usize>;
+
+    /// Return info about the transactions in the legacy relay pool, in
+    /// descending order of fee density, like
+    /// [`mempool_overview`](Self::mempool_overview) does for the mempool.
+    async fn legacy_relay_pool_overview(
+        token: auth::Token,
+        start_index: usize,
+        number: usize,
+    ) -> RpcResult<Vec<MempoolTransactionInfo>>;
 }
 
 #[derive(Clone)]
@@ -2045,6 +2189,45 @@ impl NeptuneRPCServer {
             rpc_server_to_main_tx,
             data_directory,
         }
+    }
+
+    /// Send the message to the main loop, or fail if the main loop has stopped.
+    async fn send_to_main_loop(&self, message: RPCServerToMain) -> RpcResult<()> {
+        self.rpc_server_to_main_tx
+            .send(message)
+            .await
+            .map_err(|e| RpcError::SendError(format!("could not send message to main loop: {e}")))
+    }
+
+    /// Fail unless the libp2p network stack runs on this node: it is enabled,
+    /// and has not stopped.
+    fn ensure_libp2p_runs(&self) -> RpcResult<()> {
+        if self.state.libp2p_runs() {
+            Ok(())
+        } else {
+            Err(RpcError::Libp2pNotRunning)
+        }
+    }
+
+    /// The IP addresses named by the multiaddresses. Fails if any of them
+    /// routes through a relay, which names the relay rather than the peer, or
+    /// names no IP address.
+    fn ips_of(addresses: &[Multiaddr]) -> RpcResult<Vec<IpAddr>> {
+        addresses
+            .iter()
+            .map(|address| {
+                refuse_dns(address).map_err(RpcError::InvalidPeerAddress)?;
+                if is_relayed(address) {
+                    return Err(RpcError::InvalidPeerAddress(format!(
+                        "`{address}` names a relay rather than the peer"
+                    )));
+                }
+
+                ip_of(address).ok_or_else(|| {
+                    RpcError::InvalidPeerAddress(format!("`{address}` does not name an IP address"))
+                })
+            })
+            .collect()
     }
 
     async fn confirmations_internal(&self, state: &GlobalState) -> Option<BlockHeight> {
@@ -2137,7 +2320,15 @@ impl NeptuneRPCServer {
         }
 
         if incoming_utxo.utxo.lock_script_hash() != spending_key.lock_script_hash() {
-            let err = error::ClaimError::ForeignLockScript;
+            let is_legacy_lock = state
+                .wallet_state
+                .legacy_dctidh_lock_hashes()
+                .contains(&incoming_utxo.utxo.lock_script_hash());
+            let err = if is_legacy_lock {
+                error::ClaimError::LegacyFormatLock
+            } else {
+                error::ClaimError::ForeignLockScript
+            };
             warn!("{}", err.to_string());
             return Err(err);
         }
@@ -2163,7 +2354,7 @@ impl NeptuneRPCServer {
                         .num_leafs()
                         - 1;
                     let num_outputs_in_block: u64 = block
-                        .mutator_set_update()
+                        .mutator_set_update(network)
                         .expect("Block from state must have mutator set update")
                         .additions
                         .len()
@@ -2758,9 +2949,14 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        let ret = ReceivingAddress::from_bech32m(&address_string, network).ok();
+        // A symmetric key also parses, but it is a secret, not an address. The
+        // submitted string is never logged.
+        let ret = ReceivingAddress::from_bech32m(&address_string, network)
+            .ok()
+            .filter(|address| !matches!(address, ReceivingAddress::Symmetric(_)))
+            .filter(|address| address.validate_as_recipient().is_ok());
         tracing::debug!(
-            "Responding to address validation request of {address_string}: {}",
+            "Responding to address validation request: {}",
             ret.is_some()
         );
         Ok(ret)
@@ -2924,7 +3120,9 @@ impl RPC for NeptuneRPCServer {
             .lock_guard()
             .await
             .wallet_state
-            .get_all_known_spending_keys()
+            // Addressable keys only: legacy-derivation keys are for scanning
+            // and spending, and must not be handed out as receiving keys.
+            .get_all_known_addressable_spending_keys()
             .collect())
     }
 
@@ -2943,7 +3141,7 @@ impl RPC for NeptuneRPCServer {
             .lock_guard()
             .await
             .wallet_state
-            .get_known_spending_keys(key_type)
+            .get_known_addressable_spending_keys(key_type)
             .collect())
     }
 
@@ -3124,7 +3322,18 @@ impl RPC for NeptuneRPCServer {
         // iterates and modifies standing field for all connected peers
         global_state_mut.net.clear_all_standings_in_database().await;
 
-        Ok(global_state_mut.flush_databases().await?)
+        // Let the peers reconnect at once.
+        global_state_mut.net.forget_all_disconnections();
+
+        global_state_mut.flush_databases().await?;
+        drop(global_state_mut);
+
+        // Lift the bans on the libp2p network stack, too.
+        if self.state.libp2p_runs() {
+            self.send_to_main_loop(RPCServerToMain::UnbanAll).await?;
+        }
+
+        Ok(())
     }
 
     // Locking:
@@ -3140,13 +3349,14 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
+        let ip = ip.to_canonical();
         let mut global_state_mut = self.state.lock_guard_mut().await;
         global_state_mut
             .net
             .peer_map
             .iter_mut()
             .for_each(|(socketaddr, peerinfo)| {
-                if socketaddr.ip() == ip {
+                if socketaddr.ip().to_canonical() == ip {
                     peerinfo.standing.clear_standing();
                 }
             });
@@ -3154,7 +3364,18 @@ impl RPC for NeptuneRPCServer {
         //Also clears this IP's standing in database, whether it is connected or not.
         global_state_mut.net.clear_ip_standing_in_database(ip).await;
 
-        Ok(global_state_mut.flush_databases().await?)
+        // Let the peers at the IP reconnect at once.
+        global_state_mut.net.forget_disconnections_at(ip);
+
+        global_state_mut.flush_databases().await?;
+        drop(global_state_mut);
+
+        // Lift the ban on the libp2p network stack, too.
+        if self.state.libp2p_runs() {
+            self.send_to_main_loop(RPCServerToMain::Unban(ip)).await?;
+        }
+
+        Ok(())
     }
 
     // documented in trait. do not add doc-comment.
@@ -3234,7 +3455,7 @@ impl RPC for NeptuneRPCServer {
     }
 
     async fn upgrade(
-        mut self,
+        self,
         _ctx: context::Context,
         token: auth::Token,
         tx_kernel_id: TransactionKernelId,
@@ -3270,7 +3491,7 @@ impl RPC for NeptuneRPCServer {
                 let gobbling_potential = NativeCurrencyAmount::zero();
                 let update_job = self
                     .state
-                    .lock_guard_mut()
+                    .lock_guard()
                     .await
                     .update_single_proof_job(
                         tx.kernel,
@@ -3287,7 +3508,7 @@ impl RPC for NeptuneRPCServer {
                 let gobbling_potential = NativeCurrencyAmount::zero();
                 let raise_job = self
                     .state
-                    .lock_guard_mut()
+                    .lock_guard()
                     .await
                     .upgrade_proof_collection_job(
                         tx.kernel,
@@ -3364,6 +3585,28 @@ impl RPC for NeptuneRPCServer {
 
         // 2. Send acknowledgement to client.
         Ok(response.is_ok())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn consolidate(
+        mut self,
+        _ctx: context::Context,
+        token: auth::Token,
+        num_inputs: Option<usize>,
+        to_address: Option<ReceivingAddress>,
+    ) -> RpcResult<usize> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let num_inputs =
+            num_inputs.unwrap_or_else(|| usize::from(self.state.cli().num_consolidation_inputs));
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_initiator_mut()
+            .consolidate(num_inputs, to_address, Timestamp::now())
+            .await?)
     }
 
     // documented in trait. do not add doc-comment.
@@ -4209,8 +4452,7 @@ impl RPC for NeptuneRPCServer {
             .state
             .lock_guard()
             .await
-            .mempool
-            .get(tx_kernel_id)
+            .mempool_or_legacy_pool_get(tx_kernel_id)
             .map(|tx| &tx.kernel)
             .cloned())
     }
@@ -4260,6 +4502,254 @@ impl RPC for NeptuneRPCServer {
         .map_err(|e| RpcError::Failed(e.to_string()))?;
 
         Ok(encoded)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn ban(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        addresses: Vec<Multiaddr>,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        for ip in Self::ips_of(&addresses)? {
+            self.send_to_main_loop(RPCServerToMain::Ban(ip)).await?;
+        }
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn unban(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        addresses: Vec<Multiaddr>,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        for ip in Self::ips_of(&addresses)? {
+            self.send_to_main_loop(RPCServerToMain::Unban(ip)).await?;
+        }
+
+        Ok(())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn unban_all(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        self.send_to_main_loop(RPCServerToMain::UnbanAll).await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn dial(
+        self,
+        _: context::Context,
+        token: auth::Token,
+        address: Multiaddr,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+        self.ensure_libp2p_runs()?;
+        refuse_dns(&address).map_err(RpcError::InvalidPeerAddress)?;
+
+        self.send_to_main_loop(RPCServerToMain::Dial(address)).await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn probe_nat(self, _: context::Context, token: auth::Token) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+        self.ensure_libp2p_runs()?;
+
+        self.send_to_main_loop(RPCServerToMain::ProbeNat).await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn reset_relay_reservations(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<()> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+        self.ensure_libp2p_runs()?;
+
+        self.send_to_main_loop(RPCServerToMain::ResetRelayReservations)
+            .await
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn network_overview(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<Option<NetworkOverviewData>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(request_network_overview(self.state.libp2p_runs(), &self.rpc_server_to_main_tx).await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn legacy_dctidh_utxos(
+        self,
+        _: context::Context,
+        token: auth::Token,
+    ) -> RpcResult<Vec<WalletStatusElement>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let wallet_status = self
+            .state
+            .lock_guard()
+            .await
+            .get_wallet_status_for_tip()
+            .await;
+        Ok(wallet_status
+            .synced_unspent
+            .into_iter()
+            .map(|(element, _)| element)
+            .filter(|element| element.is_legacy)
+            .collect())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn migrate_dctidh(
+        mut self,
+        _: context::Context,
+        token: auth::Token,
+        destination: Option<MigrationDestination>,
+        max_inputs: Option<usize>,
+        fee: Option<NativeCurrencyAmount>,
+        allow_foreign: bool,
+    ) -> RpcResult<DctidhMigrationReport> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let cli = self.state.cli().clone();
+        let settings = cli.dctidh_migration();
+
+        let max_inputs = max_inputs.unwrap_or(cli.migrate_dctidh_batch);
+        if !(1..=MAX_NUM_MIGRATION_INPUTS).contains(&max_inputs) {
+            return Err(RpcError::Failed(format!(
+                "the number of inputs must be between 1 and {MAX_NUM_MIGRATION_INPUTS}, got \
+                 {max_inputs}"
+            )));
+        }
+
+        let fee = fee.or(cli.migrate_dctidh_fee);
+        if let Some(fee) = fee {
+            let per_input = cli.min_relay_pctx_fee_per_input;
+            let relay_minimum = u32::try_from(max_inputs)
+                .ok()
+                .and_then(|max_inputs| per_input.checked_scalar_mul(max_inputs));
+            if !relay_minimum.is_some_and(|relay_minimum| fee >= relay_minimum) {
+                return Err(RpcError::Failed(format!(
+                    "fee {fee} is below the minimum at which peers relay a transaction with \
+                     {max_inputs} inputs ({per_input} per input)"
+                )));
+            }
+        }
+
+        let destination = match destination {
+            Some(MigrationDestination::Address(address)) => {
+                if !allow_foreign
+                    && !is_own_address(&self.state.lock_guard().await.wallet_state, &address)
+                {
+                    return Err(RpcError::Failed(
+                        "the destination address is not owned by this wallet; set allow_foreign \
+                         to move the funds there anyway"
+                            .to_string(),
+                    ));
+                }
+                MigrationDestination::Address(address)
+            }
+            Some(destination) => destination,
+            None => settings
+                .map(|settings| settings.destination)
+                .unwrap_or(MigrationDestination::Generation { index: None }),
+        };
+
+        Ok(self
+            .state
+            .api_mut()
+            .tx_initiator_mut()
+            .migrate_dctidh_utxos(
+                destination,
+                fee,
+                Timestamp::now(),
+                NUM_RECENT_BLOCKS_EXCLUDED,
+                max_inputs,
+            )
+            .await?)
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn legacy_relay_pool_tx_count(
+        self,
+        _context: tarpc::context::Context,
+        token: auth::Token,
+    ) -> RpcResult<usize> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        Ok(self.state.lock_guard().await.legacy_relay_pool.len())
+    }
+
+    // documented in trait. do not add doc-comment.
+    async fn legacy_relay_pool_overview(
+        self,
+        _context: ::tarpc::context::Context,
+        token: auth::Token,
+        start_index: usize,
+        number: usize,
+    ) -> RpcResult<Vec<MempoolTransactionInfo>> {
+        log_slow_scope!(fn_name!());
+        token.auth(&self.valid_tokens)?;
+
+        let global_state = self.state.lock_guard().await;
+        let (incoming, outgoing): (HashMap<_, _>, HashMap<_, _>) = {
+            let (incoming_iter, outgoing_iter) =
+                global_state.wallet_state.mempool_balance_updates();
+            (incoming_iter.collect(), outgoing_iter.collect())
+        };
+        let tip_msah = global_state
+            .chain
+            .light_state()
+            .mutator_set_accumulator_after()
+            .expect("Block from state must have mutator set after")
+            .hash();
+
+        let pool = &global_state.legacy_relay_pool;
+        let transactions = pool
+            .txids_by_fee_density()
+            .into_iter()
+            .skip(start_index)
+            .take(number)
+            .filter_map(|txid| {
+                let tx = pool.get(txid)?;
+                let mut info = MempoolTransactionInfo::from(tx);
+                if tx.kernel.mutator_set_hash == tip_msah {
+                    info = info.synced();
+                }
+                if let Some(positive_effect) = incoming.get(&txid) {
+                    info = info.with_positive_effect_on_balance(*positive_effect);
+                }
+                if let Some(negative_effect) = outgoing.get(&txid) {
+                    info = info.with_negative_effect_on_balance(*negative_effect);
+                }
+
+                Some(info)
+            })
+            .collect_vec();
+
+        Ok(transactions)
     }
 }
 
@@ -4317,6 +4807,21 @@ pub mod error {
 
         #[error("Wallet key counter is zero. Must be positive after init")]
         WalletKeyCounterIsZero,
+
+        #[error("consolidation error: {0}")]
+        ConsolidationError(String),
+
+        #[error("the libp2p network stack does not run on this node")]
+        Libp2pNotRunning,
+
+        #[error("invalid peer address: {0}")]
+        InvalidPeerAddress(String),
+    }
+
+    impl From<tx_initiation::consolidate::ConsolidationError> for RpcError {
+        fn from(err: tx_initiation::consolidate::ConsolidationError) -> Self {
+            RpcError::ConsolidationError(err.to_string())
+        }
     }
 
     impl From<tx_initiation::error::CreateTxError> for RpcError {
@@ -4379,6 +4884,12 @@ pub mod error {
         // catch-all error, eg for anyhow errors
         #[error("claim unsuccessful")]
         Failed(String),
+
+        #[error(
+            "claimed utxo is held at a legacy-format dCTIDH lock; off-chain notifications for \
+             legacy-format locks cannot be claimed"
+        )]
+        LegacyFormatLock,
     }
 
     // convert anyhow::Error to a ClaimError::Failed.
@@ -4399,7 +4910,7 @@ mod tests {
     use num_traits::Zero;
     use proptest::prop_assume;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use strum::IntoEnumIterator;
     use tracing_test::traced_test;
@@ -4413,6 +4924,7 @@ mod tests {
     use crate::protocol::peer::NegativePeerSanction;
     use crate::protocol::peer::PeerSanction;
     use crate::protocol::proof_abstractions::mast_hash::MastHash;
+    use crate::state::transaction::tx_proving_capability::TxProvingCapability;
     use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
     use crate::state::wallet::address::generation_address::GenerationSpendingKey;
     use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
@@ -4711,6 +5223,15 @@ mod tests {
             )
             .await;
 
+        let _ = rpc_server
+            .clone()
+            .legacy_dctidh_utxos(ctx, token)
+            .await
+            .unwrap();
+        let _ = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, None, None, None, false)
+            .await;
         let _ = rpc_server.clone().pause_miner(ctx, token).await;
         let _ = rpc_server.clone().restart_miner(ctx, token).await;
         let _ = rpc_server
@@ -4728,6 +5249,54 @@ mod tests {
         let _ = rpc_server.shutdown(ctx, token).await;
 
         Ok(())
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn migrate_dctidh_checks_destination_batch_and_fee() {
+        let cli = cli_args::Args {
+            tx_proving_capability: Some(TxProvingCapability::SingleProof),
+            ..cli_args::Args::default_with_network(Network::Testnet(0))
+        };
+        let rpc_server = test_rpc_server(WalletEntropy::new_random(), 2, cli).await;
+        let token = cookie_token(&rpc_server).await;
+        let ctx = context::current();
+
+        let foreign_address: ReceivingAddress =
+            GenerationReceivingAddress::derive_from_seed(rand::random()).into();
+        let destination = Some(MigrationDestination::Address(Box::new(foreign_address)));
+        let foreign_refused = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, destination.clone(), None, None, false)
+            .await;
+        assert!(matches!(foreign_refused, Err(RpcError::Failed(_))));
+
+        // Allowed, but the wallet holds nothing to move.
+        let report = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, destination, None, None, true)
+            .await
+            .unwrap();
+        assert!(report.txid.is_none());
+        assert_eq!(0, report.num_waiting);
+
+        for max_inputs in [0, MAX_NUM_MIGRATION_INPUTS + 1] {
+            let batch_refused = rpc_server
+                .clone()
+                .migrate_dctidh(ctx, token, None, Some(max_inputs), None, false)
+                .await;
+            assert!(
+                matches!(batch_refused, Err(RpcError::Failed(_))),
+                "{max_inputs}"
+            );
+        }
+
+        // 10 inputs at 0.0005 each
+        let fee = NativeCurrencyAmount::coins_from_str("0.004").unwrap();
+        let fee_refused = rpc_server
+            .clone()
+            .migrate_dctidh(ctx, token, None, Some(10), Some(fee), false)
+            .await;
+        assert!(matches!(fee_refused, Err(RpcError::Failed(_))));
     }
 
     #[apply(shared_tokio_runtime)]
@@ -5001,11 +5570,11 @@ mod tests {
 
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+                .write_peer_standing(peer_address0.ip(), standing0)
                 .await;
             global_state_mut
                 .net
-                .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+                .write_peer_standing(peer_address1.ip(), standing1)
                 .await;
         }
 
@@ -5120,11 +5689,11 @@ mod tests {
 
         state
             .net
-            .write_peer_standing_on_decrease(peer_address0.ip(), standing0)
+            .write_peer_standing(peer_address0.ip(), standing0)
             .await;
         state
             .net
-            .write_peer_standing_on_decrease(peer_address1.ip(), standing1)
+            .write_peer_standing(peer_address1.ip(), standing1)
             .await;
 
         drop(state);
@@ -5208,6 +5777,398 @@ mod tests {
         assert!(after_global_forgiveness.is_empty());
 
         Ok(())
+    }
+
+    /// A test RPC server, and the receiving end of its channel to the main
+    /// loop.
+    async fn test_rpc_server_and_main_loop_rx(
+        cli: cli_args::Args,
+    ) -> (
+        NeptuneRPCServer,
+        tokio::sync::mpsc::Receiver<RPCServerToMain>,
+    ) {
+        let mut rpc_server = test_rpc_server(WalletEntropy::new_random(), 2, cli).await;
+        let (rpc_server_to_main_tx, rpc_server_to_main_rx) = tokio::sync::mpsc::channel(10);
+        rpc_server.rpc_server_to_main_tx = rpc_server_to_main_tx;
+
+        (rpc_server, rpc_server_to_main_rx)
+    }
+
+    fn cli_without_libp2p() -> cli_args::Args {
+        cli_args::Args {
+            disable_libp2p: true,
+            ..cli_args::Args::default_with_network(Network::Main)
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn clearing_standings_lifts_libp2p_bans() {
+        let ip = IpAddr::from([198, 51, 100, 7]);
+        for cli in [
+            cli_args::Args::default_with_network(Network::Main),
+            cli_without_libp2p(),
+        ] {
+            let libp2p_enabled = cli.libp2p_enabled();
+            let (rpc_server, mut main_loop_rx) = test_rpc_server_and_main_loop_rx(cli).await;
+            let token = cookie_token(&rpc_server).await;
+
+            rpc_server
+                .clone()
+                .clear_standing_by_ip(context::current(), token, ip)
+                .await
+                .unwrap();
+            rpc_server
+                .clone()
+                .clear_all_standings(context::current(), token)
+                .await
+                .unwrap();
+
+            if libp2p_enabled {
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::Unban(unbanned)) if unbanned == ip
+                ));
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::UnbanAll)
+                ));
+            }
+            assert!(main_loop_rx.try_recv().is_err());
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn ban_and_unban_reach_main_loop_with_and_without_libp2p() {
+        let addresses: Vec<Multiaddr> = vec![
+            "/ip4/198.51.100.7".parse().unwrap(),
+            "/ip6/2001:db8::7/udp/9901/quic-v1".parse().unwrap(),
+        ];
+        let ips = [
+            IpAddr::from([198, 51, 100, 7]),
+            "2001:db8::7".parse::<IpAddr>().unwrap(),
+        ];
+        for cli in [
+            cli_args::Args::default_with_network(Network::Main),
+            cli_without_libp2p(),
+        ] {
+            let (rpc_server, mut main_loop_rx) = test_rpc_server_and_main_loop_rx(cli).await;
+            let token = cookie_token(&rpc_server).await;
+
+            rpc_server
+                .clone()
+                .ban(context::current(), token, addresses.clone())
+                .await
+                .unwrap();
+            for ip in ips {
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::Ban(banned)) if banned == ip
+                ));
+            }
+
+            rpc_server
+                .clone()
+                .unban(context::current(), token, addresses.clone())
+                .await
+                .unwrap();
+            for ip in ips {
+                assert!(matches!(
+                    main_loop_rx.try_recv(),
+                    Ok(RPCServerToMain::Unban(unbanned)) if unbanned == ip
+                ));
+            }
+
+            rpc_server
+                .unban_all(context::current(), token)
+                .await
+                .unwrap();
+            assert!(matches!(
+                main_loop_rx.try_recv(),
+                Ok(RPCServerToMain::UnbanAll)
+            ));
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn ban_and_unban_refuse_addresses_that_name_no_peer_ip_address() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+
+        for refused in [
+            "/dns4/example.com/tcp/9902",
+            "/ip4/198.51.100.7/udp/9901/quic-v1/p2p-circuit",
+        ] {
+            let addresses: Vec<Multiaddr> = vec![
+                "/ip4/203.0.113.7".parse().unwrap(),
+                refused.parse().unwrap(),
+            ];
+
+            let ban_result = rpc_server
+                .clone()
+                .ban(context::current(), token, addresses.clone())
+                .await;
+            assert!(matches!(ban_result, Err(RpcError::InvalidPeerAddress(_))));
+
+            let unban_result = rpc_server
+                .clone()
+                .unban(context::current(), token, addresses)
+                .await;
+            assert!(matches!(unban_result, Err(RpcError::InvalidPeerAddress(_))));
+
+            assert!(
+                main_loop_rx.try_recv().is_err(),
+                "no address may be banned or unbanned if one is refused"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn libp2p_commands_fail_without_libp2p() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_without_libp2p()).await;
+        let token = cookie_token(&rpc_server).await;
+        let address: Multiaddr = "/ip4/198.51.100.7/udp/9901/quic-v1".parse().unwrap();
+
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .dial(context::current(), token, address)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .probe_nat(context::current(), token)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .reset_relay_reservations(context::current(), token)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert_eq!(
+            None,
+            rpc_server
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+
+        assert!(main_loop_rx.try_recv().is_err());
+    }
+
+    /// Once the libp2p network stack has stopped, the node reports so, as it
+    /// does when the stack is disabled.
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn libp2p_commands_fail_once_libp2p_has_stopped() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        rpc_server.state.set_libp2p_stopped();
+        let address: Multiaddr = "/ip4/198.51.100.7/udp/9901/quic-v1".parse().unwrap();
+
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .dial(context::current(), token, address)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert!(matches!(
+            rpc_server
+                .clone()
+                .probe_nat(context::current(), token)
+                .await,
+            Err(RpcError::Libp2pNotRunning)
+        ));
+        assert_eq!(
+            None,
+            rpc_server
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+
+        assert!(main_loop_rx.try_recv().is_err());
+    }
+
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn dial_refuses_dns_names() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        let address: Multiaddr = "/dns4/example.com/udp/9901/quic-v1".parse().unwrap();
+
+        assert!(matches!(
+            rpc_server.dial(context::current(), token, address).await,
+            Err(RpcError::InvalidPeerAddress(_))
+        ));
+        assert!(main_loop_rx.try_recv().is_err());
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn clearing_standings_lifts_the_reconnect_cooldown() {
+        let ipv4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+        let (rpc_server, _main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_without_libp2p()).await;
+        let token = cookie_token(&rpc_server).await;
+        let disconnected = |server: &NeptuneRPCServer, instance_id| {
+            let state = server.state.clone();
+            async move {
+                state
+                    .lock_guard()
+                    .await
+                    .net
+                    .last_disconnection_time_of_peer(instance_id)
+                    .is_some()
+            }
+        };
+
+        {
+            let mut state = rpc_server.state.clone();
+            let mut global_state = state.lock_guard_mut().await;
+            global_state.net.register_peer_disconnection(
+                1,
+                IpAddr::V4(ipv4),
+                std::time::SystemTime::now(),
+            );
+            global_state.net.register_peer_disconnection(
+                2,
+                IpAddr::from([203, 0, 113, 9]),
+                std::time::SystemTime::now(),
+            );
+        }
+
+        // Either form of the IP address will do.
+        rpc_server
+            .clone()
+            .clear_standing_by_ip(context::current(), token, IpAddr::V6(ipv4.to_ipv6_mapped()))
+            .await
+            .unwrap();
+        assert!(!disconnected(&rpc_server, 1).await);
+        assert!(disconnected(&rpc_server, 2).await);
+
+        rpc_server
+            .clone()
+            .clear_all_standings(context::current(), token)
+            .await
+            .unwrap();
+        assert!(!disconnected(&rpc_server, 2).await);
+    }
+
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn libp2p_commands_reach_main_loop() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        let address: Multiaddr = "/ip4/198.51.100.7/udp/9901/quic-v1".parse().unwrap();
+
+        rpc_server
+            .clone()
+            .dial(context::current(), token, address.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            main_loop_rx.try_recv(),
+            Ok(RPCServerToMain::Dial(dialed)) if dialed == address
+        ));
+
+        rpc_server
+            .clone()
+            .probe_nat(context::current(), token)
+            .await
+            .unwrap();
+        assert!(matches!(
+            main_loop_rx.try_recv(),
+            Ok(RPCServerToMain::ProbeNat)
+        ));
+
+        rpc_server
+            .reset_relay_reservations(context::current(), token)
+            .await
+            .unwrap();
+        assert!(matches!(
+            main_loop_rx.try_recv(),
+            Ok(RPCServerToMain::ResetRelayReservations)
+        ));
+    }
+
+    /// The main loop answers the first request for a network overview, as it
+    /// does with a running network actor, and drops the second, as it does
+    /// without one.
+    #[cfg(feature = "libp2p")]
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_the_answer_of_the_main_loop() {
+        let (rpc_server, mut main_loop_rx) =
+            test_rpc_server_and_main_loop_rx(cli_args::Args::default_with_network(Network::Main))
+                .await;
+        let token = cookie_token(&rpc_server).await;
+        let network_overview = NetworkOverviewData {
+            nat_status: "private".to_string(),
+            reachability_state: "unknown".to_string(),
+            external_addresses: vec!["/ip4/198.51.100.7/udp/9901/quic-v1".to_string()],
+            connection_count: 3,
+            connection_limit: 10,
+            num_active_relays: 1,
+            peer_id: "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string(),
+            address_book_size: 5,
+            num_banned_peers: 2,
+        };
+
+        let answer = network_overview.clone();
+        let main_loop = tokio::spawn(async move {
+            let Some(RPCServerToMain::GetNetworkOverview(answered_reply)) =
+                main_loop_rx.recv().await
+            else {
+                panic!("main loop must be asked for a network overview");
+            };
+            answered_reply.send(answer).unwrap();
+
+            let Some(RPCServerToMain::GetNetworkOverview(dropped_reply)) =
+                main_loop_rx.recv().await
+            else {
+                panic!("main loop must be asked for a network overview");
+            };
+            drop(dropped_reply);
+        });
+
+        assert_eq!(
+            Some(network_overview),
+            rpc_server
+                .clone()
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            None,
+            rpc_server
+                .network_overview(context::current(), token)
+                .await
+                .unwrap()
+        );
+        main_loop.await.unwrap();
     }
 
     #[traced_test]
@@ -6146,7 +7107,7 @@ mod tests {
             let sender_randomness: Digest = rand::random();
             let off_chain_notification = |utxo: Utxo| {
                 let payload = UtxoNotificationPayload::new(utxo, sender_randomness);
-                own_address.private_notification(payload, network)
+                own_address.private_notification(payload, network).unwrap()
             };
 
             let foreign_utxo =
@@ -6905,6 +7866,132 @@ mod tests {
 
                 Ok(())
             }
+        }
+    }
+
+    mod legacy_dctidh {
+        use bech32::FromBase32;
+        use bech32::ToBase32;
+
+        use super::*;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey;
+        use crate::state::wallet::address::symmetric_key::SymmetricKey;
+        use crate::state::wallet::address::SpendingKey;
+        use crate::state::wallet::utxo_notification::UtxoNotificationPayload;
+
+        const NETWORK: Network = Network::RegTest;
+
+        async fn rpc_server() -> NeptuneRPCServer {
+            let cli = cli_args::Args::default_with_network(NETWORK);
+            test_rpc_server(WalletEntropy::new_random(), 2, cli).await
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn validate_address_refuses_symmetric_keys_and_unusable_dctidh_addresses() {
+            let rpc_server = rpc_server().await;
+            let token = cookie_token(&rpc_server).await;
+            let validate = |address: String| {
+                rpc_server
+                    .clone()
+                    .validate_address(context::current(), token, address, NETWORK)
+            };
+
+            let dctidh = ReceivingAddress::from(
+                dCTIDHSpendingKey::derive_from_seed(rand::random()).to_address(),
+            );
+            let encoded = dctidh.to_bech32m(NETWORK).unwrap();
+            assert_eq!(Some(dctidh), validate(encoded.clone()).await.unwrap());
+
+            let symmetric = ReceivingAddress::from(SymmetricKey::from_seed(rand::random()));
+            let symmetric = symmetric.to_bech32m(NETWORK).unwrap();
+            assert!(ReceivingAddress::from_bech32m(&symmetric, NETWORK).is_ok());
+            assert_eq!(None, validate(symmetric).await.unwrap());
+
+            // the same address with a public key that is not a valid curve
+            let (hrp, data, variant) = bech32::decode(&encoded).unwrap();
+            let mut payload = Vec::<u8>::from_base32(&data).unwrap();
+            payload[..64].fill(0xff);
+            let invalid_key = bech32::encode(&hrp, payload.to_base32(), variant).unwrap();
+            assert!(ReceivingAddress::from_bech32m(&invalid_key, NETWORK).is_ok());
+            assert_eq!(None, validate(invalid_key).await.unwrap());
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn claim_utxo_reports_legacy_format_lock() {
+            let mut rpc_server = rpc_server().await;
+            let (key, legacy_key) = {
+                let mut state = rpc_server.state.lock_guard_mut().await;
+                state.wallet_state.set_legacy_dctidh_key_bound(1).await;
+                state
+                    .wallet_state
+                    .wallet_entropy
+                    .nth_dctidh_spending_key_with_legacy(0)
+            };
+
+            // A notification for the legacy-format lock of index 0, encrypted
+            // to the public key that both address formats of the index share.
+            let utxo = Utxo::new_native_currency(
+                SpendingKey::from(legacy_key).lock_script_hash(),
+                NativeCurrencyAmount::coins(1),
+            );
+            let payload = UtxoNotificationPayload::new(utxo, rand::random());
+            let notification = ReceivingAddress::from(key.to_address())
+                .private_notification(payload, NETWORK)
+                .unwrap();
+
+            let result = rpc_server.claim_utxo_inner(notification, None).await;
+            assert!(
+                matches!(result, Err(error::ClaimError::LegacyFormatLock)),
+                "{result:?}"
+            );
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn send_to_address_with_invalid_public_key_is_an_error() {
+            let rpc_server = rpc_server().await;
+            let token = cookie_token(&rpc_server).await;
+
+            let address = ReceivingAddress::from(
+                dCTIDHSpendingKey::derive_from_seed(rand::random()).to_address(),
+            );
+            let (hrp, data, variant) =
+                bech32::decode(&address.to_bech32m(NETWORK).unwrap()).unwrap();
+            let mut payload = Vec::<u8>::from_base32(&data).unwrap();
+            payload[..64].fill(0xff);
+            let invalid_key = bech32::encode(&hrp, payload.to_base32(), variant).unwrap();
+            let invalid_key = ReceivingAddress::from_bech32m(&invalid_key, NETWORK).unwrap();
+
+            let outputs = rpc_server
+                .clone()
+                .generate_tx_outputs(
+                    context::current(),
+                    token,
+                    vec![OutputFormat::AddressAndAmount(
+                        invalid_key,
+                        NativeCurrencyAmount::coins(1),
+                    )],
+                )
+                .await
+                .unwrap();
+            let result = rpc_server
+                .clone()
+                .generate_tx_details(
+                    context::current(),
+                    token,
+                    TxInputList::default(),
+                    outputs,
+                    ChangePolicy::default(),
+                    NativeCurrencyAmount::zero(),
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(RpcError::CreateTxError(e)) if e.contains("invalid public key")),
+                "{result:?}"
+            );
         }
     }
 }

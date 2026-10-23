@@ -2,6 +2,7 @@ pub mod collect_lock_scripts;
 pub mod collect_type_scripts;
 pub mod collect_type_scripts_v2;
 pub mod kernel_to_outputs;
+pub mod legacy_v7;
 pub mod neptune_proof;
 pub mod proof_collection;
 pub mod removal_records_integrity;

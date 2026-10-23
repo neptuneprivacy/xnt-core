@@ -3,7 +3,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use num_traits::Zero;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::prelude::Digest;
 use tracing::error;
@@ -13,6 +13,9 @@ use tracing::warn;
 use crate::api::tx_initiation::builder::transaction_proof_builder::TransactionProofBuilder;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
+use crate::api::tx_initiation::legacy_era::prove_legacy_era_proof_collection;
+use crate::api::tx_initiation::legacy_era::prove_legacy_era_single_proof;
+use crate::api::tx_initiation::legacy_era::prove_legacy_era_transaction;
 use crate::application::config::fee_notification_policy::FeeNotificationPolicy;
 use crate::application::config::network::Network;
 use crate::application::loops::main_loop::upgrade_incentive::UpgradeIncentive;
@@ -20,12 +23,19 @@ use crate::application::triton_vm_job_queue::TritonVmJobPriority;
 use crate::application::triton_vm_job_queue::TritonVmJobQueue;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+use crate::protocol::consensus::chaintx::cast::cast;
+use crate::protocol::consensus::chaintx::chain::chain;
+use crate::protocol::consensus::chaintx::forge::forge;
+use crate::protocol::consensus::chaintx::link_primitive_witness::LinkPrimitiveWitness;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::fix_link_tx;
+use crate::protocol::consensus::transaction::validity::single_proof_v2::single_proof_program_digest;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
@@ -45,6 +55,13 @@ use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulat
 use crate::MainToPeerTask;
 
 pub(crate) const SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE: usize = 100;
+
+/// A transaction of this node that is still backed by its primitive witness
+/// has never left the node, and its inputs are not selected again while it
+/// sits in the mempool. Upgrading its proof is attempted this many times
+/// before the transaction is removed from the mempool, which makes its inputs
+/// spendable again.
+const MAX_NUM_OWN_UPGRADE_ATTEMPTS: usize = 2;
 
 /// Enumerates the types of 'proof upgrades' that can be done.
 ///
@@ -66,6 +83,127 @@ pub enum UpgradeJob {
         upgrade_incentive: UpgradeIncentive,
     },
     UpdateMutatorSetData(UpdateMutatorSetDataJob),
+
+    /// Fix a resolved link transaction into a `SingleProof`-backed
+    /// transaction with the same txid. Gobbles nothing; the incentive
+    /// reflects this node's own interest in the transaction, e.g. having
+    /// initiated (part of) it.
+    Fix {
+        link_tx: LinkTx,
+        mutator_set: MutatorSetAccumulator,
+        upgrade_incentive: UpgradeIncentive,
+    },
+}
+
+/// Forge a [`LinkPrimitiveWitness`] into a proof-backed [`LinkTx`]: the first
+/// step of a chained send.
+///
+/// Like its chain-pipeline siblings [`CastJob`], [`ChainJob`] and
+/// [`UpdateLinkJob`], not a variant of [`UpgradeJob`]: the output is a
+/// [`LinkTx`], not a [`Transaction`], so it does not fit that enum's `upgrade`
+/// interface.
+#[derive(Clone, Debug)]
+pub(crate) struct ForgeJob {
+    pub link_primitive_witness: LinkPrimitiveWitness,
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl ForgeJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        Ok(forge(
+            &self.link_primitive_witness,
+            single_proof_program_digest(self.consensus_rule_set),
+            self.consensus_rule_set,
+            triton_vm_job_queue,
+            proof_job_options,
+        )
+        .await?)
+    }
+}
+
+/// Cast a `SingleProof`-backed [`Transaction`] into a proof-backed
+/// [`LinkTx`], so it can be cut through, i.e. be an operand of [`ChainJob`].
+#[derive(Clone, Debug)]
+pub(crate) struct CastJob {
+    pub transaction: Transaction,
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl CastJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        Ok(cast(
+            self.transaction,
+            single_proof_program_digest(self.consensus_rule_set),
+            self.consensus_rule_set,
+            triton_vm_job_queue,
+            proof_job_options,
+        )
+        .await?)
+    }
+}
+
+/// Chain two proof-backed [`LinkTx`]s into one, with maximal cut-through.
+#[derive(Clone, Debug)]
+pub(crate) struct ChainJob {
+    pub left: LinkTx,
+    pub right: LinkTx,
+    pub shuffle_seed: [u8; 32],
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl ChainJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        Ok(chain(
+            self.left,
+            self.right,
+            single_proof_program_digest(self.consensus_rule_set),
+            self.consensus_rule_set,
+            self.shuffle_seed,
+            triton_vm_job_queue,
+            proof_job_options,
+        )
+        .await?)
+    }
+}
+
+/// Re-target a proof-backed [`LinkTx`] at a newer mutator set, after blocks
+/// arrived while a chained send was proving. See [`ForgeJob`].
+#[derive(Clone, Debug)]
+pub(crate) struct UpdateLinkJob {
+    pub link_tx: LinkTx,
+    pub old_mutator_set_accumulator: MutatorSetAccumulator,
+    pub mutator_set_update: MutatorSetUpdate,
+    pub consensus_rule_set: ConsensusRuleSet,
+}
+
+impl UpdateLinkJob {
+    pub(crate) async fn upgrade(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> anyhow::Result<LinkTx> {
+        self.link_tx
+            .new_with_updated_mutator_set_records(
+                &self.old_mutator_set_accumulator,
+                &self.mutator_set_update,
+                single_proof_program_digest(self.consensus_rule_set),
+                triton_vm_job_queue,
+                proof_job_options,
+            )
+            .await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +239,11 @@ pub struct PrimitiveWitnessToSingleProof {
 impl PrimitiveWitnessToSingleProof {
     /// Execute the upgrade from a primitive witness to a single proof.
     ///
+    /// For the legacy era, the v7 proof collection is raised to a v7 single
+    /// proof only where this machine can hold it; otherwise the transaction
+    /// keeps its v7 proof collection. See
+    /// [`prove_legacy_era_transaction`].
+    ///
     /// Takes a very long time to execute, so no locks maybe be held when this
     /// is invoked.
     pub(crate) async fn upgrade(
@@ -109,6 +252,19 @@ impl PrimitiveWitnessToSingleProof {
         proof_job_options: &TritonVmProofJobOptions,
         consensus_rule_set: ConsensusRuleSet,
     ) -> anyhow::Result<Transaction> {
+        if consensus_rule_set.is_legacy_era() {
+            info!("Proof-upgrader: Start producing v7 single proof");
+            let transaction = prove_legacy_era_transaction(
+                &self.primitive_witness,
+                triton_vm_job_queue,
+                proof_job_options,
+                true,
+            )
+            .await?;
+            info!("Proof-upgrader, v7 proof: Done");
+            return Ok(transaction);
+        }
+
         let options = TritonVmProofJobOptionsBuilder::new()
             .template(proof_job_options)
             .proof_type(TransactionProofType::SingleProof)
@@ -137,11 +293,28 @@ pub struct PrimitiveWitnessToProofCollection {
 }
 
 impl PrimitiveWitnessToProofCollection {
+    /// Prove the transaction's proof collection under the given rule set. For
+    /// the legacy era, the result is verified before it is returned; see
+    /// [`prove_legacy_era_transaction`].
     pub(crate) async fn upgrade(
         self,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: &TritonVmProofJobOptions,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> anyhow::Result<Transaction> {
+        if consensus_rule_set.is_legacy_era() {
+            info!("Proof-upgrader: Start producing v7 proof collection");
+            let transaction = prove_legacy_era_transaction(
+                &self.primitive_witness,
+                triton_vm_job_queue,
+                proof_job_options,
+                false,
+            )
+            .await?;
+            info!("Proof-upgrader, v7 proof collection: Done");
+            return Ok(transaction);
+        }
+
         let options = TritonVmProofJobOptionsBuilder::new()
             .template(proof_job_options)
             .proof_type(TransactionProofType::ProofCollection)
@@ -149,6 +322,7 @@ impl PrimitiveWitnessToProofCollection {
 
         info!("Proof-upgrader: Start producing proof collection");
         let proof_collection = TransactionProofBuilder::new()
+            .consensus_rule_set(consensus_rule_set)
             .primitive_witness_ref(&self.primitive_witness)
             .job_queue(triton_vm_job_queue.clone())
             .proof_job_options(options)
@@ -306,6 +480,7 @@ impl UpgradeJob {
             UpgradeJob::UpdateMutatorSetData(update_mutator_set_data_job) => {
                 update_mutator_set_data_job.old_kernel.timestamp
             }
+            UpgradeJob::Fix { link_tx, .. } => link_tx.kernel.kernel.timestamp,
         }
     }
 
@@ -331,6 +506,36 @@ impl UpgradeJob {
             UpgradeJob::UpdateMutatorSetData(UpdateMutatorSetDataJob {
                 upgrade_incentive, ..
             }) => *upgrade_incentive,
+            UpgradeJob::Fix {
+                upgrade_incentive, ..
+            } => *upgrade_incentive,
+        }
+    }
+
+    /// Whether this job proves a transaction of this node from its primitive
+    /// witness.
+    fn is_own_witness_upgrade(&self) -> bool {
+        matches!(
+            self,
+            UpgradeJob::PrimitiveWitnessToProofCollection(_)
+                | UpgradeJob::PrimitiveWitnessToSingleProof(_)
+        )
+    }
+
+    /// The primitive witness that an upgrade of this node's own transaction
+    /// proves from, and whether it asks for a single proof.
+    fn legacy_era_own_witness(&self) -> Option<(PrimitiveWitness, bool)> {
+        match self {
+            UpgradeJob::PrimitiveWitnessToProofCollection(pw_to_pc) => {
+                Some((pw_to_pc.primitive_witness.clone(), false))
+            }
+            UpgradeJob::PrimitiveWitnessToSingleProof(pw_to_sp) => {
+                Some((pw_to_sp.primitive_witness.clone(), true))
+            }
+            UpgradeJob::ProofCollectionToSingleProof(_)
+            | UpgradeJob::Merge { .. }
+            | UpgradeJob::UpdateMutatorSetData(_)
+            | UpgradeJob::Fix { .. } => None,
         }
     }
 
@@ -357,6 +562,7 @@ impl UpgradeJob {
                 vec![pw_to_sp.primitive_witness.kernel.txid()]
             }
             UpgradeJob::UpdateMutatorSetData(update_job) => vec![update_job.old_kernel.txid()],
+            UpgradeJob::Fix { link_tx, .. } => vec![link_tx.txid()],
         }
     }
 
@@ -375,6 +581,7 @@ impl UpgradeJob {
                 ..
             }) => mutator_set.clone(),
             UpgradeJob::Merge { mutator_set, .. } => mutator_set.clone(),
+            UpgradeJob::Fix { mutator_set, .. } => mutator_set.clone(),
             UpgradeJob::UpdateMutatorSetData(update_mutator_set_data_job) => {
                 let mut new_msa = update_mutator_set_data_job.old_mutator_set.clone();
                 update_mutator_set_data_job
@@ -406,7 +613,161 @@ impl UpgradeJob {
             UpgradeJob::UpdateMutatorSetData(_) => {
                 "Transaction got mined while this update job was running?"
             }
+            UpgradeJob::Fix { .. } => {
+                "The link transaction got mined or fixed by someone else already?"
+            }
         }
+    }
+
+    /// The upgrade of this node's own transaction in the legacy era: prove its
+    /// v7 proof collection, and take it into the legacy relay pool and
+    /// announce it as soon as it exists; then, if `attempt_single_proof`, try
+    /// the v7 single proof once, at low priority, and take it likewise.
+    ///
+    /// A proof that a block made stale while proving, or of a transaction that
+    /// the pool no longer holds as this node's, is dropped and not made again:
+    /// the update jobs of each block prove this node's transactions of that
+    /// era again (see `LegacyRelayPool::update_with_block`), as proof
+    /// collections, which take seconds, where a single proof takes minutes.
+    async fn handle_legacy_era_own_upgrade(
+        primitive_witness: PrimitiveWitness,
+        attempt_single_proof: bool,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        mut global_state_lock: GlobalStateLock,
+        main_to_peer_channel: tokio::sync::broadcast::Sender<MainToPeerTask>,
+        job_options: TritonVmProofJobOptions,
+    ) {
+        let txid = primitive_witness.kernel.txid();
+        let proof_collection = match prove_legacy_era_proof_collection(
+            &primitive_witness,
+            triton_vm_job_queue.clone(),
+            &job_options,
+        )
+        .await
+        {
+            Ok(transaction) => transaction,
+            Err(e) => {
+                warn!(
+                    "Proving the v7 proof collection of transaction {txid} failed: {e}. The \
+                     update jobs of the next block prove it again."
+                );
+                return;
+            }
+        };
+        if !Self::take_legacy_era_proof(
+            &mut global_state_lock,
+            &primitive_witness,
+            &proof_collection,
+            &main_to_peer_channel,
+        )
+        .await
+        {
+            return;
+        }
+        if !attempt_single_proof {
+            return;
+        }
+
+        let single_proof_options = TritonVmProofJobOptionsBuilder::new()
+            .template(&job_options)
+            .job_priority(TritonVmJobPriority::Low)
+            .build();
+        match prove_legacy_era_single_proof(
+            &proof_collection,
+            triton_vm_job_queue,
+            &single_proof_options,
+        )
+        .await
+        {
+            Ok(Some(single_proof)) => {
+                Self::take_legacy_era_proof(
+                    &mut global_state_lock,
+                    &primitive_witness,
+                    &single_proof,
+                    &main_to_peer_channel,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => info!(
+                "Transaction {txid} keeps its v7 proof collection: the v7 single proof failed: {e}"
+            ),
+        }
+    }
+
+    /// Take a v7 proof of this node's own transaction into the legacy relay
+    /// pool, with the primitive witness it was proven from, and announce it.
+    /// Only while the next block still belongs to the legacy era, the proof is
+    /// synced to the tip and its inputs unspent, and the pool holds the
+    /// transaction as this node's: a block may have mined it, or it may have
+    /// been removed, while proving. Returns whether the proof was taken.
+    async fn take_legacy_era_proof(
+        global_state_lock: &mut GlobalStateLock,
+        primitive_witness: &PrimitiveWitness,
+        transaction: &Transaction,
+        main_to_peer_channel: &tokio::sync::broadcast::Sender<MainToPeerTask>,
+    ) -> bool {
+        let txid = transaction.kernel.txid();
+        let mut state = global_state_lock.lock_guard_mut().await;
+        let next_block_rule_set = state.next_block_consensus_rule_set();
+        if !next_block_rule_set.is_legacy_era() {
+            info!(
+                "Discarding the v7 proof of transaction {txid}: the next block follows \
+                 {next_block_rule_set}"
+            );
+            return false;
+        }
+
+        let tip_mutator_set = state
+            .chain
+            .light_state()
+            .mutator_set_accumulator_after()
+            .expect("Block from state must have mutator set after");
+        if transaction.kernel.mutator_set_hash != tip_mutator_set.hash() {
+            info!(
+                "Discarding the v7 proof of transaction {txid}: a block arrived while proving, \
+                 whose update jobs prove it again"
+            );
+            return false;
+        }
+        if !transaction.is_confirmable_relative_to(&tip_mutator_set) {
+            warn!("Discarding the v7 proof of transaction {txid}: an input is spent already");
+            state.mempool_remove(txid).await;
+            return false;
+        }
+        if !state.legacy_relay_pool.is_own(txid) {
+            info!(
+                "Discarding the v7 proof of transaction {txid}: the legacy relay pool no longer \
+                 holds it."
+            );
+            return false;
+        }
+
+        state
+            .mempool_update_primitive_witness(txid, primitive_witness.clone())
+            .await;
+        state
+            .mempool_insert(
+                transaction.clone(),
+                UpgradeIncentive::Critical.into(),
+                AddReason::Upgraded,
+            )
+            .await;
+        drop(state);
+
+        let peer_msg = MainToPeerTask::TransactionNotification(transaction.try_into().unwrap());
+        if let Err(e) = main_to_peer_channel.send(peer_msg) {
+            // panic only if receiver_count is non-zero.
+            let receiver_count = main_to_peer_channel.receiver_count();
+            assert_eq!(
+                receiver_count, 0,
+                "failed to broadcast message from main to {} peers: {:?}",
+                receiver_count, e
+            );
+        }
+        info!("Took the v7 proof of transaction {txid}");
+
+        true
     }
 
     /// Upgrade transaction proofs, inserts upgraded tx into the mempool and
@@ -425,6 +786,8 @@ impl UpgradeJob {
             _ => TritonVmJobPriority::Low,
         };
 
+        let mut num_failed_attempts = 0;
+
         // process in a loop.  in case a new block comes in while processing
         // the current tx, then we can move on to the next, and so on.
         loop {
@@ -439,18 +802,38 @@ impl UpgradeJob {
 
             // It's a important to *not* hold any locks when proving happens.
             // Otherwise, entire application freezes!!
-            let (wallet_entropy, block_height) = {
+            let (wallet_entropy, block_height, consensus_rule_set) = {
                 let state = global_state_lock.lock_guard().await;
                 (
                     state.wallet_state.wallet_entropy.clone(),
                     state.chain.light_state().header().height,
+                    state.next_block_consensus_rule_set(),
                 )
             };
+
+            // In the legacy era, this node's own transactions are proven in
+            // two steps, and not again after a block.
+            if consensus_rule_set.is_legacy_era() {
+                if let Some((primitive_witness, attempt_single_proof)) =
+                    upgrade_job.legacy_era_own_witness()
+                {
+                    Self::handle_legacy_era_own_upgrade(
+                        primitive_witness,
+                        attempt_single_proof,
+                        triton_vm_job_queue,
+                        global_state_lock,
+                        main_to_peer_channel,
+                        job_options,
+                    )
+                    .await;
+                    return;
+                }
+            }
 
             /* Perform upgrade */
             // No locks may be held here!
             let offchain_notifications = global_state_lock.cli().fee_notification;
-            let (upgraded, expected_utxos) = match upgrade_job
+            let (upgraded, gobbler_expected_utxo) = match upgrade_job
                 .clone()
                 .upgrade(
                     triton_vm_job_queue.clone(),
@@ -461,21 +844,55 @@ impl UpgradeJob {
                 )
                 .await
             {
-                Ok((upgraded_tx, expected_utxos)) => {
+                Ok((upgraded_tx, expected_utxo)) => {
                     info!(
                         "Successfully upgraded transaction {}",
                         upgraded_tx.kernel.txid()
                     );
-                    (upgraded_tx, expected_utxos)
+                    (upgraded_tx, expected_utxo)
                 }
                 Err(e) => {
-                    error!("UpgradeProof job failed. error: {e}");
+                    error!(
+                        "UpgradeProof job failed for transaction(s) {}. error: {e}",
+                        affected_txids.iter().join("; ")
+                    );
                     error!(
                         "Consider lowering your proving capability to {}, in case it is set higher.\nCurrent proving \
                         capability is set to: {}.",
                         TxProvingCapability::ProofCollection,
                         global_state_lock.cli().proving_capability()
                     );
+
+                    if upgrade_job.is_own_witness_upgrade() {
+                        num_failed_attempts += 1;
+                        if num_failed_attempts < MAX_NUM_OWN_UPGRADE_ATTEMPTS {
+                            info!(
+                                "Retrying the proof upgrade of own transaction {}",
+                                affected_txids.iter().join("; ")
+                            );
+                            continue;
+                        }
+
+                        warn!(
+                            "Removing own transaction {} from the mempool after {num_failed_attempts} \
+                             failed proof upgrades. Its inputs can be spent again.",
+                            affected_txids.iter().join("; ")
+                        );
+                        let mut global_state = global_state_lock.lock_guard_mut().await;
+                        for txid in affected_txids {
+                            global_state.mempool_remove(txid).await;
+                        }
+                        return;
+                    }
+
+                    // Pass over these transactions until the next block, so
+                    // that one job that cannot succeed does not keep every
+                    // other candidate from being upgraded.
+                    global_state_lock
+                        .lock_guard_mut()
+                        .await
+                        .mempool_record_upgrade_failure(affected_txids);
+
                     return;
                 }
             };
@@ -483,17 +900,34 @@ impl UpgradeJob {
             /* Check if upgrade resulted in valid transaction */
             upgrade_job = {
                 let mut global_state = global_state_lock.lock_guard_mut().await;
+                // Notify wallet of gobbler UTXO
+                global_state
+                    .wallet_state
+                    .add_expected_utxos(gobbler_expected_utxo)
+                    .await;
+
+                // A proof made for one era is of no use in the other. When
+                // the next block changed eras while proving, this node's own
+                // transactions are carried over by the change itself, see
+                // `GlobalState::set_new_tip`.
+                let next_block_rule_set = global_state.next_block_consensus_rule_set();
+                if next_block_rule_set != consensus_rule_set {
+                    info!(
+                        "Discarding the proof upgrade of transaction(s) {}: it was made for \
+                         {consensus_rule_set}, but the next block follows {next_block_rule_set}",
+                        affected_txids.iter().join("; ")
+                    );
+                    return;
+                }
+
                 let tip_mutator_set = global_state
                     .chain
                     .light_state()
                     .mutator_set_accumulator_after()
                     .expect("Block from state must have mutator set after");
-
                 let transaction_is_up_to_date =
                     upgraded.kernel.mutator_set_hash == tip_mutator_set.hash();
 
-                let network = global_state.cli().network;
-                let consensus_rule_set = ConsensusRuleSet::infer_from(network, block_height);
                 if transaction_is_up_to_date {
                     // Did the transaction get mined while the proof upgrade
                     // job was running? If so, don't share it or insert it into
@@ -512,11 +946,6 @@ impl UpgradeJob {
                     // sure to have it when they ask.
                     global_state
                         .mempool_insert(upgraded.clone(), upgrade_incentive.into(), AddReason::Upgraded)
-                        .await;
-
-                    global_state
-                        .wallet_state
-                        .add_expected_utxos(expected_utxos)
                         .await;
                     drop(global_state); // sooner is better.
 
@@ -544,7 +973,7 @@ impl UpgradeJob {
 
                 let Some(ms_update) = global_state
                     .chain
-                    .archival_state_mut()
+                    .archival_state()
                     .get_mutator_set_update_to_tip(
                         &mutator_set_for_tx,
                         SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
@@ -555,7 +984,17 @@ impl UpgradeJob {
                     return;
                 };
 
-                if let TransactionProof::SingleProof(single_proof) = upgraded.proof {
+                if consensus_rule_set.is_legacy_era() {
+                    // This version does not update v7 proofs. Its own
+                    // transactions of the legacy era do not come here, see
+                    // `handle_legacy_era_own_upgrade`.
+                    warn!(
+                        "Not updating the upgraded transaction {}: this version does not update \
+                         proofs of {consensus_rule_set}",
+                        upgraded.kernel.txid()
+                    );
+                    return;
+                } else if let TransactionProof::SingleProof(single_proof) = upgraded.proof {
                     // Transaction is single-proof supported but MS data is deprecated. Create new
                     // upgrade job to fix that.
                     let upgrade_incentive = upgrade_incentive.after_upgrade();
@@ -589,6 +1028,7 @@ impl UpgradeJob {
                         UpgradeJob::ProofCollectionToSingleProof { .. } => unreachable!(),
                         UpgradeJob::Merge { .. } => unreachable!(),
                         UpgradeJob::UpdateMutatorSetData(_) => unreachable!(),
+                        UpgradeJob::Fix { .. } => unreachable!(),
                     }
                 }
             };
@@ -630,6 +1070,9 @@ impl UpgradeJob {
 
     /// Build a single-proof backed gobbler transaction that can be used to
     /// charge another transaction for upgrading a proof.
+    ///
+    /// Returns the transaction and the to-be-expected UTXO if node uses
+    /// off-chain fee notificaitons.
     #[expect(clippy::too_many_arguments)]
     async fn build_gobbler(
         gobbling_fee: NativeCurrencyAmount,
@@ -640,7 +1083,7 @@ impl UpgradeJob {
         fee_notification_policy: FeeNotificationPolicy,
         mutator_set: MutatorSetAccumulator,
         old_tx_timestamp: Timestamp,
-    ) -> anyhow::Result<(Transaction, Vec<ExpectedUtxo>)> {
+    ) -> anyhow::Result<(Transaction, Option<ExpectedUtxo>)> {
         info!("Producing gobbler-transaction for a value of {gobbling_fee}");
         let (utxo_notification_method, receiver_preimage) =
             Self::gobbler_notification_method_with_receiver_preimage(
@@ -659,12 +1102,17 @@ impl UpgradeJob {
 
         let gobbler_witness = gobbler.primitive_witness();
 
-        let expected_utxos = if fee_notification_policy == FeeNotificationPolicy::OffChain {
+        let expected_utxo = if fee_notification_policy == FeeNotificationPolicy::OffChain {
             gobbler
                 .tx_outputs
                 .expected_utxos(UtxoNotifier::FeeGobbler, receiver_preimage)
         } else {
             vec![]
+        };
+        let expected_utxo = match expected_utxo.len() {
+            0 => None,
+            1 => Some(expected_utxo[0].clone()),
+            _ => panic!("Fee gobbler can maximum create one known output"),
         };
 
         // ensure that proof-type is SingleProof
@@ -673,7 +1121,7 @@ impl UpgradeJob {
             .proof_type(TransactionProofType::SingleProof)
             .build();
 
-        let consensus_rule_set = ConsensusRuleSet::infer_from(
+        let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(
             proof_job_options.job_settings.network,
             current_block_height,
         );
@@ -691,17 +1139,18 @@ impl UpgradeJob {
             proof,
         };
 
-        Ok((gobbler_tx, expected_utxos))
+        Ok((gobbler_tx, expected_utxo))
     }
 
     /// Execute the proof upgrade.
     ///
     /// Upgrades transactions to a proof of higher quality that is more likely
     /// to be picked up by a miner. Returns the upgraded proof, or an error if
-    /// the prover is already in use and the proof_job_options is set to not wait if
-    /// prover is busy.
+    /// the prover is already in use and the proof_job_options is set to not
+    /// wait if prover is busy.
     ///
-    /// Charges a fee for the upgrade task if this is desirable.
+    /// Charges a fee for the upgrade task if this is desirable, and returns
+    /// the to-be-expected UTXO associated with this fee.
     pub(crate) async fn upgrade(
         self,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
@@ -709,15 +1158,18 @@ impl UpgradeJob {
         own_wallet_entropy: &WalletEntropy,
         current_block_height: BlockHeight,
         fee_notification_policy: FeeNotificationPolicy,
-    ) -> anyhow::Result<(Transaction, Vec<ExpectedUtxo>)> {
+    ) -> anyhow::Result<(Transaction, Option<ExpectedUtxo>)> {
         let gobbling_fee = self.gobbling_fee();
         let mutator_set = self.mutator_set();
         let old_tx_timestamp = self.old_tx_timestamp();
+        // The upgraded transaction is mined in a later block, so it is made
+        // for the rule set of the next block.
         let network = proof_job_options.job_settings.network;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, current_block_height);
+        let consensus_rule_set =
+            ConsensusRuleSet::infer_for_next_block(network, current_block_height);
 
-        let (maybe_gobbler, expected_utxos) = if gobbling_fee.is_positive() {
-            let (gobbler, eutxos) = Self::build_gobbler(
+        let (maybe_gobbler, gobbler_expected_utxo) = if gobbling_fee.is_positive() {
+            let (gobbler, gobbler_eutxo) = Self::build_gobbler(
                 gobbling_fee,
                 triton_vm_job_queue.clone(),
                 proof_job_options.clone(),
@@ -729,9 +1181,9 @@ impl UpgradeJob {
             )
             .await?;
 
-            (Some(gobbler), eutxos)
+            (Some(gobbler), gobbler_eutxo)
         } else {
-            (None, vec![])
+            (None, None)
         };
 
         let mut rng: StdRng =
@@ -778,7 +1230,7 @@ impl UpgradeJob {
                     upgraded_tx
                 };
 
-                Ok((tx, expected_utxos))
+                Ok((tx, gobbler_expected_utxo))
             }
             UpgradeJob::Merge {
                 left_kernel,
@@ -822,13 +1274,17 @@ impl UpgradeJob {
                     info!("Proof-upgrader merging with gobbler: Done");
                 };
 
-                Ok((ret, expected_utxos))
+                Ok((ret, gobbler_expected_utxo))
             }
             UpgradeJob::PrimitiveWitnessToProofCollection(pw_to_pc) => Ok((
                 pw_to_pc
-                    .upgrade(triton_vm_job_queue.clone(), &proof_job_options)
+                    .upgrade(
+                        triton_vm_job_queue.clone(),
+                        &proof_job_options,
+                        consensus_rule_set,
+                    )
                     .await?,
-                expected_utxos,
+                gobbler_expected_utxo,
             )),
             UpgradeJob::PrimitiveWitnessToSingleProof(pw_to_sp) => Ok((
                 pw_to_sp
@@ -838,13 +1294,24 @@ impl UpgradeJob {
                         consensus_rule_set,
                     )
                     .await?,
-                expected_utxos,
+                gobbler_expected_utxo,
             )),
             UpgradeJob::UpdateMutatorSetData(update_job) => {
                 let ret = update_job
                     .upgrade(triton_vm_job_queue, proof_job_options)
                     .await?;
-                Ok((ret, expected_utxos))
+                Ok((ret, gobbler_expected_utxo))
+            }
+            UpgradeJob::Fix { link_tx, .. } => {
+                let ret = fix_link_tx(
+                    link_tx,
+                    consensus_rule_set,
+                    triton_vm_job_queue,
+                    proof_job_options,
+                )
+                .await?;
+                info!("Proof-upgrader, fix: Done");
+                Ok((ret, gobbler_expected_utxo))
             }
         }
     }
@@ -855,7 +1322,7 @@ impl UpgradeJob {
 /// of this job to the wallet of this node. The value reported will be zero for
 /// all 3rd party transactions.
 pub(super) async fn get_upgrade_task_from_mempool(
-    global_state: &mut GlobalState,
+    global_state: &GlobalState,
 ) -> Option<UpgradeJob> {
     let tip_mutator_set = global_state
         .chain
@@ -867,6 +1334,30 @@ pub(super) async fn get_upgrade_task_from_mempool(
     let num_proofs_threshold = global_state.max_num_proofs();
 
     let upgrade_filter = global_state.cli().tx_upgrade_filter;
+
+    // Do we have a resolved link transaction to fix? Fixing gobbles nothing,
+    // but our own interest in the transaction can still make it urgent. A
+    // foreign one is fixed only if this node upgrades for free. And only under
+    // a rule set whose `SingleProof` program has the `Fix` branch, and that
+    // the next block keeps, since a fixed transaction is mined no earlier.
+    let tip_height = global_state.chain.light_state().header().height;
+    let network = global_state.cli().network;
+    let tip_rule_set = ConsensusRuleSet::infer_from(network, tip_height);
+    let next_rule_set = ConsensusRuleSet::infer_from(network, tip_height.next());
+    let fix_job = (tip_rule_set == next_rule_set && tip_rule_set.has_chain_branches())
+        .then(|| global_state.mempool.preferred_link_fix(upgrade_filter))
+        .flatten()
+        .map(|(link_tx, priority)| {
+            let upgrade_incentive =
+                priority.incentive_given_gobble_potential(NativeCurrencyAmount::zero());
+            (link_tx, upgrade_incentive)
+        })
+        .filter(|(_, upgrade_incentive)| upgrade_incentive.upgrade_is_worth_it(min_gobbling_fee))
+        .map(|(link_tx, upgrade_incentive)| UpgradeJob::Fix {
+            link_tx: link_tx.to_owned(),
+            mutator_set: tip_mutator_set.clone(),
+            upgrade_incentive,
+        });
 
     // Do we have any `ProofCollection`s?
     let proof_collection_job = if let Some((kernel, proof, upgrade_priority)) = global_state
@@ -953,13 +1444,13 @@ pub(super) async fn get_upgrade_task_from_mempool(
     };
 
     // pick the most profitable option
-    let mut jobs = [proof_collection_job, merge_job, update_job]
+    let mut jobs = [proof_collection_job, merge_job, update_job, fix_job]
         .into_iter()
         .flatten()
         .collect_vec();
     jobs.sort_by_key(|job| job.upgrade_incentive());
 
-    jobs.first().cloned()
+    jobs.last().cloned()
 }
 
 #[cfg(test)]
@@ -1033,7 +1524,9 @@ mod tests {
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn dont_upgrade_foreign_proof_collection_if_fee_too_low() {
-        let network = Network::Main;
+        // Use a network whose premine funds the devnet wallet; on mainnet
+        // this fork's premine leaves the test wallet without funds.
+        let network = Network::RegTest;
 
         // Alice is premine recipient, so she can make a transaction (after
         // expiry of timelock). Rando is not premine recipient.
@@ -1061,9 +1554,9 @@ mod tests {
                 .await;
             assert!(
                 !upgrade_priority.is_irrelevant()
-                    && get_upgrade_task_from_mempool(&mut rando).await.is_some()
+                    && get_upgrade_task_from_mempool(&rando).await.is_some()
                     || upgrade_priority.is_irrelevant()
-                        && get_upgrade_task_from_mempool(&mut rando).await.is_none()
+                        && get_upgrade_task_from_mempool(&rando).await.is_none()
             );
 
             // A high-fee paying transaction must be returned for upgrading
@@ -1078,7 +1571,7 @@ mod tests {
             rando
                 .mempool_insert(pc_tx_high_fee.clone().into(), UpgradePriority::Irrelevant, AddReason::Submitted)
                 .await;
-            let job = get_upgrade_task_from_mempool(&mut rando).await.unwrap();
+            let job = get_upgrade_task_from_mempool(&rando).await.unwrap();
             let UpgradeJob::ProofCollectionToSingleProof(ProofCollectionToSingleProof {
                 kernel,
                 ..
@@ -1093,6 +1586,99 @@ mod tests {
                 "Returned job must be the one with a high fee"
             );
         }
+    }
+
+    /// A resolved, proof-backed link transaction synced to the genesis block of
+    /// the network, which has chain branches at every height.
+    fn resolved_link_tx(network: Network) -> LinkTx {
+        use tasm_lib::triton_vm::proof::Claim;
+
+        use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;
+        use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::tests::shared::mock_tx::make_plenty_mock_transaction_supported_by_invalid_single_proofs;
+
+        let mutator_set_hash = Block::genesis(network)
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .hash();
+        let [tx] = make_plenty_mock_transaction_supported_by_invalid_single_proofs(1)
+            .try_into()
+            .unwrap();
+        LinkTx {
+            kernel: LinkKernel {
+                kernel: TransactionKernelModifier::default()
+                    .mutator_set_hash(mutator_set_hash)
+                    .modify(tx.kernel),
+                thruputs: vec![],
+            },
+            proof: LinkTxProof::Proof(Proof::valid_mock(Claim::new(Digest::default()))),
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn foreign_link_is_fixed_only_when_upgrading_for_free() {
+        let network = Network::RegTest;
+        let resolved_foreign_link = resolved_link_tx(network);
+
+        for (min_gobbling_fee, expect_fix) in [
+            (NativeCurrencyAmount::coins(1), false),
+            (NativeCurrencyAmount::coins(0), true),
+        ] {
+            let cli_args = cli_args::Args {
+                min_gobbling_fee,
+                network,
+                tx_proving_capability: Some(TxProvingCapability::SingleProof),
+                ..Default::default()
+            };
+            let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli_args).await;
+            bob.lock_guard_mut()
+                .await
+                .mempool_insert_link(
+                    resolved_foreign_link.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::FromPeer,
+                )
+                .await;
+
+            let job = get_upgrade_task_from_mempool(&*bob.lock_guard().await).await;
+            assert_eq!(
+                expect_fix,
+                matches!(job, Some(UpgradeJob::Fix { .. })),
+                "min gobbling fee {min_gobbling_fee}"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn fix_job_yields_a_single_proof_transaction_with_the_same_txid() {
+        let network = Network::RegTest;
+        let link_tx = resolved_link_tx(network);
+        let txid = link_tx.txid();
+        let job = UpgradeJob::Fix {
+            mutator_set: Block::genesis(network)
+                .mutator_set_accumulator_after()
+                .unwrap(),
+            link_tx,
+            upgrade_incentive: UpgradeIncentive::Critical,
+        };
+        assert_eq!(vec![txid], job.affected_txids());
+
+        let (fixed, gobbler_utxo) = job
+            .upgrade(
+                TritonVmJobQueue::get_instance(),
+                TritonVmProofJobOptions::default_with_network(network),
+                &WalletEntropy::new_random(),
+                BlockHeight::genesis(),
+                FeeNotificationPolicy::OffChain,
+            )
+            .await
+            .unwrap();
+        assert_eq!(txid, fixed.txid());
+        assert!(fixed.proof.is_single_proof());
+        assert!(gobbler_utxo.is_none(), "fixing gobbles nothing");
     }
 
     #[traced_test]
@@ -1228,7 +1814,7 @@ mod tests {
             let genesis_block = Block::genesis(network);
             let block1 =
                 invalid_empty_block_with_timestamp(&genesis_block, pwtx.kernel.timestamp, network);
-            let block1_msu = block1.mutator_set_update().unwrap();
+            let block1_msu = block1.mutator_set_update(network).unwrap();
             println!(
                 "block1_msu #addition records: {}; block1_msu #removal records: {}",
                 block1_msu.additions.len(),
@@ -1336,8 +1922,8 @@ mod tests {
         }
 
         let merge_upgrade_job = {
-            let mut alice = alice.lock_guard_mut().await;
-            get_upgrade_task_from_mempool(&mut alice).await.unwrap()
+            let alice = alice.lock_guard().await;
+            get_upgrade_task_from_mempool(&alice).await.unwrap()
         };
         assert!(
             matches!(merge_upgrade_job, UpgradeJob::Merge { .. }),

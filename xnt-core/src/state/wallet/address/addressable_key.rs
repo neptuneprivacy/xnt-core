@@ -200,8 +200,20 @@ impl SpendingKey {
         }
     }
 
-    pub(crate) fn lock_script_hash(&self) -> Digest {
+    pub fn lock_script_hash(&self) -> Digest {
         self.lock_script().hash()
+    }
+
+    /// True for dCTIDH keys derived with the legacy (pre-v0.3) lock
+    /// derivation. Such keys only recognize and spend UTXOs received at
+    /// legacy-format addresses and have no receiving address; see
+    /// [dctidh_address::legacy_dctidh_cutoff] for the heights at which such
+    /// UTXOs are recognized.
+    pub fn is_legacy(&self) -> bool {
+        match self {
+            Self::dCTIDH(k) => k.is_legacy(),
+            Self::Generation(_) | Self::Symmetric(_) => false,
+        }
     }
 
     /// Return the privacy preimage if this spending key has a corresponding
@@ -277,6 +289,7 @@ impl SpendingKey {
         // pre-compute some fields, and early-abort if key cannot receive.
         let receiver_identifier = self.receiver_identifier();
         let receiver_preimage = self.privacy_preimage();
+        let lock_script_hash = self.lock_script_hash();
 
         // for all announcements
         tx_kernel
@@ -306,20 +319,18 @@ impl SpendingKey {
             // party can craft an announcement that decrypts under this key but
             // whose UTXO is locked by a foreign script; tracking it would
             // inflate the wallet balance with unspendable funds.
-            .filter(|(utxo, _, _)| utxo.lock_script_hash() == self.lock_script_hash())
+            .filter(|(utxo, _, _)| utxo.lock_script_hash() == lock_script_hash)
 
-            // ... map to IncomingUtxo
-            .map(move |(utxo, sender_randomness, payment_id)| {
-                // and join those with the receiver digest to get a commitment
-                // Note: the commitment is computed in the same way as in the mutator set.
-                IncomingUtxo {
-                    utxo,
-                    sender_randomness,
-                    receiver_preimage,
-                    is_guesser_fee: false,
-                    payment_id,
-                }
-            }).collect()
+            // and join those with the receiver digest to get a commitment
+            // Note: the commitment is computed in the same way as in the mutator set.
+            .map(|(utxo, sender_randomness, payment_id)| IncomingUtxo {
+                utxo,
+                sender_randomness,
+                receiver_preimage,
+                is_guesser_fee: false,
+                payment_id,
+            })
+            .collect()
     }
 
     /// converts a result into an Option and logs a warning on any error

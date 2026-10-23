@@ -6,7 +6,7 @@ use get_size2::GetSize;
 use itertools::Itertools;
 use rand::rngs::StdRng;
 use rand::Rng;
-use rand::RngCore;
+use rand::RngExt;
 use rand::SeedableRng;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;

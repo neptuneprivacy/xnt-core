@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arbitrary::Arbitrary;
 use get_size2::GetSize;
 use itertools::Itertools;
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::triton_vm::prelude::*;
@@ -134,6 +134,15 @@ impl LockScriptAndWitness {
         )
     }
 
+    /// A hash lock with the same unlock key as a generation address derived
+    /// from `seed`, so that tests can unlock such UTXOs.
+    #[cfg(any(test, feature = "arbitrary-impls"))]
+    pub fn genaddr_like_hash_lock_from_seed(seed: Digest) -> LockScriptAndWitness {
+        let preimage =
+            Tip5::hash_varlen(&[seed.values().to_vec(), vec![BFieldElement::new(1)]].concat());
+        Self::standard_hash_lock_from_preimage(preimage)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_nd_tokens(&mut self, tokens: Vec<BFieldElement>) {
         self.nd_tokens = tokens;
@@ -177,14 +186,18 @@ impl LockScriptAndWitness {
         VM::run(self.program.clone(), public_input, self.nondeterminism()).is_ok()
     }
 
-    /// Assuming the lock script halts gracefully, prove it.
+    /// Assuming the lock script halts gracefully, prove it, for a claim of
+    /// the given version.
     pub(crate) async fn prove(
         &self,
         public_input: PublicInput,
+        claim_version: u32,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
     ) -> Result<Proof, CreateProofError> {
-        let claim = Claim::new(self.program.hash()).with_input(public_input.individual_tokens);
+        let claim = Claim::new(self.program.hash())
+            .about_version(claim_version)
+            .with_input(public_input.individual_tokens);
         ProofBuilder::new()
             .program(self.program.clone())
             .claim(claim)

@@ -7,7 +7,7 @@ use neptune_privacy::api::export::KeyType;
 use neptune_privacy::api::export::NativeCurrencyAmount;
 use neptune_privacy::api::export::Timestamp;
 use neptune_privacy::api::export::TxProvingCapability;
-use rand::Rng;
+use rand::RngExt;
 use tracing_test::traced_test;
 
 /// Test: Alice creates a proof-collection backed transaction.

@@ -4,7 +4,7 @@ use std::fmt::Display;
 use get_size2::GetSize;
 use itertools::Itertools;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use serde::Deserialize;
 use serde::Serialize;
@@ -22,8 +22,10 @@ use super::utxo::Utxo;
 use super::TransactionDetails;
 use crate::api::export::TxInputList;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::collected_type_script_hashes;
 use crate::protocol::consensus::type_scripts::known_type_scripts;
 use crate::protocol::consensus::type_scripts::known_type_scripts::match_type_script_and_generate_witness;
+use crate::protocol::consensus::type_scripts::known_type_scripts::match_type_script_and_generate_witness_v2;
 use crate::protocol::consensus::type_scripts::TypeScriptAndWitness;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::util_types::mutator_set::authenticated_item::AuthenticatedItem;
@@ -325,8 +327,6 @@ impl PrimitiveWitness {
         // (possibly legacy) hash onto its current program hash and de-duplicate,
         // exactly as `generate_primitive_witness` does, so the required set lines
         // up with the witnesses (which are keyed by the current program hash).
-        // Same input-then-output ordering as generation, so required[j] matches
-        // type_scripts_and_witnesses[j].
         let required_type_script_hashes = Utxo::type_script_hashes(
             self.input_utxos
                 .utxos
@@ -340,7 +340,7 @@ impl PrimitiveWitness {
         let type_script_dictionary = self
             .type_scripts_and_witnesses
             .iter()
-            .map(|tsaw| (tsaw.program.hash(), tsaw.program.to_owned()))
+            .map(|tsaw| (tsaw.program.hash(), tsaw))
             .collect::<HashMap<_, _>>();
 
         // Verify we don't have too many type script witnesses.
@@ -370,10 +370,40 @@ impl PrimitiveWitness {
             return Err(error);
         }
 
-        // verify type scripts
-        for (j, type_script_hash) in required_type_script_hashes.iter().enumerate() {
-            let type_script = type_script_dictionary[type_script_hash].clone();
-            let nondeterminism = self.type_scripts_and_witnesses[j].nondeterminism();
+        // verify type scripts. Run the programs `CollectTypeScriptsV2` names,
+        // with the witnesses `ProofCollection::produce_v2` proves them with, so
+        // that this check accepts exactly what the type-script proofs will: a
+        // coin tagged with a `TimeLock` hash runs `TimeLockV2`. A program the
+        // V2 dispatch does not know runs with its witness from this object.
+        let governing_type_script_hashes = collected_type_script_hashes(
+            self.input_utxos
+                .utxos
+                .iter()
+                .chain(&self.output_utxos.utxos),
+        );
+        for type_script_hash in &governing_type_script_hashes {
+            let type_script_and_witness = match_type_script_and_generate_witness_v2(
+                *type_script_hash,
+                self.kernel.clone(),
+                self.input_utxos.clone(),
+                self.output_utxos.clone(),
+            )
+            .or_else(|| {
+                type_script_dictionary
+                    .get(type_script_hash)
+                    .map(|&tsaw| tsaw.clone())
+            });
+            let Some(type_script_and_witness) = type_script_and_witness else {
+                let typescript_name = known_type_scripts::typescript_name(*type_script_hash);
+                let error = WitnessValidationError::MissingTypeScriptWitness {
+                    type_script_hash: *type_script_hash,
+                    type_script_name: typescript_name.to_owned(),
+                };
+                warn!("{}", error);
+                return Err(error);
+            };
+            let nondeterminism = type_script_and_witness.nondeterminism();
+            let type_script = type_script_and_witness.program;
             let public_input = [
                 self.kernel.mast_hash(),
                 Tip5::hash(&self.input_utxos),
@@ -565,6 +595,31 @@ pub enum WitnessValidationError {
     // catch-all error, eg for anyhow errors
     #[error("transaction could not be created.  reason: {0}")]
     Failed(String),
+
+    #[error(
+        "input UTXO count ({input_utxos}) does not equal confirmed inputs \
+         ({confirmed}) plus thruputs ({thruputs})"
+    )]
+    CardinalityMismatch {
+        input_utxos: usize,
+        confirmed: usize,
+        thruputs: usize,
+    },
+
+    #[error("thruput at index {index} does not match the commitment of its UTXO")]
+    ThruputCommitmentMismatch { index: usize },
+
+    #[error(
+        "output UTXO count ({output_utxos}) does not equal addition record \
+         count ({outputs})"
+    )]
+    OutputCardinalityMismatch { output_utxos: usize, outputs: usize },
+
+    #[error("output at index {index} does not match the commitment of its UTXO")]
+    OutputCommitmentMismatch { index: usize },
+
+    #[error("this witness's kernel cannot carry a coinbase")]
+    CoinbaseSet,
 }
 
 #[cfg(any(test, feature = "arbitrary-impls"))]
@@ -1125,6 +1180,7 @@ mod tests {
     use crate::protocol::consensus::type_scripts::time_lock::neptune_arbitrary::arbitrary_primitive_witness_with_expired_timelocks;
     use crate::protocol::consensus::type_scripts::time_lock::TimeLock;
     use crate::protocol::consensus::type_scripts::time_lock::TimeLockWitness;
+    use crate::protocol::consensus::type_scripts::time_lock_v2::TimeLockV2;
     use crate::protocol::consensus::type_scripts::TypeScriptWitness;
     use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
     use crate::protocol::proof_abstractions::timestamp::Timestamp;
@@ -2190,17 +2246,33 @@ mod tests {
         #[strategy(3usize..10)] _num_inputs: usize,
         #[strategy(3usize..10)] _num_outputs: usize,
         #[strategy(3usize..10)] _num_announcements: usize,
-        #[strategy(arb())] rng_seed: u64,
         #[strategy(PrimitiveWitness::arbitrary_with_size_numbers(Some(#_num_inputs), #_num_outputs, #_num_announcements
         ))]
         mut transaction_primitive_witness: PrimitiveWitness,
     ) {
-        // Mess up witness data for one of the type scripts, assumed to be the
-        // native currency type script. But actually doesn't matter which one it
-        // is as the goal is simply to get one of the type scripts to fail.
-        transaction_primitive_witness.type_scripts_and_witnesses[0]
-            .scramble_non_determinism(rng_seed);
-        prop_assert!(transaction_primitive_witness.validate().await.is_err());
+        // Make the native currency type script fail: raise the amount of one
+        // output, so that the outputs exceed the inputs. (Scrambling the stored
+        // witness would not do: `validate` generates the witnesses of the
+        // programs it knows, as `ProofCollection::produce_v2` does.)
+        let output = &transaction_primitive_witness.output_utxos.utxos[0];
+        let lock_script_hash = output.lock_script_hash();
+        let raised_amount = output.get_native_currency_amount() + NativeCurrencyAmount::one_nau();
+        let coins = output
+            .coins()
+            .iter()
+            .filter(|coin| !NativeCurrency::is_native_currency(coin.type_script_hash))
+            .cloned()
+            .chain(raised_amount.to_native_coins())
+            .collect_vec();
+        transaction_primitive_witness.output_utxos.utxos[0] = Utxo::new(lock_script_hash, coins);
+
+        let Err(WitnessValidationError::InvalidTypeScript {
+            type_script_hash, ..
+        }) = transaction_primitive_witness.validate().await
+        else {
+            panic!("Must fail during type script validation");
+        };
+        prop_assert_eq!(NativeCurrency.hash(), type_script_hash);
     }
 
     #[proptest(cases = 5, async = "tokio")]
@@ -2237,9 +2309,9 @@ mod tests {
         };
 
         prop_assert_eq!(
-            TimeLock.hash(),
+            TimeLockV2.hash(),
             type_script_hash,
-            "Must fail in time lock type script"
+            "Must fail in the type script governing time locks"
         );
     }
 
@@ -2262,6 +2334,23 @@ mod tests {
                 .any(|ts_digest| ts_digest == TimeLock.hash()),
             "Type scripts witness must contain timelock"
         );
+    }
+
+    /// `validate` runs each type script with that program's own witness,
+    /// whatever the order of `type_scripts_and_witnesses`.
+    #[proptest(cases = 3, async = "tokio")]
+    async fn type_script_witness_order_is_irrelevant(
+        #[strategy(1usize..4)] _num_inputs: usize,
+        #[strategy(1usize..4)] _num_outputs: usize,
+        #[strategy(0usize..2)] _num_public_announcements: usize,
+        #[strategy(arb())] _now: Timestamp,
+        #[strategy(arbitrary_primitive_witness_with_expired_timelocks(#_num_inputs, #_num_outputs, #_num_public_announcements, #_now
+        ))]
+        mut primitive_witness: PrimitiveWitness,
+    ) {
+        prop_assert!(primitive_witness.type_scripts_and_witnesses.len() > 1);
+        primitive_witness.type_scripts_and_witnesses.reverse();
+        prop_assert!(primitive_witness.validate().await.is_ok());
     }
 
     #[proptest]
