@@ -1719,7 +1719,7 @@ impl XntTransaction {
 /// Library version
 #[napi(catch_unwind)]
 pub fn xnt_version() -> String {
-    "0.1.0".to_string()
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 /// Get current timestamp in milliseconds

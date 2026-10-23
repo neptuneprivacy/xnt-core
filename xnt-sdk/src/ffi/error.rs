@@ -91,7 +91,7 @@ pub extern "C" fn xnt_clear_error() {
 #[no_mangle]
 pub extern "C" fn xnt_version() -> *const c_char {
     ffi_guard(std::ptr::null(), || {
-        static VERSION: &[u8] = b"0.1.0\0";
+        static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
         VERSION.as_ptr() as *const c_char
     })
 }
