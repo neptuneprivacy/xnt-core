@@ -20,14 +20,23 @@ pub enum UtxoNotificationMedium {
 
 /// enumerates how utxos and spending information is communicated, including how
 /// to encrypt this information.
+///
+/// The addresses are read with [ReceivingAddress::deserialize_unchecked], so
+/// that past transactions stored in the wallet database stay readable. Outputs
+/// built from an address are checked with
+/// [ReceivingAddress::validate_as_recipient] instead.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) enum UtxoNotificationMethod {
     /// the utxo notification should be transferred to recipient encrypted on the blockchain
-    OnChain(ReceivingAddress),
+    OnChain(
+        #[serde(deserialize_with = "ReceivingAddress::deserialize_unchecked")] ReceivingAddress,
+    ),
 
     /// the utxo notification should be transferred to recipient off the blockchain
-    OffChain(ReceivingAddress),
+    OffChain(
+        #[serde(deserialize_with = "ReceivingAddress::deserialize_unchecked")] ReceivingAddress,
+    ),
 
     /// No UTXO notification is intended
     None,

@@ -1,18 +1,24 @@
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::channel::oneshot;
+use multiaddr::Multiaddr;
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::triton_vm::prelude::Digest;
 use tasm_lib::twenty_first::util_types::mmr::mmr_accumulator::MmrAccumulator;
 
 use crate::application::loops::main_loop::proof_upgrader::UpgradeJob;
+use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+use crate::protocol::peer::link_tx_notification::LinkTxNotification;
 use crate::protocol::peer::transaction_notification::TransactionNotification;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
 use crate::state::wallet::expected_utxo::ExpectedUtxo;
@@ -127,6 +133,9 @@ pub(crate) enum MainToPeerTask {
     /// Publish knowledge of a transaction
     TransactionNotification(TransactionNotification),
 
+    /// Publish knowledge of a proof-backed link transaction
+    LinkTxNotification(LinkTxNotification),
+
     /// Disconnect from a specific peer
     Disconnect(SocketAddr),
 
@@ -145,6 +154,7 @@ impl MainToPeerTask {
                 "make specific peer discovery req"
             }
             MainToPeerTask::TransactionNotification(_) => "transaction notification",
+            MainToPeerTask::LinkTxNotification(_) => "link transaction notification",
             MainToPeerTask::Disconnect(_) => "disconnect",
             MainToPeerTask::DisconnectAll() => "disconnect all",
             MainToPeerTask::BlockProposalNotification(_) => "block proposal notification",
@@ -163,6 +173,7 @@ impl MainToPeerTask {
             MainToPeerTask::MakePeerDiscoveryRequest => false,
             MainToPeerTask::MakeSpecificPeerDiscoveryRequest(_) => false,
             MainToPeerTask::TransactionNotification(_) => true,
+            MainToPeerTask::LinkTxNotification(_) => true,
             MainToPeerTask::Disconnect(_) => false,
             MainToPeerTask::DisconnectAll() => false,
         }
@@ -187,13 +198,24 @@ pub(crate) enum PeerTaskToMain {
     PeerDiscoveryAnswer((Vec<(SocketAddr, u128)>, SocketAddr, u8)),
 
     Transaction(Box<PeerTaskToMainTransaction>),
+    LinkTx(Box<PeerTaskToMainLinkTx>),
     BlockProposal(Box<Block>),
     DisconnectFromLongestLivedPeer,
+
+    /// The peer at this address has reached a bad standing. Its IP address is
+    /// to be refused on the libp2p stack as well.
+    Ban(SocketAddr),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerTaskToMainTransaction {
     pub transaction: Transaction,
+    pub confirmable_for_block: Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerTaskToMainLinkTx {
+    pub link_tx: LinkTx,
     pub confirmable_for_block: Digest,
 }
 
@@ -205,8 +227,10 @@ impl PeerTaskToMain {
             PeerTaskToMain::RemovePeerMaxBlockHeight(_) => "remove peer max block height",
             PeerTaskToMain::PeerDiscoveryAnswer(_) => "peer discovery answer",
             PeerTaskToMain::Transaction(_) => "transaction",
+            PeerTaskToMain::LinkTx(_) => "link transaction",
             PeerTaskToMain::BlockProposal(_) => "block proposal",
             PeerTaskToMain::DisconnectFromLongestLivedPeer => "disconnect from longest lived peer",
+            PeerTaskToMain::Ban(_) => "ban",
         }
         .to_string()
     }
@@ -224,9 +248,10 @@ pub(crate) struct ClaimUtxoData {
 }
 
 /// represents messages that can be sent from RPC server to main loop.
-#[derive(Clone, Debug, strum::Display)]
+#[derive(Debug, strum::Display)]
 pub enum RPCServerToMain {
     BroadcastTx(Arc<Transaction>),
+    BroadcastOwnLinkTx(Arc<LinkTx>),
     PerformTxProofUpgrade(Box<UpgradeJob>),
     BroadcastMempoolTransactions,
     BroadcastBlockProposal,
@@ -237,8 +262,36 @@ pub enum RPCServerToMain {
     RestartMiner,
     SetTipToStoredBlock(Digest),
 
-    // Used by JSON-RPC
-    SubmitTx(Box<Transaction>),
+    /// Used by JSON-RPC: a transaction verified under the given rule set,
+    /// that of the next block at the time.
+    SubmitTx(Box<Transaction>, ConsensusRuleSet),
+
+    /// Give the IP address a bad standing, disconnect the peers at it, and
+    /// refuse it on both network stacks.
+    Ban(IpAddr),
+
+    /// Clear the standing of the IP address, and lift its ban on both network
+    /// stacks. A ban given with `--ban` stands.
+    Unban(IpAddr),
+
+    /// Clear all standings, and lift all bans on both network stacks, except
+    /// those given with `--ban`.
+    UnbanAll,
+
+    /// Dial the address over the libp2p stack. A bad standing of its IP
+    /// address is cleared first, unless the IP address was banned with
+    /// `--ban`.
+    Dial(Multiaddr),
+
+    /// Probe whether the node is reachable from the outside, over libp2p.
+    ProbeNat,
+
+    /// Drop and renew the relay reservations of the libp2p stack.
+    ResetRelayReservations,
+
+    /// Report on the libp2p stack. The sender is dropped without an answer if
+    /// the libp2p stack does not run.
+    GetNetworkOverview(tokio::sync::oneshot::Sender<NetworkOverviewData>),
 }
 
 pub trait Cancelable: Send + Sync {

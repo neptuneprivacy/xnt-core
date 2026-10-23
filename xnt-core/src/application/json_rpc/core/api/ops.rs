@@ -171,6 +171,9 @@ pub enum RpcMethods {
 
     #[namespace(Namespace::Archival)]
     GetArchivalMutatorSet,
+
+    #[namespace(Namespace::Networking)]
+    NetworkOverview,
 }
 
 #[cfg(test)]

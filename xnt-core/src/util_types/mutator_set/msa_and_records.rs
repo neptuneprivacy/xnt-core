@@ -35,7 +35,7 @@ impl MsaAndRecords {
     }
 
     pub(crate) fn packed_removal_records(&self) -> Vec<RemovalRecord> {
-        RemovalRecordList::pack(self.removal_records.clone())
+        RemovalRecordList::pack(self.removal_records.clone(), true)
     }
 
     pub fn verify(&self, items: &[Digest]) -> bool {
@@ -68,7 +68,7 @@ pub mod neptune_arbitrary {
     use proptest::strategy::Strategy;
     use proptest_arbitrary_interop::arb;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tasm_lib::prelude::Tip5;
     use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
@@ -336,7 +336,7 @@ mod tests {
     use proptest::test_runner::TestRunner;
     use proptest_arbitrary_interop::arb;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tasm_lib::prelude::Digest;
     use tasm_lib::twenty_first::prelude::Mmr;

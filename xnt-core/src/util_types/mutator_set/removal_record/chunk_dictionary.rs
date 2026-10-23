@@ -16,9 +16,15 @@ use triton_vm::prelude::Digest;
 
 use super::chunk::Chunk;
 use crate::prelude::triton_vm;
+use crate::util_types::mutator_set::shared::deserialize_bounded_vec;
 
 type AuthenticatedChunk = (MmrMembershipProof, Chunk);
 type ChunkIndex = u64;
+
+/// Upper bound on the number of entries a deserialized dictionary may have.
+/// The dictionary of a packed removal record list holds the chunks of all
+/// inputs; a block with 2^14 inputs of 45 chunks each needs about 740 000.
+const MAX_NUM_ENTRIES: usize = 1_000_000;
 
 #[derive(
     Clone, Debug, Serialize, Deserialize, GetSize, PartialEq, Eq, Default, BFieldCodec, TasmObject,
@@ -29,6 +35,7 @@ pub struct ChunkDictionary {
     /// This list is always sorted. It has max. NUM_TRIALS=45 elements, so we
     /// don't care about the cost of reallocation when `insert`ing or
     /// `remove`ing.
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_ENTRIES>")]
     pub(crate) dictionary: Vec<(u64, (MmrMembershipProof, Chunk))>,
 }
 

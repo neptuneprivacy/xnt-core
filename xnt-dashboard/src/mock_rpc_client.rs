@@ -19,6 +19,7 @@ use neptune_privacy::api::export::TxCreationArtifacts;
 use neptune_privacy::application::rpc::auth;
 use neptune_privacy::application::rpc::server::error::RpcError;
 use neptune_privacy::application::rpc::server::mempool_transaction_info::MempoolTransactionInfo;
+use neptune_privacy::application::rpc::server::network_overview_data::NetworkOverviewData;
 use neptune_privacy::application::rpc::server::overview_data::OverviewData;
 use neptune_privacy::application::rpc::server::ui_utxo::UiUtxo;
 use neptune_privacy::application::rpc::server::RpcResult;
@@ -26,7 +27,7 @@ use neptune_privacy::protocol::peer::peer_info::PeerInfo;
 use neptune_privacy::state::wallet::address::generation_address::GenerationReceivingAddress;
 use rand::rng;
 use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use tasm_lib::prelude::Digest;
 
@@ -162,6 +163,17 @@ impl MockRpcClient {
         tokio::task::yield_now().await;
         let state = self.state.lock().unwrap();
         Ok(Ok(state.overview_data.clone()))
+    }
+
+    /// The mock node runs no libp2p network stack.
+    pub(crate) async fn network_overview(
+        &self,
+        _ctx: ::tarpc::context::Context,
+        _token: auth::Token,
+    ) -> ::core::result::Result<RpcResult<Option<NetworkOverviewData>>, ::tarpc::client::RpcError>
+    {
+        tokio::task::yield_now().await;
+        Ok(Ok(None))
     }
 
     pub async fn known_keys(

@@ -1,6 +1,7 @@
 use num_traits::CheckedSub;
 use num_traits::Zero;
 use tasm_lib::prelude::Digest;
+use tasm_lib::prelude::Tip5;
 
 use crate::api::export::NativeCurrencyAmount;
 use crate::api::export::Timestamp;
@@ -87,7 +88,6 @@ impl ComposerParameters {
             return Vec::<TxOutput>::default().into();
         }
 
-        let sender_randomness = self.sender_randomness;
         let notification_medium: UtxoNotificationMedium = self.notification_policy.into();
         let owned = true;
         let mut ret = vec![];
@@ -99,6 +99,13 @@ impl ComposerParameters {
                 / 1000i128;
             let amount = NativeCurrencyAmount::from_nau(amount);
             distributed += amount;
+
+            // Derive a per-recipient sender_randomness from the composer's base
+            // randomness and the recipient, so each output's randomness is unique.
+            let sender_randomness = Tip5::hash_pair(
+                self.sender_randomness,
+                coinbase_output.recipient().privacy_digest(),
+            );
             let mut tx_output = TxOutput::native_currency(
                 amount,
                 sender_randomness,

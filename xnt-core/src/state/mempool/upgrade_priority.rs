@@ -1,6 +1,7 @@
 use std::ops::Add;
 
 use get_size2::GetSize;
+use num_traits::Zero;
 
 use crate::api::export::NativeCurrencyAmount;
 use crate::application::loops::main_loop::upgrade_incentive::UpgradeIncentive;
@@ -11,6 +12,8 @@ use crate::application::loops::main_loop::upgrade_incentive::UpgradeIncentive;
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(any(test, feature = "arbitrary-impls"), derive(arbitrary::Arbitrary))]
 pub enum UpgradePriority {
+    /// This transaction was received from a 3rd party and does not have a
+    /// financial interest for this node operator.
     #[default]
     Irrelevant,
 
@@ -29,6 +32,12 @@ pub enum UpgradePriority {
 impl From<UpgradeIncentive> for UpgradePriority {
     fn from(incentive: UpgradeIncentive) -> Self {
         match incentive {
+            // Nothing to gain is no interest.
+            UpgradeIncentive::Gobble(amount) | UpgradeIncentive::BalanceAffecting(amount)
+                if amount.is_zero() =>
+            {
+                UpgradePriority::Irrelevant
+            }
             UpgradeIncentive::Gobble(amount) => UpgradePriority::Interested(amount),
             UpgradeIncentive::BalanceAffecting(amount) => UpgradePriority::Interested(amount),
             UpgradeIncentive::Critical => UpgradePriority::Critical,
@@ -101,5 +110,29 @@ impl Add for UpgradePriority {
             (Interested(self_amt), Interested(other_amt)) => Interested(self_amt + other_amt),
             (_, Critical) | (Critical, _) => Critical,
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_to_gain_is_irrelevant() {
+        let nothing = NativeCurrencyAmount::coins(0);
+        let something = NativeCurrencyAmount::coins(1);
+        assert_eq!(
+            UpgradePriority::Irrelevant,
+            UpgradePriority::from(UpgradeIncentive::Gobble(nothing))
+        );
+        assert_eq!(
+            UpgradePriority::Irrelevant,
+            UpgradePriority::from(UpgradeIncentive::BalanceAffecting(nothing))
+        );
+        assert_eq!(
+            UpgradePriority::Interested(something),
+            UpgradePriority::from(UpgradeIncentive::Gobble(something))
+        );
     }
 }

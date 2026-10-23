@@ -1493,6 +1493,7 @@ pub mod tests {
                 txk_mast_hash,
                 salted_input_utxos_hash,
                 salted_output_utxos_hash,
+                claim.version,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
             )

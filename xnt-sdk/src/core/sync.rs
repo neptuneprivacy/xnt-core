@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use super::error::{Result, XntError};
 use super::json_rpc::RpcClient;
-use super::types::Digest;
+use super::types::{Digest, Network};
 use super::utxo::Utxo;
 use super::wallet::SpendingKey;
 
@@ -30,22 +30,45 @@ pub type SpentStatus = Vec<i64>;
 pub type AoclIndices = Vec<i64>;
 
 /// Mutator set accumulator wrapper
+///
+/// Also records the height of the tip whose mutator set it is, if known: a
+/// transaction built on it is proven for the consensus rule set of the block
+/// after that tip, see [super::transaction::BuiltTransaction::prove].
 #[derive(Clone)]
 pub struct MutatorSet {
     pub(crate) inner: MutatorSetAccumulator,
+    pub(crate) tip_height: Option<u64>,
 }
 
 impl MutatorSet {
     /// Serialize to bytes
+    ///
+    /// The tip height is not serialized; restore it with
+    /// [Self::with_tip_height] after [Self::from_bytes].
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(&self.inner).map_err(|e| XntError::EncodingError(e.to_string()))
     }
 
     /// Deserialize from bytes
+    ///
+    /// The tip height is unknown, see [Self::with_tip_height].
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let inner: MutatorSetAccumulator =
             bincode::deserialize(data).map_err(|e| XntError::EncodingError(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self { inner, tip_height: None })
+    }
+
+    /// The same mutator set, as the one of the tip at `tip_height`. For callers
+    /// that cache the accumulator, see [Self::to_bytes].
+    pub fn with_tip_height(mut self, tip_height: u64) -> Self {
+        self.tip_height = Some(tip_height);
+        self
+    }
+
+    /// The height of the tip whose mutator set this is, if known.
+    /// [get_mutator_set] records it.
+    pub fn tip_height(&self) -> Option<u64> {
+        self.tip_height
     }
 
     /// Verify membership proof
@@ -58,7 +81,7 @@ impl MutatorSet {
     }
 
     pub(crate) fn from_core(inner: MutatorSetAccumulator) -> Self {
-        Self { inner }
+        Self { inner, tip_height: None }
     }
 }
 
@@ -112,8 +135,52 @@ pub struct SpendableInput {
     pub block_height: u64,
     /// Block digest where the UTXO was created
     pub block_digest: Digest,
+    /// True if the UTXO is locked to a legacy-format (pre-v0.3) dCTIDH lock,
+    /// see [SpendingKey::is_legacy]. Such inputs are sweep-only: move them to
+    /// a current-format key and never count them towards the available
+    /// balance.
+    pub is_legacy: bool,
+    /// Payment id the UTXO was received with, from its decrypted notification:
+    /// 0 for the base address of the key, otherwise the payment id of the
+    /// subaddress it was sent to. All payment ids of a key share its lock, so
+    /// the payment id is known only from the notification.
+    pub payment_id: u64,
 }
 
+impl SpendableInput {
+    /// Hash of the input's absolute index set, by which [check_spent] tells
+    /// whether it is spent.
+    pub fn absolute_index_set_hash(&self) -> Digest {
+        compute_absolute_index_set_hash(
+            &self.utxo.hash(),
+            &self.sender_randomness,
+            &self.spending_key.receiver_preimage(),
+            self.aocl_index,
+        )
+    }
+}
+
+/// Indexed entries a scan skipped instead of failing for the whole range.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    /// Entries without a block height, or whose ciphertext is larger than the
+    /// size limit or not a list of field elements.
+    pub malformed: usize,
+    /// Entries this key could not decrypt.
+    pub undecryptable: usize,
+    /// Decrypted UTXOs locked to a lock script this key cannot satisfy.
+    pub foreign_lock: usize,
+    /// UTXOs at a legacy-format dCTIDH lock confirmed at or above the legacy
+    /// cutoff height, see [super::wallet::legacy_dctidh_cutoff].
+    pub legacy_after_cutoff: usize,
+}
+
+impl ScanStats {
+    /// Total number of skipped entries.
+    pub fn total(&self) -> usize {
+        self.malformed + self.undecryptable + self.foreign_lock + self.legacy_after_cutoff
+    }
+}
 
 /// Compute canonical commitment for UTXO (using receiver_preimage)
 pub fn compute_commitment(
@@ -173,20 +240,89 @@ const MAX_UTXO_CIPHERTEXT_SIZE: usize = 10_000;
 const MAX_UTXOS_PER_RESPONSE: usize = 10_000;
 
 /// Fetch UTXOs from indexer by receiver_id_hash
+///
+/// Malformed entries are skipped, see [fetch_utxos_with_skipped].
 pub fn fetch_utxos(
     client: &RpcClient,
     receiver_id_hash: &Digest,
     from_height: u64,
     to_height: u64,
 ) -> Result<Vec<IndexedUtxo>> {
-    let params = json!({
-        "receiverIdHash": receiver_id_hash.to_hex(),
-        "fromBlockHeight": from_height,
-        "toBlockHeight": to_height
-    });
+    fetch_utxos_with_skipped(client, receiver_id_hash, from_height, to_height)
+        .map(|(utxos, _skipped)| utxos)
+}
 
-    let result = client.call("archival_getUtxosByReceiver", params)?;
+/// Fetch UTXOs from indexer by receiver_id_hash, and count the entries that
+/// were skipped instead of failing the whole range: entries without a block
+/// height, or whose ciphertext is larger than the size limit or not a list of
+/// field elements.
+///
+/// Both heights are inclusive. A range of more than 10,000 blocks, which the
+/// indexer refuses, is fetched in parts.
+pub fn fetch_utxos_with_skipped(
+    client: &RpcClient,
+    receiver_id_hash: &Digest,
+    from_height: u64,
+    to_height: u64,
+) -> Result<(Vec<IndexedUtxo>, usize)> {
+    fetch_in_block_ranges(from_height, to_height, |from, to| {
+        let params = json!({
+            "receiverIdHash": receiver_id_hash.to_hex(),
+            "fromBlockHeight": from,
+            "toBlockHeight": to
+        });
 
+        let result = client.call("archival_getUtxosByReceiver", params)?;
+        parse_indexed_utxos(&result)
+    })
+}
+
+/// Largest block range the indexer serves in one `archival_getUtxosByReceiver`
+/// request: `toBlockHeight - fromBlockHeight` must not exceed it, else it
+/// answers with the error `{"BlockRangeExceedsLimit":10000}`.
+pub(crate) const MAX_BLOCK_RANGE_PER_REQUEST: u64 = 10_000;
+
+/// The inclusive block ranges, each within [MAX_BLOCK_RANGE_PER_REQUEST], that
+/// together cover `from_height..=to_height`. A range that ends below its start
+/// is passed on as it is.
+fn block_ranges(from_height: u64, to_height: u64) -> Vec<(u64, u64)> {
+    if to_height <= from_height {
+        return vec![(from_height, to_height)];
+    }
+
+    let mut ranges = Vec::new();
+    let mut from = from_height;
+    loop {
+        let to = from.saturating_add(MAX_BLOCK_RANGE_PER_REQUEST).min(to_height);
+        ranges.push((from, to));
+        if to == to_height {
+            return ranges;
+        }
+        from = to + 1;
+    }
+}
+
+/// Fetch the indexed UTXOs of `from_height..=to_height` with `fetch`, one
+/// request per range of [block_ranges], and merge the results and the numbers
+/// of skipped entries.
+fn fetch_in_block_ranges(
+    from_height: u64,
+    to_height: u64,
+    mut fetch: impl FnMut(u64, u64) -> Result<(Vec<IndexedUtxo>, usize)>,
+) -> Result<(Vec<IndexedUtxo>, usize)> {
+    let mut utxos = Vec::new();
+    let mut skipped = 0;
+    for (from, to) in block_ranges(from_height, to_height) {
+        let (range_utxos, range_skipped) = fetch(from, to)?;
+        utxos.extend(range_utxos);
+        skipped += range_skipped;
+    }
+    Ok((utxos, skipped))
+}
+
+/// Parse an `archival_getUtxosByReceiver` result, skipping and counting
+/// malformed entries.
+fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
     let utxos = result
         .get("utxos")
         .and_then(|v| v.as_array())
@@ -201,34 +337,23 @@ pub fn fetch_utxos(
     }
 
     let mut indexed_utxos = Vec::with_capacity(utxos.len());
+    let mut skipped = 0;
 
     for utxo in utxos {
-        let block_height = utxo.get("blockHeight").and_then(|v| v.as_u64()).unwrap_or(0);
+        let Some(block_height) = utxo.get("blockHeight").and_then(|v| v.as_u64()) else {
+            skipped += 1;
+            continue;
+        };
         let block_digest = utxo
             .get("blockDigest")
             .and_then(|v| v.as_str())
             .and_then(Digest::from_hex)
             .unwrap_or_default();
 
-        let ciphertext_bfes: Vec<u64> = if let Some(Value::Array(arr)) = utxo.get("ciphertext") {
-            if arr.len() * 8 > MAX_UTXO_CIPHERTEXT_SIZE {
-                return Err(XntError::RpcError(format!(
-                    "ciphertext too large: {} bytes > {} max",
-                    arr.len() * 8,
-                    MAX_UTXO_CIPHERTEXT_SIZE
-                )));
-            }
-            arr.iter()
-                .filter_map(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                .collect()
-        } else {
-            Vec::new()
+        let Some(ciphertext) = utxo.get("ciphertext").and_then(ciphertext_from_json) else {
+            skipped += 1;
+            continue;
         };
-
-        let ciphertext: Vec<u8> = ciphertext_bfes
-            .iter()
-            .flat_map(|&v| v.to_le_bytes())
-            .collect();
 
         indexed_utxos.push(IndexedUtxo {
             block_height,
@@ -237,7 +362,29 @@ pub fn fetch_utxos(
         });
     }
 
-    Ok(indexed_utxos)
+    Ok((indexed_utxos, skipped))
+}
+
+/// Ciphertext of an indexed entry as little-endian u64s, or `None` if it is
+/// not a list of canonical field elements or larger than
+/// [MAX_UTXO_CIPHERTEXT_SIZE].
+fn ciphertext_from_json(value: &Value) -> Option<Vec<u8>> {
+    use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
+
+    let arr = value.as_array()?;
+    if arr.is_empty() || arr.len() * 8 > MAX_UTXO_CIPHERTEXT_SIZE {
+        return None;
+    }
+
+    let mut ciphertext = Vec::with_capacity(arr.len() * 8);
+    for v in arr {
+        let word = v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .filter(|&word| word < BFieldElement::P)?;
+        ciphertext.extend_from_slice(&word.to_le_bytes());
+    }
+    Some(ciphertext)
 }
 
 /// Check spent status of UTXOs
@@ -275,81 +422,66 @@ pub fn get_aocl_indices(client: &RpcClient, commitments: &[Digest]) -> Result<Ao
 
 /// Collect spendable inputs (UTXOs + membership proofs) for a single spending key.
 ///
-/// This will:
-/// - fetch UTXOs by receiver_id_hash
-/// - decrypt them using the provided key
-/// - compute commitments and AOCL indices
-/// - filter out spent UTXOs
-/// - restore membership proofs for the remaining ones
+/// Applies the main-net legacy cutoff, the strictest one; use
+/// [collect_spendable_inputs] to apply the rule of another network and to get
+/// the number of skipped entries.
 pub fn collect_spendable_inputs_for_key(
     client: &RpcClient,
     key: &SpendingKey,
     from_height: u64,
     to_height: u64,
 ) -> Result<Vec<SpendableInput>> {
+    collect_spendable_inputs(client, key, Network::Main, from_height, to_height)
+        .map(|(inputs, _skipped)| inputs)
+}
+
+/// Collect spendable inputs (UTXOs + membership proofs) for a single spending key.
+///
+/// This will:
+/// - fetch UTXOs by receiver_id_hash
+/// - decrypt them using the provided key
+/// - compute commitments and AOCL indices
+/// - filter out spent UTXOs
+/// - restore membership proofs for the remaining ones
+///
+/// Indexed entries that are malformed, cannot be decrypted, are locked to a
+/// foreign lock script, or are at a legacy-format dCTIDH lock confirmed at or
+/// above the legacy cutoff of `network` are skipped and counted in the
+/// returned [ScanStats] instead of failing the whole range. Inputs at a
+/// legacy-format lock below the cutoff are returned with
+/// [SpendableInput::is_legacy] set: they are sweep-only.
+pub fn collect_spendable_inputs(
+    client: &RpcClient,
+    key: &SpendingKey,
+    network: Network,
+    from_height: u64,
+    to_height: u64,
+) -> Result<(Vec<SpendableInput>, ScanStats)> {
     // Derive receiver_id_hash and receiver_preimage from SDK key
     let rid_hash = key.receiver_id_hash();
     let receiver_preimage = key.receiver_preimage();
 
     // Fetch indexed UTXOs from archival node
-    let indexed = fetch_utxos(client, &rid_hash, from_height, to_height)?;
-    if indexed.is_empty() {
-        return Ok(Vec::new());
-    }
+    let (indexed, malformed) = fetch_utxos_with_skipped(client, &rid_hash, from_height, to_height)?;
+    let mut stats = ScanStats {
+        malformed,
+        ..ScanStats::default()
+    };
 
-    // Decrypt UTXOs using core SpendingKey::decrypt (works for Generation and dCTIDH)
-    let own_lock_script_hash = key.lock_script_hash();
-    let mut utxos: Vec<(Utxo, Digest, i128, u64, Digest)> = Vec::new();
-    for idx in indexed {
-        // ciphertext_bfes are encoded little-endian u64s; convert back to BFieldElements
-        let bfe_words = idx
-            .ciphertext
-            .chunks(8)
-            .map(|chunk| {
-                let mut arr = [0u8; 8];
-                arr[..chunk.len()].copy_from_slice(chunk);
-                u64::from_le_bytes(arr)
-            })
-            .collect::<Vec<u64>>();
-
-        let bfes: Vec<neptune_privacy::prelude::twenty_first::prelude::BFieldElement> =
-            bfe_words
-                .into_iter()
-                .map(|v| neptune_privacy::prelude::twenty_first::prelude::BFieldElement::new(v))
-                .collect();
-
-        let (core_utxo, sr, _payment_id) = key
-            .inner
-            .decrypt(&bfes)
-            .map_err(|e| XntError::CryptoError(format!("decryption failed: {e}")))?;
-        {
-            let utxo = Utxo::from_core(core_utxo);
-
-            // A third party can craft an announcement that decrypts under
-            // this key but whose UTXO is locked by a foreign script; counting
-            // it would inflate the balance with unspendable funds.
-            if utxo.lock_script_hash() != own_lock_script_hash {
-                continue;
-            }
-
-            let amount = utxo.amount();
-            utxos.push((utxo, Digest::from_core(sr), amount, idx.block_height, idx.block_digest));
-        }
-    }
-
+    let utxos = decrypt_indexed_utxos(key, network, indexed, &mut stats);
     if utxos.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), stats));
     }
 
     // Compute commitments and fetch AOCL indices
     let commits: Vec<Digest> = utxos
         .iter()
-        .map(|(u, sr, _, _, _)| compute_commitment(&u.hash(), sr, &receiver_preimage))
+        .map(|(u, sr, _, _, _, _)| compute_commitment(&u.hash(), sr, &receiver_preimage))
         .collect();
 
     let aocl = get_aocl_indices(client, &commits)?;
     if aocl.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), stats));
     }
 
     // Build AbsoluteIndexSet hashes and check spent status
@@ -357,7 +489,7 @@ pub fn collect_spendable_inputs_for_key(
     let mut valid_indices: Vec<usize> = Vec::new();
     for (i, &idx) in aocl.iter().enumerate() {
         if idx >= 0 && i < utxos.len() {
-            let (ref u, ref sr, _, _, _) = utxos[i];
+            let (ref u, ref sr, _, _, _, _) = utxos[i];
             let h = compute_absolute_index_set_hash(&u.hash(), sr, &receiver_preimage, idx as u64);
             abs_hashes.push(h);
             valid_indices.push(i);
@@ -365,7 +497,7 @@ pub fn collect_spendable_inputs_for_key(
     }
 
     if abs_hashes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), stats));
     }
 
     let spent = check_spent(client, &abs_hashes)?;
@@ -388,7 +520,7 @@ pub fn collect_spendable_inputs_for_key(
     }
 
     if unspent_indices.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), stats));
     }
 
     // Restore membership proofs for unspent UTXOs
@@ -397,7 +529,7 @@ pub fn collect_spendable_inputs_for_key(
     let absolute_index_sets: Vec<AbsoluteIndexSet> = unspent_indices
         .iter()
         .map(|(oi, idx)| {
-            let (ref u, ref sr, _, _, _) = utxos[*oi];
+            let (ref u, ref sr, _, _, _, _) = utxos[*oi];
             AbsoluteIndexSet::compute(
                 u.hash().to_core(),
                 sr.to_core(),
@@ -430,7 +562,7 @@ pub fn collect_spendable_inputs_for_key(
                 .map_err(|e| XntError::RpcError(format!("parse proof {idx} failed: {e}")))?;
 
         let (_oi, aocl_idx) = unspent_indices[idx];
-        let (ref u, ref sr, amount, bh, bd) = utxos[unspent_indices[idx].0];
+        let (ref u, ref sr, amount, bh, bd, payment_id) = utxos[unspent_indices[idx].0];
 
         let msmp = rpc_proof
             .extract_ms_membership_proof(aocl_idx, sr.to_core(), receiver_preimage.to_core())
@@ -447,29 +579,131 @@ pub fn collect_spendable_inputs_for_key(
             amount,
             block_height: bh,
             block_digest: bd.clone(),
+            is_legacy: key.is_legacy(),
+            payment_id,
         });
     }
 
-    Ok(res)
+    Ok((res, stats))
 }
 
-/// Get current mutator set from archival node
+/// Decrypt indexed entries with `key`, skipping and counting in `stats` the
+/// entries that cannot be decrypted, are locked to a foreign lock script, or
+/// are at a legacy-format lock not recognized at their height on `network`.
+///
+/// Returns (utxo, sender randomness, amount, block height, block digest,
+/// payment id).
+fn decrypt_indexed_utxos(
+    key: &SpendingKey,
+    network: Network,
+    indexed: Vec<IndexedUtxo>,
+    stats: &mut ScanStats,
+) -> Vec<(Utxo, Digest, i128, u64, Digest, u64)> {
+    use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
+
+    let own_lock_script_hash = key.lock_script_hash();
+    let mut utxos = Vec::new();
+    for idx in indexed {
+        // ciphertext_bfes are encoded little-endian u64s; convert back to BFieldElements
+        let bfes: Vec<BFieldElement> = idx
+            .ciphertext
+            .chunks(8)
+            .map(|chunk| {
+                let mut arr = [0u8; 8];
+                arr[..chunk.len()].copy_from_slice(chunk);
+                BFieldElement::new(u64::from_le_bytes(arr))
+            })
+            .collect();
+
+        let Ok((core_utxo, sr, payment_id)) = key.inner.decrypt(&bfes) else {
+            stats.undecryptable += 1;
+            continue;
+        };
+        let utxo = Utxo::from_core(core_utxo);
+
+        // A third party can craft an announcement that decrypts under
+        // this key but whose UTXO is locked by a foreign script; counting
+        // it would inflate the balance with unspendable funds.
+        if utxo.lock_script_hash() != own_lock_script_hash {
+            stats.foreign_lock += 1;
+            continue;
+        }
+
+        if !key.recognizes_utxos_at(network, idx.block_height) {
+            stats.legacy_after_cutoff += 1;
+            continue;
+        }
+
+        let amount = utxo.amount();
+        utxos.push((
+            utxo,
+            Digest::from_core(sr),
+            amount,
+            idx.block_height,
+            idx.block_digest,
+            payment_id.value(),
+        ));
+    }
+    utxos
+}
+
+/// Get current mutator set from archival node, with the height of the tip it
+/// belongs to, see [MutatorSet::tip_height].
+///
+/// The node does not report that height with the mutator set, so it is read
+/// before and after; if a block arrives in between, the mutator set is
+/// fetched again, up to 3 times.
 pub fn get_mutator_set(client: &RpcClient) -> Result<MutatorSet> {
     use neptune_privacy::application::json_rpc::core::model::block::body::RpcMutatorSetAccumulator;
 
-    let result = client.call("archival_getArchivalMutatorSet", json!([]))?;
+    let (inner, tip_height) = fetch_at_one_tip_height(
+        || client.chain_height(),
+        || {
+            let result = client.call("archival_getArchivalMutatorSet", json!([]))?;
 
-    let msa_obj = result
-        .get("archivalMutatorSet")
-        .ok_or_else(|| XntError::RpcError("missing archivalMutatorSet".to_string()))?;
+            let msa_obj = result
+                .get("archivalMutatorSet")
+                .ok_or_else(|| XntError::RpcError("missing archivalMutatorSet".to_string()))?;
 
-    let rpc_msa: RpcMutatorSetAccumulator = serde_json::from_value(msa_obj.clone())
-        .map_err(|e| XntError::RpcError(format!("parse mutator set failed: {e}")))?;
+            let rpc_msa: RpcMutatorSetAccumulator = serde_json::from_value(msa_obj.clone())
+                .map_err(|e| XntError::RpcError(format!("parse mutator set failed: {e}")))?;
+            Ok(MutatorSetAccumulator::from(rpc_msa))
+        },
+    )?;
 
-    Ok(MutatorSet::from_core(rpc_msa.into()))
+    Ok(MutatorSet::from_core(inner).with_tip_height(tip_height))
+}
+
+/// Number of times [get_mutator_set] fetches the mutator set at most, while
+/// blocks arrive in between.
+pub(crate) const MUTATOR_SET_FETCH_ATTEMPTS: usize = 3;
+
+/// Fetch with `fetch` while the tip height that `tip_height` reads is the same
+/// before and after, and return the result with that height. Fails after
+/// [MUTATOR_SET_FETCH_ATTEMPTS] attempts at different heights.
+fn fetch_at_one_tip_height<T>(
+    mut tip_height: impl FnMut() -> Result<u64>,
+    mut fetch: impl FnMut() -> Result<T>,
+) -> Result<(T, u64)> {
+    for _ in 0..MUTATOR_SET_FETCH_ATTEMPTS {
+        let before = tip_height()?;
+        let fetched = fetch()?;
+        let after = tip_height()?;
+        if before == after {
+            return Ok((fetched, after));
+        }
+    }
+
+    Err(XntError::RpcError(format!(
+        "the tip changed while fetching the mutator set, {MUTATOR_SET_FETCH_ATTEMPTS} times"
+    )))
 }
 
 /// Get membership proofs via wallet RPC
+///
+/// `receiver_preimage` is a spending secret for dCTIDH keys, see
+/// [SpendingKey::receiver_preimage]. It is used locally and not sent to the
+/// node.
 pub fn get_membership_proofs(
     client: &RpcClient,
     utxo_hashes: &[Digest],
@@ -477,8 +711,6 @@ pub fn get_membership_proofs(
     receiver_preimage: &Digest,
     aocl_indices: &[u64],
 ) -> Result<Vec<MembershipProof>> {
-    use neptune_privacy::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipProofPrivacyPreserving;
-
     if utxo_hashes.len() != sender_randomnesses.len() || utxo_hashes.len() != aocl_indices.len() {
         return Err(XntError::RpcError("array length mismatch".to_string()));
     }
@@ -502,6 +734,24 @@ pub fn get_membership_proofs(
     let params = json!([absolute_index_sets]);
     let result = client.call("archival_restoreMembershipProof", params)?;
 
+    membership_proofs_from_response(
+        &result,
+        sender_randomnesses,
+        receiver_preimage,
+        aocl_indices,
+    )
+}
+
+/// Parse an `archival_restoreMembershipProof` result for the requested
+/// UTXOs. Fails unless it holds exactly one proof per requested UTXO.
+fn membership_proofs_from_response(
+    result: &Value,
+    sender_randomnesses: &[Digest],
+    receiver_preimage: &Digest,
+    aocl_indices: &[u64],
+) -> Result<Vec<MembershipProof>> {
+    use neptune_privacy::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipProofPrivacyPreserving;
+
     // Parse response
     let snapshot = result
         .get("snapshot")
@@ -511,6 +761,14 @@ pub fn get_membership_proofs(
         .get("membershipProofs")
         .and_then(|v| v.as_array())
         .ok_or_else(|| XntError::RpcError("missing membershipProofs".to_string()))?;
+
+    if proofs_arr.len() != aocl_indices.len() || proofs_arr.len() != sender_randomnesses.len() {
+        return Err(XntError::RpcError(format!(
+            "membershipProofs length mismatch: {} proofs for {} requested",
+            proofs_arr.len(),
+            aocl_indices.len()
+        )));
+    }
 
     let mut membership_proofs = Vec::with_capacity(proofs_arr.len());
     for (i, proof_val) in proofs_arr.iter().enumerate() {
@@ -532,11 +790,36 @@ pub fn get_membership_proofs(
 }
 
 /// Decrypt indexed UTXO ciphertext
+///
+/// Applies the main-net legacy cutoff, the strictest one; use
+/// [decrypt_indexed_utxo_for_network] to apply the rule of another network.
 pub fn decrypt_indexed_utxo(
     spending_key: &SpendingKey,
     ciphertext_bytes: &[u8],
     block_height: u64,
     block_digest: Digest,
+) -> Result<super::utxo::DecryptedUtxo> {
+    decrypt_indexed_utxo_for_network(
+        spending_key,
+        ciphertext_bytes,
+        block_height,
+        block_digest,
+        Network::Main,
+    )
+}
+
+/// Decrypt indexed UTXO ciphertext confirmed in the block at `block_height`.
+///
+/// Fails for a UTXO at a legacy-format dCTIDH lock confirmed at or above the
+/// legacy cutoff of `network` (see [super::wallet::legacy_dctidh_cutoff]).
+/// A UTXO at a legacy-format lock below the cutoff is returned with
+/// [super::utxo::DecryptedUtxo::is_legacy] set: it is sweep-only.
+pub fn decrypt_indexed_utxo_for_network(
+    spending_key: &SpendingKey,
+    ciphertext_bytes: &[u8],
+    block_height: u64,
+    block_digest: Digest,
+    network: Network,
 ) -> Result<super::utxo::DecryptedUtxo> {
     use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
 
@@ -561,12 +844,20 @@ pub fn decrypt_indexed_utxo(
         ));
     }
 
+    if !spending_key.recognizes_utxos_at(network, block_height) {
+        return Err(XntError::CryptoError(format!(
+            "UTXO at a legacy-format dCTIDH lock confirmed at height {block_height} is not \
+             recognized: such UTXOs are recognized only below the legacy cutoff height"
+        )));
+    }
+
     Ok(super::utxo::DecryptedUtxo {
         utxo,
         sender_randomness: Digest::from_core(sender_randomness),
         payment_id: payment_id.value(),
         block_height,
         block_digest,
+        is_legacy: spending_key.is_legacy(),
     })
 }
 
@@ -766,10 +1057,20 @@ pub fn decrypt_mempool_announcement(
 
 /// Check mempool for pending incoming UTXOs
 /// Returns list of (utxo, sender_randomness, payment_id) for pending incoming
+///
+/// For a legacy key nothing is returned once the next block is at or above
+/// the main-net legacy cutoff, see [super::wallet::legacy_dctidh_cutoff].
 pub fn mempool_incoming(
     client: &RpcClient,
     spending_key: &SpendingKey,
 ) -> Result<Vec<(Utxo, Digest, u64)>> {
+    if spending_key.is_legacy() {
+        let next_height = client.chain_height()?.saturating_add(1);
+        if !spending_key.recognizes_utxos_at(Network::Main, next_height) {
+            return Ok(Vec::new());
+        }
+    }
+
     let tx_ids = get_mempool_transactions(client)?;
     let mut pending_incoming = Vec::new();
 
@@ -784,4 +1085,282 @@ pub fn mempool_incoming(
     }
 
     Ok(pending_incoming)
+}
+
+#[cfg(test)]
+mod tests {
+    use neptune_privacy::api::export::NativeCurrencyAmount;
+    use neptune_privacy::api::export::TxOutput;
+    use neptune_privacy::prelude::tasm_lib::prelude::Digest as CoreDigest;
+    use neptune_privacy::prelude::twenty_first::prelude::BFieldElement;
+    use neptune_privacy::state::wallet::address::ciphertext_from_announcement;
+
+    use super::*;
+    use crate::core::wallet::WalletEntropy;
+
+    /// Ciphertext of an on-chain notification of `amount` coins to `key`'s
+    /// receiving address, as the indexer returns it.
+    fn ciphertext_to(key: &SpendingKey, amount: u32) -> Vec<u64> {
+        ciphertext_to_address(key.to_address().unwrap().inner, amount)
+    }
+
+    /// Ciphertext of an on-chain notification of `amount` coins to `address`,
+    /// as the indexer returns it.
+    fn ciphertext_to_address(
+        address: neptune_privacy::state::wallet::address::ReceivingAddress,
+        amount: u32,
+    ) -> Vec<u64> {
+        let tx_output = TxOutput::onchain_native_currency(
+            NativeCurrencyAmount::coins(amount),
+            rand::random::<CoreDigest>(),
+            address,
+            false,
+        );
+        let announcement = tx_output.announcement().unwrap();
+        ciphertext_from_announcement(&announcement)
+            .unwrap()
+            .iter()
+            .map(|bfe| bfe.value())
+            .collect()
+    }
+
+    fn indexed(block_height: u64, ciphertext: &[u64]) -> IndexedUtxo {
+        IndexedUtxo {
+            block_height,
+            block_digest: Digest::new(),
+            ciphertext: ciphertext.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    #[test]
+    fn block_ranges_cover_the_range_within_the_indexer_limit() {
+        const LIMIT: u64 = MAX_BLOCK_RANGE_PER_REQUEST;
+        assert_eq!(10_000, LIMIT);
+
+        // Within the limit, as the indexer takes it: one request.
+        assert_eq!(vec![(0, LIMIT)], block_ranges(0, LIMIT));
+        assert_eq!(vec![(5, 5)], block_ranges(5, 5));
+        assert_eq!(vec![(9, 3)], block_ranges(9, 3));
+
+        assert_eq!(vec![(0, LIMIT), (LIMIT + 1, LIMIT + 1)], block_ranges(0, LIMIT + 1));
+        assert_eq!(
+            vec![(100, 10_100), (10_101, 20_101), (20_102, 25_000)],
+            block_ranges(100, 25_000)
+        );
+        assert_eq!(vec![(u64::MAX - 1, u64::MAX)], block_ranges(u64::MAX - 1, u64::MAX));
+
+        // Main net from genesis to the tip: contiguous, without overlaps,
+        // each part within the limit.
+        let ranges = block_ranges(0, 94_072);
+        assert_eq!(10, ranges.len());
+        assert_eq!(0, ranges[0].0);
+        assert_eq!(94_072, ranges.last().unwrap().1);
+        for (from, to) in &ranges {
+            assert!(to - from <= LIMIT);
+        }
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn utxos_of_a_long_range_are_fetched_in_parts_and_merged() {
+        let mut requests = Vec::new();
+        let (utxos, skipped) = fetch_in_block_ranges(0, 25_000, |from, to| {
+            requests.push((from, to));
+            Ok((vec![indexed(from, &[1]), indexed(to, &[2])], 1))
+        })
+        .unwrap();
+
+        assert_eq!(vec![(0, 10_000), (10_001, 20_001), (20_002, 25_000)], requests);
+        assert_eq!(
+            vec![0, 10_000, 10_001, 20_001, 20_002, 25_000],
+            utxos.iter().map(|utxo| utxo.block_height).collect::<Vec<_>>()
+        );
+        assert_eq!(3, skipped);
+
+        // A failing part fails the whole range.
+        let result = fetch_in_block_ranges(0, 25_000, |from, _to| {
+            if from > 0 {
+                Err(XntError::RpcError("BlockRangeExceedsLimit".to_string()))
+            } else {
+                Ok((vec![], 0))
+            }
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_mutator_set_is_fetched_again_while_the_tip_changes() {
+        // The tip moves on between the first two readings, then stays.
+        let heights = std::cell::RefCell::new(vec![100, 101, 101, 101].into_iter());
+        let mut fetches = 0;
+        let (fetched, tip_height) = fetch_at_one_tip_height(
+            || Ok(heights.borrow_mut().next().unwrap()),
+            || {
+                fetches += 1;
+                Ok(fetches)
+            },
+        )
+        .unwrap();
+        assert_eq!((2, 101), (fetched, tip_height));
+
+        // The tip moves on at every attempt.
+        let height = std::cell::Cell::new(0);
+        let result = fetch_at_one_tip_height(
+            || {
+                height.set(height.get() + 1);
+                Ok(height.get())
+            },
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(2 * MUTATOR_SET_FETCH_ATTEMPTS as u64, height.get());
+    }
+
+    #[test]
+    fn the_tip_height_is_kept_but_not_serialized() {
+        let mutator_set = MutatorSet::from_core(Default::default());
+        assert_eq!(None, mutator_set.tip_height());
+        let mutator_set = mutator_set.with_tip_height(94_000);
+        assert_eq!(Some(94_000), mutator_set.tip_height());
+
+        let bytes = mutator_set.to_bytes().unwrap();
+        assert_eq!(bincode::serialize(&mutator_set.inner).unwrap(), bytes);
+        let restored = MutatorSet::from_bytes(&bytes).unwrap();
+        assert_eq!(None, restored.tip_height());
+        assert_eq!(Some(7), restored.with_tip_height(7).tip_height());
+    }
+
+    #[test]
+    fn malformed_indexed_entries_are_skipped_and_counted() {
+        let good = json!({ "blockHeight": 7, "blockDigest": "00", "ciphertext": [1, "2", 3] });
+        let oversized = vec![1u64; MAX_UTXO_CIPHERTEXT_SIZE / 8 + 1];
+        let result = json!({ "utxos": [
+            good,
+            { "blockHeight": 8, "ciphertext": oversized },
+            { "blockHeight": 9, "ciphertext": [1, BFieldElement::P] },
+            { "blockHeight": 10, "ciphertext": [1, "x"] },
+            { "blockHeight": 11, "ciphertext": [] },
+            { "blockHeight": 12 },
+            { "ciphertext": [1, 2] },
+            good,
+        ]});
+
+        let (utxos, skipped) = parse_indexed_utxos(&result).unwrap();
+        assert_eq!(6, skipped);
+        assert_eq!(2, utxos.len());
+        for utxo in utxos {
+            assert_eq!(7, utxo.block_height);
+            assert_eq!(
+                [1u64, 2, 3]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<_>>(),
+                utxo.ciphertext
+            );
+        }
+    }
+
+    #[test]
+    fn undecryptable_and_foreign_lock_entries_are_skipped_and_counted() {
+        let wallet = WalletEntropy::generate().unwrap();
+        let current = wallet.derive_dctidh_spending_key(0);
+        let legacy = wallet.derive_legacy_dctidh_spending_key(0);
+        let ciphertext = ciphertext_to(&current, 5);
+        let entries = || {
+            vec![
+                indexed(3, &ciphertext),
+                indexed(4, &[1, 2, 3, 4, 5]),
+                indexed(5, &ciphertext),
+            ]
+        };
+
+        let mut stats = ScanStats::default();
+        let utxos = decrypt_indexed_utxos(&current, Network::Main, entries(), &mut stats);
+        assert_eq!(2, utxos.len());
+        assert_eq!(
+            ScanStats {
+                undecryptable: 1,
+                ..ScanStats::default()
+            },
+            stats
+        );
+
+        // The legacy key has its own decryption key, so it decrypts none of them
+        let mut stats = ScanStats::default();
+        let utxos = decrypt_indexed_utxos(&legacy, Network::Main, entries(), &mut stats);
+        assert!(utxos.is_empty());
+        assert_eq!(
+            ScanStats {
+                undecryptable: 3,
+                ..ScanStats::default()
+            },
+            stats
+        );
+        assert_eq!(3, stats.total());
+    }
+
+    #[test]
+    fn decrypted_entries_carry_the_payment_id_of_their_notification() {
+        let wallet = WalletEntropy::generate().unwrap();
+        let key = wallet.derive_dctidh_spending_key(0);
+        let address = key.to_address().unwrap();
+        let entries = vec![
+            indexed(3, &ciphertext_to(&key, 1)),
+            indexed(4, &ciphertext_to_address(address.dctidh_subaddress(7).unwrap().inner, 2)),
+            indexed(5, &ciphertext_to_address(address.dctidh_subaddress(42).unwrap().inner, 3)),
+        ];
+
+        let mut stats = ScanStats::default();
+        let utxos = decrypt_indexed_utxos(&key, Network::Main, entries, &mut stats);
+        assert_eq!(0, stats.total());
+        assert_eq!(
+            vec![(3, 0), (4, 7), (5, 42)],
+            utxos
+                .iter()
+                .map(|(_, _, _, block_height, _, payment_id)| (*block_height, *payment_id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec![
+                NativeCurrencyAmount::coins(1).to_nau(),
+                NativeCurrencyAmount::coins(2).to_nau(),
+                NativeCurrencyAmount::coins(3).to_nau()
+            ],
+            utxos.iter().map(|(_, _, amount, _, _, _)| *amount).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn decrypted_utxo_reports_its_lock_and_legacy_flag() {
+        let wallet = WalletEntropy::generate().unwrap();
+        let key = wallet.derive_dctidh_spending_key(0);
+        let bytes: Vec<u8> = ciphertext_to(&key, 2)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+
+        let decrypted =
+            decrypt_indexed_utxo_for_network(&key, &bytes, u64::MAX, Digest::new(), Network::Main)
+                .unwrap();
+        assert!(!decrypted.is_legacy);
+        assert_eq!(key.lock_script_hash(), decrypted.utxo.lock_script_hash());
+
+        let legacy = wallet.derive_legacy_dctidh_spending_key(0);
+        assert!(decrypt_indexed_utxo(&legacy, &bytes, 1, Digest::new()).is_err());
+    }
+
+    #[test]
+    fn membership_proof_response_must_match_the_request() {
+        let response = json!({ "snapshot": { "membershipProofs": [] } });
+        let err =
+            membership_proofs_from_response(&response, &[Digest::new()], &Digest::new(), &[0])
+                .err()
+                .unwrap();
+        assert!(err.to_string().contains("length mismatch"), "{err}");
+
+        let empty = membership_proofs_from_response(&response, &[], &Digest::new(), &[]);
+        assert!(empty.unwrap().is_empty());
+    }
 }

@@ -20,9 +20,17 @@ pub struct Address {
 
 impl Address {
     /// Decode address from bech32m string
+    ///
+    /// Refuses symmetric keys: their bech32m encoding is a secret key, not an
+    /// address.
     pub fn from_bech32(bech32: &str, network: Network) -> Result<Self> {
         let inner = CoreReceivingAddress::from_bech32m(bech32, network.into())
             .map_err(|e| XntError::InvalidAddress(e.to_string()))?;
+        if matches!(inner, CoreReceivingAddress::Symmetric(_)) {
+            return Err(XntError::InvalidAddress(
+                "symmetric keys are not receiving addresses".to_string(),
+            ));
+        }
         Ok(Self { inner })
     }
 
@@ -202,5 +210,23 @@ impl Address {
         ReceivingAddress {
             inner: self.inner.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use neptune_privacy::prelude::tasm_lib::prelude::Digest as CoreDigest;
+    use neptune_privacy::state::wallet::address::symmetric_key::SymmetricKey;
+
+    use super::*;
+
+    #[test]
+    fn symmetric_keys_are_not_receiving_addresses() {
+        let key = SymmetricKey::from_seed(CoreDigest::default());
+        let encoded = CoreReceivingAddress::from(key)
+            .to_bech32m(Network::RegTest.into())
+            .unwrap();
+        assert!(CoreReceivingAddress::from_bech32m(&encoded, Network::RegTest.into()).is_ok());
+        assert!(Address::from_bech32(&encoded, Network::RegTest).is_err());
     }
 }

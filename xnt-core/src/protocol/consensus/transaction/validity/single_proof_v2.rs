@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 
 use crate::api::tx_initiation::builder::proof_builder::ProofBuilder;
 use crate::api::tx_initiation::error::CreateProofError;
+use crate::application::config::network::Network;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+use crate::protocol::consensus::transaction::validity::legacy_v7;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::triton_vm::prelude::*;
 use itertools::Itertools;
@@ -39,12 +41,29 @@ use crate::protocol::proof_abstractions::SecretWitness;
 use crate::BFieldElement;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 
+use super::tasm::single_proof::fix_branch::FixBranch;
+use super::tasm::single_proof::fix_branch::FixWitness;
 use super::tasm::single_proof::merge_branch::MergeWitness;
 use super::tasm::single_proof::update_branch::UpdateWitness;
+use super::tasm::single_proof::weld_branch::WeldBranch;
+use super::tasm::single_proof::weld_branch::WeldWitness;
+use crate::protocol::consensus::chaintx::link_proof::link_proof_claim;
+use crate::protocol::consensus::chaintx::link_tx::LinkTx;
+use crate::protocol::consensus::transaction::transaction_proof::TransactionProof;
+use crate::protocol::consensus::transaction::Transaction;
+use crate::protocol::proof_abstractions::verifier::verify;
 
 pub(crate) const DISCRIMINANT_FOR_PROOF_COLLECTION: u64 = 0;
 pub(crate) const DISCRIMINANT_FOR_UPDATE: u64 = 1;
 pub(crate) const DISCRIMINANT_FOR_MERGE: u64 = 2;
+
+/// Transaction chaining, from `UpgradeVMv8` onwards; see
+/// [`ConsensusRuleSet::has_chain_branches`].
+pub(crate) const DISCRIMINANT_FOR_FIX: u64 = 3;
+
+/// Transaction chaining, from `UpgradeVMv8` onwards; see
+/// [`ConsensusRuleSet::has_chain_branches`].
+pub(crate) const DISCRIMINANT_FOR_WELD: u64 = 4;
 
 const INVALID_WITNESS_DISCRIMINANT_ERROR: i128 = 1_000_050;
 const NO_BRANCH_TAKEN_ERROR: i128 = 1_000_051;
@@ -55,6 +74,14 @@ pub enum SingleProofV2Witness {
     Collection(Box<ProofCollection>),
     Update(UpdateWitness),
     Merger(MergeWitness),
+    /// `LinkTx -> Transaction`: send a chained transaction whose thruputs are
+    /// all resolved to a block-borne, `SingleProof`-backed one.
+    Fix(FixWitness),
+    /// `Transaction * LinkTx -> Transaction`: fold a link transaction into a
+    /// `SingleProof`-backed one, cutting every thruput through against that
+    /// transaction's outputs. What `Fix(Chain(Cast(A), B))` computes in three
+    /// proofs, in one.
+    Weld(Box<WeldWitness>),
     // Wait for Hard Fork One:
     // IntegralMempool(IntegralMempoolMembershipWitness)
 }
@@ -70,6 +97,91 @@ impl SingleProofV2Witness {
 
     pub(crate) fn from_merge(merge_witness: MergeWitness) -> Self {
         Self::Merger(merge_witness)
+    }
+
+    pub fn from_fix(witness: FixWitness) -> Self {
+        Self::Fix(witness)
+    }
+
+    pub fn from_weld(witness: WeldWitness) -> Self {
+        Self::Weld(Box::new(witness))
+    }
+
+    /// Prove this witness under the given rule set's [`SingleProofV2`]
+    /// program, yielding a [`SingleProofV2`]-backed [`Proof`].
+    ///
+    /// Under `UpgradeVMv7` only a [`ProofCollection`] can be raised, and the
+    /// padded-height limit of the job is lowered to what the available memory
+    /// holds; see `nondeterminism_for` and `SingleProofV2::job_options_for`.
+    pub async fn produce(
+        self,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> Result<Proof, CreateProofError> {
+        // Through the versioned builder, like the verifier.
+        let claim = single_proof_claim(self.kernel_mast_hash(), consensus_rule_set);
+        let program = SingleProofV2::program_for(consensus_rule_set)?;
+        let nondeterminism = self
+            .nondeterminism_for(consensus_rule_set, proof_job_options.job_settings.network)
+            .await?;
+        let proof_job_options =
+            SingleProofV2::job_options_for(consensus_rule_set, proof_job_options);
+        ProofBuilder::new()
+            .program(program)
+            .claim(claim)
+            .nondeterminism(|| nondeterminism)
+            .job_queue(triton_vm_job_queue)
+            .proof_job_options(proof_job_options)
+            .build()
+            .await
+    }
+
+    /// The nondeterminism for proving this witness under the given rule set's
+    /// [`SingleProofV2`] program; see [`SingleProofV2::program_for`].
+    ///
+    /// The `UpgradeVMv7` program verifies triton-vm v7 proofs, so its
+    /// nondeterminism comes from the tasm-lib v7 verifier, which verifies every
+    /// sub-proof first; that runs in a blocking task. This version raises only
+    /// proof collections to v7 single proofs; updating and merging v7 single
+    /// proofs is left to nodes of that era. On networks with mock proofs the
+    /// prover reads no nondeterminism, and the sub-proofs are mock proofs that
+    /// the v7 verifier rejects, so none is derived.
+    pub(crate) async fn nondeterminism_for(
+        &self,
+        consensus_rule_set: ConsensusRuleSet,
+        network: Network,
+    ) -> Result<NonDeterminism, CreateProofError> {
+        match (consensus_rule_set, self) {
+            (ConsensusRuleSet::UpgradeVMv8, _) => Ok(self.nondeterminism()),
+            (ConsensusRuleSet::UpgradeVMv7, Self::Collection(_)) if network.use_mock_proof() => {
+                Ok(NonDeterminism::default())
+            }
+            (ConsensusRuleSet::UpgradeVMv7, Self::Collection(proof_collection)) => Ok(
+                legacy_v7::v7_single_proof_nondeterminism_blocking((**proof_collection).clone())
+                    .await?,
+            ),
+            (ConsensusRuleSet::UpgradeVMv7, _) => Err(CreateProofError::NotProducible {
+                proof: "a single proof other than from a proof collection",
+                consensus_rule_set,
+            }),
+            _ => Err(CreateProofError::NotProducible {
+                proof: "a single proof",
+                consensus_rule_set,
+            }),
+        }
+    }
+
+    /// MAST hash of the transaction kernel this witness attests to -- the public
+    /// input of the `SingleProof` claim.
+    pub fn kernel_mast_hash(&self) -> Digest {
+        match self {
+            Self::Collection(pc) => pc.kernel_mast_hash,
+            Self::Update(witness) => witness.new_kernel_mast_hash,
+            Self::Merger(witness) => witness.new_kernel.mast_hash(),
+            Self::Fix(witness) => witness.kernel_mast_hash(),
+            Self::Weld(witness) => witness.kernel_mast_hash(),
+        }
     }
 }
 
@@ -110,6 +222,10 @@ impl TasmObject for SingleProofV2Witness {
             DISCRIMINANT_FOR_MERGE => {
                 Ok(Box::new(Self::Merger(*BFieldCodec::decode(&field_data)?)))
             }
+            DISCRIMINANT_FOR_FIX => Ok(Box::new(Self::Fix(*BFieldCodec::decode(&field_data)?))),
+            DISCRIMINANT_FOR_WELD => Ok(Box::new(Self::Weld(Box::new(*BFieldCodec::decode(
+                &field_data,
+            )?)))),
             _ => Err(Box::new(BFieldCodecError::ElementOutOfRange)),
         }
     }
@@ -117,12 +233,7 @@ impl TasmObject for SingleProofV2Witness {
 
 impl SecretWitness for SingleProofV2Witness {
     fn standard_input(&self) -> PublicInput {
-        let kernel_mast_hash = match self {
-            Self::Collection(pc) => pc.kernel_mast_hash,
-            Self::Update(witness) => witness.new_kernel_mast_hash,
-            Self::Merger(witness) => witness.new_kernel.mast_hash(),
-        };
-        kernel_mast_hash.reversed().values().into()
+        self.kernel_mast_hash().reversed().values().into()
     }
 
     fn output(&self) -> Vec<BFieldElement> {
@@ -213,6 +324,12 @@ impl SecretWitness for SingleProofV2Witness {
                 witness_of_merge
                     .populate_nd_streams(&mut nondeterminism, single_proof_program_hash);
             }
+            SingleProofV2Witness::Fix(witness) => {
+                witness.populate_nd_streams(&mut nondeterminism, single_proof_program_hash);
+            }
+            SingleProofV2Witness::Weld(witness) => {
+                witness.populate_nd_streams(&mut nondeterminism, single_proof_program_hash);
+            }
         }
 
         nondeterminism
@@ -229,6 +346,59 @@ impl SingleProofV2 {
             .with_input(tx_kernel_mast_hash.reversed().values())
     }
 
+    /// The `SingleProofV2` program of the given rule set, for the rule sets
+    /// this version proves under: the linked program for `UpgradeVMv8`, and
+    /// the program reassembled with the tasm-lib v7 verifier for `UpgradeVMv7`
+    /// (see [`legacy_v7::single_proof_v2_v7_program`]). Both hash to the program
+    /// digest of [`single_proof_claim`] for their rule set.
+    pub(crate) fn program_for(
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> Result<Program, CreateProofError> {
+        match consensus_rule_set {
+            ConsensusRuleSet::UpgradeVMv8 => Ok(SingleProofV2.program()),
+            ConsensusRuleSet::UpgradeVMv7 => {
+                // Refuse to prove if the reassembled program drifted from the
+                // pinned digest: no node of that era would accept the proof.
+                let program = legacy_v7::single_proof_v2_v7_program();
+                if program.hash() != single_proof_program_digest(consensus_rule_set) {
+                    return Err(CreateProofError::NotProducible {
+                        proof: "a single proof: the assembled program does not hash to the pinned \
+                                digest",
+                        consensus_rule_set,
+                    });
+                }
+
+                Ok(program)
+            }
+            ConsensusRuleSet::Reboot
+            | ConsensusRuleSet::HardforkAlpha
+            | ConsensusRuleSet::Xnt
+            | ConsensusRuleSet::TimelockExtension
+            | ConsensusRuleSet::UpgradeVM
+            | ConsensusRuleSet::UpgradeVMv4
+            | ConsensusRuleSet::UpgradeVMv5 => Err(CreateProofError::NotProducible {
+                proof: "a single proof",
+                consensus_rule_set,
+            }),
+        }
+    }
+
+    /// The job options for proving the given rule set's program on this
+    /// machine: for `UpgradeVMv7`, with the padded-height limit lowered to
+    /// what the available memory holds; see
+    /// [`legacy_v7::v7_single_proof_job_options`].
+    pub(crate) fn job_options_for(
+        consensus_rule_set: ConsensusRuleSet,
+        proof_job_options: TritonVmProofJobOptions,
+    ) -> TritonVmProofJobOptions {
+        match consensus_rule_set {
+            ConsensusRuleSet::UpgradeVMv7 => {
+                legacy_v7::v7_single_proof_job_options(proof_job_options)
+            }
+            _ => proof_job_options,
+        }
+    }
+
     /// Generate a [SingleProofV2] for the transaction, given its primitive
     /// witness.
     ///
@@ -240,26 +410,32 @@ impl SingleProofV2 {
         primitive_witness: &PrimitiveWitness,
         triton_vm_job_queue: Arc<TritonVmJobQueue>,
         proof_job_options: TritonVmProofJobOptions,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> Result<Proof, CreateProofError> {
+        // Fail before proving the collection if the rule set's program is not
+        // available.
+        SingleProofV2::program_for(consensus_rule_set)?;
+
         let proof_collection = ProofCollection::produce_v2(
             primitive_witness,
             triton_vm_job_queue.clone(),
             proof_job_options.clone(),
+            consensus_rule_set,
         )
         .await?;
         let single_proof_witness = SingleProofV2Witness::from_collection(proof_collection);
-        let claim = single_proof_witness.claim();
 
-        let nondeterminism = single_proof_witness.nondeterminism();
+        // The witness builds the claim through the versioned builder rather
+        // than its default `claim()`, which stamps the LINKED triton-vm's
+        // `CURRENT_VERSION`. Those two agree only while the era being produced
+        // for is the current one; for any other era they disagree, and because
+        // the claim's version is part of the Fiat-Shamir transcript the proof
+        // then answers a different question than the verifier asks. Going
+        // through the same builder the verifier uses makes them agree by
+        // construction. Upstream: d4742c65.
         info!("Start: generate single proof from proof collection");
-
-        let proof = ProofBuilder::new()
-            .program(SingleProofV2.program())
-            .claim(claim)
-            .nondeterminism(|| nondeterminism)
-            .job_queue(triton_vm_job_queue)
-            .proof_job_options(proof_job_options)
-            .build()
+        let proof = single_proof_witness
+            .produce(triton_vm_job_queue, proof_job_options, consensus_rule_set)
             .await?;
         info!("Done");
 
@@ -288,10 +464,17 @@ pub(crate) async fn produce_single_proof(
         | ConsensusRuleSet::UpgradeVM
         | ConsensusRuleSet::UpgradeVMv4
         | ConsensusRuleSet::UpgradeVMv5
-        | ConsensusRuleSet::UpgradeVMv7 => {
+        | ConsensusRuleSet::UpgradeVMv7
+        | ConsensusRuleSet::UpgradeVMv8 => {
             // backed by CollectTypeScriptsV2's hash. For now it shares V1 so
             // the variant is wired and the rest of the cascade can be built.
-            SingleProofV2::produce(primitive_witness, triton_vm_job_queue, proof_job_options).await
+            SingleProofV2::produce(
+                primitive_witness,
+                triton_vm_job_queue,
+                proof_job_options,
+                consensus_rule_set,
+            )
+            .await
         }
     }
 }
@@ -320,6 +503,8 @@ pub(crate) fn single_proof_claim(
         "15312e1a996ae949b1c5aa9b3af6c3ca5f9566cae3e40aa7d0552b2ed780a279a7c3a3bb783aeee7";
     const SINGLE_PROOF_V2_UPGRADE_VM_V5_DIGEST: &str = // SingleProofV2, v5 tree (UpgradeVMv5)
         "e66985a98e4d5e455c5d11e57a16c3dca3cce2bd2a16d6f5e791f592801cc32eb99c57c32bf90e88";
+    const SINGLE_PROOF_V2_UPGRADE_VM_V7_DIGEST: &str = // SingleProofV2, v7 tree (UpgradeVMv7)
+        "5c75cc2d808464503cccf3bf2467ff13bd3fc736d06aa4f661415852549900e04eb667ddd9792d76";
 
     let input = tx_kernel_mast_hash.reversed().values().to_vec();
     let version = consensus_rule_set.triton_proof_version().claim_version();
@@ -355,9 +540,97 @@ pub(crate) fn single_proof_claim(
                 .about_version(version)
                 .with_input(input)
         }
-        // Current (v7) bytecode — recompute from the linked program.
-        ConsensusRuleSet::UpgradeVMv7 => SingleProofV2::claim(tx_kernel_mast_hash),
+        // UpgradeVMv7 (v7) bytecode — now a pre-v8 era, hardcoded.
+        ConsensusRuleSet::UpgradeVMv7 => {
+            Claim::new(Digest::try_from_hex(SINGLE_PROOF_V2_UPGRADE_VM_V7_DIGEST).unwrap())
+                .about_version(version)
+                .with_input(input)
+        }
+        // Current (v8) bytecode — recompute from the linked program.
+        ConsensusRuleSet::UpgradeVMv8 => SingleProofV2::claim(tx_kernel_mast_hash),
     }
+}
+
+/// The digest of this consensus rule set's `SingleProof` program: the `D` that
+/// link proofs under it carry.
+pub(crate) fn single_proof_program_digest(consensus_rule_set: ConsensusRuleSet) -> Digest {
+    single_proof_claim(Digest::default(), consensus_rule_set).program_digest
+}
+
+/// The claim a proof-backed [`LinkTx`]'s proof must relate to, for this
+/// consensus rule set: the [`link_proof_claim`] with `D` instantiated to the
+/// rule set's `SingleProof` digest.
+///
+/// Only meaningful for a rule set with chain branches; see
+/// [`ConsensusRuleSet::has_chain_branches`].
+pub(crate) fn link_tx_claim(
+    link_kernel_mast_hash: Digest,
+    consensus_rule_set: ConsensusRuleSet,
+) -> Claim {
+    link_proof_claim(
+        link_kernel_mast_hash,
+        single_proof_program_digest(consensus_rule_set),
+        consensus_rule_set,
+    )
+}
+
+/// Fix a resolved [`LinkTx`] into a `SingleProof`-backed [`Transaction`].
+///
+/// The exit of the chain pipeline: the link transaction must be proof-backed
+/// with no thruputs left, and the resulting transaction is block-eligible
+/// like any other single-proof transaction.
+///
+/// Returns [`CreateProofError::LinkTxNotFixable`] if the link transaction
+/// carries thruputs, is not proof-backed, or if the rule set's `SingleProof`
+/// program has no `Fix` branch.
+pub(crate) async fn fix_link_tx(
+    link_tx: LinkTx,
+    consensus_rule_set: ConsensusRuleSet,
+    triton_vm_job_queue: Arc<TritonVmJobQueue>,
+    proof_job_options: TritonVmProofJobOptions,
+) -> Result<Transaction, CreateProofError> {
+    if !consensus_rule_set.has_chain_branches() {
+        return Err(CreateProofError::LinkTxNotFixable(
+            "the rule set's SingleProof program has no Fix branch",
+        ));
+    }
+    if !link_tx.kernel.thruputs.is_empty() {
+        return Err(CreateProofError::LinkTxNotFixable(
+            "it has unresolved thruputs",
+        ));
+    }
+    if !link_tx.proof.is_proof() {
+        return Err(CreateProofError::LinkTxNotFixable(
+            "it is not backed by a link proof",
+        ));
+    }
+
+    let witness = FixWitness::fix(link_tx);
+    let kernel = witness.kernel.clone();
+
+    let network = proof_job_options.job_settings.network;
+    let proof = if network.use_mock_proof() {
+        Proof::valid_mock(Claim::new(Digest::default()))
+    } else {
+        // The link proof must answer the claim `Fix` builds for it, which
+        // names this rule set's `SingleProof` program. Checked here, as an
+        // error, rather than while assembling the nondeterminism.
+        let claim = witness.link_proof_claim(single_proof_program_digest(consensus_rule_set));
+        if !verify(claim, witness.link_proof.clone(), network).await {
+            return Err(CreateProofError::LinkTxNotFixable(
+                "its link proof does not answer the Fix claim",
+            ));
+        }
+
+        SingleProofV2Witness::from_fix(witness)
+            .produce(triton_vm_job_queue, proof_job_options, consensus_rule_set)
+            .await?
+    };
+
+    Ok(Transaction {
+        kernel,
+        proof: TransactionProof::SingleProof(proof),
+    })
 }
 
 pub(crate) fn produce_single_proof_mock(valid_mock: bool) -> Proof {
@@ -369,10 +642,30 @@ pub(crate) fn produce_single_proof_mock(valid_mock: bool) -> Proof {
     }
 }
 
-impl ConsensusProgram for SingleProofV2 {
-    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
-        let mut library = Library::new();
+impl SingleProofV2 {
+    /// Assemble the program, with or without the transaction-chaining
+    /// branches.
+    ///
+    /// Only the `UpgradeVMv8` program, which has them, is ever proven against;
+    /// see [`ConsensusRuleSet::has_chain_branches`]. Assembling it without them
+    /// reproduces the program as it was before they were added, which is what
+    /// shows that adding them changed nothing else.
+    fn assemble(&self, with_chain_branches: bool) -> (Library, Vec<LabelledInstruction>) {
+        self.assemble_into(Library::new(), with_chain_branches)
+    }
 
+    /// Like [`Self::assemble`], into a library that may already hold imports.
+    ///
+    /// Imports deduplicate by entrypoint label, so a snippet imported up front
+    /// replaces every later import of the same label. The `UpgradeVMv7`
+    /// program uses this to substitute the tasm-lib v7 STARK verifier and the
+    /// claim builder for claim version 5; see
+    /// [`legacy_v7::single_proof_v2_v7_code`].
+    pub(crate) fn assemble_into(
+        &self,
+        mut library: Library,
+        with_chain_branches: bool,
+    ) -> (Library, Vec<LabelledInstruction>) {
         // imports
         let stark_verify = library.import(Box::new(StarkVerify::new_with_dynamic_layout(
             Stark::default(),
@@ -406,6 +699,39 @@ impl ConsensusProgram for SingleProofV2 {
         let claim_field_with_size_output = triton_asm!(read_mem 1 addi 1 place 1 addi -1);
         let merkle_verify =
             library.import(Box::new(tasm_lib::hashing::merkle_verify::MerkleVerify));
+
+        // The chaining branches are imported last: an import both emits code and
+        // hands out static-memory addresses, and importing them after every
+        // other snippet keeps the existing branches' allocations where they were.
+        //
+        // `Fix` and `Weld` share one slot for `D`, this program's own digest: both
+        // instantiate the `LinkProof` family at it, neither runs in the same
+        // execution as the other, and one slot is one `kmalloc` less.
+        let chain_branches = with_chain_branches.then(|| {
+            let single_proof_digest_alloc = library.kmalloc(u32::try_from(Digest::LEN).unwrap());
+            let fix = library.import(Box::new(FixBranch::new(single_proof_digest_alloc)));
+            let weld = library.import(Box::new(WeldBranch::new(single_proof_digest_alloc)));
+            (fix, weld)
+        });
+
+        // The `Fix` and `Weld` discriminants are only legal when their branches
+        // are present.
+        let (accept_chain_discriminants, dispatch_chain_branches) = match chain_branches {
+            None => (triton_asm!(), triton_asm!()),
+            Some((fix_branch, weld_branch)) => (
+                triton_asm!(
+                    dup 1 push {DISCRIMINANT_FOR_FIX} eq add
+                    dup 1 push {DISCRIMINANT_FOR_WELD} eq add
+                ),
+                triton_asm!(
+                    dup 0 push {DISCRIMINANT_FOR_FIX} eq
+                    skiz call {fix_branch}
+
+                    dup 0 push {DISCRIMINANT_FOR_WELD} eq
+                    skiz call {weld_branch}
+                ),
+            ),
+        };
 
         let verify_scripts_loop_label = "neptune_transaction_verify_lock_scripts_loop";
         let verify_scripts_loop_body = triton_asm! {
@@ -731,6 +1057,9 @@ impl ConsensusProgram for SingleProofV2 {
             add
             // _ discr (discr == proof_coll || discr == update || discr == merge)
 
+            {&accept_chain_discriminants}
+            // _ discr (.. [|| discr == fix || discr == weld])
+
             assert error_id {INVALID_WITNESS_DISCRIMINANT_ERROR}
             // _ discr
         );
@@ -763,6 +1092,8 @@ impl ConsensusProgram for SingleProofV2 {
             dup 0 push {DISCRIMINANT_FOR_MERGE} eq
             skiz call {merge_branch}
 
+            {&dispatch_chain_branches}
+
             // _ [own_digest] [txk_digest] *single_proof_witness discriminant
 
             // a discriminant of -1 indicates that some branch was executed
@@ -784,6 +1115,12 @@ impl ConsensusProgram for SingleProofV2 {
         };
 
         (library, code)
+    }
+}
+
+impl ConsensusProgram for SingleProofV2 {
+    fn library_and_code(&self) -> (Library, Vec<LabelledInstruction>) {
+        self.assemble(ConsensusRuleSet::UpgradeVMv8.has_chain_branches())
     }
 
     fn hash(&self) -> Digest {
@@ -824,6 +1161,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::application::config::network::Network;
     use crate::application::triton_vm_job_queue::TritonVmJobPriority;
+    use crate::protocol::consensus::consensus_rule_set::TritonProofVersion;
     use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
     use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
     use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2Witness;
@@ -910,6 +1248,12 @@ pub(crate) mod tests {
                 SingleProofV2Witness::Merger(witness) => {
                     witness.branch_source(own_program_digest, txk_digest)
                 }
+                SingleProofV2Witness::Fix(witness) => {
+                    witness.branch_source(own_program_digest, txk_digest)
+                }
+                SingleProofV2Witness::Weld(witness) => {
+                    witness.branch_source(own_program_digest, txk_digest)
+                }
             }
         }
     }
@@ -917,7 +1261,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn invalid_discriminant_crashes_execution() {
         let pub_input = PublicInput::new(bfe_vec![0, 0, 0, 0, 0]);
-        for illegal_discriminant_value in bfe_array![-1, 3, 4, 1u64 << 40] {
+        for illegal_discriminant_value in bfe_array![-1, 5, 6, 1u64 << 40] {
             let init_ram: HashMap<_, _> = [(
                 FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
                 illegal_discriminant_value,
@@ -963,6 +1307,7 @@ pub(crate) mod tests {
                 &good_primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
@@ -981,6 +1326,7 @@ pub(crate) mod tests {
                 &bad_primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
@@ -1014,10 +1360,16 @@ pub(crate) mod tests {
                 &primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
-            assert!(proof_collection.verify_v2(txk_mast_hash, network).await);
+            let claim_version = TritonProofVersion::V8.claim_version();
+            assert!(
+                proof_collection
+                    .verify_v2(txk_mast_hash, network, claim_version)
+                    .await
+            );
 
             let witness = SingleProofV2Witness::from_collection(proof_collection.clone());
             let claim = witness.claim();
@@ -1064,10 +1416,16 @@ pub(crate) mod tests {
                 &primitive_witness,
                 TritonVmJobQueue::get_instance(),
                 TritonVmJobPriority::default().into(),
+                ConsensusRuleSet::UpgradeVMv8,
             )
             .await
             .unwrap();
-            assert!(proof_collection.verify_v2(txk_mast_hash, network).await);
+            let claim_version = TritonProofVersion::V8.claim_version();
+            assert!(
+                proof_collection
+                    .verify_v2(txk_mast_hash, network, claim_version)
+                    .await
+            );
 
             let witness = SingleProofV2Witness::from_collection(proof_collection.clone());
             let claim = witness.claim();
@@ -1372,6 +1730,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// The pre-chaining `UpgradeVMv8` program: the branches the chaining
+    /// branches were added to are unchanged, down to their static-memory
+    /// addresses, which is why `FixBranch` and `WeldBranch` are imported last.
+    #[test]
+    fn program_without_chain_branches_is_the_pre_chaining_program() {
+        let (_, code) = SingleProofV2.assemble(false);
+        assert_eq!(
+            "307f41ff80f6f7af27a6382ae91cf0d54f9464c0cda525652c1e5285c0ab0044374a488c3d7dc75e",
+            Program::new(&code).hash().to_hex(),
+        );
+    }
+
+    /// Without the chaining branches, their discriminants are as illegal as
+    /// any other unknown value.
+    #[apply(shared_tokio_runtime)]
+    async fn chain_discriminants_are_illegal_without_chain_branches() {
+        let (_, code) = SingleProofV2.assemble(false);
+        let program = Program::new(&code);
+        let pub_input = PublicInput::new(bfe_vec![0, 0, 0, 0, 0]);
+        for discriminant in [DISCRIMINANT_FOR_FIX, DISCRIMINANT_FOR_WELD] {
+            let init_ram: HashMap<_, _> = [(
+                FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
+                bfe!(discriminant),
+            )]
+            .into_iter()
+            .collect();
+            let nondeterminism = NonDeterminism::default().with_ram(init_ram);
+
+            let_assert!(
+                Err(vm_error) = VM::run(program.clone(), pub_input.clone(), nondeterminism)
+            );
+            let_assert!(InstructionError::AssertionFailed(assertion_err) = vm_error.source);
+            assert_eq!(Some(INVALID_WITNESS_DISCRIMINANT_ERROR), assertion_err.id);
+        }
+    }
+
     test_program_snapshot!(
         SingleProofV2,
         // SP_V2_HASH frozen after phase 6 of the +1 year timelock hard fork.
@@ -1380,9 +1774,14 @@ pub(crate) mod tests {
         // so SingleProofV2 verifies a CollectTypeScriptsV2 proof instead of
         // a V1 proof. Used by BlockAppendix consensus_claims under
         // ConsensusRuleSet::TimelockExtension.
-        // Program hash updated for UpgradeVMv7 (triton-vm v7 / tasm-lib u128
-        // range-check); the UpgradeVMv5 (v5) digest (e66985a8…) lives on as a
-        // hardcoded constant in single_proof_claim.
-        "5c75cc2d808464503cccf3bf2467ff13bd3fc736d06aa4f661415852549900e04eb667ddd9792d76"
+        // Program hash updated for UpgradeVMv8 (triton-vm v8: sound Hash/Program
+        // Table AIR, randomized quotient table). The UpgradeVMv7 (v7) digest
+        // (5c75cc2d…) lives on as a hardcoded constant in single_proof_claim,
+        // as does the v5 one (e66985a8…).
+        // Program hash updated again for the `Fix` and `Weld` branches
+        // (transaction chaining), which activate together with the v8 virtual
+        // machine. Without them the program still hashes to 307f41ff…; see
+        // `program_without_chain_branches_is_the_pre_chaining_program`.
+        "3ab71f45d12c1b1709197789ffe6194b25492fd0e7dd1aed054a68cf369ae14b17d9b80e99a5e8cf"
     );
 }

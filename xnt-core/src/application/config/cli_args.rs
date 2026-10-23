@@ -1,4 +1,6 @@
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::num::NonZero;
 use std::ops::RangeInclusive;
@@ -11,16 +13,25 @@ use clap::builder::RangedI64ValueParser;
 use clap::builder::TypedValueParser;
 use clap::Parser;
 use itertools::Itertools;
+use multiaddr::Multiaddr;
+use multiaddr::Protocol;
 use num_traits::Zero;
 use sysinfo::System;
 use tracing::error;
 
 use super::fee_notification_policy::FeeNotificationPolicy;
 use super::network::Network;
+use super::parser::multiaddr::parse_ip_or_multiaddr;
+use super::parser::peer_address::PeerAddress;
+use crate::application::config::auto_consolidation::AutoConsolidationSettings;
+use crate::application::config::auto_consolidation::ConsolidationTarget;
+use crate::application::config::dctidh_migration::DctidhMigrationSettings;
 use crate::application::config::triton_vm_env_vars::TritonVmEnvVars;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::application::json_rpc::core::api::ops::Namespace;
 use crate::application::triton_vm_job_queue::TritonVmJobPriority;
+use crate::protocol::consensus::block::block_height::BlockHeight;
+use crate::protocol::consensus::consensus_rule_set::set_v8_activation_height;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::peer::transfer_transaction::TransactionProofQuality;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
@@ -86,8 +97,10 @@ pub struct Args {
     ///
     /// To do this, see `--peer`.
     ///
-    /// E.g.: --ban 1.2.3.4 --ban 5.6.7.8
-    #[clap(long, value_name = "IP")]
+    /// If a multiaddress is given, the IP address it names is banned.
+    ///
+    /// E.g.: --ban 1.2.3.4 --ban 5.6.7.8 --ban /ip4/8.8.4.4/udp/1337/quic-v1
+    #[clap(long, value_name = "IP|MULTIADDR", value_parser = parse_ip_or_multiaddr)]
     pub(crate) ban: Vec<IpAddr>,
 
     /// The threshold at which a peer's standing is considered “bad”. Current
@@ -131,12 +144,24 @@ pub struct Args {
     #[clap(long)]
     pub(crate) max_connections_per_ip: Option<usize>,
 
+    /// Maximum number of inbound libp2p connections to accept from each
+    /// address prefix, /24 for IPv4 and /64 for IPv6, which is the granularity
+    /// at which one operator usually controls addresses.
+    #[clap(long, default_value = "8", value_name = "COUNT")]
+    pub max_connections_per_prefix: Option<usize>,
+
+    /// Maximum number of inbound libp2p connection attempts to accept from one
+    /// IP address per minute, refused attempts included.
+    #[clap(long, default_value = "6", value_name = "COUNT")]
+    pub max_connection_attempts_per_ip_per_minute: Option<usize>,
+
     /// Handshake timeout in seconds.
     ///
     /// The timeout used for all messages received and sent during the handshake
-    /// protocol for incoming connections. Can be lowered if the client is
-    /// attacked by many connection attempts. Can be raised if client is running
-    /// on a machine with a bad internet connection.
+    /// protocol for incoming connections, and for libp2p connections in either
+    /// direction. Can be lowered if the client receives many connection
+    /// attempts. Can be raised if client is running on a machine with a bad
+    /// internet connection.
     #[clap(long, default_value = "4", value_name = "SECONDS")]
     pub(crate) handshake_timeout: u8,
 
@@ -149,6 +174,14 @@ pub struct Args {
     /// refuse incoming connections when the max is reached.
     #[clap(long)]
     pub(crate) bootstrap: bool,
+
+    /// Do not act as a libp2p relay server for peers behind NATs.
+    ///
+    /// By default, the node offers relay reservations so that peers behind
+    /// NATs can be reached through it. Setting this flag turns that service
+    /// off. The node can still use other nodes this way.
+    #[clap(long)]
+    pub disable_relay_server: bool,
 
     /// If this flag is set, the node will refuse to initiate a transaction.
     /// This flag makes sense for machines whose resources are dedicated to
@@ -191,7 +224,7 @@ pub struct Args {
     /// involves the computationally expensive task of producing STARK proofs.
     /// You should have plenty of cores and probably at least 128 GB of RAM.
     #[clap(long)]
-    pub(crate) tx_proof_upgrading: bool,
+    pub tx_proof_upgrading: bool,
 
     /// If [`Self::tx_proof_upgrading`] is set, only upgrade transactions that
     /// match this filter. Syntax: `--tx-upgrade-filter <divisor>:<remainder>`
@@ -234,6 +267,115 @@ pub struct Args {
     /// relayed to peers.
     #[clap(long, default_value = "0.0005", value_parser = NativeCurrencyAmount::coins_from_str)]
     pub(crate) min_relay_pctx_fee_per_input: NativeCurrencyAmount,
+
+    /// The number of blocks before a hard fork from which this node creates no
+    /// new transactions for the era before the fork.
+    ///
+    /// Such a transaction must be mined before the fork, and this version
+    /// cannot carry it over. Main net follows the `UpgradeVMv7` consensus rule
+    /// set until the `UpgradeVMv8` hard fork at block 97000; with the default,
+    /// the last such transactions are created on top of block 96989. The
+    /// transactions created before go on being relayed and re-proven until the
+    /// next block belongs to the new era.
+    #[clap(long, default_value = "10", value_name = "BLOCKS")]
+    pub(crate) fork_tx_cutoff_margin: u64,
+
+    /// On a test network, the height of the first block that follows the
+    /// `UpgradeVMv8` consensus rule set. The blocks below it follow
+    /// `UpgradeVMv7`, as main net does until its hard fork at block 97000, so
+    /// that the switch between the two eras can be exercised on a test
+    /// network, also together with nodes of the previous release, which follow
+    /// `UpgradeVMv7` there from genesis on. This node does not compose blocks
+    /// below it. The genesis block is the same with and without it.
+    ///
+    /// Only for testnet, testnet-mock and regtest, and above 0; refused on
+    /// main net, whose fork height is fixed. All nodes of a test network must
+    /// use the same value. Without it, test networks follow `UpgradeVMv8` from
+    /// genesis on.
+    #[clap(long, value_name = "HEIGHT")]
+    pub(crate) v8_activation_height: Option<u64>,
+
+    /// If set, move funds received at legacy-format dCTIDH addresses to a
+    /// destination, one batch per new block, also after startup and for
+    /// blocks this node finds. Current-format dCTIDH funds are left untouched.
+    /// Nothing happens while the node is syncing, nor within
+    /// --fork-tx-cutoff-margin blocks before the UpgradeVMv8 hard fork. Before
+    /// that, the transactions are made for the era before the fork, with at
+    /// most 10 inputs each. Leave unset to disable.
+    ///
+    /// Accepts `generation` (a Generation address of this wallet), `dctidh` (a
+    /// current-format dCTIDH address of this wallet), or an explicit bech32m
+    /// address. For `generation` and `dctidh`, each transaction goes to the
+    /// next unused address of that type, unless --migrate-dctidh-index is
+    /// given. An explicit address not owned by this wallet also requires
+    /// --migrate-dctidh-allow-foreign.
+    #[clap(long, value_name = "generation|dctidh|ADDRESS")]
+    pub(crate) migrate_dctidh: Option<String>,
+
+    /// Fee attached to each dCTIDH migration transaction. Must be at least
+    /// --min-relay-pctx-fee-per-input times --migrate-dctidh-batch.
+    ///
+    /// If unset, the fee follows the proving capability like for
+    /// --auto-consolidate: 0.005 on nodes that can produce single proofs, 0.1
+    /// on nodes that can only produce proof collections, and never less than
+    /// --min-relay-pctx-fee-per-input per input.
+    #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+    pub(crate) migrate_dctidh_fee: Option<NativeCurrencyAmount>,
+
+    /// Maximum number of inputs consumed by each dCTIDH migration transaction,
+    /// between 1 and 200. The largest UTXOs are moved first; UTXOs not worth
+    /// more than their share of the fee are not moved.
+    #[clap(long, default_value = "10")]
+    pub(crate) migrate_dctidh_batch: usize,
+
+    /// Derivation index of the destination when --migrate-dctidh is
+    /// `generation` or `dctidh`; all transactions then go to this one address.
+    /// If the wallet has not derived the index yet, its derivation counter is
+    /// raised at startup. Not allowed with an explicit destination address.
+    #[clap(long)]
+    pub(crate) migrate_dctidh_index: Option<u64>,
+
+    /// Allow --migrate-dctidh to send to an explicit address that is not owned
+    /// by this wallet.
+    #[clap(long)]
+    pub(crate) migrate_dctidh_allow_foreign: bool,
+
+    #[clap(skip)]
+    pub(crate) dctidh_migration_cache: OnceLock<Option<DctidhMigrationSettings>>,
+
+    /// Enable automatic consolidation of UTXOs.
+    ///
+    /// If this flag is set, then after every new block the node initiates and
+    /// broadcasts a transaction that spends `--num-consolidation-inputs` of the
+    /// oldest UTXOs managed by the wallet, each with at least 10 confirmations,
+    /// to a single output. The output goes to this wallet's Generation address
+    /// at derivation index 0, or else to the given address, and is always
+    /// announced on-chain. Nothing happens while fewer UTXOs qualify, or while
+    /// the node is syncing.
+    ///
+    /// The fee is fixed per transaction: 0.005 on nodes that can produce
+    /// single proofs, 0.1 on nodes that can only produce proof collections.
+    ///
+    /// Examples:
+    ///
+    /// ```text
+    /// --auto-consolidate
+    /// --auto-consolidate <ADDRESS>
+    /// ```
+    // OK to suppress this linter rule because we are parsing and the nested
+    // type tells clap how to parse.
+    #[expect(clippy::option_option)]
+    #[clap(long, default_value = None, value_name = "ADDRESS")]
+    pub(crate) auto_consolidate: Option<Option<String>>,
+
+    #[clap(skip)]
+    pub(crate) auto_consolidate_cache: OnceLock<AutoConsolidationSettings>,
+
+    /// Number of inputs per automated consolidation transaction. Will never
+    /// auto-consolidate with any other number of inputs than this. Must be
+    /// between 2 and 200.
+    #[clap(long, default_value = "8", value_name = "NUM_INPUTS")]
+    pub(crate) num_consolidation_inputs: u8,
 
     /// Whether to produce block proposals, which is the 2nd step of three-step
     /// mining. Note that composing block proposals involves the computationally
@@ -360,6 +502,14 @@ pub struct Args {
     #[clap(long, default_value = "9899", value_name = "PORT")]
     pub rpc_port: u16,
 
+    /// Port on which to listen for libp2p QUIC peer connections (UDP).
+    #[clap(long, default_value = "9901", value_name = "PORT")]
+    pub quic_port: u16,
+
+    /// Port on which to listen for libp2p TCP peer connections.
+    #[clap(long, default_value = "9902", value_name = "PORT")]
+    pub tcp_port: u16,
+
     /// Enable REST API server.
     #[clap(long)]
     pub(crate) rest_api_enable: bool,
@@ -376,6 +526,20 @@ pub struct Args {
     #[clap(short, long, default_value = "::")]
     pub peer_listen_addr: IpAddr,
 
+    /// Public IP where the node is reachable over libp2p.
+    ///
+    /// Only use for globally accessible IPs. Setting this value overrides
+    /// libp2p AutoNAT behaviour. If no public IPs are set, libp2p's AutoNAT
+    /// protocol will automatically try to guess the NAT status and external
+    /// addresses.
+    ///
+    /// Examples:
+    /// ```text
+    /// --public-ip 93.7.1.1 --public-ip 2001:db8::1428:57ab
+    /// ```
+    #[clap(long = "public-ip", value_name = "IP")]
+    pub public_ips: Vec<IpAddr>,
+
     /// Maximum number of blocks that the client can catch up to without going
     /// into sync mode.
     ///
@@ -391,9 +555,39 @@ pub struct Args {
     #[clap(long, default_value = "1000", value_parser(RangedI64ValueParser::<usize>::new().range(10..100000)))]
     pub(crate) sync_mode_threshold: usize,
 
-    /// IPs of nodes to connect to, e.g.: --peer 8.8.8.8:9898 --peer 8.8.4.4:1337.
-    #[structopt(long = "peer")]
-    pub peers: Vec<SocketAddr>,
+    /// Nodes to connect to, as `ip:port`, as an IP, or as a multiaddress, e.g.:
+    /// ```text
+    /// --peer 8.8.8.8:9898 \
+    /// --peer 8.8.4.4:1337 \
+    /// --peer 8.8.8.8 \
+    /// --peer /ip4/8.8.4.4/udp/9901/quic-v1
+    /// ```
+    ///
+    /// `ip:port` is dialed over the legacy TCP stack, unless the port is
+    /// 9901 (libp2p QUIC) or 9902 (libp2p TCP). A bare IP is dialed over both
+    /// stacks, on ports 9898 and 9901. A multiaddress is dialed over libp2p,
+    /// except `/ip4/<ip>/tcp/9898`, which is dialed over the legacy stack.
+    ///
+    /// A multiaddress ending in `/p2p/<peer id>` only connects to the peer
+    /// with that identity.
+    #[structopt(long = "peer", value_name = "ADDRESS")]
+    pub peers: Vec<PeerAddress>,
+
+    /// Generate a new libp2p identity to use going forward.
+    ///
+    /// The old identity file is kept as a backup.
+    #[clap(long)]
+    pub new_identity: bool,
+
+    /// Use the libp2p identity contained in the given file. By default, the
+    /// identity is kept in the `network` subdirectory of the data directory.
+    #[clap(long, value_name = "FILE")]
+    pub identity_file: Option<PathBuf>,
+
+    /// Do not run the libp2p network stack (QUIC and libp2p TCP). Peers are
+    /// then only reached over the legacy TCP stack.
+    #[clap(long)]
+    pub disable_libp2p: bool,
 
     /// Specify network, `main`, `alpha`, `beta`, `testnet`, or `regtest`
     #[structopt(long, default_value = "main", short)]
@@ -699,6 +893,116 @@ impl Args {
         }
     }
 
+    /// Whether the libp2p network stack runs: it is compiled in, and not
+    /// switched off with `--disable-libp2p`.
+    pub fn libp2p_enabled(&self) -> bool {
+        cfg!(feature = "libp2p") && !self.disable_libp2p
+    }
+
+    /// The `--peer` addresses that the legacy TCP stack dials.
+    ///
+    /// Without libp2p, every `ip:port` is dialed over the legacy stack,
+    /// whatever its port.
+    pub fn legacy_peers(&self) -> Vec<SocketAddr> {
+        let libp2p_enabled = self.libp2p_enabled();
+        self.peers
+            .iter()
+            .filter_map(|peer| match peer {
+                PeerAddress::Socket(socket_addr) if !libp2p_enabled => Some(*socket_addr),
+                _ => peer.legacy_address(),
+            })
+            .collect()
+    }
+
+    /// The `--peer` addresses that the libp2p stack dials. Empty if libp2p does
+    /// not run.
+    pub fn libp2p_peers(&self) -> Vec<Multiaddr> {
+        if !self.libp2p_enabled() {
+            return vec![];
+        }
+
+        self.peers
+            .iter()
+            .filter_map(PeerAddress::libp2p_address)
+            .collect()
+    }
+
+    /// The `--peer` entries that neither network stack dials: those only the
+    /// libp2p stack can reach, if it does not run.
+    pub fn peers_dialed_by_neither_stack(&self) -> Vec<&PeerAddress> {
+        if self.libp2p_enabled() {
+            return vec![];
+        }
+
+        self.peers
+            .iter()
+            .filter(|peer| {
+                !matches!(peer, PeerAddress::Socket(_)) && peer.legacy_address().is_none()
+            })
+            .collect()
+    }
+
+    /// The IP addresses of the `--peer` entries, for those that name one, in
+    /// canonical form.
+    pub fn peer_ips(&self) -> Vec<IpAddr> {
+        self.peers
+            .iter()
+            .filter_map(PeerAddress::ip)
+            .map(|ip| ip.to_canonical())
+            .collect()
+    }
+
+    /// The IP addresses banned with `--ban`, in canonical form, so that a ban
+    /// of an IPv4 address applies to its IPv4-mapped IPv6 form, too.
+    pub fn banned_ips(&self) -> Vec<IpAddr> {
+        self.ban.iter().map(|ip| ip.to_canonical()).collect()
+    }
+
+    /// The local addresses the libp2p stack binds to.
+    ///
+    /// For each IP, there is a TCP multiaddress on [`Self::tcp_port`] and a
+    /// QUIC multiaddress on [`Self::quic_port`]. If [`Self::peer_listen_addr`]
+    /// is `::`, on which the legacy stack accepts IPv4 and IPv6 alike, both
+    /// the IPv4 and the IPv6 unspecified addresses are used, since libp2p
+    /// sockets accept one IP version each. Any other address, `0.0.0.0`
+    /// included, is used as given.
+    ///
+    /// [`Self::peer_port`] belongs to the legacy TCP stack and is not included.
+    pub fn own_listen_addresses(&self) -> Vec<Multiaddr> {
+        let ips = if self.peer_listen_addr == IpAddr::V6(Ipv6Addr::UNSPECIFIED) {
+            vec![
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ]
+        } else {
+            vec![self.peer_listen_addr]
+        };
+
+        self.libp2p_multiaddrs(&ips)
+    }
+
+    /// The publicly reachable libp2p addresses given with `--public-ip`.
+    ///
+    /// If non-empty, this list overrides libp2p's AutoNAT behaviour and informs
+    /// libp2p of the external addresses this node is reachable on.
+    pub fn own_public_addresses(&self) -> Vec<Multiaddr> {
+        self.libp2p_multiaddrs(&self.public_ips)
+    }
+
+    /// A TCP and a QUIC multiaddress on the libp2p ports, for each IP.
+    fn libp2p_multiaddrs(&self, ips: &[IpAddr]) -> Vec<Multiaddr> {
+        ips.iter()
+            .flat_map(|&ip| {
+                [
+                    Multiaddr::from(ip).with(Protocol::Tcp(self.tcp_port)),
+                    Multiaddr::from(ip)
+                        .with(Protocol::Udp(self.quic_port))
+                        .with(Protocol::QuicV1),
+                ]
+            })
+            .collect()
+    }
+
     /// Whether to engage in mining (composing or guessing or both)
     pub(crate) fn mine(&self) -> bool {
         self.guess || self.compose
@@ -717,6 +1021,114 @@ impl Args {
             }
         }
         Ok(())
+    }
+
+    /// Validates the auto-consolidation settings and caches the result.
+    /// Returns an error if the consolidation address cannot be parsed, if the
+    /// number of consolidation inputs is too small, or if auto-consolidation
+    /// is enabled on a node that does not initiate transactions.
+    pub fn validate_auto_consolidation(&self) -> Result<(), String> {
+        let settings = AutoConsolidationSettings::parse(
+            &self.auto_consolidate,
+            self.num_consolidation_inputs,
+            self.network,
+        )?;
+
+        if !matches!(settings.policy, ConsolidationTarget::Inactive) {
+            if self.no_transaction_initiation {
+                return Err(
+                    "--auto-consolidate cannot be combined with --no-transaction-initiation"
+                        .to_string(),
+                );
+            }
+            if matches!(
+                self.tx_proving_capability,
+                Some(TxProvingCapability::LockScript | TxProvingCapability::PrimitiveWitness)
+            ) {
+                return Err(
+                    "--auto-consolidate requires a proving capability of at least \
+                     proof collection"
+                        .to_string(),
+                );
+            }
+        }
+
+        let _ = self.auto_consolidate_cache.set(settings);
+        Ok(())
+    }
+
+    /// Get the auto-consolidation setting.
+    ///
+    /// Invalid settings are rejected at startup by
+    /// [`Self::validate_auto_consolidation`]. If that was skipped and the
+    /// settings are invalid, auto-consolidation is inactive.
+    pub(crate) fn auto_consolidate(&self) -> AutoConsolidationSettings {
+        self.auto_consolidate_cache
+            .get_or_init(|| {
+                AutoConsolidationSettings::parse(
+                    &self.auto_consolidate,
+                    self.num_consolidation_inputs,
+                    self.network,
+                )
+                .unwrap_or_else(|err| {
+                    tracing::warn!("auto-consolidation disabled: {err}");
+                    AutoConsolidationSettings::default()
+                })
+            })
+            .clone()
+    }
+
+    /// Applies `--v8-activation-height` to this process, see
+    /// [`set_v8_activation_height`]. Returns an error if it is given for main
+    /// net or as 0, or if another activation height is set already.
+    ///
+    /// Must be called before any state is built.
+    pub fn apply_v8_activation_height(&self) -> Result<(), String> {
+        let Some(height) = self.v8_activation_height else {
+            return Ok(());
+        };
+        set_v8_activation_height(self.network, BlockHeight::from(height))
+            .map_err(|err| format!("--v8-activation-height {height}: {err}"))?;
+        tracing::info!(
+            "{}: the UpgradeVMv8 consensus rule set activates at block {height}",
+            self.network
+        );
+
+        Ok(())
+    }
+
+    /// Validates the dCTIDH migration settings, including the destination
+    /// address, and caches them. Returns an error if `--migrate-dctidh` or the
+    /// flags that go with it are invalid.
+    ///
+    /// The checks against the wallet happen at startup, see
+    /// [`DctidhMigrationSettings::prepare_wallet`].
+    pub fn validate_dctidh_migration(&self) -> Result<(), String> {
+        let settings = DctidhMigrationSettings::parse(self).map_err(|err| err.to_string())?;
+        if let Some(settings) = &settings {
+            settings
+                .validate_destination()
+                .map_err(|err| err.to_string())?;
+        }
+
+        let _ = self.dctidh_migration_cache.set(settings);
+        Ok(())
+    }
+
+    /// Get the dCTIDH migration settings, or `None` if the migration is off.
+    ///
+    /// Invalid settings are rejected at startup by
+    /// [`Self::validate_dctidh_migration`]. If that was skipped and the
+    /// settings are invalid, the migration is off.
+    pub(crate) fn dctidh_migration(&self) -> Option<DctidhMigrationSettings> {
+        self.dctidh_migration_cache
+            .get_or_init(|| {
+                DctidhMigrationSettings::parse(self).unwrap_or_else(|err| {
+                    tracing::warn!("dCTIDH migration disabled: {err}");
+                    None
+                })
+            })
+            .clone()
     }
 
     pub(crate) fn proof_job_options(
@@ -802,6 +1214,33 @@ impl Args {
         self.into()
     }
 
+    /// Check if a link transaction pays enough fees to be relayed and accepted.
+    ///
+    /// It must clear a fraction of the proof-collection fee floor since a link
+    /// is cheaper to upgrade than a proof collection. A link transaction
+    /// without confirmed inputs pays the floor of one input.
+    pub(crate) fn relay_link_transaction(
+        &self,
+        num_inputs: u64,
+        tx_fee: NativeCurrencyAmount,
+    ) -> bool {
+        /// How much cheaper a link is to upgrade than a proof collection.
+        const LINK_TX_FEE_FLOOR_DIVISOR: i128 = 4;
+
+        let Ok(num_inputs) = u32::try_from(num_inputs) else {
+            return false;
+        };
+        let Some(pctx_floor) = self
+            .min_relay_pctx_fee_per_input
+            .checked_scalar_mul(num_inputs.max(1))
+        else {
+            error!("Multiplication overflowed in fee calculation. This should not happen.");
+            return false;
+        };
+
+        tx_fee >= NativeCurrencyAmount::from_nau(pctx_floor.to_nau() / LINK_TX_FEE_FLOOR_DIVISOR)
+    }
+
     /// Check if a transaction should be inserted into the mempool and relayed
     /// to peers. Proofcollection-backed transactions that pay too small fees
     /// are not relayed.
@@ -868,6 +1307,9 @@ mod tests {
     use std::ops::RangeBounds;
 
     use super::*;
+    use crate::application::config::parser::peer_address::DEFAULT_LIBP2P_TCP_PORT;
+    use crate::application::config::parser::peer_address::DEFAULT_PEER_PORT;
+    use crate::application::config::parser::peer_address::DEFAULT_QUIC_PORT;
     use crate::protocol::consensus::transaction::transaction_proof::TransactionProofType;
 
     // extra methods for tests.
@@ -910,6 +1352,267 @@ mod tests {
     }
 
     #[test]
+    fn libp2p_default_args_test() {
+        let default_args = Args::default();
+
+        assert_eq!(DEFAULT_PEER_PORT, default_args.peer_port);
+        assert_eq!(DEFAULT_QUIC_PORT, default_args.quic_port);
+        assert_eq!(DEFAULT_LIBP2P_TCP_PORT, default_args.tcp_port);
+        assert_eq!(9901, default_args.quic_port);
+        assert_eq!(9902, default_args.tcp_port);
+        assert!(!default_args.disable_relay_server);
+        assert_eq!(Some(8), default_args.max_connections_per_prefix);
+        assert_eq!(
+            Some(6),
+            default_args.max_connection_attempts_per_ip_per_minute
+        );
+        assert_eq!(None, default_args.max_connections_per_ip);
+        assert!(default_args.public_ips.is_empty());
+        assert!(!default_args.new_identity);
+        assert!(default_args.identity_file.is_none());
+        assert_eq!(cfg!(feature = "libp2p"), default_args.libp2p_enabled());
+        assert!(default_args.peers.is_empty());
+        assert!(default_args.ban.is_empty());
+    }
+
+    #[test]
+    fn peers_are_split_between_the_stacks() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--peer",
+            "1.2.3.4:9898",
+            "--peer",
+            "127.0.0.1:29790",
+            "--peer",
+            "5.6.7.8:9902",
+            "--peer",
+            "/ip4/9.9.9.9/udp/9901/quic-v1",
+            "--peer",
+            "/ip4/10.0.0.1/tcp/9898",
+            "--peer",
+            "11.0.0.1",
+        ])
+        .unwrap();
+
+        let socket = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let multiaddr = |s: &str| s.parse::<Multiaddr>().unwrap();
+        let mut expected_legacy_peers = vec![socket("1.2.3.4:9898"), socket("127.0.0.1:29790")];
+        if !args.libp2p_enabled() {
+            expected_legacy_peers.push(socket("5.6.7.8:9902"));
+        }
+        expected_legacy_peers.extend([socket("10.0.0.1:9898"), socket("11.0.0.1:9898")]);
+        assert_eq!(expected_legacy_peers, args.legacy_peers());
+
+        if args.libp2p_enabled() {
+            assert_eq!(
+                vec![
+                    multiaddr("/ip4/5.6.7.8/tcp/9902"),
+                    multiaddr("/ip4/9.9.9.9/udp/9901/quic-v1"),
+                    multiaddr("/ip4/11.0.0.1/udp/9901/quic-v1"),
+                ],
+                args.libp2p_peers()
+            );
+        }
+
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            vec![
+                ip("1.2.3.4"),
+                ip("127.0.0.1"),
+                ip("5.6.7.8"),
+                ip("9.9.9.9"),
+                ip("10.0.0.1"),
+                ip("11.0.0.1"),
+            ],
+            args.peer_ips()
+        );
+    }
+
+    #[test]
+    fn without_libp2p_every_socket_address_peer_is_legacy() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--disable-libp2p",
+            "--peer",
+            "1.2.3.4:9898",
+            "--peer",
+            "5.6.7.8:9902",
+            "--peer",
+            "5.6.7.8:9901",
+            "--peer",
+            "/ip4/9.9.9.9/udp/9901/quic-v1",
+        ])
+        .unwrap();
+
+        assert!(!args.libp2p_enabled());
+        assert_eq!(
+            vec![
+                "1.2.3.4:9898".parse::<SocketAddr>().unwrap(),
+                "5.6.7.8:9902".parse().unwrap(),
+                "5.6.7.8:9901".parse().unwrap(),
+            ],
+            args.legacy_peers()
+        );
+        assert!(args.libp2p_peers().is_empty());
+    }
+
+    #[test]
+    fn socket_address_peers_keep_working() {
+        let peer = "8.8.4.4:1337".parse::<SocketAddr>().unwrap();
+        let args = Args::try_parse_from(["xnt-core", "--peer", "8.8.4.4:1337"]).unwrap();
+        assert_eq!(vec![PeerAddress::Socket(peer)], args.peers);
+        assert_eq!(vec![peer], args.legacy_peers());
+
+        let mut default_args = Args::default();
+        default_args.peers.push(peer.into());
+        assert_eq!(vec![peer], default_args.legacy_peers());
+    }
+
+    #[test]
+    fn invalid_peers_are_refused() {
+        for peer in ["8.8.4.4:", "example.com:9898", "/ip4/8.8.4.4/tcp", ""] {
+            assert!(
+                Args::try_parse_from(["xnt-core", "--peer", peer]).is_err(),
+                "{peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn bans_accept_ips_and_multiaddrs() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--ban",
+            "1.2.3.4",
+            "--ban",
+            "/ip4/8.8.4.4/udp/1337/quic-v1",
+            "--ban",
+            "/ip6/2001:db8::1/tcp/9898",
+        ])
+        .unwrap();
+
+        let expected: Vec<IpAddr> = vec![
+            "1.2.3.4".parse().unwrap(),
+            "8.8.4.4".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        assert_eq!(expected, args.ban);
+        assert_eq!(expected, args.banned_ips());
+    }
+
+    #[test]
+    fn bans_without_an_ip_are_refused() {
+        for ban in ["/dns4/example.com/tcp/9898", "1.2.3.4:9898", "example.com"] {
+            assert!(
+                Args::try_parse_from(["xnt-core", "--ban", ban]).is_err(),
+                "{ban}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_libp2p_addresses() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--quic-port",
+            "19901",
+            "--tcp-port",
+            "19902",
+            "--public-ip",
+            "93.7.1.1",
+        ])
+        .unwrap();
+
+        let multiaddrs = |list: &[&str]| {
+            list.iter()
+                .map(|s| s.parse::<Multiaddr>().unwrap())
+                .collect_vec()
+        };
+        assert_eq!(
+            multiaddrs(&[
+                "/ip4/0.0.0.0/tcp/19902",
+                "/ip4/0.0.0.0/udp/19901/quic-v1",
+                "/ip6/::/tcp/19902",
+                "/ip6/::/udp/19901/quic-v1",
+            ]),
+            args.own_listen_addresses()
+        );
+        assert_eq!(
+            multiaddrs(&["/ip4/93.7.1.1/tcp/19902", "/ip4/93.7.1.1/udp/19901/quic-v1"]),
+            args.own_public_addresses()
+        );
+
+        let loopback_args =
+            Args::try_parse_from(["xnt-core", "--peer-listen-addr", "127.0.0.1"]).unwrap();
+        assert_eq!(
+            multiaddrs(&["/ip4/127.0.0.1/tcp/9902", "/ip4/127.0.0.1/udp/9901/quic-v1"]),
+            loopback_args.own_listen_addresses()
+        );
+        assert!(loopback_args.own_public_addresses().is_empty());
+
+        // An IPv4 listen address keeps libp2p on IPv4, too.
+        let ipv4_args =
+            Args::try_parse_from(["xnt-core", "--peer-listen-addr", "0.0.0.0"]).unwrap();
+        assert_eq!(
+            multiaddrs(&["/ip4/0.0.0.0/tcp/9902", "/ip4/0.0.0.0/udp/9901/quic-v1"]),
+            ipv4_args.own_listen_addresses()
+        );
+    }
+
+    #[test]
+    fn peers_only_libp2p_can_reach_are_dialed_by_neither_stack_without_libp2p() {
+        let peers = [
+            "1.2.3.4:9898",
+            "5.6.7.8:9902",
+            "9.9.9.9",
+            "/ip4/10.0.0.1/tcp/9898",
+            "/ip4/11.0.0.1/udp/9901/quic-v1",
+            "/ip4/12.0.0.1/tcp/40123",
+        ];
+        let args_with = |disable_libp2p: bool| {
+            let mut args = vec!["xnt-core"];
+            if disable_libp2p {
+                args.push("--disable-libp2p");
+            }
+            for peer in peers {
+                args.extend(["--peer", peer]);
+            }
+            Args::try_parse_from(args).unwrap()
+        };
+
+        let without_libp2p = args_with(true);
+        assert_eq!(
+            vec!["/ip4/11.0.0.1/udp/9901/quic-v1", "/ip4/12.0.0.1/tcp/40123"],
+            without_libp2p
+                .peers_dialed_by_neither_stack()
+                .iter()
+                .map(ToString::to_string)
+                .collect_vec()
+        );
+
+        let with_libp2p = args_with(false);
+        if with_libp2p.libp2p_enabled() {
+            assert!(with_libp2p.peers_dialed_by_neither_stack().is_empty());
+        }
+    }
+
+    #[test]
+    fn ipv4_bans_and_peers_are_in_canonical_form() {
+        let args = Args::try_parse_from([
+            "xnt-core",
+            "--ban",
+            "::ffff:198.51.100.7",
+            "--peer",
+            "[::ffff:198.51.100.8]:9898",
+        ])
+        .unwrap();
+
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(vec![ip("198.51.100.7")], args.banned_ips());
+        assert_eq!(vec![ip("198.51.100.8")], args.peer_ips());
+    }
+
+    #[test]
     fn max_peers_0_means_no_incoming_connections() {
         let args = Args {
             max_num_peers: 0,
@@ -940,6 +1643,31 @@ mod tests {
     #[test]
     fn cli_args_default_network_agrees_with_enum_default() {
         assert_eq!(Args::default().network, Network::default());
+    }
+
+    #[test]
+    fn relay_link_transaction_unit_test() {
+        let cli = Args::default();
+        let floor_per_input =
+            NativeCurrencyAmount::from_nau(cli.min_relay_pctx_fee_per_input.to_nau() / 4);
+        assert!(cli.relay_link_transaction(1, floor_per_input));
+        assert!(!cli.relay_link_transaction(
+            1,
+            NativeCurrencyAmount::from_nau(floor_per_input.to_nau() - 1)
+        ));
+        assert!(
+            cli.relay_link_transaction(0, floor_per_input),
+            "a link transaction without confirmed inputs pays the floor of one"
+        );
+        assert!(!cli.relay_link_transaction(0, NativeCurrencyAmount::zero()));
+        assert!(!cli.relay_link_transaction(
+            2,
+            NativeCurrencyAmount::from_nau(floor_per_input.scalar_mul(2).to_nau() - 1)
+        ));
+        assert!(
+            !cli.relay_link_transaction(u64::MAX, NativeCurrencyAmount::coins(1000)),
+            "an overflowing input count is refused"
+        );
     }
 
     #[test]
@@ -1022,5 +1750,40 @@ mod tests {
         assert_range_eq!(5u64..=u64::MAX, parse_range("5:").unwrap());
         assert_range_eq!(0u64..10, parse_range(":10").unwrap());
         assert_range_eq!(0u64..=u64::MAX, parse_range(":").unwrap());
+    }
+
+    /// `--v8-activation-height` is refused on main net and as 0, before
+    /// anything is set; without it, nothing is set.
+    #[test]
+    fn v8_activation_height_is_refused_on_main_net_and_at_genesis() {
+        assert_eq!(None, Args::default().v8_activation_height);
+        assert!(Args::default().apply_v8_activation_height().is_ok());
+
+        let main_net = Args::try_parse_from([
+            "xnt-core",
+            "--network",
+            "main",
+            "--v8-activation-height",
+            "100",
+        ])
+        .unwrap();
+        assert_eq!(Some(100), main_net.v8_activation_height);
+        assert!(main_net
+            .apply_v8_activation_height()
+            .unwrap_err()
+            .contains("main net"));
+
+        let at_genesis = Args::try_parse_from([
+            "xnt-core",
+            "--network",
+            "regtest",
+            "--v8-activation-height",
+            "0",
+        ])
+        .unwrap();
+        assert!(at_genesis
+            .apply_v8_activation_height()
+            .unwrap_err()
+            .contains("genesis"));
     }
 }

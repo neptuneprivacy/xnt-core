@@ -1,9 +1,11 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use get_size2::GetSize;
 use itertools::Itertools;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 use strum::EnumCount;
 use strum::VariantArray;
@@ -13,6 +15,7 @@ use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
 use tasm_lib::twenty_first::tip5::digest::Digest;
 
 use super::announcement::Announcement;
+use crate::protocol::consensus::block::MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
@@ -21,6 +24,8 @@ use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 use crate::util_types::mutator_set::removal_record::removal_record_list::RemovalRecordListUnpackError;
 use crate::util_types::mutator_set::removal_record::RemovalRecord;
+use crate::util_types::mutator_set::shared::deserialize_bounded_vec;
+use crate::util_types::mutator_set::shared::deserialize_checked_vec;
 
 /// TransactionKernel is immutable and its hash never changes.
 ///
@@ -29,8 +34,15 @@ use crate::util_types::mutator_set::removal_record::RemovalRecord;
 #[derive(Debug, Clone, Serialize, Deserialize, GetSize, BFieldCodec, TasmObject)]
 pub struct TransactionKernel {
     // note: see field descriptions in [`TransactionKernelProxy`]
+    #[serde(deserialize_with = "deserialize_inputs")]
     pub inputs: Vec<RemovalRecord>,
+    #[serde(
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>"
+    )]
     pub outputs: Vec<AdditionRecord>,
+    #[serde(
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>"
+    )]
     pub announcements: Vec<Announcement>,
     pub fee: NativeCurrencyAmount,
     pub coinbase: Option<NativeCurrencyAmount>,
@@ -47,6 +59,33 @@ pub struct TransactionKernel {
     #[tasm_object(ignore)]
     #[get_size(ignore)]
     mast_sequences: OnceLock<Vec<Vec<BFieldElement>>>,
+}
+
+/// Upper bound on the number of chunk dictionary entries over all inputs of a
+/// kernel. A block holds at most `max_block_size` field elements and every
+/// entry takes several of them, so no block comes near this bound.
+const MAX_NUM_INPUT_CHUNKS: usize = 1_000_000;
+
+/// Deserialize the inputs of a kernel, refusing more than the maximum number of
+/// inputs, and more chunk dictionary entries over all inputs than
+/// [`MAX_NUM_INPUT_CHUNKS`]. The entries may sit in any of the records.
+fn deserialize_inputs<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<RemovalRecord>, D::Error> {
+    let num_chunks = Cell::new(0usize);
+    deserialize_checked_vec::<D, _, MAX_NUM_INPUTS_OUTPUTS_ANNOUNCEMENTS>(
+        deserializer,
+        |_, record: &RemovalRecord| {
+            let total = num_chunks.get().saturating_add(record.target_chunks.len());
+            if total > MAX_NUM_INPUT_CHUNKS {
+                return Err(format!(
+                    "inputs have more than {MAX_NUM_INPUT_CHUNKS} chunk dictionary entries"
+                ));
+            }
+            num_chunks.set(total);
+            Ok(())
+        },
+    )
 }
 
 impl std::fmt::Display for TransactionKernel {
@@ -121,7 +160,6 @@ impl TransactionKernel {
         // check validity of removal records
         //       ^^^^^^^^
 
-        // meaning: a) all required membership proofs exist; and b) are valid.
         let inputs = &self.inputs;
         let maybe_invalid_removal_record = inputs
             .iter()
@@ -676,5 +714,101 @@ pub mod tests {
             let decoded = *TransactionKernel::decode(&encoded).unwrap();
             assert_eq!(kernel, decoded);
         }
+    }
+
+    /// A packed list of inputs carries the chunks of every input in the
+    /// dictionary of its first record; an unpacked list carries up to
+    /// `NUM_TRIALS` chunks per record; the entries may also sit in a later
+    /// record. Every shape survives the encodings used between peers, on disk,
+    /// and over JSON-RPC.
+    #[test]
+    fn kernels_with_packed_and_unpacked_inputs_round_trip() {
+        use bincode::Options;
+        use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
+
+        use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+        use crate::util_types::mutator_set::removal_record::chunk::Chunk;
+        use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
+        use crate::util_types::mutator_set::shared::NUM_TRIALS;
+
+        let record_with_chunks = |num_chunks: u64| RemovalRecord {
+            absolute_indices: AbsoluteIndexSet::new([0; NUM_TRIALS as usize]),
+            target_chunks: ChunkDictionary::new(
+                (0..num_chunks)
+                    .map(|i| (i, (MmrMembershipProof::new(vec![]), Chunk::empty_chunk())))
+                    .collect(),
+            ),
+        };
+        let kernel_with_inputs = |inputs: Vec<RemovalRecord>| {
+            TransactionKernelProxy {
+                inputs,
+                outputs: vec![],
+                announcements: vec![],
+                fee: NativeCurrencyAmount::coins(0),
+                coinbase: None,
+                timestamp: Timestamp::now(),
+                mutator_set_hash: Digest::default(),
+                merge_bit: false,
+            }
+            .into_kernel()
+        };
+
+        let full = u64::from(NUM_TRIALS);
+        let packed = kernel_with_inputs(vec![
+            record_with_chunks(full * 1000),
+            record_with_chunks(0),
+            record_with_chunks(0),
+        ]);
+        let unpacked = kernel_with_inputs(vec![record_with_chunks(full); 3]);
+        let in_later_record = kernel_with_inputs(vec![
+            record_with_chunks(full),
+            record_with_chunks(full * 1000),
+            record_with_chunks(0),
+        ]);
+
+        for kernel in [packed, unpacked, in_later_record] {
+            let options = bincode::DefaultOptions::new();
+            let varint_bytes = options.serialize(&kernel).unwrap();
+            assert_eq!(
+                kernel,
+                options
+                    .deserialize::<TransactionKernel>(&varint_bytes)
+                    .unwrap()
+            );
+
+            let fixint_bytes = bincode::serialize(&kernel).unwrap();
+            assert_eq!(
+                kernel,
+                bincode::deserialize::<TransactionKernel>(&fixint_bytes).unwrap()
+            );
+
+            let json = serde_json::to_vec(&kernel).unwrap();
+            assert_eq!(
+                kernel,
+                serde_json::from_slice::<TransactionKernel>(&json).unwrap()
+            );
+        }
+    }
+
+    /// The bound on the chunk dictionary entries of a kernel's inputs is
+    /// looser than what any block can hold.
+    #[test]
+    fn input_chunk_bound_exceeds_what_a_block_can_hold() {
+        use strum::IntoEnumIterator;
+        use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
+
+        use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+        use crate::util_types::mutator_set::removal_record::chunk::Chunk;
+        use crate::util_types::mutator_set::removal_record::chunk_dictionary::ChunkDictionary;
+
+        let entry = (0, (MmrMembershipProof::new(vec![]), Chunk::empty_chunk()));
+        let entry_len = ChunkDictionary::new(vec![entry]).encode().len()
+            - ChunkDictionary::empty().encode().len();
+        let max_block_size = ConsensusRuleSet::iter()
+            .map(|rule_set| rule_set.max_block_size())
+            .max()
+            .unwrap();
+
+        assert!(max_block_size < MAX_NUM_INPUT_CHUNKS * entry_len);
     }
 }

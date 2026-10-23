@@ -172,6 +172,25 @@ impl TransactionDetailsBuilder {
             ..
         } = self;
 
+        // Refuse outputs whose UTXO notification cannot be encrypted to their
+        // receiving address, before any change key is derived.
+        tx_outputs
+            .validate_recipients()
+            .map_err(|e| CreateTxError::InvalidRecipient(e.to_string()))?;
+
+        // A transparent transaction publishes each input's receiver preimage,
+        // so only inputs whose lock does not open with that preimage can be
+        // spent transparently.
+        if self.transparent
+            && tx_inputs.iter().any(|input| {
+                let receiver_postimage = input.mutator_set_mp().receiver_preimage.hash();
+                LockScript::standard_hash_lock_from_after_image(receiver_postimage).hash()
+                    == input.utxo.lock_script_hash()
+            })
+        {
+            return Err(CreateTxError::TransparentInputNotAllowed);
+        }
+
         // default to present time if unspecified
         let timestamp = timestamp.unwrap_or_else(Timestamp::now);
 
@@ -325,7 +344,7 @@ impl TransactionDetailsBuilder {
     /// with claiming it later on.
     //
     // "Later on" meaning: as an [ExpectedUtxo].
-    fn create_change_output(
+    pub(crate) fn create_change_output(
         wallet_state: &WalletState,
         tip_height: BlockHeight,
         change_amount: NativeCurrencyAmount,

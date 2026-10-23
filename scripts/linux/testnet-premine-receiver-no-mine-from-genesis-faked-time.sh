@@ -22,12 +22,12 @@ echo '{"name":"standard_wallet","secret_seed":{"coefficients":[12063201067205522
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
 export FAKETIME="+200d"
 
-# LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 FAKETIME="+200d" RUST_BACKTRACE=1 XDG_DATA_HOME="$NC_DATA_DIRECTORY" nice -n 1 --  cargo run -- --network testnet --tx-proving-capability=proofcollection --peer-port 29790 --rpc-port 19790  2>&1 | tee integration_test.log | sed 's/(.*)/\0 \[I0\]/g'  &
-XDG_DATA_HOME="$NC_LOCAL_STATE_DIR/0/" cargo run -- --network testnet --tx-proving-capability=proofcollection --peer-port 29790 --rpc-port 19790 --max-peers=1 2>&1 | tee integration_test0.log | sed 's/(.*)/\0 \[I0\]/g'  &
+# LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 FAKETIME="+200d" RUST_BACKTRACE=1 XDG_DATA_HOME="$NC_DATA_DIRECTORY" nice -n 1 --  cargo run -- --network testnet --tx-proving-capability=proofcollection --peer-port 29790 --rpc-port 19790 --quic-port 29800 --tcp-port 29810  2>&1 | tee integration_test.log | sed 's/(.*)/\0 \[I0\]/g'  &
+XDG_DATA_HOME="$NC_LOCAL_STATE_DIR/0/" cargo run -- --network testnet --tx-proving-capability=proofcollection --peer-port 29790 --rpc-port 19790 --quic-port 29800 --tcp-port 29810 --max-peers=1 2>&1 | tee integration_test0.log | sed 's/(.*)/\0 \[I0\]/g'  &
 pid[0]=$!
 sleep 2s;
 
-XDG_DATA_HOME="$NC_LOCAL_STATE_DIR/1/" cargo run -- --network testnet --tx-proving-capability=proofcollection --peer-port 29791 --rpc-port 19791 --max-peers=1 --peers 127.0.0.1:29790 2>&1 | tee integration_test1.log | sed 's/(.*)/\0 \[I1\]/g'  &
+XDG_DATA_HOME="$NC_LOCAL_STATE_DIR/1/" cargo run -- --network testnet --tx-proving-capability=proofcollection --peer-port 29791 --rpc-port 19791 --quic-port 29801 --tcp-port 29811 --max-peers=1 --peers 127.0.0.1:29790 2>&1 | tee integration_test1.log | sed 's/(.*)/\0 \[I1\]/g'  &
 pid[0]=$!
 sleep 2s;
 

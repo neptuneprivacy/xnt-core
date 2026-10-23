@@ -11,7 +11,44 @@ use tasm_lib::triton_vm::prelude::*;
 #[derive(Debug, Copy, Clone)]
 pub struct NewClaim;
 
+/// [`NewClaim`] for claims of the given version instead of the linked
+/// triton-vm's `CURRENT_VERSION`.
+///
+/// Has the same entrypoint label as [`NewClaim`]: a program assembled for an
+/// earlier era imports this snippet first, and every later import of
+/// [`NewClaim`] then deduplicates onto it.
+#[derive(Debug, Copy, Clone)]
+pub struct VersionedNewClaim {
+    pub version: u32,
+}
+
+impl NewClaim {
+    fn versioned(self) -> VersionedNewClaim {
+        VersionedNewClaim {
+            version: triton_vm::proof::CURRENT_VERSION,
+        }
+    }
+}
+
 impl BasicSnippet for NewClaim {
+    fn parameters(&self) -> Vec<(DataType, String)> {
+        self.versioned().parameters()
+    }
+
+    fn return_values(&self) -> Vec<(DataType, String)> {
+        self.versioned().return_values()
+    }
+
+    fn entrypoint(&self) -> String {
+        self.versioned().entrypoint()
+    }
+
+    fn code(&self, library: &mut Library) -> Vec<LabelledInstruction> {
+        self.versioned().code(library)
+    }
+}
+
+impl BasicSnippet for VersionedNewClaim {
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::U32, "input_length".to_string()),
@@ -94,7 +131,7 @@ impl BasicSnippet for NewClaim {
                 hint version: Pointer = stack[0]
                 // _ *claim *output *input *version
 
-                push {triton_vm::proof::CURRENT_VERSION}
+                push {self.version}
                 pick 1
                 write_mem 1
                 hint program_digest: Pointer = stack[0]
@@ -111,7 +148,7 @@ mod tests {
     use std::collections::HashMap;
 
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use tasm_lib::prelude::BasicSnippet;
     use tasm_lib::prelude::Digest;
@@ -126,6 +163,25 @@ mod tests {
     use super::*;
 
     impl Function for NewClaim {
+        fn rust_shadow(
+            &self,
+            stack: &mut Vec<BFieldElement>,
+            memory: &mut HashMap<BFieldElement, BFieldElement>,
+        ) -> Result<(), RustShadowError> {
+            self.versioned().rust_shadow(stack, memory)
+        }
+
+        fn pseudorandom_initial_state(
+            &self,
+            seed: [u8; 32],
+            bench_case: Option<BenchmarkCase>,
+        ) -> FunctionInitialState {
+            self.versioned()
+                .pseudorandom_initial_state(seed, bench_case)
+        }
+    }
+
+    impl Function for VersionedNewClaim {
         fn rust_shadow(
             &self,
             stack: &mut Vec<BFieldElement>,
@@ -165,7 +221,7 @@ mod tests {
             memory.insert(output_len_pointer, bfe!(output_len));
             memory.insert(input_size_pointer, bfe!(input_len + 1));
             memory.insert(input_len_pointer, bfe!(input_len));
-            memory.insert(version_pointer, bfe!(triton_vm::proof::CURRENT_VERSION));
+            memory.insert(version_pointer, bfe!(self.version));
 
             stack.push(claim_pointer);
             stack.push(output_pointer);
@@ -175,6 +231,7 @@ mod tests {
             // sanity check
             let the_new_claim = *Claim::decode_from_memory(memory, claim_pointer).unwrap();
             let empty_claim = Claim::new(Digest::default())
+                .about_version(self.version)
                 .with_input(bfe_vec![0; input_len])
                 .with_output(bfe_vec![0; output_len]);
             assert_eq!(empty_claim, the_new_claim);
@@ -206,5 +263,29 @@ mod tests {
     #[test]
     fn unit_test() {
         ShadowedFunction::new(NewClaim).test()
+    }
+
+    #[test]
+    fn unit_test_v7_claim_version() {
+        ShadowedFunction::new(VersionedNewClaim { version: 5 }).test()
+    }
+
+    #[test]
+    fn new_claim_is_the_versioned_snippet_for_the_current_version() {
+        let current = VersionedNewClaim {
+            version: triton_vm::proof::CURRENT_VERSION,
+        };
+        assert_eq!(current.entrypoint(), NewClaim.entrypoint());
+        assert_eq!(
+            current.code(&mut Library::new()),
+            NewClaim.code(&mut Library::new())
+        );
+
+        let v7 = VersionedNewClaim { version: 5 };
+        assert_eq!(v7.entrypoint(), NewClaim.entrypoint());
+        assert_ne!(
+            v7.code(&mut Library::new()),
+            NewClaim.code(&mut Library::new())
+        );
     }
 }

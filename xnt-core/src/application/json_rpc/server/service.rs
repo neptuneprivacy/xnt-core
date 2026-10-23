@@ -11,6 +11,7 @@ use crate::api::export::Timestamp;
 use crate::api::export::Transaction;
 use crate::api::export::TransactionProof;
 use crate::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use crate::api::tx_initiation::legacy_era;
 use crate::api::tx_initiation::send::TransactionSender;
 use crate::api::wallet::Wallet;
 use crate::application::json_rpc::core::api::rpc::*;
@@ -27,14 +28,26 @@ use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplat
 use crate::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipSnapshot;
 use crate::application::json_rpc::server::rpc::RpcServer;
 use crate::application::loops::channel::RPCServerToMain;
+use crate::application::rpc::server::network_overview_data::request_network_overview;
 use crate::protocol::consensus::block::block_selector::BlockSelector;
 use crate::protocol::consensus::block::Block;
 use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 
 use crate::application::database::storage::storage_vec::traits::StorageVecStream;
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
+
+/// How many membership proofs are derived per acquisition of the state lock.
+/// Deriving one reads from disk, and the lock blocks the application of new
+/// tips, so the derivations of a request are spread over several acquisitions.
+const RESTORE_MEMBERSHIP_PROOF_CHUNK_SIZE: usize = 16;
+
+/// How many times membership-proof derivation is restarted when a new tip
+/// arrives while it is running. Every proof in a response must be relative to
+/// the same mutator set, so a new tip invalidates the proofs derived so far.
+const RESTORE_MEMBERSHIP_PROOF_MAX_ATTEMPTS: usize = 3;
 
 #[async_trait]
 impl RpcApi for RpcServer {
@@ -351,14 +364,17 @@ impl RpcApi for RpcServer {
         let state = self.state.lock_guard().await;
 
         // Check if utxo_digest is in mempool first
-        let in_mempool = state.mempool.fee_density_iter().any(|(txid, _)| {
-            state.mempool.get(txid).is_some_and(|tx| {
+        let in_mempool = state
+            .mempool
+            .fee_density_iter()
+            .filter_map(|(txid, _)| state.mempool.get(txid))
+            .chain(state.legacy_relay_pool.transactions())
+            .any(|tx| {
                 tx.kernel
                     .outputs
                     .iter()
                     .any(|o| o.canonical_commitment == request.utxo_digest)
-            })
-        });
+            });
 
         if in_mempool {
             return Ok(FindUtxoLeafIndexResponse {
@@ -485,7 +501,7 @@ impl RpcApi for RpcServer {
         // Collect known outputs from wallet
         let known_outputs: std::collections::HashMap<Digest, _> = state
             .wallet_state
-            .scan_for_utxos_announced_to_known_keys(&tx_kernel)
+            .scan_for_utxos_announced_to_known_keys(&tx_kernel, header.height)
             .map(|incoming| (incoming.addition_record().canonical_commitment, incoming))
             .collect();
 
@@ -499,9 +515,12 @@ impl RpcApi for RpcServer {
                 let utxo_digest = ar.canonical_commitment;
 
                 if let Some(incoming) = known_outputs.get(&utxo_digest) {
+                    // Only addressable keys may be rendered as a receiving
+                    // address; legacy-derivation keys are for scanning and
+                    // spending only.
                     let spending_key = state
                         .wallet_state
-                        .find_spending_key_for_utxo(&incoming.utxo);
+                        .find_addressable_spending_key_for_utxo(&incoming.utxo);
                     let receiving_address = spending_key
                         .as_ref()
                         .and_then(|key| key.clone().to_address().to_bech32m(network).ok());
@@ -515,7 +534,7 @@ impl RpcApi for RpcServer {
                         utxo_digest,
                         sender_randomness: Some(incoming.sender_randomness),
                         receiving_address,
-                        receiver_digest: Some(incoming.receiver_preimage),
+                        receiver_digest: Some(incoming.receiver_preimage.hash()),
                         receiver_identifier,
                         utxo: Some(ApiUtxo::new(&incoming.utxo)),
                     }
@@ -585,40 +604,84 @@ impl RpcApi for RpcServer {
         &self,
         request: RestoreMembershipProofRequest,
     ) -> RpcResult<RestoreMembershipProofResponse> {
-        if request.absolute_index_sets.len() > 256 && !self.unrestricted {
+        let got = request.absolute_index_sets.len();
+        if got > MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS {
+            return Err(RpcError::TooManyAbsoluteIndexSets {
+                max: MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS,
+                got,
+            });
+        }
+        if got > MAX_RESTRICTED_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS && !self.unrestricted {
             return Err(RpcError::RestoreMembershipProof(
                 RestoreMembershipProofError::ExceedsAllowed,
             ));
         }
 
-        let state = self.state.lock_guard().await;
-        let ams = state.chain.archival_state().archival_mutator_set.ams();
-        let mut membership_proofs = Vec::with_capacity(request.absolute_index_sets.len());
+        // Ensure the read lock is not held too long: do derivation in chunks.
+        // All authentication paths in the response must be relative to the same
+        // mutator set. So verify that tip does not move in between chunks.
+        for _ in 0..RESTORE_MEMBERSHIP_PROOF_MAX_ATTEMPTS {
+            let (tip_hash, tip_height, tip_mutator_set) = {
+                let state = self.state.lock_guard().await;
+                let current_tip = state.chain.light_state();
+                (
+                    current_tip.hash(),
+                    current_tip.header().height,
+                    current_tip
+                        .mutator_set_accumulator_after()
+                        .expect("Tip must have valid MSA after"),
+                )
+            };
 
-        for (index, set) in request.absolute_index_sets.into_iter().enumerate() {
-            match ams.restore_membership_proof_privacy_preserving(set).await {
-                Ok(msmp) => membership_proofs.push(msmp.into()),
-                Err(err) => {
-                    debug!("Failed to restore MSMP for {index}: {err}");
-                    return Err(RpcError::RestoreMembershipProof(
-                        RestoreMembershipProofError::Failed(index),
-                    ));
+            let mut membership_proofs = Vec::with_capacity(got);
+            let mut tip_moved = false;
+
+            for (j, index_sets) in request
+                .absolute_index_sets
+                .chunks(RESTORE_MEMBERSHIP_PROOF_CHUNK_SIZE)
+                .enumerate()
+            {
+                let state = self.state.lock_guard().await;
+                if state.chain.light_state().hash() != tip_hash {
+                    tip_moved = true;
+                    break;
+                }
+
+                let ams = state.chain.archival_state().archival_mutator_set.ams();
+                for (offset, index_set) in index_sets.iter().enumerate() {
+                    match ams
+                        .restore_membership_proof_privacy_preserving(*index_set)
+                        .await
+                    {
+                        Ok(msmp) => membership_proofs.push(msmp.into()),
+                        Err(err) => {
+                            let index = j * RESTORE_MEMBERSHIP_PROOF_CHUNK_SIZE + offset;
+                            debug!("Failed to restore MSMP for {index}: {err}");
+                            return Err(RpcError::RestoreMembershipProof(
+                                RestoreMembershipProofError::Failed(index),
+                            ));
+                        }
+                    }
                 }
             }
+
+            if tip_moved {
+                continue;
+            }
+
+            let snapshot = RpcMsMembershipSnapshot {
+                synced_height: tip_height.into(),
+                synced_hash: tip_hash,
+                membership_proofs,
+                synced_mutator_set: (&tip_mutator_set).into(),
+            };
+
+            return Ok(RestoreMembershipProofResponse { snapshot });
         }
 
-        let current_tip = state.chain.light_state();
-        let tip_mutator_set = current_tip
-            .mutator_set_accumulator_after()
-            .expect("Tip must have valid MSA after");
-        let snapshot = RpcMsMembershipSnapshot {
-            synced_height: current_tip.header().height.into(),
-            synced_hash: current_tip.hash(),
-            membership_proofs,
-            synced_mutator_set: (&tip_mutator_set).into(),
-        };
-
-        Ok(RestoreMembershipProofResponse { snapshot })
+        Err(RpcError::RestoreMembershipProof(
+            RestoreMembershipProofError::TipMoved,
+        ))
     }
 
     async fn submit_transaction_call(
@@ -627,11 +690,52 @@ impl RpcApi for RpcServer {
     ) -> RpcResult<SubmitTransactionResponse> {
         let transaction: Transaction = request.transaction.into();
         let network = self.state.cli().network;
-        let consensus_rule_set = self.state.lock_guard().await.consensus_rule_set();
 
+        // The transaction must be valid under the rule set of the next block,
+        // in which it is mined. Next to a hard fork, one valid on the other
+        // side of it is reported as such.
+        let tip_height = self
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .header()
+            .height;
+        let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
         if !transaction.is_valid(network, consensus_rule_set).await {
+            let neighboring_rule_sets = [
+                ConsensusRuleSet::infer_from(network, tip_height),
+                ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
+            ];
+            for neighboring_rule_set in neighboring_rule_sets {
+                if neighboring_rule_set != consensus_rule_set
+                    && transaction.is_valid(network, neighboring_rule_set).await
+                {
+                    return Err(RpcError::SubmitTransaction(
+                        SubmitTransactionError::OtherEra,
+                    ));
+                }
+            }
+
             return Err(RpcError::SubmitTransaction(
                 SubmitTransactionError::InvalidTransaction,
+            ));
+        }
+
+        // Before the fork, a transaction must meet the terms on which the
+        // nodes of that era relay and upgrade it, and not come too close to
+        // the fork.
+        if consensus_rule_set.is_legacy_era()
+            && !legacy_era::submitted_transaction_meets_terms(
+                &transaction,
+                network,
+                tip_height,
+                self.state.cli().fork_tx_cutoff_margin,
+            )
+        {
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::BelowLegacyEraTerms,
             ));
         }
 
@@ -671,7 +775,10 @@ impl RpcApi for RpcServer {
 
         let response = self
             .to_main_tx
-            .send(RPCServerToMain::SubmitTx(Box::new(transaction)))
+            .send(RPCServerToMain::SubmitTx(
+                Box::new(transaction),
+                consensus_rule_set,
+            ))
             .await;
 
         Ok(SubmitTransactionResponse {
@@ -769,16 +876,18 @@ impl RpcApi for RpcServer {
     }
 
     async fn transactions_call(&self, _: TransactionsRequest) -> RpcResult<TransactionsResponse> {
-        let transactions = self
-            .state
-            .lock_guard()
-            .await
+        let state = self.state.lock_guard().await;
+        let transactions = state
             .mempool
             .fee_density_iter()
             .map(|(txkid, _)| txkid)
             .collect();
+        let legacy_transactions = state.legacy_relay_pool.txids_by_fee_density();
 
-        Ok(TransactionsResponse { transactions })
+        Ok(TransactionsResponse {
+            transactions,
+            legacy_transactions,
+        })
     }
 
     async fn get_transaction_kernel_call(
@@ -789,8 +898,7 @@ impl RpcApi for RpcServer {
             .state
             .lock_guard()
             .await
-            .mempool
-            .get(request.id)
+            .mempool_or_legacy_pool_get(request.id)
             .cloned();
 
         Ok(GetTransactionKernelResponse {
@@ -806,8 +914,7 @@ impl RpcApi for RpcServer {
             .state
             .lock_guard()
             .await
-            .mempool
-            .get(request.id)
+            .mempool_or_legacy_pool_get(request.id)
             .cloned();
 
         Ok(GetTransactionProofResponse {
@@ -873,9 +980,11 @@ impl RpcApi for RpcServer {
         let wallet_status = state.get_wallet_status_for_tip().await;
 
         let confirmed_available = wallet_status.available_confirmed(Timestamp::now());
+        let legacy = wallet_status.legacy_confirmed();
 
         Ok(GetBalanceResponse {
             balance: confirmed_available.to_string(),
+            legacy_balance: legacy.is_positive().then(|| legacy.to_string()),
         })
     }
 
@@ -898,6 +1007,7 @@ impl RpcApi for RpcServer {
             .mutator_set_accumulator_after()
             .expect("block from state must have mutator set after");
 
+        let legacy_dctidh_locks = state.wallet_state.legacy_dctidh_lock_hashes();
         let monitored_utxos = state.wallet_state.wallet_db.monitored_utxos();
         let stream = monitored_utxos.stream_values().await;
         futures::pin_mut!(stream);
@@ -955,6 +1065,7 @@ impl RpcApi for RpcServer {
                 timestamp,
                 receiving_address,
                 utxo: ApiUtxo::new(&mutxo.utxo),
+                is_legacy: legacy_dctidh_locks.contains(&lock_script_hash),
             });
         }
 
@@ -1072,7 +1183,11 @@ impl RpcApi for RpcServer {
         use crate::state::wallet::address::SubAddress;
         let network = self.state.cli().network;
 
-        let parsed = ReceivingAddress::from_bech32m(&request.address_string, network).ok();
+        // A symmetric key also parses, but it is a secret, not an address.
+        let parsed = ReceivingAddress::from_bech32m(&request.address_string, network)
+            .ok()
+            .filter(|address| !matches!(address, ReceivingAddress::Symmetric(_)))
+            .filter(|address| address.validate_as_recipient().is_ok());
 
         match parsed {
             Some(addr) => {
@@ -1237,6 +1352,12 @@ impl RpcApi for RpcServer {
         let spendable_inputs = tx_initiator
             .spendable_inputs(Timestamp::now(), request.exclude_recent_blocks)
             .await;
+        let legacy_dctidh_locks = self
+            .state
+            .lock_guard()
+            .await
+            .wallet_state
+            .legacy_dctidh_lock_hashes();
 
         let utxos: Vec<UnspentUtxo> = spendable_inputs
             .iter()
@@ -1244,6 +1365,7 @@ impl RpcApi for RpcServer {
                 leaf_index: input.mutator_set_mp().aocl_leaf_index,
                 lock_script_hash: input.utxo.lock_script_hash(),
                 amount: input.native_currency_amount().to_string(),
+                is_legacy: legacy_dctidh_locks.contains(&input.utxo.lock_script_hash()),
             })
             .collect();
 
@@ -1398,6 +1520,23 @@ impl RpcApi for RpcServer {
             archival_mutator_set: (&accumulator).into(),
         })
     }
+
+    async fn network_overview_call(
+        &self,
+        _: NetworkOverviewRequest,
+    ) -> RpcResult<NetworkOverviewResponse> {
+        let network_overview = request_network_overview(self.state.libp2p_runs(), &self.to_main_tx)
+            .await
+            .map_err(|e| {
+                RpcError::Server(JsonError::Custom {
+                    code: -32000,
+                    message: format!("Failed to report on the libp2p network stack: {e}"),
+                    data: None,
+                })
+            })?;
+
+        Ok(NetworkOverviewResponse { network_overview })
+    }
 }
 
 #[cfg(test)]
@@ -1450,6 +1589,32 @@ pub mod tests {
     }
 
     #[apply(shared_tokio_runtime)]
+    async fn validate_address_refuses_symmetric_keys() {
+        use crate::application::json_rpc::core::model::message::ValidateAddressRequest;
+        use crate::state::wallet::address::generation_address::GenerationReceivingAddress;
+        use crate::state::wallet::address::symmetric_key::SymmetricKey;
+        use crate::state::wallet::address::ReceivingAddress;
+
+        let rpc_server = test_rpc_server().await;
+        let validate = |address_string: String| {
+            rpc_server.validate_address(ValidateAddressRequest { address_string })
+        };
+
+        let generation =
+            ReceivingAddress::from(GenerationReceivingAddress::derive_from_seed(rand::random()));
+        let generation = generation.to_bech32m(Network::Main).unwrap();
+        let generation_response = validate(generation.clone()).await.unwrap();
+        assert_eq!(Some(generation), generation_response.address);
+
+        let symmetric = ReceivingAddress::from(SymmetricKey::from_seed(rand::random()));
+        let symmetric_response = validate(symmetric.to_bech32m(Network::Main).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(None, symmetric_response.address);
+        assert_eq!(None, symmetric_response.address_type);
+    }
+
+    #[apply(shared_tokio_runtime)]
     async fn network_is_consistent() {
         let rpc_server = test_rpc_server().await;
         assert_eq!("main", rpc_server.network().await.unwrap().network);
@@ -1462,6 +1627,117 @@ pub mod tests {
             BlockHeight::genesis(),
             rpc_server.height().await.unwrap().height
         );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_none_without_libp2p() {
+        let cli = cli_args::Args {
+            disable_libp2p: true,
+            ..cli_args::Args::default_with_network(Network::Main)
+        };
+        let global_state_lock =
+            mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let rpc_server = RpcServer::new(global_state_lock, None);
+
+        assert!(rpc_server
+            .network_overview()
+            .await
+            .unwrap()
+            .network_overview
+            .is_none());
+    }
+
+    #[cfg(feature = "libp2p")]
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_the_answer_of_the_main_loop() {
+        use crate::application::loops::channel::RPCServerToMain;
+        use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
+
+        let mut rpc_server = test_rpc_server().await;
+        let (to_main_tx, mut to_main_rx) = tokio::sync::mpsc::channel(1);
+        rpc_server.to_main_tx = to_main_tx;
+        let network_overview = NetworkOverviewData {
+            nat_status: "public(/ip4/198.51.100.7/udp/9901/quic-v1)".to_string(),
+            reachability_state: "public: /ip4/198.51.100.7/udp/9901/quic-v1".to_string(),
+            external_addresses: vec!["/ip4/198.51.100.7/udp/9901/quic-v1".to_string()],
+            connection_count: 4,
+            connection_limit: 10,
+            num_active_relays: 0,
+            peer_id: "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string(),
+            address_book_size: 7,
+            num_banned_peers: 0,
+        };
+
+        let answer = network_overview.clone();
+        tokio::spawn(async move {
+            if let Some(RPCServerToMain::GetNetworkOverview(reply)) = to_main_rx.recv().await {
+                let _ = reply.send(answer);
+            }
+        });
+
+        assert_eq!(
+            Some(network_overview),
+            rpc_server
+                .network_overview()
+                .await
+                .unwrap()
+                .network_overview
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn network_overview_is_in_networking_namespace_only() {
+        use std::sync::Arc;
+
+        use serde_json::json;
+
+        use crate::application::json_rpc::core::api::ops::Namespace;
+        use crate::application::json_rpc::core::api::ops::RpcMethods;
+        use crate::application::json_rpc::core::model::json::JsonError;
+
+        const METHOD: &str = "networking_networkOverview";
+
+        let default_namespaces = HashSet::from([Namespace::Node, Namespace::Chain]);
+        let default_router =
+            RpcMethods::new_router(Arc::new(test_rpc_server().await), default_namespaces);
+        assert!(matches!(
+            default_router.dispatch(METHOD, json!([])).await,
+            Err(JsonError::MethodNotFound)
+        ));
+
+        let networking_router = RpcMethods::new_router(
+            Arc::new(test_rpc_server().await),
+            HashSet::from([Namespace::Networking]),
+        );
+        assert!(networking_router.dispatch(METHOD, json!([])).await.is_ok());
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn restore_membership_proof_rejects_too_many_index_sets() {
+        use crate::application::json_rpc::core::api::rpc::MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS;
+        use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
+        use crate::util_types::mutator_set::shared::NUM_TRIALS;
+
+        let absolute_index_set = AbsoluteIndexSet::new([0_u128; NUM_TRIALS as usize]);
+        let got = MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS + 1;
+
+        for unrestricted in [false, true] {
+            let mut rpc_server = test_rpc_server().await;
+            rpc_server.unrestricted = unrestricted;
+
+            let err = rpc_server
+                .restore_membership_proof(vec![absolute_index_set; got])
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                RpcError::TooManyAbsoluteIndexSets {
+                    max: MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS,
+                    got
+                },
+                err
+            );
+        }
     }
 
     #[test_strategy::proptest(async = "tokio", cases = 5)]
@@ -1920,6 +2196,59 @@ pub mod tests {
                     assert_eq!(proof.unwrap(), tx.proof.into());
                 }
             }
+        }
+    }
+
+    /// Before the fork, a submitted transaction is verified under the rule set
+    /// of the next block, `UpgradeVMv7`, and the transactions of that era are
+    /// held in the legacy relay pool, listed apart from the mempool's and
+    /// looked up like them.
+    #[apply(shared_tokio_runtime)]
+    async fn legacy_era_transactions_are_verified_and_listed_apart() {
+        use crate::api::tx_initiation::migrate_dctidh::tests::main_net_placeholder_block;
+        use crate::application::json_rpc::core::api::rpc::SubmitTransactionError;
+
+        let mut rpc_server = test_rpc_server().await;
+        let tip = rpc_server
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .light_state()
+            .clone();
+        let pre_fork = main_net_placeholder_block(&tip, 94_000u64.into());
+        rpc_server.state.set_new_tip(pre_fork).await.unwrap();
+
+        let mut txs = make_plenty_mock_transaction_supported_by_primitive_witness(3);
+        for tx in &mut txs {
+            tx.proof = TransactionProof::invalid();
+        }
+
+        // Not valid in any era.
+        let refused = rpc_server
+            .submit_transaction(txs[0].clone().into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            RpcError::SubmitTransaction(SubmitTransactionError::InvalidTransaction),
+            refused
+        );
+
+        for tx in &txs {
+            rpc_server
+                .state
+                .lock_guard_mut()
+                .await
+                .mempool_insert(tx.clone(), UpgradePriority::Irrelevant, AddReason::FromPeer)
+                .await;
+        }
+        let listed = rpc_server.transactions().await.unwrap();
+        assert!(listed.transactions.is_empty());
+        assert_eq!(3, listed.legacy_transactions.len());
+        for tx in &txs {
+            assert!(listed.legacy_transactions.contains(&tx.txid()));
+            let kernel = rpc_server.get_transaction_kernel(tx.txid()).await.unwrap();
+            assert_eq!(Some(tx.kernel.clone()), kernel.kernel.map(Into::into));
         }
     }
 }

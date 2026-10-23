@@ -7,6 +7,7 @@
 mod addressable_key;
 mod common;
 pub mod dctidh_address;
+mod dctidh_sampler;
 pub mod encrypted_utxo_notification;
 pub mod generation_address;
 mod receiving_address;
@@ -125,7 +126,7 @@ mod tests {
                 NativeCurrencyAmount::coins(7),
             );
             let payload = UtxoNotificationPayload::new(utxo.clone(), sender_randomness);
-            let announcement = subaddress.generate_announcement(payload);
+            let announcement = subaddress.generate_announcement(payload).unwrap();
 
             // The *base* key is the one the wallet scans with.
             let caught = base_key.scan_for_announced_utxos(&kernel_with(vec![announcement]));
@@ -166,7 +167,7 @@ mod tests {
             let address = key.clone().to_address();
             let kernel_with_announcement = |utxo: Utxo| {
                 let payload = UtxoNotificationPayload::new(utxo, sender_randomness);
-                let announcement = address.generate_announcement(payload);
+                let announcement = address.generate_announcement(payload).unwrap();
                 TransactionKernelProxy {
                     inputs: vec![],
                     outputs: vec![],

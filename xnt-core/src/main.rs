@@ -7,6 +7,9 @@ use neptune_privacy::display_banner;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::FmtSubscriber;
 
+// jemalloc, shared with the triton-vm-prover binary.
+mod global_allocator;
+
 pub fn main() -> Result<()> {
     display_banner();
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -21,6 +24,16 @@ pub fn main() -> Result<()> {
 
         // Validate RPC authentication settings
         if let Err(e) = args.validate_rpc_auth() {
+            anyhow::bail!(e);
+        }
+
+        // Validate auto-consolidation settings
+        if let Err(e) = args.validate_auto_consolidation() {
+            anyhow::bail!(e);
+        }
+
+        // Validate dCTIDH migration settings
+        if let Err(e) = args.validate_dctidh_migration() {
             anyhow::bail!(e);
         }
 

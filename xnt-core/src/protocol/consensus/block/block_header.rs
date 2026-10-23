@@ -343,7 +343,7 @@ impl rand::distr::Distribution<BlockHeader> for rand::distr::StandardUniform {
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod tests {
     use rand::rng;
-    use rand::Rng;
+    use rand::RngExt;
 
     use super::*;
     use crate::tests::shared::blocks::invalid_empty_block_with_proof_size;

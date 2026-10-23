@@ -263,6 +263,8 @@ impl Display for Timestamp {
 
 impl Distribution<Timestamp> for StandardUniform {
     fn sample<R: rand::prelude::Rng + ?Sized>(&self, rng: &mut R) -> Timestamp {
+        use rand::RngExt;
+
         Timestamp(rng.random::<BFieldElement>())
     }
 }

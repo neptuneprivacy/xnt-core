@@ -21,6 +21,10 @@ pub use crate::protocol::consensus::transaction::validity::neptune_proof::Neptun
 pub use crate::protocol::consensus::transaction::Transaction;
 pub use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 pub use crate::protocol::proof_abstractions::timestamp::Timestamp;
+pub use crate::state::transaction::chained_transaction_details::ChainedTransactionDetails;
+pub use crate::state::transaction::chained_transaction_details::ThruputInput;
+pub use crate::state::transaction::chained_tx_artifacts::ChainedTxArtifacts;
+pub use crate::state::transaction::link_tx_artifacts::LinkTxArtifacts;
 pub use crate::state::transaction::transaction_details::TransactionDetails;
 pub use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 pub use crate::state::transaction::tx_creation_artifacts::TxCreationArtifacts;

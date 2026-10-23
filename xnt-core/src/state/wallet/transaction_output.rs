@@ -367,17 +367,28 @@ impl TxOutput {
     }
 
     /// Retrieve on-chain UTXO notification announcement, if any.
+    ///
+    /// Returns `None`, and logs an error, if the notification cannot be
+    /// encrypted to the receiving address. Outputs built through
+    /// [TransactionDetailsBuilder](crate::api::tx_initiation::builder::transaction_details_builder::TransactionDetailsBuilder)
+    /// have their addresses checked up front, see
+    /// [TxOutputList::validate_recipients].
     pub fn announcement(&self) -> Option<Announcement> {
         match &self.notification_method {
             UtxoNotificationMethod::None => None,
             UtxoNotificationMethod::OffChain(_) => None,
             UtxoNotificationMethod::OnChain(receiving_address) => {
                 let notification_payload = self.notification_payload();
-                Some(receiving_address.generate_announcement(notification_payload))
+                receiving_address
+                    .generate_announcement(notification_payload)
+                    .inspect_err(|e| tracing::error!("no UTXO notification for output: {e}"))
+                    .ok()
             }
         }
     }
 
+    /// Returns `None`, and logs an error, if the notification cannot be
+    /// encrypted to the receiving address, see [Self::announcement].
     pub(crate) fn offchain_notification(
         &self,
         network: Network,
@@ -386,11 +397,12 @@ impl TxOutput {
             UtxoNotificationMethod::OnChain(_) => None,
             UtxoNotificationMethod::OffChain(receiving_address) => {
                 let notification_payload = self.notification_payload();
+                let notification = receiving_address
+                    .private_notification(notification_payload, network)
+                    .inspect_err(|e| tracing::error!("no UTXO notification for output: {e}"))
+                    .ok()?;
 
-                Some((
-                    receiving_address.private_notification(notification_payload, network),
-                    receiving_address.to_owned(),
-                ))
+                Some((notification, receiving_address.to_owned()))
             }
             UtxoNotificationMethod::None => None,
         }
@@ -568,6 +580,15 @@ impl TxOutputList {
         self.offchain_notifications(network).filter(|n| !n.owned)
     }
 
+    /// Check the receiving address of every output that notifies one, see
+    /// [ReceivingAddress::validate_as_recipient].
+    pub fn validate_recipients(&self) -> anyhow::Result<()> {
+        self.0
+            .iter()
+            .filter_map(TxOutput::receiving_address)
+            .try_for_each(ReceivingAddress::validate_as_recipient)
+    }
+
     /// indicates if any offchain notifications exist
     pub fn has_offchain(&self) -> bool {
         self.0.iter().any(|u| u.is_offchain())
@@ -637,7 +658,7 @@ mod tests {
     use proptest::prop_assert;
     use proptest::prop_assert_eq;
     use proptest_arbitrary_interop::arb;
-    use rand::Rng;
+    use rand::RngExt;
     use test_strategy::proptest;
 
     use super::*;

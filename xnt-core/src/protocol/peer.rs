@@ -1,23 +1,31 @@
 pub(crate) mod handshake_data;
+pub mod link_tx_notification;
 pub mod peer_block_notifications;
 pub mod peer_info;
 pub mod transaction_notification;
 pub mod transfer_block;
+pub mod transfer_link_tx;
 pub mod transfer_transaction;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod peer_wire_golden_tests;
 
 use std::fmt::Display;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use handshake_data::HandshakeData;
 use itertools::Itertools;
+use link_tx_notification::LinkTxNotification;
 use num_bigint::BigUint;
+use num_traits::CheckedSub;
 use num_traits::ToPrimitive;
-use num_traits::Zero;
 use peer_block_notifications::PeerBlockNotification;
 use rand::rngs::StdRng;
 use rand::Rng;
-use rand::RngCore;
+use rand::RngExt;
 use rand::SeedableRng;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,18 +37,20 @@ use tracing::debug;
 use tracing::trace;
 use tracing::warn;
 use transaction_notification::TransactionNotification;
+use transfer_link_tx::TransferLinkTx;
+use transfer_transaction::TransactionProofQuality;
 use transfer_transaction::TransferTransaction;
 
 use super::consensus::block::block_header::BlockHeader;
 use super::consensus::block::block_header::BlockHeaderWithBlockHashWitness;
 use super::consensus::block::block_height::BlockHeight;
-use super::consensus::block::difficulty_control::Difficulty;
 use super::consensus::block::difficulty_control::ProofOfWork;
 use super::consensus::block::Block;
 use super::proof_abstractions::timestamp::Timestamp;
 use crate::application::config::network::Network;
 use crate::application::loops::channel::BlockProposalNotification;
 use crate::protocol::consensus::block::difficulty_control::max_cumulative_pow_after;
+use crate::protocol::consensus::block::difficulty_control::min_difficulty_after;
 use crate::protocol::peer::transfer_block::TransferBlock;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
 
@@ -88,7 +98,8 @@ pub enum NegativePeerSanction {
     DoubleSpendingTransaction,
     CannotApplyTransactionToMutatorSet,
     OversizedAnnouncement,
-    /// Block exceeds size limit during fork reconciliation (RAM exhaustion attack)
+    /// A message exceeds the size limit for its kind, or a block exceeds the
+    /// size limit during fork reconciliation.
     OversizedBlock,
 
     InvalidBlockMmrAuthentication,
@@ -243,9 +254,9 @@ impl Sanction for NegativePeerSanction {
             NegativePeerSanction::DoubleSpendingTransaction => -14,
             NegativePeerSanction::CannotApplyTransactionToMutatorSet => -3,
             NegativePeerSanction::OversizedAnnouncement => -10,
-            NegativePeerSanction::OversizedBlock => -50,
+            NegativePeerSanction::OversizedBlock => -200,
             NegativePeerSanction::NonMinedTransactionHasCoinbase => -10,
-            NegativePeerSanction::NoStandingFoundMaybeCrash => -10,
+            NegativePeerSanction::NoStandingFoundMaybeCrash => -20,
             NegativePeerSanction::BlockProposalNotFound => -1,
             NegativePeerSanction::InvalidBlockProposal => -10,
             NegativePeerSanction::UnwantedMessage => -1,
@@ -302,9 +313,14 @@ impl Sanction for PeerSanction {
 //
 // The most central methods are [PeerStanding::sanction] and
 // [PeerStanding::is_bad].
+/// How long negative peer standing takes to halve.
+pub const STANDING_HALF_LIFE: Duration = Duration::from_secs(48 * 60 * 60);
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PeerStanding {
-    /// The actual standing. The higher, the better.
+    /// The standing as last recorded. The higher, the better. Negative values
+    /// decay with time; read [`Self::standing_now`] for the value that applies
+    /// now.
     pub standing: i32,
     pub latest_punishment: Option<(NegativePeerSanction, SystemTime)>,
     pub latest_reward: Option<(PositivePeerSanction, SystemTime)>,
@@ -338,6 +354,10 @@ impl PeerStanding {
         &mut self,
         sanction: PeerSanction,
     ) -> Result<(), StandingExceedsBanThreshold> {
+        // Reduce negative standing with time-decay, before applying this
+        // sanction.
+        self.realise_decay();
+
         self.standing = self
             .standing
             .saturating_add(sanction.severity())
@@ -365,12 +385,62 @@ impl PeerStanding {
         self.latest_reward = None;
     }
 
+    /// The number of whole half-lives that have passed since the peer was last
+    /// punished.
+    fn half_lives_since_punishment(&self) -> u32 {
+        let Some((_sanction, punished_at)) = self.latest_punishment else {
+            return 0;
+        };
+
+        // A clock that has moved backwards returns 0 half lives.
+        let Ok(elapsed) = punished_at.elapsed() else {
+            return 0;
+        };
+
+        u32::try_from(elapsed.as_secs() / STANDING_HALF_LIFE.as_secs()).unwrap_or(u32::MAX)
+    }
+
+    /// The standing as it applies now.
+    ///
+    /// Negative standing decays toward zero, halving every
+    /// [`STANDING_HALF_LIFE`], so that a peer sanctioned once is not shut out
+    /// for the lifetime of the database. Positive standing does not decay.
+    pub fn standing_now(&self) -> i32 {
+        if !self.standing.is_negative() {
+            return self.standing;
+        }
+
+        // Arithmetic shift halves toward negative infinity, which errs on the
+        // side of keeping the sanction.
+        match self.half_lives_since_punishment() {
+            0 => self.standing,
+            half_lives if half_lives >= i32::BITS => 0,
+            half_lives => self.standing >> half_lives,
+        }
+    }
+
+    /// Reduce any negative standing with the right number of half lives.
+    fn realise_decay(&mut self) {
+        let half_lives = self.half_lives_since_punishment();
+        if half_lives == 0 {
+            return;
+        }
+
+        self.standing = self.standing_now();
+        if let Some((sanction, punished_at)) = self.latest_punishment {
+            let consumed = STANDING_HALF_LIFE.saturating_mul(half_lives);
+            self.latest_punishment = punished_at
+                .checked_add(consumed)
+                .map(|advanced| (sanction, advanced));
+        }
+    }
+
     pub fn is_negative(&self) -> bool {
-        self.standing.is_negative()
+        self.standing_now().is_negative()
     }
 
     pub(crate) fn is_bad(&self) -> bool {
-        self.standing <= -self.peer_tolerance
+        self.standing_now() <= -self.peer_tolerance
     }
 
     pub(crate) fn is_good(&self) -> bool {
@@ -380,7 +450,7 @@ impl PeerStanding {
 
 impl Display for PeerStanding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.standing)
+        write!(f, "{}", self.standing_now())
     }
 }
 
@@ -416,6 +486,12 @@ pub enum ConnectionRefusedReason {
 impl ConnectionRefusedReason {
     pub(crate) fn bad_timestamp() -> Self {
         Self::Other(0)
+    }
+
+    /// The peer is not among the peers given with `--peer`, and connections
+    /// are restricted to those with `--restrict-peers-to-list`.
+    pub(crate) fn not_on_peer_list() -> Self {
+        Self::Other(1)
     }
 }
 
@@ -465,7 +541,15 @@ impl BlockProposalRequest {
 }
 
 #[non_exhaustive]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, strum::EnumDiscriminants)]
+#[strum_discriminants(
+    name(PeerMessageKind),
+    derive(Hash, strum::Display, strum::FromRepr),
+    doc = "The kind of a [`PeerMessage`], without the payload.",
+    doc = "",
+    doc = "The variant index is the tag that starts a bincode encoding of the",
+    doc = "message."
+)]
 pub(crate) enum PeerMessage {
     Handshake {
         magic_value: [u8; 15],
@@ -505,7 +589,62 @@ pub(crate) enum PeerMessage {
     /// Inform peer that we are disconnecting them.
     Bye,
     ConnectionStatus(TransferConnectionStatus),
+    /// Send a notification to a peer, informing it that this node stores the
+    /// proof-backed link transaction specified in `LinkTxNotification`.
+    LinkTxNotification(LinkTxNotification),
+    /// Send a request that this node would like a copy of the link
+    /// transaction with the given id.
+    LinkTxRequest(TransactionKernelId),
+    /// Send a full, proof-backed link transaction to a peer.
+    LinkTx(Box<TransferLinkTx>),
     // New variants must be added here at the bottom to be backwards compatible.
+}
+
+impl PeerMessageKind {
+    /// The kind of message that a bincode frame carries, given the variant
+    /// index that starts the frame.
+    pub(crate) fn from_bincode_tag(tag: u32) -> Option<Self> {
+        Self::from_repr(usize::try_from(tag).ok()?)
+    }
+
+    /// Upper bound on the bincode size of a message of this kind, or `None`
+    /// if only the frame limit of the transport applies.
+    ///
+    /// The bounds leave room for the largest message consensus allows. A block
+    /// has at most one million field elements, nine bytes each as bincode, and
+    /// a sync challenge response carries 22 blocks. A transaction can carry a
+    /// proof collection with a proof per input, each around a megabyte. A
+    /// block batch response carries up to `STANDARD_BLOCK_BATCH_SIZE` blocks.
+    pub(crate) fn max_frame_length(self) -> Option<usize> {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * KIB;
+
+        let limit = match self {
+            Self::Handshake
+            | Self::BlockNotificationRequest
+            | Self::BlockNotification
+            | Self::BlockRequestByHeight
+            | Self::BlockRequestByHash
+            | Self::UnableToSatisfyBatchRequest
+            | Self::SyncChallenge
+            | Self::BlockProposalNotification
+            | Self::BlockProposalRequest
+            | Self::TransactionNotification
+            | Self::TransactionRequest
+            | Self::PeerListRequest
+            | Self::Bye
+            | Self::ConnectionStatus
+            | Self::LinkTxNotification
+            | Self::LinkTxRequest => 64 * KIB,
+            Self::BlockRequestBatch | Self::PeerListResponse => 2 * MIB,
+            Self::Block | Self::BlockProposal => 20 * MIB,
+            Self::LinkTx => 64 * MIB,
+            Self::Transaction | Self::SyncChallengeResponse => 270 * MIB,
+            Self::BlockResponseBatch => return None,
+        };
+
+        Some(limit)
+    }
 }
 
 impl PeerMessage {
@@ -532,6 +671,9 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => "unable to satisfy batch request",
             PeerMessage::SyncChallenge(_) => "sync challenge",
             PeerMessage::SyncChallengeResponse(_) => "sync challenge response",
+            PeerMessage::LinkTxNotification(_) => "link transaction notification",
+            PeerMessage::LinkTxRequest(_) => "link transaction request",
+            PeerMessage::LinkTx(_) => "link transaction",
         }
         .to_string()
     }
@@ -559,6 +701,9 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => true,
             PeerMessage::SyncChallenge(_) => false,
             PeerMessage::SyncChallengeResponse(_) => false,
+            PeerMessage::LinkTxNotification(_) => false,
+            PeerMessage::LinkTxRequest(_) => false,
+            PeerMessage::LinkTx(_) => false,
         }
     }
 
@@ -586,6 +731,9 @@ impl PeerMessage {
             PeerMessage::UnableToSatisfyBatchRequest => false,
             PeerMessage::SyncChallenge(_) => false,
             PeerMessage::SyncChallengeResponse(_) => false,
+            PeerMessage::LinkTxNotification(_) => true,
+            PeerMessage::LinkTxRequest(_) => true,
+            PeerMessage::LinkTx(_) => true,
         }
     }
 
@@ -614,6 +762,9 @@ impl PeerMessage {
             PeerMessage::PeerListResponse(_) => false,
             PeerMessage::Bye => false,
             PeerMessage::ConnectionStatus(_) => false,
+            PeerMessage::LinkTxNotification(_) => true,
+            PeerMessage::LinkTxRequest(_) => true,
+            PeerMessage::LinkTx(_) => true,
         }
     }
 }
@@ -635,9 +786,42 @@ pub struct MutablePeerState {
     /// Used on the receiver side to mirror the sender's cooldown so compliant
     /// peers (one challenge per `SYNC_CHALLENGE_COOLDOWN`) accrue no penalty.
     pub(crate) last_received_sync_challenge_time: Option<Timestamp>,
+
+    /// The transactions from this peer that were verified but not taken, see
+    /// [`UntakenTransaction`]. Such a transaction is verified once per tip,
+    /// and ignored when it comes again. Holds the latest
+    /// [`Self::MAX_UNTAKEN_TRANSACTIONS`].
+    untaken_transactions: Vec<UntakenTransaction>,
+}
+
+/// Why a transaction from a peer was verified but not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UntakenReason {
+    /// It is valid only on the other side of a hard fork next to the block
+    /// after the tip. Another proof of it, for the next block, may follow,
+    /// under the same id and of the same quality.
+    OtherEra,
+
+    /// It is valid only as the previous release checks it.
+    PreviousRelease,
+}
+
+/// A transaction from a peer that was verified but not taken, at the tip with
+/// the given digest: identified by its id, its proof quality and a fingerprint
+/// of its proof, so that another proof of the same transaction is verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UntakenTransaction {
+    pub(crate) tip: Digest,
+    pub(crate) txid: TransactionKernelId,
+    pub(crate) proof_quality: TransactionProofQuality,
+    pub(crate) proof_fingerprint: u64,
+    pub(crate) reason: UntakenReason,
 }
 
 impl MutablePeerState {
+    /// The largest number of untaken transactions remembered.
+    const MAX_UNTAKEN_TRANSACTIONS: usize = 64;
+
     pub fn new(block_height: BlockHeight) -> Self {
         Self {
             highest_shared_block_height: block_height,
@@ -645,7 +829,63 @@ impl MutablePeerState {
             sync_challenge: None,
             successful_sync_challenge_response_time: None,
             last_received_sync_challenge_time: None,
+            untaken_transactions: vec![],
         }
+    }
+
+    /// Whether this peer sent a transaction with this id that was verified but
+    /// not taken at the tip with this digest, whatever its proof.
+    pub(crate) fn has_untaken_transaction(&self, tip: Digest, txid: TransactionKernelId) -> bool {
+        self.untaken_transactions
+            .iter()
+            .any(|untaken| untaken.tip == tip && untaken.txid == txid)
+    }
+
+    /// Whether this peer sent this transaction, with this proof, that was
+    /// verified but not taken at the tip with this digest.
+    pub(crate) fn is_untaken_transaction(
+        &self,
+        tip: Digest,
+        txid: TransactionKernelId,
+        proof_quality: TransactionProofQuality,
+        proof_fingerprint: u64,
+    ) -> bool {
+        self.untaken_transactions.iter().any(|untaken| {
+            untaken.tip == tip
+                && untaken.txid == txid
+                && untaken.proof_quality == proof_quality
+                && untaken.proof_fingerprint == proof_fingerprint
+        })
+    }
+
+    /// Whether an announcement from this peer of a transaction with this id
+    /// and proof quality need not be followed up at the tip with this digest:
+    /// the peer sent such a transaction that is valid only as the previous
+    /// release checks it. One valid only on the other side of a hard fork is
+    /// requested again, as a proof for the next block may follow.
+    pub(crate) fn skips_announcement(
+        &self,
+        tip: Digest,
+        txid: TransactionKernelId,
+        proof_quality: TransactionProofQuality,
+    ) -> bool {
+        self.untaken_transactions.iter().any(|untaken| {
+            untaken.tip == tip
+                && untaken.txid == txid
+                && untaken.proof_quality == proof_quality
+                && untaken.reason == UntakenReason::PreviousRelease
+        })
+    }
+
+    /// Remember a transaction from this peer that was verified but not taken.
+    pub(crate) fn record_untaken_transaction(&mut self, untaken: UntakenTransaction) {
+        if self.untaken_transactions.contains(&untaken) {
+            return;
+        }
+        if self.untaken_transactions.len() >= Self::MAX_UNTAKEN_TRANSACTIONS {
+            self.untaken_transactions.remove(0);
+        }
+        self.untaken_transactions.push(untaken);
     }
 }
 
@@ -892,8 +1132,14 @@ impl SyncChallengeResponse {
 
         let first = self.blocks[0].0.header;
         let last = self.tip.header;
-        let total_pow_increase = BigUint::from(last.cumulative_proof_of_work)
-            - BigUint::from(first.cumulative_proof_of_work);
+
+        // Cum-pow values are the responder's to choose, so the difference is
+        // not known to be positive.
+        let Some(total_pow_increase) = BigUint::from(last.cumulative_proof_of_work)
+            .checked_sub(&BigUint::from(first.cumulative_proof_of_work))
+        else {
+            return false;
+        };
         let span = last.height - first.height;
         let average_difficulty = total_pow_increase.to_f64().unwrap() / (span as f64);
         debug_assert!(
@@ -964,18 +1210,49 @@ impl SyncChallengeResponse {
     /// Check whether the claimed difficulties are large enough relative to that
     /// of our own tip.
     ///
-    /// Sum all verified difficulties and verify that this number is larger than
-    /// our own tip difficulty. This inequality guarantees that the successful
-    /// attacker must have spent at least one block's worth of guessing power to
-    /// produce the malicious chain, and probably much more.
-    pub(crate) fn check_difficulty(&self, own_tip_difficulty: Difficulty) -> bool {
-        let own_tip_difficulty = ProofOfWork::zero() + own_tip_difficulty;
-        let mut fork_relative_cumpow = ProofOfWork::zero();
-        for (_parent, child) in &self.blocks {
-            fork_relative_cumpow = fork_relative_cumpow + child.header.difficulty;
+    /// The difficulty control rules bound how far the difficulty can fall over
+    /// a number of blocks and a span of time. Every challenged block above our
+    /// own tip must have at least the lowest difficulty that these rules allow
+    /// for a chain that passed through a block like our tip, given its height
+    /// and timestamp. The bound follows the rules rather than assuming that the
+    /// difficulty stays put, so a difficulty that fell over months because
+    /// less guessing power was spent is accepted.
+    pub(crate) fn check_difficulty(&self, own_tip: &BlockHeader, network: Network) -> bool {
+        // Difficulty resets make any difficulty reachable at any time.
+        if network.difficulty_reset_interval().is_some() {
+            return true;
         }
 
-        fork_relative_cumpow > own_tip_difficulty
+        self.blocks
+            .iter()
+            .map(|(_parent, child)| &child.header)
+            .filter(|child| child.height > own_tip.height)
+            .all(|child| {
+                let num_blocks = u64::try_from(child.height - own_tip.height).unwrap_or(u64::MAX);
+                let elapsed = Timestamp::millis(
+                    child
+                        .timestamp
+                        .to_millis()
+                        .saturating_sub(own_tip.timestamp.to_millis()),
+                );
+                let lower_bound = min_difficulty_after(
+                    own_tip.difficulty,
+                    num_blocks,
+                    elapsed,
+                    network.target_block_interval(),
+                    network.minimum_block_time(),
+                );
+                let difficulty = BigUint::from(child.difficulty).to_f64().unwrap();
+                if difficulty < lower_bound {
+                    debug!(
+                        "Difficulty {} at height {} is below {lower_bound:e}, the lowest that \
+                         {num_blocks} blocks and {elapsed} after our tip allow.",
+                        child.difficulty, child.height,
+                    );
+                }
+
+                difficulty >= lower_bound
+            })
     }
 }
 
@@ -1162,6 +1439,160 @@ mod tests {
                 &invalid_pow_chain
             ));
         }
+    }
+
+    #[test]
+    fn check_pow_rejects_first_block_with_more_work_than_last() {
+        use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+
+        let network = Network::Testnet(42);
+        let genesis = Block::genesis(network);
+        let block = TransferBlock {
+            header: *genesis.header(),
+            body: genesis.body().clone(),
+            appendix: genesis.appendix().clone(),
+            proof: Proof::invalid(),
+        };
+        let witness = BlockHeaderWithBlockHashWitness::new(
+            *genesis.header(),
+            HeaderToBlockHashWitness::from(&genesis),
+        );
+        let mut response = SyncChallengeResponse {
+            blocks: std::array::from_fn(|_| (block.clone(), block.clone())),
+            membership_proofs: std::array::from_fn(|_| MmrMembershipProof::new(vec![])),
+            tip_parent: block.clone(),
+            tip: block.clone(),
+            pow_witnesses: std::array::from_fn(|_| witness.clone()),
+        };
+        response.blocks[0].0.header.cumulative_proof_of_work =
+            block.header.cumulative_proof_of_work + [1u32];
+
+        assert!(!response.check_pow(network, 1u64.into()));
+    }
+
+    /// On main net the difficulty fell from about 2.1e13 at height 9,000 to
+    /// about 9.7e11 at height 93,800 over ten months, as less guessing power
+    /// was spent. A node whose tip is at height 9,000 accepts that chain, but
+    /// not one whose difficulty falls faster than the difficulty control rules
+    /// allow.
+    #[test]
+    fn difficulty_check_follows_the_difficulty_control_rules() {
+        use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;
+        use crate::protocol::consensus::block::difficulty_control::Difficulty;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+
+        let network = Network::Main;
+        let genesis = Block::genesis(network);
+        let block = TransferBlock {
+            header: *genesis.header(),
+            body: genesis.body().clone(),
+            appendix: genesis.appendix().clone(),
+            proof: Proof::invalid(),
+        };
+        let witness = BlockHeaderWithBlockHashWitness::new(
+            *genesis.header(),
+            HeaderToBlockHashWitness::from(&genesis),
+        );
+        let response_with_children_at = |height: u64, timestamp: Timestamp, difficulty: u64| {
+            let mut child = block.clone();
+            child.header.height = height.into();
+            child.header.timestamp = timestamp;
+            child.header.difficulty = Difficulty::from_u64(difficulty);
+            SyncChallengeResponse {
+                blocks: std::array::from_fn(|_| (block.clone(), child.clone())),
+                membership_proofs: std::array::from_fn(|_| MmrMembershipProof::new(vec![])),
+                tip_parent: block.clone(),
+                tip: block.clone(),
+                pow_witnesses: std::array::from_fn(|_| witness.clone()),
+            }
+        };
+
+        let mut own_tip = *genesis.header();
+        own_tip.height = 9_000u64.into();
+        own_tip.timestamp = Timestamp::millis(1_766_890_648_746);
+        own_tip.difficulty = Difficulty::from_u64(21_312_894_178_840);
+
+        let ten_months_later = response_with_children_at(
+            93_800,
+            Timestamp::millis(1_792_334_465_110),
+            966_001_234_024,
+        );
+        assert!(ten_months_later.check_difficulty(&own_tip, network));
+
+        let one_hour_later = own_tip.timestamp + Timestamp::hours(1);
+        let gradual_decrease = response_with_children_at(9_012, one_hour_later, 18_000_000_000_000);
+        assert!(gradual_decrease.check_difficulty(&own_tip, network));
+
+        let tenfold_decrease = response_with_children_at(9_012, one_hour_later, 2_131_289_417_884);
+        assert!(!tenfold_decrease.check_difficulty(&own_tip, network));
+
+        // Challenged blocks at or below the own tip are not compared.
+        let below_own_tip = response_with_children_at(8_990, one_hour_later, 1);
+        assert!(below_own_tip.check_difficulty(&own_tip, network));
+    }
+
+    /// Peer messages are encoded by variant index, so the link-transaction
+    /// messages are appended: every older variant keeps its index, and an
+    /// older peer can decode every message it knows.
+    #[test]
+    fn link_transaction_messages_are_appended() {
+        let tag = |message: &PeerMessage| -> u32 {
+            u32::from_le_bytes(
+                bincode::serialize(message).unwrap()[..4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(19, tag(&PeerMessage::Bye));
+        let txid = TransactionKernelId::default();
+        assert_eq!(22, tag(&PeerMessage::LinkTxRequest(txid)));
+    }
+
+    /// The kind of a message is read from the start of its frame, so the
+    /// kinds must follow the bincode tags of the messages.
+    #[test]
+    fn peer_message_kinds_follow_the_bincode_tags() {
+        use bincode::Options;
+
+        let txid = TransactionKernelId::default();
+        let messages = [
+            PeerMessage::BlockNotificationRequest,
+            PeerMessage::BlockRequestByHeight(1u64.into()),
+            PeerMessage::UnableToSatisfyBatchRequest,
+            PeerMessage::TransactionRequest(txid),
+            PeerMessage::PeerListRequest,
+            PeerMessage::Bye,
+            PeerMessage::LinkTxRequest(txid),
+        ];
+        for message in messages {
+            let options = bincode::DefaultOptions::new();
+            let bytes = options.serialize(&message).unwrap();
+            let tag = options.deserialize_from::<_, u32>(&bytes[..]).unwrap();
+            assert_eq!(
+                Some(PeerMessageKind::from(&message)),
+                PeerMessageKind::from_bincode_tag(tag)
+            );
+        }
+    }
+
+    /// The frame limits leave room for the largest messages consensus allows:
+    /// blocks of `max_block_size` field elements, nine bytes each as bincode.
+    #[test]
+    fn frame_limits_leave_room_for_the_largest_blocks() {
+        use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
+
+        let max_block_len = 9 * ConsensusRuleSet::UpgradeVMv8.max_block_size();
+        let limit = |kind: PeerMessageKind| kind.max_frame_length().unwrap();
+
+        assert!(max_block_len <= limit(PeerMessageKind::Block));
+        assert!(max_block_len <= limit(PeerMessageKind::BlockProposal));
+        let num_blocks_in_sync_challenge_response = 2 * SYNC_CHALLENGE_NUM_BLOCK_PAIRS + 2;
+        assert!(
+            num_blocks_in_sync_challenge_response * max_block_len
+                <= limit(PeerMessageKind::SyncChallengeResponse)
+        );
+        assert_eq!(None, PeerMessageKind::BlockResponseBatch.max_frame_length());
     }
 
     #[test]

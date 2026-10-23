@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 
 use tasm_lib::twenty_first::prelude::Mmr;
 
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::api::export::Network;
 use crate::protocol::consensus::block::block_body::BlockBody;
 use crate::protocol::consensus::block::block_header::BlockHeader;
@@ -107,7 +108,15 @@ impl BlockPrimitiveWitness {
                 \nPredecessor block had {predecessor_msa_digest};\ntransaction had {tx_msa_digest}\n\n"
             );
 
-            let inputs = RemovalRecordList::try_unpack(transaction_kernel.inputs.clone()).expect("Inputs must be packed in block transaction");
+            let consensus_rule_set = ConsensusRuleSet::infer_from(
+                self.network,
+                self.predecessor_block.header().height.next(),
+            );
+            let inputs = RemovalRecordList::try_unpack(
+                transaction_kernel.inputs.clone(),
+                consensus_rule_set.allow_big_chunks(),
+            )
+            .expect("Inputs must be packed in block transaction");
 
             let mutator_set_update = MutatorSetUpdate::new(inputs, self.transaction.kernel.outputs.clone());
 

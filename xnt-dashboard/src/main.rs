@@ -112,8 +112,27 @@ async fn main() {
         }
     };
 
+    // Ask for the overview of the libp2p network stack only if the node knows
+    // the request, as a node closes the connection on a request it does not
+    // know.
+    let network_overview_supported = match &client {
+        DashboardRpcClient::Authentic(_) => {
+            node_supports_network_overview(server_socket, token).await
+        }
+        #[cfg(feature = "mock")]
+        DashboardRpcClient::Mock(_) => true,
+    };
+
     // run app until quit
-    let res = DashboardApp::run(args, client, network, token, listen_addr_for_peers).await;
+    let res = DashboardApp::run(
+        args,
+        client,
+        network,
+        token,
+        listen_addr_for_peers,
+        network_overview_supported,
+    )
+    .await;
 
     restore_text_mode(); // just in case.
 
@@ -126,6 +145,25 @@ async fn main() {
             print!("{output}");
         }
     }
+}
+
+/// Whether the node answers the `network_overview` request.
+///
+/// The request is sent once, over a connection of its own: a node that does
+/// not know the request closes the connection it came on, and the connection
+/// the dashboard uses for everything else must stay open. A node that does
+/// not answer counts as not supporting the request.
+async fn node_supports_network_overview(server_socket: SocketAddr, token: auth::Token) -> bool {
+    let Ok(transport) = tarpc::serde_transport::tcp::connect(server_socket, Json::default).await
+    else {
+        return false;
+    };
+    let probe_client = RPCClient::new(client::Config::default(), transport).spawn();
+
+    probe_client
+        .network_overview(context::current(), token)
+        .await
+        .is_ok()
 }
 
 // returns result with a CookieHint{ data_directory, network }.

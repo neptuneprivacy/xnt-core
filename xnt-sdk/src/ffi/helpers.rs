@@ -19,6 +19,24 @@ pub fn vec_to_ptr<T>(v: Vec<T>) -> *mut T {
     }
 }
 
+/// Drop a handle that was returned to the caller as a boxed pointer. NULL is
+/// ignored.
+pub(crate) fn free_handle<T>(handle: *mut T) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle)) }
+    }
+}
+
+/// Read an amount in nau passed as 16 bytes, little-endian two's complement.
+///
+/// # Safety
+/// - `ptr` must be valid for reading 16 bytes
+pub(crate) unsafe fn read_amount_le(ptr: *const u8) -> i128 {
+    let mut bytes = [0u8; 16];
+    std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), 16);
+    i128::from_le_bytes(bytes)
+}
+
 /// Parse C string, returns None on null or invalid UTF-8
 pub fn parse_cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {

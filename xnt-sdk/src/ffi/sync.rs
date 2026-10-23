@@ -4,12 +4,13 @@
 
 use crate::core::{
     check_spent, compute_absolute_index_set_hash, compute_commitment,
-    compute_commitment_for_output, decrypt_indexed_utxo, fetch_utxos, get_aocl_indices,
-    get_membership_proofs, get_mutator_set, MembershipProof, MutatorSet,
+    compute_commitment_for_output, decrypt_indexed_utxo_for_network, fetch_utxos_with_skipped,
+    get_aocl_indices, get_membership_proofs, get_mutator_set, MembershipProof, MutatorSet, Network,
 };
 
-use super::error::{set_last_error, XntErrorCode};
-use super::helpers::{read_slice, vec_to_ptr};
+use super::address::network_from_raw;
+use super::error::{ffi_guard, set_last_error, XntErrorCode};
+use super::helpers::{free_handle, read_slice, vec_to_ptr};
 use super::json_rpc::RpcClientHandle;
 use super::seed::SpendingKeyHandle;
 use super::types::{ByteBuffer, XntDigest};
@@ -71,6 +72,10 @@ pub struct MsMembershipProofHandle(pub(crate) MembershipProof);
 
 
 /// Fetch UTXOs by receiver_id_hash from indexer
+///
+/// Entries without a block height, or whose ciphertext is oversized or not a
+/// list of field elements, are skipped, see
+/// xnt_sync_fetch_utxos_with_skipped.
 #[no_mangle]
 pub extern "C" fn xnt_sync_fetch_utxos(
     client: *const RpcClientHandle,
@@ -78,68 +83,147 @@ pub extern "C" fn xnt_sync_fetch_utxos(
     from_height: u64,
     to_height: u64,
 ) -> XntIndexedUtxoArray {
-    ffi_begin!();
-    if client.is_null() || receiver_id_hash.is_null() {
-        set_last_error("null pointer");
-        return XntIndexedUtxoArray::null();
-    }
+    ffi_guard(XntIndexedUtxoArray::null(), || {
+        xnt_sync_fetch_utxos_with_skipped(
+            client,
+            receiver_id_hash,
+            from_height,
+            to_height,
+            std::ptr::null_mut(),
+        )
+    })
+}
 
-    let client = ffi_ref!(client);
-    let digest = ffi_ref!(receiver_id_hash);
-    let core_digest = crate::core::Digest::from_bytes(digest.bytes);
+/// Fetch UTXOs by receiver_id_hash from indexer, and write the number of
+/// entries skipped instead of failing the whole range to `out_skipped` (may be
+/// NULL): entries without a block height, or whose ciphertext is oversized or
+/// not a list of field elements.
+#[no_mangle]
+pub extern "C" fn xnt_sync_fetch_utxos_with_skipped(
+    client: *const RpcClientHandle,
+    receiver_id_hash: *const XntDigest,
+    from_height: u64,
+    to_height: u64,
+    out_skipped: *mut usize,
+) -> XntIndexedUtxoArray {
+    ffi_guard(XntIndexedUtxoArray::null(), || {
+        ffi_begin!();
+        if client.is_null() || receiver_id_hash.is_null() {
+            set_last_error("null pointer");
+            return XntIndexedUtxoArray::null();
+        }
 
-    match fetch_utxos(&client.0, &core_digest, from_height, to_height) {
-        Ok(utxos) => {
-            let mut indexed_utxos: Vec<XntIndexedUtxo> = Vec::with_capacity(utxos.len());
-            for utxo in utxos {
-                let ciphertext = utxo.ciphertext;
-                let ciphertext_len = ciphertext.len();
-                indexed_utxos.push(XntIndexedUtxo {
-                    block_height: utxo.block_height,
-                    block_digest: XntDigest::from_bytes(utxo.block_digest.bytes),
-                    ciphertext_data: vec_to_ptr(ciphertext),
-                    ciphertext_len,
-                });
+        let client = ffi_ref!(client);
+        let digest = ffi_ref!(receiver_id_hash);
+        let core_digest = crate::core::Digest::from_bytes(digest.bytes);
+
+        match fetch_utxos_with_skipped(&client.0, &core_digest, from_height, to_height) {
+            Ok((utxos, skipped)) => {
+                if !out_skipped.is_null() {
+                    unsafe { *out_skipped = skipped };
+                }
+                let mut indexed_utxos: Vec<XntIndexedUtxo> = Vec::with_capacity(utxos.len());
+                for utxo in utxos {
+                    let ciphertext = utxo.ciphertext;
+                    let ciphertext_len = ciphertext.len();
+                    indexed_utxos.push(XntIndexedUtxo {
+                        block_height: utxo.block_height,
+                        block_digest: XntDigest::from_bytes(utxo.block_digest.bytes),
+                        ciphertext_data: vec_to_ptr(ciphertext),
+                        ciphertext_len,
+                    });
+                }
+                let len = indexed_utxos.len();
+                XntIndexedUtxoArray {
+                    data: vec_to_ptr(indexed_utxos),
+                    len,
+                }
             }
-            let len = indexed_utxos.len();
-            XntIndexedUtxoArray { data: vec_to_ptr(indexed_utxos), len }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                XntIndexedUtxoArray::null()
+            }
         }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            XntIndexedUtxoArray::null()
-        }
-    }
+    })
 }
 
 /// Free indexed UTXO array
 #[no_mangle]
 pub extern "C" fn xnt_sync_indexed_utxos_free(arr: *mut XntIndexedUtxoArray) {
-    if arr.is_null() {
-        return;
-    }
-    unsafe {
-        let arr = &mut *arr;
-        if !arr.data.is_null() && arr.len > 0 {
-            let slice = std::slice::from_raw_parts_mut(arr.data, arr.len);
-            for utxo in slice.iter_mut() {
-                if !utxo.ciphertext_data.is_null() && utxo.ciphertext_len > 0 {
-                    drop(Vec::from_raw_parts(utxo.ciphertext_data, utxo.ciphertext_len, utxo.ciphertext_len));
-                }
-            }
-            drop(Vec::from_raw_parts(arr.data, arr.len, arr.len));
+    ffi_guard((), || {
+        if arr.is_null() {
+            return;
         }
-        arr.data = std::ptr::null_mut();
-        arr.len = 0;
-    }
+        unsafe {
+            let arr = &mut *arr;
+            if !arr.data.is_null() && arr.len > 0 {
+                let slice = std::slice::from_raw_parts_mut(arr.data, arr.len);
+                for utxo in slice.iter_mut() {
+                    if !utxo.ciphertext_data.is_null() && utxo.ciphertext_len > 0 {
+                        drop(Vec::from_raw_parts(
+                            utxo.ciphertext_data,
+                            utxo.ciphertext_len,
+                            utxo.ciphertext_len,
+                        ));
+                    }
+                }
+                drop(Vec::from_raw_parts(arr.data, arr.len, arr.len));
+            }
+            arr.data = std::ptr::null_mut();
+            arr.len = 0;
+        }
+    })
 }
 
 /// Decrypt indexed UTXO ciphertext with spending key
+///
+/// Applies the main-net legacy cutoff, the strictest one; see
+/// xnt_sync_decrypt_indexed_utxo_for_network.
 #[no_mangle]
 pub extern "C" fn xnt_sync_decrypt_indexed_utxo(
     spending_key: *const SpendingKeyHandle,
     indexed_utxo: *const XntIndexedUtxo,
 ) -> XntDecryptedUtxo {
-    ffi_begin!();
+    ffi_guard(XntDecryptedUtxo::null(), || {
+        ffi_begin!();
+        decrypt_indexed(
+            spending_key,
+            indexed_utxo,
+            Network::Main,
+            std::ptr::null_mut(),
+        )
+    })
+}
+
+/// Decrypt indexed UTXO ciphertext with spending key, applying the legacy
+/// cutoff of `network` (one of the XntNetwork values).
+///
+/// Fails for a UTXO at a legacy-format dCTIDH lock confirmed at or above
+/// xnt_legacy_dctidh_cutoff. Writes whether the UTXO is at a legacy-format
+/// lock, and so sweep-only, to `out_is_legacy` (may be NULL).
+#[no_mangle]
+pub extern "C" fn xnt_sync_decrypt_indexed_utxo_for_network(
+    spending_key: *const SpendingKeyHandle,
+    indexed_utxo: *const XntIndexedUtxo,
+    network: u32,
+    out_is_legacy: *mut bool,
+) -> XntDecryptedUtxo {
+    ffi_guard(XntDecryptedUtxo::null(), || {
+        ffi_begin!();
+        let Some(network) = network_from_raw(network) else {
+            set_last_error("invalid network");
+            return XntDecryptedUtxo::null();
+        };
+        decrypt_indexed(spending_key, indexed_utxo, network, out_is_legacy)
+    })
+}
+
+fn decrypt_indexed(
+    spending_key: *const SpendingKeyHandle,
+    indexed_utxo: *const XntIndexedUtxo,
+    network: Network,
+    out_is_legacy: *mut bool,
+) -> XntDecryptedUtxo {
     if spending_key.is_null() || indexed_utxo.is_null() {
         set_last_error("null pointer");
         return XntDecryptedUtxo::null();
@@ -156,14 +240,21 @@ pub extern "C" fn xnt_sync_decrypt_indexed_utxo(
     let bytes = unsafe { read_slice(utxo.ciphertext_data, utxo.ciphertext_len) };
     let block_digest = crate::core::Digest::from_bytes(utxo.block_digest.bytes);
 
-    match decrypt_indexed_utxo(&key.0, bytes, utxo.block_height, block_digest) {
-        Ok(decrypted) => XntDecryptedUtxo {
-            utxo: Box::into_raw(Box::new(UtxoHandle(decrypted.utxo))),
-            sender_randomness: XntDigest::from_bytes(decrypted.sender_randomness.bytes),
-            payment_id: decrypted.payment_id,
-            block_height: decrypted.block_height,
-            block_digest: XntDigest::from_bytes(decrypted.block_digest.bytes),
-        },
+    let result =
+        decrypt_indexed_utxo_for_network(&key.0, bytes, utxo.block_height, block_digest, network);
+    match result {
+        Ok(decrypted) => {
+            if !out_is_legacy.is_null() {
+                unsafe { *out_is_legacy = decrypted.is_legacy };
+            }
+            XntDecryptedUtxo {
+                utxo: Box::into_raw(Box::new(UtxoHandle(decrypted.utxo))),
+                sender_randomness: XntDigest::from_bytes(decrypted.sender_randomness.bytes),
+                payment_id: decrypted.payment_id,
+                block_height: decrypted.block_height,
+                block_digest: XntDigest::from_bytes(decrypted.block_digest.bytes),
+            }
+        }
         Err(e) => {
             set_last_error(&format!("{e}"));
             XntDecryptedUtxo::null()
@@ -179,41 +270,48 @@ pub extern "C" fn xnt_sync_check_spent(
     hashes: *const XntDigest,
     count: usize,
 ) -> XntSpentStatus {
-    ffi_begin!();
-    if client.is_null() || hashes.is_null() || count == 0 {
-        set_last_error("invalid input");
-        return XntSpentStatus::null();
-    }
-
-    let client = ffi_ref!(client);
-    let digests = unsafe { read_slice(hashes, count) };
-    let core_digests: Vec<crate::core::Digest> = digests
-        .iter()
-        .map(|d| crate::core::Digest::from_bytes(d.bytes))
-        .collect();
-
-    match check_spent(&client.0, &core_digests) {
-        Ok(heights) => {
-            let len = heights.len();
-            XntSpentStatus { heights: vec_to_ptr(heights), len }
+    ffi_guard(XntSpentStatus::null(), || {
+        ffi_begin!();
+        if client.is_null() || hashes.is_null() || count == 0 {
+            set_last_error("invalid input");
+            return XntSpentStatus::null();
         }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            XntSpentStatus::null()
+
+        let client = ffi_ref!(client);
+        let digests = unsafe { read_slice(hashes, count) };
+        let core_digests: Vec<crate::core::Digest> = digests
+            .iter()
+            .map(|d| crate::core::Digest::from_bytes(d.bytes))
+            .collect();
+
+        match check_spent(&client.0, &core_digests) {
+            Ok(heights) => {
+                let len = heights.len();
+                XntSpentStatus {
+                    heights: vec_to_ptr(heights),
+                    len,
+                }
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                XntSpentStatus::null()
+            }
         }
-    }
+    })
 }
 
 /// Free spent status result
 #[no_mangle]
 pub extern "C" fn xnt_sync_spent_status_free(status: *mut XntSpentStatus) {
-    if status.is_null() {
-        return;
-    }
-    let s = ffi_mut!(status);
-    free_vec!(s.heights, s.len);
-    s.heights = std::ptr::null_mut();
-    s.len = 0;
+    ffi_guard((), || {
+        if status.is_null() {
+            return;
+        }
+        let s = ffi_mut!(status);
+        free_vec!(s.heights, s.len);
+        s.heights = std::ptr::null_mut();
+        s.len = 0;
+    })
 }
 
 
@@ -224,61 +322,70 @@ pub extern "C" fn xnt_sync_get_aocl_indices(
     commitments: *const XntDigest,
     count: usize,
 ) -> XntAoclIndices {
-    ffi_begin!();
-    if client.is_null() || commitments.is_null() || count == 0 {
-        set_last_error("invalid input");
-        return XntAoclIndices::null();
-    }
-
-    let client = ffi_ref!(client);
-    let digests = unsafe { read_slice(commitments, count) };
-    let core_digests: Vec<crate::core::Digest> = digests
-        .iter()
-        .map(|d| crate::core::Digest::from_bytes(d.bytes))
-        .collect();
-
-    match get_aocl_indices(&client.0, &core_digests) {
-        Ok(indices) => {
-            let len = indices.len();
-            XntAoclIndices { indices: vec_to_ptr(indices), len }
+    ffi_guard(XntAoclIndices::null(), || {
+        ffi_begin!();
+        if client.is_null() || commitments.is_null() || count == 0 {
+            set_last_error("invalid input");
+            return XntAoclIndices::null();
         }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            XntAoclIndices::null()
+
+        let client = ffi_ref!(client);
+        let digests = unsafe { read_slice(commitments, count) };
+        let core_digests: Vec<crate::core::Digest> = digests
+            .iter()
+            .map(|d| crate::core::Digest::from_bytes(d.bytes))
+            .collect();
+
+        match get_aocl_indices(&client.0, &core_digests) {
+            Ok(indices) => {
+                let len = indices.len();
+                XntAoclIndices {
+                    indices: vec_to_ptr(indices),
+                    len,
+                }
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                XntAoclIndices::null()
+            }
         }
-    }
+    })
 }
 
 /// Free AOCL indices result
 #[no_mangle]
 pub extern "C" fn xnt_sync_aocl_indices_free(result: *mut XntAoclIndices) {
-    if result.is_null() {
-        return;
-    }
-    let r = ffi_mut!(result);
-    free_vec!(r.indices, r.len);
-    r.indices = std::ptr::null_mut();
-    r.len = 0;
+    ffi_guard((), || {
+        if result.is_null() {
+            return;
+        }
+        let r = ffi_mut!(result);
+        free_vec!(r.indices, r.len);
+        r.indices = std::ptr::null_mut();
+        r.len = 0;
+    })
 }
 
 
 /// Get current block height from node
 #[no_mangle]
 pub extern "C" fn xnt_sync_get_height(client: *const RpcClientHandle) -> i64 {
-    ffi_begin!();
-    if client.is_null() {
-        set_last_error("null pointer");
-        return -1;
-    }
-
-    let client = ffi_ref!(client);
-    match client.0.chain_height() {
-        Ok(h) => h as i64,
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            -1
+    ffi_guard(-1, || {
+        ffi_begin!();
+        if client.is_null() {
+            set_last_error("null pointer");
+            return -1;
         }
-    }
+
+        let client = ffi_ref!(client);
+        match client.0.chain_height() {
+            Ok(h) => h as i64,
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                -1
+            }
+        }
+    })
 }
 
 
@@ -290,18 +397,20 @@ pub extern "C" fn xnt_compute_commitment(
     receiver_preimage: *const XntDigest,
     out_commitment: *mut u8,
 ) -> XntErrorCode {
-    ffi_begin!();
-    check_null!(utxo_hash);
-    check_null!(sender_randomness);
-    check_null!(receiver_preimage);
-    check_null!(out_commitment);
+    ffi_guard(XntErrorCode::InternalError, || {
+        ffi_begin!();
+        check_null!(utxo_hash);
+        check_null!(sender_randomness);
+        check_null!(receiver_preimage);
+        check_null!(out_commitment);
 
-    let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
-    let sr = crate::core::Digest::from_bytes(ffi_ref!(sender_randomness).bytes);
-    let rp = crate::core::Digest::from_bytes(ffi_ref!(receiver_preimage).bytes);
+        let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
+        let sr = crate::core::Digest::from_bytes(ffi_ref!(sender_randomness).bytes);
+        let rp = crate::core::Digest::from_bytes(ffi_ref!(receiver_preimage).bytes);
 
-    let commitment = compute_commitment(&item, &sr, &rp);
-    copy_bytes_out!(commitment.bytes, out_commitment, 40)
+        let commitment = compute_commitment(&item, &sr, &rp);
+        copy_bytes_out!(commitment.bytes, out_commitment, 40)
+    })
 }
 
 /// Compute canonical commitment for output (using receiver_postimage)
@@ -312,18 +421,20 @@ pub extern "C" fn xnt_compute_commitment_for_output(
     receiver_postimage: *const XntDigest,
     out_commitment: *mut u8,
 ) -> XntErrorCode {
-    ffi_begin!();
-    check_null!(utxo_hash);
-    check_null!(sender_randomness);
-    check_null!(receiver_postimage);
-    check_null!(out_commitment);
+    ffi_guard(XntErrorCode::InternalError, || {
+        ffi_begin!();
+        check_null!(utxo_hash);
+        check_null!(sender_randomness);
+        check_null!(receiver_postimage);
+        check_null!(out_commitment);
 
-    let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
-    let sr = crate::core::Digest::from_bytes(ffi_ref!(sender_randomness).bytes);
-    let rd = crate::core::Digest::from_bytes(ffi_ref!(receiver_postimage).bytes);
+        let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
+        let sr = crate::core::Digest::from_bytes(ffi_ref!(sender_randomness).bytes);
+        let rd = crate::core::Digest::from_bytes(ffi_ref!(receiver_postimage).bytes);
 
-    let commitment = compute_commitment_for_output(&item, &sr, &rd);
-    copy_bytes_out!(commitment.bytes, out_commitment, 40)
+        let commitment = compute_commitment_for_output(&item, &sr, &rd);
+        copy_bytes_out!(commitment.bytes, out_commitment, 40)
+    })
 }
 
 /// Compute absolute_index_set_hash for spent checking
@@ -335,18 +446,20 @@ pub extern "C" fn xnt_compute_absolute_index_set_hash(
     aocl_leaf_index: u64,
     out_hash: *mut u8,
 ) -> XntErrorCode {
-    ffi_begin!();
-    check_null!(utxo_hash);
-    check_null!(sender_randomness);
-    check_null!(receiver_preimage);
-    check_null!(out_hash);
+    ffi_guard(XntErrorCode::InternalError, || {
+        ffi_begin!();
+        check_null!(utxo_hash);
+        check_null!(sender_randomness);
+        check_null!(receiver_preimage);
+        check_null!(out_hash);
 
-    let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
-    let sr = crate::core::Digest::from_bytes(ffi_ref!(sender_randomness).bytes);
-    let rp = crate::core::Digest::from_bytes(ffi_ref!(receiver_preimage).bytes);
+        let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
+        let sr = crate::core::Digest::from_bytes(ffi_ref!(sender_randomness).bytes);
+        let rp = crate::core::Digest::from_bytes(ffi_ref!(receiver_preimage).bytes);
 
-    let hash = compute_absolute_index_set_hash(&item, &sr, &rp, aocl_leaf_index);
-    copy_bytes_out!(hash.bytes, out_hash, 40)
+        let hash = compute_absolute_index_set_hash(&item, &sr, &rp, aocl_leaf_index);
+        copy_bytes_out!(hash.bytes, out_hash, 40)
+    })
 }
 
 /// Hash an AbsoluteIndexSet from JSON (from RPC mempool response)
@@ -356,110 +469,170 @@ pub extern "C" fn xnt_hash_absolute_index_set(
     json_str: *const std::ffi::c_char,
     out_hash: *mut u8,
 ) -> XntErrorCode {
-    ffi_begin!();
-    check_null!(json_str);
-    check_null!(out_hash);
+    ffi_guard(XntErrorCode::InternalError, || {
+        ffi_begin!();
+        check_null!(json_str);
+        check_null!(out_hash);
 
-    let Some(json) = super::helpers::parse_cstr(json_str) else {
-        set_last_error("invalid JSON string");
-        return XntErrorCode::InvalidInput;
-    };
+        let Some(json) = super::helpers::parse_cstr(json_str) else {
+            set_last_error("invalid JSON string");
+            return XntErrorCode::InvalidInput;
+        };
 
-    match crate::core::hash_absolute_index_set_json(&json) {
-        Ok(hash) => copy_bytes_out!(hash.bytes, out_hash, 40),
-        Err(e) => {
-            set_last_error(&e.to_string());
-            XntErrorCode::InvalidInput
+        match crate::core::hash_absolute_index_set_json(&json) {
+            Ok(hash) => copy_bytes_out!(hash.bytes, out_hash, 40),
+            Err(e) => {
+                set_last_error(&e.to_string());
+                XntErrorCode::InvalidInput
+            }
         }
-    }
+    })
 }
 
 
-/// Get current mutator set accumulator from archival node
+/// Get current mutator set accumulator from archival node, with the height of
+/// the tip it belongs to (see xnt_mutator_set_tip_height)
 #[no_mangle]
 pub extern "C" fn xnt_sync_get_mutator_set(client: *const RpcClientHandle) -> *mut MutatorSetHandle {
-    ffi_begin!();
-    check_null!(client, "null pointer");
+    ffi_guard(std::ptr::null_mut(), || {
+        ffi_begin!();
+        check_null!(client, "null pointer");
 
-    let client = ffi_ref!(client);
-    match get_mutator_set(&client.0) {
-        Ok(ms) => Box::into_raw(Box::new(MutatorSetHandle(ms))),
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            std::ptr::null_mut()
+        let client = ffi_ref!(client);
+        match get_mutator_set(&client.0) {
+            Ok(ms) => Box::into_raw(Box::new(MutatorSetHandle(ms))),
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
-ffi_free!(xnt_mutator_set_free, MutatorSetHandle);
+/// Free a mutator set handle. NULL is ignored.
+#[no_mangle]
+pub extern "C" fn xnt_mutator_set_free(handle: *mut MutatorSetHandle) {
+    ffi_guard((), || free_handle(handle))
+}
 
 /// Serialize mutator set to bytes for caching
 #[no_mangle]
 pub extern "C" fn xnt_mutator_set_serialize(handle: *const MutatorSetHandle) -> *mut ByteBuffer {
-    ffi_begin!();
-    check_null!(handle, "null pointer");
+    ffi_guard(std::ptr::null_mut(), || {
+        ffi_begin!();
+        check_null!(handle, "null pointer");
 
-    match ffi_ref!(handle).0.to_bytes() {
-        Ok(bytes) => ByteBuffer::from_vec(bytes).into_ptr(),
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            std::ptr::null_mut()
+        match ffi_ref!(handle).0.to_bytes() {
+            Ok(bytes) => ByteBuffer::from_vec(bytes).into_ptr(),
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
+}
+
+/// Height of the tip whose mutator set this is, or -1 if unknown, as after
+/// xnt_mutator_set_deserialize: the height is not serialized. A transaction
+/// built on the mutator set is proven for the block after that tip, see
+/// xnt_built_transaction_prove.
+#[no_mangle]
+pub extern "C" fn xnt_mutator_set_tip_height(handle: *const MutatorSetHandle) -> i64 {
+    ffi_guard(-1, || {
+        ffi_begin!();
+        if handle.is_null() {
+            set_last_error("null pointer");
+            return -1;
+        }
+
+        match ffi_ref!(handle).0.tip_height() {
+            Some(height) => i64::try_from(height).unwrap_or(-1),
+            None => -1,
+        }
+    })
+}
+
+/// Record the height of the tip whose mutator set this is, as for a mutator
+/// set restored with xnt_mutator_set_deserialize
+#[no_mangle]
+pub extern "C" fn xnt_mutator_set_set_tip_height(handle: *mut MutatorSetHandle, tip_height: u64) -> XntErrorCode {
+    ffi_guard(XntErrorCode::InternalError, || {
+        ffi_begin!();
+        if handle.is_null() {
+            set_last_error("null pointer");
+            return XntErrorCode::NullPointer;
+        }
+
+        let mutator_set = &mut ffi_mut!(handle).0;
+        *mutator_set = mutator_set.clone().with_tip_height(tip_height);
+        XntErrorCode::Ok
+    })
 }
 
 /// Deserialize mutator set from bytes
+///
+/// The tip height is unknown, see xnt_mutator_set_set_tip_height.
 #[no_mangle]
 pub extern "C" fn xnt_mutator_set_deserialize(data: *const u8, len: usize) -> *mut MutatorSetHandle {
-    ffi_begin!();
-    if data.is_null() || len == 0 {
-        set_last_error("invalid input");
-        return std::ptr::null_mut();
-    }
-    let bytes = unsafe { read_slice(data, len) };
-    match MutatorSet::from_bytes(bytes) {
-        Ok(ms) => Box::into_raw(Box::new(MutatorSetHandle(ms))),
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            std::ptr::null_mut()
+    ffi_guard(std::ptr::null_mut(), || {
+        ffi_begin!();
+        if data.is_null() || len == 0 {
+            set_last_error("invalid input");
+            return std::ptr::null_mut();
         }
-    }
+        let bytes = unsafe { read_slice(data, len) };
+        match MutatorSet::from_bytes(bytes) {
+            Ok(ms) => Box::into_raw(Box::new(MutatorSetHandle(ms))),
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 
-ffi_free!(xnt_ms_membership_proof_free, MsMembershipProofHandle);
+/// Free a membership proof handle. NULL is ignored.
+#[no_mangle]
+pub extern "C" fn xnt_ms_membership_proof_free(handle: *mut MsMembershipProofHandle) {
+    ffi_guard((), || free_handle(handle))
+}
 
 /// Serialize membership proof to bytes
 #[no_mangle]
 pub extern "C" fn xnt_ms_membership_proof_serialize(handle: *const MsMembershipProofHandle) -> *mut ByteBuffer {
-    ffi_begin!();
-    check_null!(handle, "null pointer");
+    ffi_guard(std::ptr::null_mut(), || {
+        ffi_begin!();
+        check_null!(handle, "null pointer");
 
-    match ffi_ref!(handle).0.to_bytes() {
-        Ok(bytes) => ByteBuffer::from_vec(bytes).into_ptr(),
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            std::ptr::null_mut()
+        match ffi_ref!(handle).0.to_bytes() {
+            Ok(bytes) => ByteBuffer::from_vec(bytes).into_ptr(),
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Deserialize membership proof from bytes
 #[no_mangle]
 pub extern "C" fn xnt_ms_membership_proof_deserialize(data: *const u8, len: usize) -> *mut MsMembershipProofHandle {
-    ffi_begin!();
-    if data.is_null() || len == 0 {
-        set_last_error("invalid input");
-        return std::ptr::null_mut();
-    }
-    let bytes = unsafe { read_slice(data, len) };
-    match MembershipProof::from_bytes(bytes) {
-        Ok(mp) => Box::into_raw(Box::new(MsMembershipProofHandle(mp))),
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            std::ptr::null_mut()
+    ffi_guard(std::ptr::null_mut(), || {
+        ffi_begin!();
+        if data.is_null() || len == 0 {
+            set_last_error("invalid input");
+            return std::ptr::null_mut();
         }
-    }
+        let bytes = unsafe { read_slice(data, len) };
+        match MembershipProof::from_bytes(bytes) {
+            Ok(mp) => Box::into_raw(Box::new(MsMembershipProofHandle(mp))),
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Verify membership proof against mutator set
@@ -469,29 +642,38 @@ pub extern "C" fn xnt_verify_membership(
     utxo_hash: *const XntDigest,
     membership_proof: *const MsMembershipProofHandle,
 ) -> bool {
-    ffi_begin!();
-    if mutator_set.is_null() || utxo_hash.is_null() || membership_proof.is_null() {
-        return false;
-    }
+    ffi_guard(false, || {
+        ffi_begin!();
+        if mutator_set.is_null() || utxo_hash.is_null() || membership_proof.is_null() {
+            return false;
+        }
 
-    let msa = &ffi_ref!(mutator_set).0;
-    let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
-    let mp = &ffi_ref!(membership_proof).0;
+        let msa = &ffi_ref!(mutator_set).0;
+        let item = crate::core::Digest::from_bytes(ffi_ref!(utxo_hash).bytes);
+        let mp = &ffi_ref!(membership_proof).0;
 
-    msa.verify(&item, mp)
+        msa.verify(&item, mp)
+    })
 }
 
 /// Get the AOCL leaf index from a membership proof
 #[no_mangle]
 pub extern "C" fn xnt_ms_membership_proof_aocl_index(handle: *const MsMembershipProofHandle) -> u64 {
-    ffi_begin!();
-    if handle.is_null() {
-        return 0;
-    }
-    ffi_ref!(handle).0.aocl_leaf_index()
+    ffi_guard(0, || {
+        ffi_begin!();
+        if handle.is_null() {
+            return 0;
+        }
+        ffi_ref!(handle).0.aocl_leaf_index()
+    })
 }
 
 /// Get membership proofs for UTXOs via wallet RPC
+///
+/// `receiver_preimage` is a spending secret for dCTIDH keys (see
+/// xnt_spending_key_receiver_preimage); it is used locally and not sent to
+/// the node. On success writes `count` proof handles to `out_proofs`, each to
+/// be freed with xnt_ms_membership_proof_free.
 #[no_mangle]
 pub extern "C" fn xnt_sync_get_membership_proofs(
     client: *const RpcClientHandle,
@@ -502,52 +684,58 @@ pub extern "C" fn xnt_sync_get_membership_proofs(
     count: usize,
     out_proofs: *mut *mut MsMembershipProofHandle,
 ) -> XntErrorCode {
-    ffi_begin!();
-    if client.is_null()
-        || utxo_hashes.is_null()
-        || sender_randomnesses.is_null()
-        || receiver_preimage.is_null()
-        || aocl_indices.is_null()
-        || out_proofs.is_null()
-        || count == 0
-    {
-        set_last_error("invalid input");
-        return XntErrorCode::InvalidInput;
-    }
+    ffi_guard(XntErrorCode::InternalError, || {
+        ffi_begin!();
+        if client.is_null()
+            || utxo_hashes.is_null()
+            || sender_randomnesses.is_null()
+            || receiver_preimage.is_null()
+            || aocl_indices.is_null()
+            || out_proofs.is_null()
+            || count == 0
+        {
+            set_last_error("invalid input");
+            return XntErrorCode::InvalidInput;
+        }
 
-    let client = ffi_ref!(client);
-    let rp = ffi_ref!(receiver_preimage);
+        let client = ffi_ref!(client);
+        let rp = ffi_ref!(receiver_preimage);
 
-    // Read input arrays
-    let hashes_slice = unsafe { read_slice(utxo_hashes, count) };
-    let sr_slice = unsafe { read_slice(sender_randomnesses, count) };
-    let indices_slice = unsafe { read_slice(aocl_indices, count) };
+        // Read input arrays
+        let hashes_slice = unsafe { read_slice(utxo_hashes, count) };
+        let sr_slice = unsafe { read_slice(sender_randomnesses, count) };
+        let indices_slice = unsafe { read_slice(aocl_indices, count) };
 
-    // Convert to core types
-    let core_hashes: Vec<crate::core::Digest> = hashes_slice
-        .iter()
-        .map(|d| crate::core::Digest::from_bytes(d.bytes))
-        .collect();
-    let core_srs: Vec<crate::core::Digest> = sr_slice
-        .iter()
-        .map(|d| crate::core::Digest::from_bytes(d.bytes))
-        .collect();
-    let core_rp = crate::core::Digest::from_bytes(rp.bytes);
-    let indices_vec: Vec<u64> = indices_slice.to_vec();
+        // Convert to core types
+        let core_hashes: Vec<crate::core::Digest> = hashes_slice
+            .iter()
+            .map(|d| crate::core::Digest::from_bytes(d.bytes))
+            .collect();
+        let core_srs: Vec<crate::core::Digest> = sr_slice
+            .iter()
+            .map(|d| crate::core::Digest::from_bytes(d.bytes))
+            .collect();
+        let core_rp = crate::core::Digest::from_bytes(rp.bytes);
+        let indices_vec: Vec<u64> = indices_slice.to_vec();
 
-    // Call core function
-    match get_membership_proofs(&client.0, &core_hashes, &core_srs, &core_rp, &indices_vec) {
-        Ok(proofs) => {
-            // Write output pointers
-            let out_slice = unsafe { std::slice::from_raw_parts_mut(out_proofs, count) };
-            for (i, proof) in proofs.into_iter().enumerate() {
-                out_slice[i] = Box::into_raw(Box::new(MsMembershipProofHandle(proof)));
+        // Call core function
+        match get_membership_proofs(&client.0, &core_hashes, &core_srs, &core_rp, &indices_vec) {
+            Ok(proofs) if proofs.len() != count => {
+                set_last_error("membership proof count does not match the request");
+                XntErrorCode::RpcError
             }
-            XntErrorCode::Ok
+            Ok(proofs) => {
+                // Write output pointers
+                let out_slice = unsafe { std::slice::from_raw_parts_mut(out_proofs, count) };
+                for (i, proof) in proofs.into_iter().enumerate() {
+                    out_slice[i] = Box::into_raw(Box::new(MsMembershipProofHandle(proof)));
+                }
+                XntErrorCode::Ok
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                XntErrorCode::RpcError
+            }
         }
-        Err(e) => {
-            set_last_error(&format!("{e}"));
-            XntErrorCode::RpcError
-        }
-    }
+    })
 }

@@ -87,7 +87,7 @@ impl MempoolEvent {
     /// Shortens the list of [`MempoolEvent`]s such that pairs of events
     /// referring to the same transaction first being added, and then removed
     /// are eliminated from the list.
-    pub(super) fn normalize(events: Vec<Self>) -> Vec<Self> {
+    pub(crate) fn normalize(events: Vec<Self>) -> Vec<Self> {
         let mut added = HashMap::new();
         let mut removed = HashMap::new();
         for event in events {

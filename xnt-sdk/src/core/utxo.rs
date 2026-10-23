@@ -30,6 +30,11 @@ pub struct DecryptedUtxo {
     pub payment_id: u64,
     pub block_height: u64,
     pub block_digest: Digest,
+    /// True if the UTXO is locked to a legacy-format (pre-v0.3) dCTIDH lock,
+    /// see [SpendingKey::is_legacy]. Such UTXOs are sweep-only: move them to
+    /// a current-format key and never count them towards the available
+    /// balance.
+    pub is_legacy: bool,
 }
 
 impl Utxo {
@@ -95,6 +100,11 @@ impl Utxo {
 }
 
 /// Decrypt announcement with spending key
+///
+/// The announcement carries no block height, so the legacy cutoff is not
+/// applied here: for a legacy key check
+/// [SpendingKey::recognizes_utxos_at] with the height of the block that
+/// confirmed the announcement before crediting the result.
 pub fn decrypt_announcement(
     spending_key: &SpendingKey,
     announcement_bfes: &[neptune_privacy::prelude::twenty_first::prelude::BFieldElement],
@@ -146,6 +156,7 @@ pub fn decrypt_announcement(
         payment_id: payment_id.value(),
         block_height: 0, // Not available from announcement
         block_digest: Digest::new(),
+        is_legacy: spending_key.is_legacy(),
     })
 }
 
@@ -168,7 +179,7 @@ mod tests {
         ];
 
         for key in keys {
-            let receiving_address = key.to_address().inner;
+            let receiving_address = key.to_address().unwrap().inner;
             let sender_randomness: CoreDigest = rand::random();
             let tx_output = TxOutput::onchain_native_currency(
                 NativeCurrencyAmount::coins(5),
