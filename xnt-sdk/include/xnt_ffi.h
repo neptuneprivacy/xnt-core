@@ -203,6 +203,22 @@ typedef struct XntAoclIndices {
     uintptr_t len;
 } XntAoclIndices;
 
+// One AOCL leaf of a commitment
+typedef struct XntAoclLeaf {
+    uint64_t aocl_leaf_index;
+    uint64_t block_height;
+    struct XntDigest block_digest;
+} XntAoclLeaf;
+
+// Every AOCL leaf of each commitment: `counts[i]` leaves of commitment `i`, in order, in
+// `leaves`
+typedef struct XntAoclLeaves {
+    struct XntAoclLeaf *leaves;
+    uintptr_t num_leaves;
+    uintptr_t *counts;
+    uintptr_t num_commitments;
+} XntAoclLeaves;
+
 // Transaction input info (C-compatible)
 //
 // `amount` is a 128-bit integer aligned to 16 bytes. Callers without one can
@@ -631,6 +647,15 @@ struct XntAoclIndices xnt_sync_get_aocl_indices(const struct XntRpcClientHandle 
 
 // Free AOCL indices result
 void xnt_sync_aocl_indices_free(struct XntAoclIndices *result);
+
+// Get every AOCL leaf of each commitment. Identical outputs share a commitment; each leaf is
+// spendable once.
+struct XntAoclLeaves xnt_sync_get_aocl_leaves(const struct XntRpcClientHandle *client,
+                                              const struct XntDigest *commitments,
+                                              uintptr_t count);
+
+// Free AOCL leaves result
+void xnt_sync_aocl_leaves_free(struct XntAoclLeaves *result);
 
 // Get current block height from node
 int64_t xnt_sync_get_height(const struct XntRpcClientHandle *client);

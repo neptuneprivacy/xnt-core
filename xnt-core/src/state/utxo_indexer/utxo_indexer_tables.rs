@@ -4,13 +4,14 @@ use std::collections::HashSet;
 
 use tasm_lib::prelude::Digest;
 
+use super::aocl_leaf::AoclLeaf;
 use super::indexed_utxo::IndexedUtxo;
 use crate::api::export::BlockHeight;
 use crate::application::database::storage::storage_schema::DbtMap;
 use crate::application::database::storage::storage_schema::DbtSingleton;
 use crate::application::database::storage::storage_schema::SimpleRustyStorage;
 
-pub(super) const UTXO_INDEXER_SCHEMA_VERSION: u16 = 2;
+pub(super) const UTXO_INDEXER_SCHEMA_VERSION: u16 = 3;
 
 pub const BUCKET_SIZE: u64 = 1000;
 
@@ -25,8 +26,8 @@ pub(super) struct UtxoIndexerTables {
     pub(super) utxos: DbtMap<(Digest, u64), Vec<IndexedUtxo>>,
     /// Orphaned block digests for reorg filtering
     pub(super) orphaned_blocks: DbtMap<Digest, ()>,
-    /// commitment -> aocl_leaf_index
-    pub(super) commitment_index: DbtMap<Digest, u64>,
+    /// commitment -> every AOCL leaf it occupies
+    pub(super) commitment_index: DbtMap<Digest, Vec<AoclLeaf>>,
     /// hash(AbsoluteIndexSet) -> (block_height, block_digest) where spent
     pub(super) removal_index: DbtMap<Digest, (BlockHeight, Digest)>,
     pub(super) sync_height: DbtSingleton<BlockHeight>,

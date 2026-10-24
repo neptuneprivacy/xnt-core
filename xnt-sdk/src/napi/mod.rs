@@ -751,6 +751,44 @@ pub fn xnt_get_aocl_indices(
         .map_err(|e| Error::from_reason(format!("get_aocl_indices: {e}")))
 }
 
+/// One AOCL leaf of a commitment
+#[napi(object)]
+pub struct XntAoclLeaf {
+    pub aocl_leaf_index: i64,
+    pub block_height: i64,
+    pub block_digest_hex: String,
+}
+
+/// Get every AOCL leaf of each commitment. Identical outputs share a commitment; each leaf is
+/// spendable once.
+#[napi(catch_unwind)]
+pub fn xnt_get_aocl_leaves(
+    client: &XntRpcClient,
+    commitment_hashes_hex: Vec<String>,
+) -> Result<Vec<Vec<XntAoclLeaf>>> {
+    let hashes: std::result::Result<Vec<crate::core::Digest>, _> = commitment_hashes_hex
+        .iter()
+        .map(|h| crate::core::Digest::from_hex(h).ok_or_else(|| format!("invalid hash {h}")))
+        .collect();
+    let hashes = hashes.map_err(|e| Error::from_reason(e))?;
+
+    let per_commitment = crate::core::get_aocl_leaves(client.inner(), &hashes)
+        .map_err(|e| Error::from_reason(format!("get_aocl_leaves: {e}")))?;
+    Ok(per_commitment
+        .into_iter()
+        .map(|leaves| {
+            leaves
+                .into_iter()
+                .map(|leaf| XntAoclLeaf {
+                    aocl_leaf_index: leaf.aocl_leaf_index as i64,
+                    block_height: leaf.block_height as i64,
+                    block_digest_hex: leaf.block_digest.to_hex(),
+                })
+                .collect()
+        })
+        .collect())
+}
+
 /// Decrypted UTXO result
 #[napi]
 pub struct XntDecryptedUtxo {
