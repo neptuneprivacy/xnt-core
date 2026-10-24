@@ -497,6 +497,72 @@ pub fn get_aocl_indices(client: &RpcClient, commitments: &[Digest]) -> Result<Ao
     Ok(indices.iter().map(|v| v.as_i64().unwrap_or(-1)).collect())
 }
 
+/// One AOCL leaf of a commitment, see [get_aocl_leaves].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AoclLeaf {
+    pub aocl_leaf_index: u64,
+    pub block_height: u64,
+    pub block_digest: Digest,
+}
+
+/// Every AOCL leaf of each commitment, in canonical blocks. Identical outputs (same UTXO, sender
+/// randomness and receiver) share one commitment; each of its leaves is spendable once.
+pub fn get_aocl_leaves(client: &RpcClient, commitments: &[Digest]) -> Result<Vec<Vec<AoclLeaf>>> {
+    let commitment_vec: Vec<String> = commitments.iter().map(|d| d.to_hex()).collect();
+    let params = json!({ "commitments": commitment_vec });
+
+    let result = client.call("archival_getAoclLeafIndices", params)?;
+
+    let leaves = result
+        .get("leaves")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| XntError::RpcError("missing leaves: the node predates them".to_string()))?;
+
+    leaves
+        .iter()
+        .map(|per_commitment| {
+            per_commitment
+                .as_array()
+                .and_then(|leaves| leaves.iter().map(aocl_leaf_from_json).collect())
+                .ok_or_else(|| XntError::RpcError("malformed AOCL leaves".to_string()))
+        })
+        .collect()
+}
+
+fn aocl_leaf_from_json(leaf: &Value) -> Option<AoclLeaf> {
+    Some(AoclLeaf {
+        aocl_leaf_index: leaf.get("aoclLeafIndex")?.as_u64()?,
+        block_height: leaf.get("blockHeight")?.as_u64()?,
+        block_digest: leaf
+            .get("blockDigest")?
+            .as_str()
+            .and_then(Digest::from_hex)?,
+    })
+}
+
+/// One entry per AOCL leaf of each distinct commitment. Identical outputs share a commitment and
+/// their notifications decrypt alike, so the items of a commitment after the first are dropped.
+pub fn expand_per_leaf<T: Clone>(
+    items: Vec<T>,
+    commitments: &[Digest],
+    leaves: Vec<Vec<AoclLeaf>>,
+) -> Result<Vec<(T, AoclLeaf)>> {
+    if items.len() != commitments.len() || leaves.len() != commitments.len() {
+        return Err(XntError::RpcError(
+            "AOCL leaves length mismatch".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for ((item, commitment), leaves) in items.into_iter().zip(commitments).zip(leaves) {
+        if seen.insert(commitment.bytes) {
+            entries.extend(leaves.into_iter().map(|leaf| (item.clone(), leaf)));
+        }
+    }
+    Ok(entries)
+}
+
 /// Collect spendable inputs (UTXOs + membership proofs) for a single spending key.
 ///
 /// Applies the main-net legacy cutoff, the strictest one; use
@@ -551,68 +617,65 @@ pub fn collect_spendable_inputs(
         return Ok((Vec::new(), stats));
     }
 
-    // Compute commitments and fetch AOCL indices
+    // Compute commitments and fetch AOCL leaves
     let commits: Vec<Digest> = utxos
         .iter()
         .map(|(u, sr, _, _, _, _)| compute_commitment(&u.hash(), sr, &receiver_preimage))
         .collect();
 
-    let aocl = get_aocl_indices(client, &commits)?;
-    if aocl.is_empty() {
+    // A leaf outside the range is another scan's: each identical payment has its own notification.
+    let leaves = get_aocl_leaves(client, &commits)?
+        .into_iter()
+        .map(|leaves| {
+            leaves
+                .into_iter()
+                .filter(|leaf| (from_height..=to_height).contains(&leaf.block_height))
+                .collect()
+        })
+        .collect();
+    let entries = expand_per_leaf(utxos, &commits, leaves)?;
+    if entries.is_empty() {
         return Ok((Vec::new(), stats));
     }
 
     // Build AbsoluteIndexSet hashes and check spent status
-    let mut abs_hashes: Vec<Digest> = Vec::new();
-    let mut valid_indices: Vec<usize> = Vec::new();
-    for (i, &idx) in aocl.iter().enumerate() {
-        if idx >= 0 && i < utxos.len() {
-            let (ref u, ref sr, _, _, _, _) = utxos[i];
-            let h = compute_absolute_index_set_hash(&u.hash(), sr, &receiver_preimage, idx as u64);
-            abs_hashes.push(h);
-            valid_indices.push(i);
-        }
-    }
-
-    if abs_hashes.is_empty() {
-        return Ok((Vec::new(), stats));
-    }
+    let abs_hashes: Vec<Digest> = entries
+        .iter()
+        .map(|((u, sr, _, _, _, _), leaf)| {
+            compute_absolute_index_set_hash(&u.hash(), sr, &receiver_preimage, leaf.aocl_leaf_index)
+        })
+        .collect();
 
     let spent = check_spent(client, &abs_hashes)?;
-    if spent.len() != valid_indices.len() {
+    if spent.len() != entries.len() {
         return Err(XntError::RpcError(
             "spent status length mismatch".to_string(),
         ));
     }
 
     // Filter to unspent
-    let mut unspent_indices: Vec<(usize, u64)> = Vec::new();
-    for (j, &h) in spent.iter().enumerate() {
-        if h < 0 && j < valid_indices.len() {
-            let oi = valid_indices[j];
-            let aocl_idx = aocl[oi];
-            if aocl_idx >= 0 {
-                unspent_indices.push((oi, aocl_idx as u64));
-            }
-        }
-    }
+    let unspent: Vec<_> = entries
+        .into_iter()
+        .zip(spent)
+        .filter(|(_, spent_at)| *spent_at < 0)
+        .map(|(entry, _)| entry)
+        .collect();
 
-    if unspent_indices.is_empty() {
+    if unspent.is_empty() {
         return Ok((Vec::new(), stats));
     }
 
     // Restore membership proofs for unspent UTXOs
     use neptune_privacy::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipProofPrivacyPreserving;
 
-    let absolute_index_sets: Vec<AbsoluteIndexSet> = unspent_indices
+    let absolute_index_sets: Vec<AbsoluteIndexSet> = unspent
         .iter()
-        .map(|(oi, idx)| {
-            let (ref u, ref sr, _, _, _, _) = utxos[*oi];
+        .map(|((u, sr, _, _, _, _), leaf)| {
             AbsoluteIndexSet::compute(
                 u.hash().to_core(),
                 sr.to_core(),
                 receiver_preimage.to_core(),
-                *idx,
+                leaf.aocl_leaf_index,
             )
         })
         .collect();
@@ -627,21 +690,21 @@ pub fn collect_spendable_inputs(
         .and_then(|v| v.as_array())
         .ok_or_else(|| XntError::RpcError("missing membershipProofs".to_string()))?;
 
-    if proofs_arr.len() != unspent_indices.len() {
+    if proofs_arr.len() != unspent.len() {
         return Err(XntError::RpcError(
             "membershipProofs length mismatch".to_string(),
         ));
     }
 
-    let mut res = Vec::with_capacity(unspent_indices.len());
-    for (idx, proof_val) in proofs_arr.iter().enumerate() {
+    let mut res = Vec::with_capacity(unspent.len());
+    for (idx, (proof_val, ((u, sr, amount, _, _, payment_id), leaf))) in
+        proofs_arr.iter().zip(unspent).enumerate()
+    {
         let rpc_proof: RpcMsMembershipProofPrivacyPreserving =
             serde_json::from_value(proof_val.clone())
                 .map_err(|e| XntError::RpcError(format!("parse proof {idx} failed: {e}")))?;
 
-        let (_oi, aocl_idx) = unspent_indices[idx];
-        let (ref u, ref sr, amount, bh, bd, payment_id) = utxos[unspent_indices[idx].0];
-
+        let aocl_idx = leaf.aocl_leaf_index;
         let msmp = rpc_proof
             .extract_ms_membership_proof(aocl_idx, sr.to_core(), receiver_preimage.to_core())
             .ok_or_else(|| {
@@ -649,14 +712,14 @@ pub fn collect_spendable_inputs(
             })?;
 
         res.push(SpendableInput {
-            utxo: u.clone(),
+            utxo: u,
             spending_key: key.clone(),
             membership_proof: MembershipProof::from_core(msmp),
-            sender_randomness: sr.clone(),
+            sender_randomness: sr,
             aocl_index: aocl_idx,
             amount,
-            block_height: bh,
-            block_digest: bd.clone(),
+            block_height: leaf.block_height,
+            block_digest: leaf.block_digest,
             is_legacy: key.is_legacy(),
             payment_id,
         });
@@ -1246,6 +1309,39 @@ mod tests {
             block_digest: Digest::new(),
             ciphertext: ciphertext.iter().flat_map(|w| w.to_le_bytes()).collect(),
         }
+    }
+
+    /// Two identical payments decrypt alike and share a commitment with two leaves: one entry per
+    /// leaf, not per notification and leaf.
+    #[test]
+    fn identical_payments_expand_to_one_entry_per_leaf() {
+        let digest = |byte: u8| Digest::from_bytes([byte; 40]);
+        let leaf = |aocl_leaf_index: u64, block_height: u64| AoclLeaf {
+            aocl_leaf_index,
+            block_height,
+            block_digest: digest(block_height as u8),
+        };
+        let shared = digest(1);
+        let other = digest(2);
+        let shared_leaves = vec![leaf(100, 286), leaf(105, 287)];
+        let other_leaves = vec![leaf(107, 287)];
+
+        let entries = expand_per_leaf(
+            vec!["payment", "payment again", "other"],
+            &[shared, shared, other],
+            vec![shared_leaves.clone(), shared_leaves, other_leaves.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            vec![
+                ("payment", leaf(100, 286)),
+                ("payment", leaf(105, 287)),
+                ("other", leaf(107, 287)),
+            ],
+            entries
+        );
+        assert!(expand_per_leaf(vec!["other"], &[other], vec![]).is_err());
     }
 
     #[test]

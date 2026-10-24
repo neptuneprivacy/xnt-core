@@ -2398,14 +2398,10 @@ impl GlobalState {
                 indexer.handle_reorg(vec![old_tip_digest]).await;
             }
 
-            let prev_aocl_len = self
-                .chain
-                .archival_state()
-                .get_tip_parent()
-                .await
-                .and_then(|parent| parent.mutator_set_accumulator_after().ok())
-                .map(|msa| msa.aocl.num_leafs())
-                .unwrap_or(0);
+            let prev_aocl_len = match self.chain.archival_state().get_tip_parent().await {
+                Some(parent) => parent.mutator_set_accumulator_after()?.aocl.num_leafs(),
+                None => 0,
+            };
 
             let indexed_count = indexer.index_block(&new_tip, prev_aocl_len).await;
             indexer.persist().await;
@@ -2870,23 +2866,24 @@ impl GlobalState {
 
         if !current_height.is_genesis() {
             let parent_height: u64 = u64::from(current_height).saturating_sub(1);
-            if let Some(parent_digest) = self
+            let parent_digest = self
                 .chain
                 .archival_state()
                 .archival_block_mmr
                 .ammr()
                 .try_get_leaf(parent_height)
                 .await
-            {
-                if let Some(parent_block) =
-                    self.chain.archival_state().get_block(parent_digest).await?
-                {
-                    prev_aocl_len = parent_block
-                        .mutator_set_accumulator_after()
-                        .map(|msa| msa.aocl.num_leafs())
-                        .unwrap_or(0);
-                }
-            }
+                .ok_or_else(|| anyhow::anyhow!("no block at height {parent_height}"))?;
+            let parent_block = self
+                .chain
+                .archival_state()
+                .get_block(parent_digest)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("block {parent_digest} not stored"))?;
+            prev_aocl_len = parent_block
+                .mutator_set_accumulator_after()?
+                .aocl
+                .num_leafs();
         }
 
         while current_height <= tip_height {
@@ -2911,10 +2908,7 @@ impl GlobalState {
             indexer.index_block_batch(&block, prev_aocl_len).await;
 
             // Get accurate AOCL length after this block for next iteration
-            prev_aocl_len = block
-                .mutator_set_accumulator_after()
-                .map(|msa| msa.aocl.num_leafs())
-                .unwrap_or(prev_aocl_len);
+            prev_aocl_len = block.mutator_set_accumulator_after()?.aocl.num_leafs();
             blocks_indexed += 1;
             current_height = current_height.next();
 

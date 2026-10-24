@@ -873,7 +873,28 @@ pub struct GetAoclLeafIndicesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAoclLeafIndicesResponse {
+    /// The latest leaf index of each commitment.
     pub indices: Vec<Option<u64>>,
+    /// Every leaf of each commitment: identical outputs share one commitment.
+    pub leaves: Vec<Vec<RpcAoclLeaf>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAoclLeaf {
+    pub aocl_leaf_index: u64,
+    pub block_height: BlockHeight,
+    pub block_digest: Digest,
+}
+
+impl From<crate::state::utxo_indexer::AoclLeaf> for RpcAoclLeaf {
+    fn from(leaf: crate::state::utxo_indexer::AoclLeaf) -> Self {
+        Self {
+            aocl_leaf_index: leaf.aocl_leaf_index,
+            block_height: leaf.block_height,
+            block_digest: leaf.block_digest,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

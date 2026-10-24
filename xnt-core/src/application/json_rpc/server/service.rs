@@ -1510,9 +1510,29 @@ impl RpcApi for RpcServer {
 
         let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
 
-        let indices = indexer.get_aocl_leaf_indices(&request.commitments).await;
+        // The index misses some forks' blocks: a leaf counts only if its block is canonical.
+        let block_mmr = state.chain.archival_state().archival_block_mmr.ammr();
+        let mut leaves = Vec::with_capacity(request.commitments.len());
+        for indexed in indexer.get_aocl_leaves(&request.commitments).await {
+            let mut canonical = Vec::with_capacity(indexed.len());
+            for leaf in indexed {
+                let digest_at_height = block_mmr.try_get_leaf(u64::from(leaf.block_height)).await;
+                if digest_at_height == Some(leaf.block_digest) {
+                    canonical.push(leaf);
+                }
+            }
+            leaves.push(canonical);
+        }
+        let indices = leaves
+            .iter()
+            .map(|leaves| crate::state::utxo_indexer::AoclLeaf::latest_index(leaves))
+            .collect();
+        let leaves = leaves
+            .into_iter()
+            .map(|leaves| leaves.into_iter().map(RpcAoclLeaf::from).collect())
+            .collect();
 
-        Ok(GetAoclLeafIndicesResponse { indices })
+        Ok(GetAoclLeafIndicesResponse { indices, leaves })
     }
 
     async fn get_spent_status_call(
@@ -1675,7 +1695,11 @@ pub mod tests {
     use crate::Block;
 
     pub async fn test_rpc_server() -> RpcServer {
-        let mut cli = cli_args::Args::default_with_network(Network::Main);
+        test_rpc_server_on(Network::Main).await
+    }
+
+    pub async fn test_rpc_server_on(network: Network) -> RpcServer {
+        let mut cli = cli_args::Args::default_with_network(network);
         cli.tx_proving_capability = Some(TxProvingCapability::ProofCollection);
         let global_state_lock =
             mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;

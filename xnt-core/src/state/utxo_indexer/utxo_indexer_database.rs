@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
 
+use super::aocl_leaf::AoclLeaf;
 use super::indexed_utxo::IndexedUtxo;
 use super::utxo_indexer_tables::height_to_bucket;
 use super::utxo_indexer_tables::UtxoIndexerTables;
@@ -202,23 +203,56 @@ impl UtxoIndexerDatabase {
             .is_some()
     }
 
-    pub async fn add_commitment(&mut self, commitment: Digest, aocl_leaf_index: u64) {
-        self.tables
+    pub async fn add_commitment(&mut self, commitment: Digest, leaf: AoclLeaf) {
+        let mut leaves = self
+            .tables
             .commitment_index
-            .insert(commitment, aocl_leaf_index)
-            .await;
+            .get(&commitment)
+            .await
+            .unwrap_or_default();
+        if !leaves.contains(&leaf) {
+            leaves.push(leaf);
+            self.tables
+                .commitment_index
+                .insert(commitment, leaves)
+                .await;
+        }
     }
 
-    pub async fn get_aocl_leaf_index(&self, commitment: &Digest) -> Option<u64> {
-        self.tables.commitment_index.get(commitment).await
-    }
-
-    pub async fn get_aocl_leaf_indices(&self, commitments: &[Digest]) -> Vec<Option<u64>> {
+    /// The AOCL leaves of each commitment, in canonical blocks only.
+    pub async fn get_aocl_leaves(&self, commitments: &[Digest]) -> Vec<Vec<AoclLeaf>> {
+        let orphaned = self.tables.get_orphaned_blocks_set().await;
         let mut results = Vec::with_capacity(commitments.len());
         for commitment in commitments {
-            results.push(self.tables.commitment_index.get(commitment).await);
+            let leaves = self
+                .tables
+                .commitment_index
+                .get(commitment)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|leaf| !orphaned.contains(&leaf.block_digest))
+                .collect();
+            results.push(leaves);
         }
         results
+    }
+
+    /// The latest AOCL leaf index of a commitment, as before the index kept every leaf.
+    pub async fn get_aocl_leaf_index(&self, commitment: &Digest) -> Option<u64> {
+        self.get_aocl_leaf_indices(std::slice::from_ref(commitment))
+            .await
+            .pop()
+            .flatten()
+    }
+
+    /// [`Self::get_aocl_leaf_index`] of each commitment.
+    pub async fn get_aocl_leaf_indices(&self, commitments: &[Digest]) -> Vec<Option<u64>> {
+        self.get_aocl_leaves(commitments)
+            .await
+            .into_iter()
+            .map(|leaves| AoclLeaf::latest_index(&leaves))
+            .collect()
     }
 
     pub async fn add_removal(
@@ -337,9 +371,12 @@ impl UtxoIndexerDatabase {
         // Index outputs (commitments)
         let outputs = &block.kernel.body.transaction_kernel.outputs;
         for (i, output) in outputs.iter().enumerate() {
-            let aocl_leaf_index = prev_aocl_len + i as u64;
-            self.add_commitment(output.canonical_commitment, aocl_leaf_index)
-                .await;
+            let leaf = AoclLeaf {
+                aocl_leaf_index: prev_aocl_len + i as u64,
+                block_height: height,
+                block_digest,
+            };
+            self.add_commitment(output.canonical_commitment, leaf).await;
         }
 
         // Index inputs (removal records)
@@ -549,55 +586,105 @@ mod tests {
         assert!(heights.contains(&1000)); // height 1000
     }
 
-    #[tokio::test]
-    async fn test_commitment_index() {
+    fn digest(value: u64) -> Digest {
+        Digest::new([BFieldElement::new(value); Digest::LEN])
+    }
+
+    fn leaf(aocl_leaf_index: u64, block_height: u64, block_digest: Digest) -> AoclLeaf {
+        AoclLeaf {
+            aocl_leaf_index,
+            block_height: BlockHeight::from(block_height),
+            block_digest,
+        }
+    }
+
+    async fn new_indexer() -> UtxoIndexerDatabase {
         let db = NeptuneLevelDb::open_new_test_database(false, None, None, None)
             .await
             .unwrap();
-        let mut indexer = UtxoIndexerDatabase::try_connect_and_migrate(db)
+        UtxoIndexerDatabase::try_connect_and_migrate(db)
             .await
-            .unwrap();
+            .unwrap()
+    }
 
-        // Create test commitments
-        let commitment1 = Digest::new([
-            BFieldElement::new(1),
-            BFieldElement::new(2),
-            BFieldElement::new(3),
-            BFieldElement::new(4),
-            BFieldElement::new(5),
-        ]);
-        let commitment2 = Digest::new([
-            BFieldElement::new(10),
-            BFieldElement::new(20),
-            BFieldElement::new(30),
-            BFieldElement::new(40),
-            BFieldElement::new(50),
-        ]);
-        let unknown_commitment = Digest::new([
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-        ]);
+    #[tokio::test]
+    async fn test_commitment_index() {
+        let mut indexer = new_indexer().await;
+        let commitment1 = digest(1);
+        let commitment2 = digest(2);
+        let unknown_commitment = digest(99);
 
-        // Add commitments
-        indexer.add_commitment(commitment1, 100).await;
-        indexer.add_commitment(commitment2, 200).await;
+        indexer
+            .add_commitment(commitment1, leaf(100, 1, digest(10)))
+            .await;
+        indexer
+            .add_commitment(commitment2, leaf(200, 2, digest(20)))
+            .await;
         indexer.persist().await;
 
-        // Test single lookup
         assert_eq!(indexer.get_aocl_leaf_index(&commitment1).await, Some(100));
         assert_eq!(indexer.get_aocl_leaf_index(&commitment2).await, Some(200));
         assert_eq!(indexer.get_aocl_leaf_index(&unknown_commitment).await, None);
 
-        // Test batch lookup
         let results = indexer
             .get_aocl_leaf_indices(&[commitment1, unknown_commitment, commitment2])
             .await;
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0], Some(100));
-        assert_eq!(results[1], None);
-        assert_eq!(results[2], Some(200));
+        assert_eq!(vec![Some(100), None, Some(200)], results);
+    }
+
+    /// Identical outputs share a commitment: each of its leaves is kept, in canonical blocks only,
+    /// and indexing a block again adds nothing.
+    #[tokio::test]
+    async fn a_commitment_keeps_every_leaf() {
+        let mut indexer = new_indexer().await;
+        let commitment = digest(1);
+        let first = leaf(100, 286, digest(286));
+        let second = leaf(105, 287, digest(287));
+        let orphaned = leaf(110, 288, digest(288));
+
+        for leaf in [first, second, second, orphaned] {
+            indexer.add_commitment(commitment, leaf).await;
+        }
+        indexer.handle_reorg(vec![orphaned.block_digest]).await;
+        indexer.persist().await;
+
+        assert_eq!(
+            vec![vec![first, second], vec![]],
+            indexer.get_aocl_leaves(&[commitment, digest(99)]).await
+        );
+        assert_eq!(Some(105), indexer.get_aocl_leaf_index(&commitment).await);
+    }
+
+    /// A database of the previous schema, whose commitment index held one leaf index, is cleared
+    /// for re-indexing from genesis.
+    #[tokio::test]
+    async fn a_v2_database_is_cleared_for_reindexing() {
+        let db = NeptuneLevelDb::open_new_test_database(false, None, None, None)
+            .await
+            .unwrap();
+        let mut indexer = UtxoIndexerDatabase::try_connect_and_migrate(db.clone())
+            .await
+            .unwrap();
+        indexer
+            .add_commitment(digest(1), leaf(100, 286, digest(286)))
+            .await;
+        indexer.set_sync_height(BlockHeight::from(300u64)).await;
+        indexer.tables.schema_version.set(2).await;
+        indexer.persist().await;
+        drop(indexer);
+
+        assert!(matches!(
+            UtxoIndexerDatabase::try_connect(db.clone()).await,
+            Err(UtxoIndexerDbConnectError::SchemaVersionTooLow {
+                found: 2,
+                expected: 3
+            })
+        ));
+        let migrated = UtxoIndexerDatabase::try_connect_and_migrate(db)
+            .await
+            .unwrap();
+        assert_eq!(UTXO_INDEXER_SCHEMA_VERSION, migrated.schema_version());
+        assert_eq!(BlockHeight::genesis(), migrated.get_sync_height());
+        assert_eq!(None, migrated.get_aocl_leaf_index(&digest(1)).await);
     }
 }

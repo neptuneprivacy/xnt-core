@@ -1546,6 +1546,32 @@ mod tests {
         }
     }
 
+    /// The sender randomness of each payment output takes a fresh nonce, also within one
+    /// transaction.
+    #[apply(shared_tokio_runtime)]
+    async fn identical_payments_at_one_tip_get_distinct_addition_records() {
+        let alice = mock_genesis_global_state(
+            2,
+            WalletEntropy::devnet_wallet(),
+            cli_args::Args::default_with_network(Network::Testnet(0)),
+        )
+        .await;
+        let recipient: ReceivingAddress =
+            GenerationReceivingAddress::derive_from_seed(rand::random()).into();
+        let payment = (recipient, NativeCurrencyAmount::coins(3));
+
+        let initiator = alice.api().tx_initiator();
+        let first = initiator.generate_tx_outputs([payment.clone()]).await;
+        let second = initiator.generate_tx_outputs([payment.clone()]).await;
+        assert_ne!(first.addition_records(), second.addition_records());
+
+        let both = initiator
+            .generate_tx_outputs([payment.clone(), payment])
+            .await
+            .addition_records();
+        assert_ne!(both[0], both[1]);
+    }
+
     /// A chained send stops, and records nothing, once a predecessor leaves
     /// the mempool while the chain pipeline proves -- whether it was mined,
     /// double-spent, or replaced.

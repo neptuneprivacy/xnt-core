@@ -5,8 +5,8 @@
 use crate::core::{
     check_spent, compute_absolute_index_set_hash, compute_commitment,
     compute_commitment_for_output, decrypt_indexed_utxo_for_network, fetch_public_utxos,
-    fetch_utxos_with_skipped, get_aocl_indices, get_membership_proofs, get_mutator_set,
-    MembershipProof, MutatorSet, Network,
+    fetch_utxos_with_skipped, get_aocl_indices, get_aocl_leaves, get_membership_proofs,
+    get_mutator_set, MembershipProof, MutatorSet, Network,
 };
 
 use super::address::network_from_raw;
@@ -85,6 +85,35 @@ pub struct XntAoclIndices {
 impl XntAoclIndices {
     fn null() -> Self {
         Self { indices: std::ptr::null_mut(), len: 0 }
+    }
+}
+
+/// One AOCL leaf of a commitment
+#[repr(C)]
+pub struct XntAoclLeaf {
+    pub aocl_leaf_index: u64,
+    pub block_height: u64,
+    pub block_digest: XntDigest,
+}
+
+/// Every AOCL leaf of each commitment: `counts[i]` leaves of commitment `i`, in order, in
+/// `leaves`
+#[repr(C)]
+pub struct XntAoclLeaves {
+    pub leaves: *mut XntAoclLeaf,
+    pub num_leaves: usize,
+    pub counts: *mut usize,
+    pub num_commitments: usize,
+}
+
+impl XntAoclLeaves {
+    fn null() -> Self {
+        Self {
+            leaves: std::ptr::null_mut(),
+            num_leaves: 0,
+            counts: std::ptr::null_mut(),
+            num_commitments: 0,
+        }
     }
 }
 
@@ -453,6 +482,69 @@ pub extern "C" fn xnt_sync_aocl_indices_free(result: *mut XntAoclIndices) {
     })
 }
 
+
+/// Get every AOCL leaf of each commitment. Identical outputs share a commitment; each leaf is
+/// spendable once.
+#[no_mangle]
+pub extern "C" fn xnt_sync_get_aocl_leaves(
+    client: *const RpcClientHandle,
+    commitments: *const XntDigest,
+    count: usize,
+) -> XntAoclLeaves {
+    ffi_guard(XntAoclLeaves::null(), || {
+        ffi_begin!();
+        if client.is_null() || commitments.is_null() || count == 0 {
+            set_last_error("invalid input");
+            return XntAoclLeaves::null();
+        }
+
+        let client = ffi_ref!(client);
+        let digests = unsafe { read_slice(commitments, count) };
+        let core_digests: Vec<crate::core::Digest> = digests
+            .iter()
+            .map(|d| crate::core::Digest::from_bytes(d.bytes))
+            .collect();
+
+        match get_aocl_leaves(&client.0, &core_digests) {
+            Ok(per_commitment) => {
+                let counts: Vec<usize> = per_commitment.iter().map(Vec::len).collect();
+                let leaves: Vec<XntAoclLeaf> = per_commitment
+                    .into_iter()
+                    .flatten()
+                    .map(|leaf| XntAoclLeaf {
+                        aocl_leaf_index: leaf.aocl_leaf_index,
+                        block_height: leaf.block_height,
+                        block_digest: XntDigest::from_bytes(leaf.block_digest.bytes),
+                    })
+                    .collect();
+                XntAoclLeaves {
+                    num_leaves: leaves.len(),
+                    leaves: vec_to_ptr(leaves),
+                    num_commitments: counts.len(),
+                    counts: vec_to_ptr(counts),
+                }
+            }
+            Err(e) => {
+                set_last_error(&format!("{e}"));
+                XntAoclLeaves::null()
+            }
+        }
+    })
+}
+
+/// Free AOCL leaves result
+#[no_mangle]
+pub extern "C" fn xnt_sync_aocl_leaves_free(result: *mut XntAoclLeaves) {
+    ffi_guard((), || {
+        if result.is_null() {
+            return;
+        }
+        let r = ffi_mut!(result);
+        free_vec!(r.leaves, r.num_leaves);
+        free_vec!(r.counts, r.num_commitments);
+        *r = XntAoclLeaves::null();
+    })
+}
 
 /// Get current block height from node
 #[no_mangle]
