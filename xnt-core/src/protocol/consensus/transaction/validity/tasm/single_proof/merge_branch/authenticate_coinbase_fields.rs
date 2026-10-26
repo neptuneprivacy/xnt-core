@@ -522,21 +522,34 @@ mod tests {
                     indexed_leafs: vec![(leaf_index as usize, leaf)],
                     authentication_structure,
                 };
-                assert!(merkle_auth_proof.verify(merkle_root));
+                if merkle_auth_proof.verify(merkle_root) {
+                    Ok(())
+                } else {
+                    Err(RustShadowError::AssertionError(
+                        MerkleVerify::ROOT_MISMATCH_ERROR_ID,
+                    ))
+                }
             };
 
-            assert_coinbase_integrity(left_txk_mast_hash, &left_txk.coinbase);
-            assert_coinbase_integrity(right_txk_mast_hash, &right_txk.coinbase);
-            assert_coinbase_integrity(new_txk_mast_hash, &new_txk.coinbase);
+            // In the order of the tasm.
+            assert_coinbase_integrity(left_txk_mast_hash, &left_txk.coinbase)?;
+            assert_coinbase_integrity(right_txk_mast_hash, &right_txk.coinbase)?;
 
-            // Assert that right is not set
-            assert!(right_txk.coinbase.is_none());
+            if right_txk.coinbase.is_some() {
+                return Err(RustShadowError::AssertionError(RIGHT_INPUT_COINBASE_ERROR));
+            }
 
-            let maybe_coinbase = &left_txk.coinbase;
+            match (&left_txk.coinbase, &new_txk.coinbase) {
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(RustShadowError::AssertionError(UNEQUAL_DISCRIMINANT_ERROR));
+                }
+                (Some(left), Some(new)) if left != new => {
+                    return Err(RustShadowError::AssertionError(UNEQUAL_VALUE_ERROR));
+                }
+                _ => {}
+            }
 
-            assert_eq!(&new_txk.coinbase, maybe_coinbase);
-
-            Ok(())
+            assert_coinbase_integrity(new_txk_mast_hash, &new_txk.coinbase)
         }
 
         fn pseudorandom_initial_state(

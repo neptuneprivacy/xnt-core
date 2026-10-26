@@ -3579,6 +3579,10 @@ mod tests {
                     AddReason::Submitted,
                 )
                 .await;
+            // The upgrader skips while the job queue, shared with other tests, is busy.
+            while vm_job_queue().num_queued_jobs() > 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             assert!(
                 main_loop_handler
                     .proof_upgrader(&mut mutable_main_loop_state)

@@ -2777,6 +2777,8 @@ mod tests {
     /// Returns three transactions: Two transactions that are input to the
     /// transaction-merge function, and the resulting merged transaction. Also
     /// returns the mutator set these transactions are synced against.
+    ///
+    /// The proofs are mock proofs: the callers test the mempool, not proofs.
     async fn merge_tx_triplet(
         consensus_rule_set: ConsensusRuleSet,
     ) -> (
@@ -2794,7 +2796,7 @@ mod tests {
         let left_single_proof = produce_single_proof(
             &left,
             TritonVmJobQueue::get_instance(),
-            TritonVmJobPriority::default().into(),
+            TritonVmProofJobOptions::default_with_network(Network::RegTest),
             consensus_rule_set,
         )
         .await
@@ -2802,7 +2804,7 @@ mod tests {
         let right_single_proof = produce_single_proof(
             &right,
             TritonVmJobQueue::get_instance(),
-            TritonVmJobPriority::default().into(),
+            TritonVmProofJobOptions::default_with_network(Network::RegTest),
             consensus_rule_set,
         )
         .await
@@ -2826,7 +2828,7 @@ mod tests {
             right.clone(),
             shuffle_seed,
             TritonVmJobQueue::get_instance(),
-            TritonVmJobPriority::default().into(),
+            TritonVmProofJobOptions::default_with_network(Network::RegTest),
             consensus_rule_set,
         )
         .await
@@ -2837,6 +2839,8 @@ mod tests {
 
     /// Return a tree of transactions, where the parents are defined as the
     /// merger of the children. All three layers are returned.
+    ///
+    /// The proofs are real: mempool replacement weighs fee density, which depends on proof size.
     ///
     ///       final_tx
     ///      /      \
@@ -3443,7 +3447,7 @@ mod tests {
         // Verify that a merged transaction replaces the two transactions that
         // are the input into the merge.
         let network = Network::Main;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
         let genesis_block = Block::genesis(network);
         let mut mempool = Mempool::new(
             ByteSize::gb(1),
@@ -3518,7 +3522,7 @@ mod tests {
     async fn mempool_insertion_is_stable_on_mergers() {
         // Ensure that the mempool state does not change once all
         // transactions in a merge tree has been seen by the mempool.
-        let consensus_rule_set = ConsensusRuleSet::Reboot;
+        let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
         let network = Network::Main;
         let mut mempool = Mempool::new(
             ByteSize::gb(1),
@@ -3612,7 +3616,7 @@ mod tests {
     async fn reorganization_clears_mempool_and_merge_input_cache() {
         let network = Network::Main;
         let genesis = Block::genesis(network);
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
 
         let block_1a = invalid_empty_block_with_timestamp(
             &genesis,
@@ -4112,7 +4116,7 @@ mod tests {
             // merge: (a, b) -> c
             // Scenario: a is mined => b is in mempool after block update
             let network = Network::Main;
-            let consensus_rule_set = ConsensusRuleSet::Reboot;
+            let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
             let (((a, b), c), mutator_set) = merge_tx_triplet(consensus_rule_set).await;
             let block1 = invalid_block_with_kernel_and_mutator_set(b.kernel.clone(), mutator_set);
 
@@ -4148,7 +4152,7 @@ mod tests {
             // merge: (a, b) -> c
             // Scenario: c is mined => mempool is empty after block update
             let network = Network::Main;
-            let consensus_rule_set = ConsensusRuleSet::Reboot;
+            let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
             let (((a, b), c), mutator_set) = merge_tx_triplet(consensus_rule_set).await;
             let block1 = invalid_block_with_kernel_and_mutator_set(c.kernel.clone(), mutator_set);
 
@@ -4180,7 +4184,7 @@ mod tests {
         #[traced_test]
         #[apply(shared_tokio_runtime)]
         async fn nested_mergers_behave() {
-            let consensus_rule_set = ConsensusRuleSet::Reboot;
+            let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
             let network = Network::Main;
             let (bottom, [left, right], final_tx, mutator_set) =
                 nested_mergers(consensus_rule_set).await;

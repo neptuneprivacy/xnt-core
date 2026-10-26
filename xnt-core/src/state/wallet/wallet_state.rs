@@ -2581,33 +2581,58 @@ pub(crate) mod tests {
         // This test is a regression test for issue:
         // <https://github.com/Neptune-Crypto/neptune-core/issues/207>.
 
-        let network = Network::Main;
-        let mut alice_global_lock = mock_genesis_global_state(
-            0,
-            WalletEntropy::devnet_wallet(),
-            cli_args::Args::default_with_network(network),
+        let network = Network::RegTest;
+        let cli = cli_args::Args::default_with_network(network);
+        let alice_wallet_secret = WalletEntropy::new_random();
+        let alice_key = alice_wallet_secret.nth_generation_spending_key_for_tests(0);
+        let mut alice_global_lock = mock_genesis_global_state(0, alice_wallet_secret, cli).await;
+
+        // Neither premine nor coinbase is timelocked, so Bob sends Alice one.
+        let (block1, bob, bob_key) = bob_mines_one_block(network).await;
+        let launch_timestamp = network.launch_date();
+        let released_timestamp = launch_timestamp + Timestamp::months(12);
+        let one_coin = NativeCurrencyAmount::coins(1);
+        let timelocked_output = TxOutput::onchain_native_currency(
+            one_coin,
+            random(),
+            alice_key.to_address().into(),
+            false,
         )
-        .await;
+        .with_time_lock(launch_timestamp + Timestamp::months(6));
+        let config = TxCreationConfig::default()
+            .recover_change_on_chain(bob_key.into())
+            .with_prover_capability(TxProvingCapability::PrimitiveWitness);
+        let tx_block2 = bob
+            .api()
+            .tx_initiator_internal()
+            .create_transaction(
+                vec![timelocked_output].into(),
+                one_coin,
+                launch_timestamp + Timestamp::minutes(11),
+                config,
+                ConsensusRuleSet::infer_from(network, block1.header().height),
+            )
+            .await
+            .unwrap()
+            .transaction;
+        let block2 = invalid_block_with_transaction(&block1, tx_block2.into());
 
         let mut alice = alice_global_lock.global_state_lock.lock_guard_mut().await;
-        let launch_timestamp = alice.chain.light_state().header().timestamp;
-        let released_timestamp = launch_timestamp + Timestamp::months(12);
-        let genesis = alice.chain.light_state();
-        let genesis_digest = genesis.hash();
-        let mutator_set_accumulator_after_genesis =
-            genesis.mutator_set_accumulator_after().unwrap();
-        let alice_ws_genesis = alice
+        alice.set_new_tip(block1).await.unwrap();
+        alice.set_new_tip(block2.clone()).await.unwrap();
+        let block2_timestamp = block2.header().timestamp;
+        let msa_block2 = block2.mutator_set_accumulator_after().unwrap();
+        let alice_ws_block2 = alice
             .wallet_state
-            .get_wallet_status(genesis_digest, &mutator_set_accumulator_after_genesis)
+            .get_wallet_status(block2.hash(), &msa_block2)
             .await;
 
         // First, check that error is returned, when available balance is not
         // there, as it is timelocked.
-        let one_coin = NativeCurrencyAmount::coins(1);
-        assert!(alice_ws_genesis
-            .available_confirmed(launch_timestamp)
+        assert!(alice_ws_block2
+            .available_confirmed(block2_timestamp)
             .is_zero());
-        assert!(!alice_ws_genesis
+        assert!(!alice_ws_block2
             .available_confirmed(released_timestamp)
             .is_zero());
         assert!(
@@ -2615,9 +2640,9 @@ pub(crate) mod tests {
                 .wallet_state
                 .allocate_sufficient_input_funds(
                     one_coin,
-                    genesis_digest,
-                    &mutator_set_accumulator_after_genesis,
-                    launch_timestamp,
+                    block2.hash(),
+                    &msa_block2,
+                    block2_timestamp,
                 )
                 .await
                 .is_err(),
@@ -2628,8 +2653,8 @@ pub(crate) mod tests {
                 .wallet_state
                 .allocate_sufficient_input_funds(
                     one_coin,
-                    genesis_digest,
-                    &mutator_set_accumulator_after_genesis,
+                    block2.hash(),
+                    &msa_block2,
                     released_timestamp,
                 )
                 .await
@@ -2637,17 +2662,13 @@ pub(crate) mod tests {
             "Allow allocation when timelock is expired"
         );
 
-        // Then check that the timelocked UTXO (from the premine) is not
-        // selected even when the necessary balance is there through other UTXOs
-        // that are *not* timelocked.
-        let block_1_timestamp = launch_timestamp + Timestamp::minutes(2);
-        let alice_key = alice
-            .wallet_state
-            .wallet_entropy
-            .nth_generation_spending_key_for_tests(0);
-        let (block1, composer_expected_utxos) = make_mock_block(
-            genesis,
-            Some(block_1_timestamp),
+        // Then check that the timelocked UTXO is not selected even when the
+        // necessary balance is there through other UTXOs that are *not*
+        // timelocked.
+        let block_3_timestamp = block2_timestamp + Timestamp::minutes(2);
+        let (block3, composer_expected_utxos) = make_mock_block(
+            &block2,
+            Some(block_3_timestamp),
             alice_key,
             Default::default(),
             network,
@@ -2658,15 +2679,15 @@ pub(crate) mod tests {
             .wallet_state
             .add_expected_utxos(composer_expected_utxos.clone())
             .await;
-        alice.set_new_tip(block1.clone()).await.unwrap();
+        alice.set_new_tip(block3.clone()).await.unwrap();
 
         let input_utxos = alice
             .wallet_state
             .allocate_sufficient_input_funds(
                 one_coin,
-                block1.hash(),
-                &block1.mutator_set_accumulator_after().unwrap(),
-                block_1_timestamp,
+                block3.hash(),
+                &block3.mutator_set_accumulator_after().unwrap(),
+                block_3_timestamp,
             )
             .await
             .unwrap();
@@ -2674,7 +2695,7 @@ pub(crate) mod tests {
         assert!(
             input_utxos
                 .iter()
-                .all(|unlocker| unlocker.utxo.can_spend_at(block_1_timestamp)),
+                .all(|unlocker| unlocker.utxo.can_spend_at(block_3_timestamp)),
             "All allocated UTXOs must be spendable now"
         );
     }
@@ -2744,7 +2765,7 @@ pub(crate) mod tests {
         // Bob sends two identical coins (=identical addition records) to Alice.
         let fee = NativeCurrencyAmount::coins(1);
         let txoutput = TxOutput::onchain_native_currency(
-            NativeCurrencyAmount::coins(7),
+            NativeCurrencyAmount::coins(1),
             random(),
             alice_key.to_address().into(),
             false,
@@ -2792,7 +2813,7 @@ pub(crate) mod tests {
                 )
                 .await;
             assert_eq!(
-                NativeCurrencyAmount::coins(14),
+                NativeCurrencyAmount::coins(2),
                 wallet_status.available_confirmed(tx_block2.kernel.timestamp),
                 "Both UTXOs must be registered by wallet and contribute to balance"
             );
@@ -2834,7 +2855,7 @@ pub(crate) mod tests {
                 )
                 .await;
             assert_eq!(
-                NativeCurrencyAmount::coins(28),
+                NativeCurrencyAmount::coins(4),
                 wallet_status.available_confirmed(tx_block2.kernel.timestamp),
                 "All four UTXOs must be registered by wallet and contribute to balance"
             );
@@ -2871,7 +2892,7 @@ pub(crate) mod tests {
             alice_key.to_address().into(),
             false,
         );
-        let fee = NativeCurrencyAmount::coins(10);
+        let fee = NativeCurrencyAmount::coins(1);
         let config = TxCreationConfig::default()
             .recover_change_on_chain(bob_key.into())
             .with_prover_capability(TxProvingCapability::PrimitiveWitness);
@@ -2975,7 +2996,7 @@ pub(crate) mod tests {
             alice_key.to_address().into(),
             false,
         );
-        let fee = NativeCurrencyAmount::coins(10);
+        let fee = NativeCurrencyAmount::coins(1);
         let config = TxCreationConfig::default()
             .recover_change_on_chain(bob_key.into())
             .with_prover_capability(TxProvingCapability::PrimitiveWitness);
@@ -3091,9 +3112,9 @@ pub(crate) mod tests {
             .add_expected_utxos(expected_utxos_block_1a.clone())
             .await;
         bob.set_new_tip(block_1a.clone()).await.unwrap();
-        assert_eq!(4, bob.wallet_state.wallet_db.monitored_utxos().len().await,);
+        assert_eq!(2, bob.wallet_state.wallet_db.monitored_utxos().len().await,);
         assert_eq!(
-            4,
+            2,
             bob.wallet_state
                 .read_utxo_ms_recovery_data()
                 .await
@@ -3142,9 +3163,9 @@ pub(crate) mod tests {
             .await;
         bob.set_new_tip(block_1b.clone()).await.unwrap();
         let final_mutxos = bob.wallet_state.wallet_db.monitored_utxos().get_all().await;
-        assert_eq!(4, final_mutxos.len());
+        assert_eq!(2, final_mutxos.len());
         assert_eq!(
-            4,
+            2,
             bob.wallet_state
                 .read_utxo_ms_recovery_data()
                 .await
@@ -3152,11 +3173,10 @@ pub(crate) mod tests {
                 .len(),
         );
 
-        // verify that the two composer MUTXOs are still valid. Notice that the
-        // guesser-fee UTXOs will not be valid, so we cannot require that all
-        // four MUTXOs have valid MSMPs, since the two guesser-UTXOs were
-        // orphaned with block 1b.
-        for mutxo in final_mutxos.iter().take((0..=1).count()) {
+        // verify that the composer MUTXO is still valid. Notice that the
+        // guesser-fee UTXO will not be valid, since it was orphaned with block
+        // 1b.
+        for mutxo in final_mutxos.iter().take(1) {
             let item = Tip5::hash(&mutxo.utxo);
             let (mutxo_sync_block_digest, msmp) =
                 mutxo.get_latest_membership_proof_entry().unwrap();
@@ -3209,9 +3229,9 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(2, bob.wallet_state.wallet_db.monitored_utxos().len().await,);
+        assert_eq!(1, bob.wallet_state.wallet_db.monitored_utxos().len().await,);
         assert_eq!(
-            2,
+            1,
             bob.wallet_state
                 .read_utxo_ms_recovery_data()
                 .await
@@ -3232,9 +3252,9 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(2, bob.wallet_state.wallet_db.monitored_utxos().len().await,);
+            assert_eq!(1, bob.wallet_state.wallet_db.monitored_utxos().len().await,);
             assert_eq!(
-                2,
+                1,
                 bob.wallet_state
                     .read_utxo_ms_recovery_data()
                     .await
@@ -3352,9 +3372,9 @@ pub(crate) mod tests {
         bob.set_new_tip(block_3a).await.unwrap();
 
         assert_eq!(
-            2,
+            1,
             bob.wallet_state.wallet_db.monitored_utxos().len().await,
-            "Monitored UTXO list must have length 2 at block 3a"
+            "Monitored UTXO list must have length 1 at block 3a"
         );
         assert!(
             bob.wallet_state
@@ -3437,25 +3457,23 @@ pub(crate) mod tests {
             "MUTXO must *not* be marked as abandoned at height 12, prior to pruning"
         );
         let prune_count_12 = bob.prune_abandoned_monitored_utxos(10).await.unwrap();
-        assert_eq!(2, prune_count_12);
+        assert_eq!(1, prune_count_12);
 
-        for i in 0..=1 {
-            assert_eq!(
-                (
-                    block_12.hash(),
-                    block_12.kernel.header.timestamp,
-                    12u64.into()
-                ),
-                bob.wallet_state
-                    .wallet_db
-                    .monitored_utxos()
-                    .get(i)
-                    .await
-                    .abandoned_at
-                    .unwrap(),
-                "MUTXO must be marked as abandoned at height 12, after pruning"
-            );
-        }
+        assert_eq!(
+            (
+                block_12.hash(),
+                block_12.kernel.header.timestamp,
+                12u64.into()
+            ),
+            bob.wallet_state
+                .wallet_db
+                .monitored_utxos()
+                .get(0)
+                .await
+                .abandoned_at
+                .unwrap(),
+            "MUTXO must be marked as abandoned at height 12, after pruning"
+        );
         assert!(
             bob.get_latest_balance_height().await.is_none(),
             "Latest balance height must be None at height 12"
@@ -3656,21 +3674,9 @@ pub(crate) mod tests {
                 .get_all()
                 .await;
             assert_eq!(
-                2,
-                mutxos.len(),
-                "Must have registered two UTXOs as guesser-reward"
-            );
-            assert_eq!(
-                2,
-                mutxos.iter().map(|x| x.addition_record()).unique().count(),
-                "Addition records from MUTXOs must be unique"
-            );
-            assert_eq!(
                 1,
-                mutxos
-                    .iter()
-                    .filter(|x| x.utxo.release_date().is_some())
-                    .count()
+                mutxos.len(),
+                "Must have registered one UTXO as guesser-reward"
             );
             assert_eq!(
                 1,
@@ -3788,7 +3794,7 @@ pub(crate) mod tests {
             let own = wallet_state.wallet_entropy.guesser_fee_key().to_address();
             incoming_block.set_header_guesser_address(own.into());
             assert_eq!(
-                2,
+                1,
                 wallet_state
                     .scan_for_guesser_fee_utxos(&incoming_block)
                     .count()
@@ -3822,7 +3828,7 @@ pub(crate) mod tests {
         #[traced_test]
         #[apply(shared_tokio_runtime)]
         async fn confirmed_and_unconfirmed_balance() -> Result<()> {
-            let network = Network::Main;
+            let network = Network::RegTest;
             let mut rng = StdRng::seed_from_u64(664505904);
             let mut global_state_lock = mock_genesis_global_state(
                 0,
@@ -3838,8 +3844,6 @@ pub(crate) mod tests {
                 .await;
 
             let coinbase_amt = Block::block_subsidy(BlockHeight::genesis().next());
-            let mut half_coinbase_amt = coinbase_amt;
-            half_coinbase_amt.div_two();
             let send_amt = NativeCurrencyAmount::coins(5);
 
             let genesis_block = Block::genesis(network);
@@ -3861,14 +3865,11 @@ pub(crate) mod tests {
                     .unwrap();
                 let wallet_status = gs.wallet_state.get_wallet_status(tip_digest, &msa).await;
 
-                assert_eq!(
-                    wallet_status.available_confirmed(timestamp),
-                    half_coinbase_amt
-                );
+                assert_eq!(wallet_status.available_confirmed(timestamp), coinbase_amt);
                 assert_eq!(
                     gs.wallet_state
                         .unconfirmed_available_balance(&wallet_status, timestamp),
-                    half_coinbase_amt
+                    coinbase_amt
                 );
 
                 // generate an output that our wallet cannot claim.
@@ -3923,14 +3924,11 @@ pub(crate) mod tests {
                     .unwrap();
                 let wallet_status = gs.wallet_state.get_wallet_status(tip_digest, &msa).await;
 
-                assert_eq!(
-                    wallet_status.available_confirmed(timestamp),
-                    half_coinbase_amt
-                );
+                assert_eq!(wallet_status.available_confirmed(timestamp), coinbase_amt);
                 assert_eq!(
                     gs.wallet_state
                         .unconfirmed_available_balance(&wallet_status, timestamp),
-                    half_coinbase_amt.checked_sub(&send_amt).unwrap()
+                    coinbase_amt.checked_sub(&send_amt).unwrap()
                 );
             }
 
@@ -3959,7 +3957,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     gs.wallet_state
                         .unconfirmed_available_balance(&wallet_status, timestamp),
-                    half_coinbase_amt
+                    coinbase_amt
                 );
             }
 
@@ -4237,7 +4235,7 @@ pub(crate) mod tests {
             let an_address = GenerationReceivingAddress::derive_from_seed(Default::default());
             let coinbase_distribution = vec![
                 CoinbaseOutput::liquid(an_address.into(), 400),
-                CoinbaseOutput::timelocked(an_address.into(), 550),
+                CoinbaseOutput::liquid(an_address.into(), 550),
                 CoinbaseOutput::liquid(an_address.into(), 50),
             ];
             let coinbase_distribution =
@@ -4253,10 +4251,10 @@ pub(crate) mod tests {
 
                 let coinbase = NativeCurrencyAmount::coins(40);
                 let composer_outputs = composer_parameters.tx_outputs(coinbase, Timestamp::now());
-                let expected_num_outputs = if cb_distribution.is_some() { 3 } else { 2 };
+                let expected_num_outputs = if cb_distribution.is_some() { 3 } else { 1 };
                 assert_eq!(expected_num_outputs, composer_outputs.len(),);
 
-                let expected_num_own_outputs = if cb_distribution.is_some() { 0 } else { 2 };
+                let expected_num_own_outputs = if cb_distribution.is_some() { 0 } else { 1 };
                 assert_eq!(
                     expected_num_own_outputs,
                     composer_parameters
@@ -4513,7 +4511,7 @@ pub(crate) mod tests {
             // 4. Reorganize onto a new chain, blocks 1b and 2b.
             // 5. Verify no abandoned/unsynced MUTXOs
             // 6. Verify that Alice can, again, create a transaction spending premine.
-            let network = Network::Main;
+            let network = Network::RegTest;
             let alice_wallet = WalletEntropy::devnet_wallet();
             let mut alice_global_lock = mock_genesis_global_state(
                 0,
@@ -4744,7 +4742,7 @@ pub(crate) mod tests {
         #[traced_test]
         #[apply(shared_tokio_runtime)]
         async fn test_recovery_on_imported_wallet() {
-            let network = Network::Main;
+            let network = Network::RegTest;
             let alice_secret = WalletEntropy::new_random();
             let data_dir = unit_test_data_directory(network).unwrap();
 
@@ -5268,7 +5266,7 @@ pub(crate) mod tests {
                 "wallet status -- # unsynced: {}",
                 wallet_status.unsynced.len()
             );
-            assert_eq!(2, wallet_status.synced_unspent.len());
+            assert_eq!(1, wallet_status.synced_unspent.len());
         }
     }
 
@@ -5446,14 +5444,14 @@ pub(crate) mod tests {
 
             let num_expected_pub_announcements = match compose_fee_notification_policy {
                 FeeNotificationPolicy::OffChain => 0,
-                FeeNotificationPolicy::OnChainSymmetric => 2,
-                FeeNotificationPolicy::OnChainGeneration => 2,
+                FeeNotificationPolicy::OnChainSymmetric => 1,
+                FeeNotificationPolicy::OnChainGeneration => 1,
             };
             assert_eq!(
                 num_expected_pub_announcements,
                 new_block.body().transaction_kernel.announcements.len()
             );
-            let num_expected_expected_utxos = 2 - num_expected_pub_announcements;
+            let num_expected_expected_utxos = 1 - num_expected_pub_announcements;
             assert_eq!(num_expected_expected_utxos, expected_utxos.len());
 
             // update wallet state with new block (ignoring expected UTXOs)
@@ -5480,7 +5478,7 @@ pub(crate) mod tests {
                     &new_block.mutator_set_accumulator_after().unwrap(),
                 )
                 .await;
-            assert_eq!(2, wallet_status.synced_unspent.len());
+            assert_eq!(1, wallet_status.synced_unspent.len());
         }
 
         #[traced_test]
@@ -5535,7 +5533,7 @@ pub(crate) mod tests {
             let mut rng = StdRng::from_seed(seed);
 
             // set up premine recipient
-            let network = Network::Main;
+            let network = Network::RegTest;
             let cli_args = cli_args::Args {
                 tx_proving_capability: Some(TxProvingCapability::SingleProof),
                 network,
@@ -5630,7 +5628,7 @@ pub(crate) mod tests {
                 &genesis_block,
                 alice.clone(),
                 now,
-                TritonVmProofJobOptions::default(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();
@@ -5639,7 +5637,7 @@ pub(crate) mod tests {
                 block_transaction,
                 now,
                 dummy_queue.clone(),
-                TritonVmProofJobOptions::default(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();
@@ -5695,7 +5693,7 @@ pub(crate) mod tests {
                 &block_one,
                 alice,
                 block_one.header().timestamp + Timestamp::minutes(10),
-                TritonVmProofJobOptions::default(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();
@@ -5707,7 +5705,7 @@ pub(crate) mod tests {
                 upgraded_transaction,
                 rng.random(),
                 dummy_queue.clone(),
-                TritonVmProofJobOptions::default(),
+                TritonVmProofJobOptions::default_with_network(network),
                 consensus_rule_set_one,
             )
             .await
@@ -5719,7 +5717,7 @@ pub(crate) mod tests {
                 block_two_transaction,
                 now + Timestamp::minutes(10),
                 dummy_queue,
-                TritonVmProofJobOptions::default(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();

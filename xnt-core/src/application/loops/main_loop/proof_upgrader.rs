@@ -1526,7 +1526,7 @@ mod tests {
             (change_key, block_height)
         };
         let dummy = TritonVmJobQueue::get_instance();
-        let timestamp = Network::Main.launch_date() + Timestamp::months(7);
+        let timestamp = Timestamp::now();
         let config = TxCreationConfig::default()
             .recover_change_off_chain(change_key.into())
             .with_prover_capability(proof_quality)
@@ -1713,7 +1713,7 @@ mod tests {
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn happy_path() {
-        let network = Network::Main;
+        let network = Network::RegTest;
 
         for proving_capability in [
             TxProvingCapability::ProofCollection,
@@ -1803,7 +1803,7 @@ mod tests {
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn race_condition_with_one_new_block() {
-        let network = Network::Main;
+        let network = Network::RegTest;
         let proving_capabilities = [
             TxProvingCapability::ProofCollection,
             TxProvingCapability::SingleProof,
@@ -1917,7 +1917,7 @@ mod tests {
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn dont_share_partly_mined_merge_upgrade() {
-        let network = Network::Main;
+        let network = Network::RegTest;
 
         // Alice is premine recipient and has mined one block, so she can make
         // (at least) two transaction.

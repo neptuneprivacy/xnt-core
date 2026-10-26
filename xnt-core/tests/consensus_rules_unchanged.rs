@@ -20,7 +20,7 @@ use crate::common::genesis_node::GenesisNode;
 #[test]
 pub fn genesis_block_hasnt_changed_main_net() {
     assert_eq!(
-        "7962e48729acd97e08efa77b5b28d49f2dc0e5609a4f1f1affca5b4549c78e520462a7f955371386",
+        "3b012c9abf353d9201bc3328391bbd0d43c5edb91da1085be15a3fc52ad55f65ea115d255922b5a4",
         Block::genesis(Network::Main).hash().to_hex()
     );
 }
@@ -29,13 +29,14 @@ pub fn genesis_block_hasnt_changed_main_net() {
 #[test]
 pub fn genesis_block_hasnt_changed_testnet_0() {
     assert_eq!(
-        "bb1fa49a35a294dd2c09811c648c4d76f6ea17acc61fe7a6f1c3c8d81c967bc68e7cdb41f472544e",
+        "fa3cd0f699c963923ad4f60a312ede9c13136c1d1f45c629e90420a57821fd333ac6bc82e591a00f",
         Block::genesis(Network::Testnet(0)).hash().to_hex()
     );
 }
 
 /// test: Verify that first ~250 blocks on main net are still considered valid,
 /// and that a global state can be restored from it.
+#[ignore = "replays Neptune Cash block files; no XNT main net block files are published"]
 #[tokio::test(flavor = "multi_thread")]
 async fn can_restore_from_real_mainnet_data_with_reorganizations() {
     logging::tracing_logger();

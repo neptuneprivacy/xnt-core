@@ -1098,6 +1098,7 @@ pub(crate) mod tests {
     use crate::application::triton_vm_job_queue::TritonVmJobQueue;
     use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
     use crate::protocol::consensus::transaction::validity::single_proof::produce_single_proof;
+    use crate::protocol::consensus::transaction::validity::single_proof::SingleProof;
     use crate::protocol::consensus::transaction::PrimitiveWitness;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::util_types::mutator_set::removal_record::RemovalRecord;
@@ -1276,10 +1277,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// The `SingleProof` program the operands of a merge are proven for.
+    pub(crate) enum OperandProgram {
+        Era(ConsensusRuleSet),
+        /// The v1 program as this build assembles it: its eras verify against pinned digests.
+        CurrentV1,
+    }
+
+    async fn prove_operand(
+        primitive_witness: &PrimitiveWitness,
+        program: &OperandProgram,
+        network: Network,
+    ) -> Proof {
+        let options = TritonVmProofJobOptions::default_with_network(network);
+        match program {
+            OperandProgram::Era(consensus_rule_set) => produce_single_proof(
+                primitive_witness,
+                TritonVmJobQueue::get_instance(),
+                options,
+                *consensus_rule_set,
+            )
+            .await
+            .unwrap(),
+            OperandProgram::CurrentV1 => SingleProof::produce_with_claim(
+                primitive_witness,
+                TritonVmJobQueue::get_instance(),
+                options,
+                SingleProof::claim(primitive_witness.kernel.mast_hash()),
+            )
+            .await
+            .unwrap(),
+        }
+    }
+
     pub(crate) async fn deterministic_merge_witness(
         params_left: (usize, usize, usize),
         params_right: (usize, usize, usize),
-        consensus_rule_set: ConsensusRuleSet,
+        program: OperandProgram,
         network: Network,
     ) -> MergeWitness {
         let mut test_runner = TestRunner::deterministic();
@@ -1299,22 +1333,8 @@ pub(crate) mod tests {
             .unwrap()
             .current();
 
-        let left_proof = produce_single_proof(
-            &primitive_witness_1,
-            TritonVmJobQueue::get_instance(),
-            TritonVmProofJobOptions::default_with_network(network),
-            consensus_rule_set,
-        )
-        .await
-        .unwrap();
-        let right_proof = produce_single_proof(
-            &primitive_witness_2,
-            TritonVmJobQueue::get_instance(),
-            TritonVmProofJobOptions::default_with_network(network),
-            consensus_rule_set,
-        )
-        .await
-        .unwrap();
+        let left_proof = prove_operand(&primitive_witness_1, &program, network).await;
+        let right_proof = prove_operand(&primitive_witness_2, &program, network).await;
 
         let left_tx = Transaction::new_single_proof(primitive_witness_1.kernel, left_proof);
         let right_tx = Transaction::new_single_proof(primitive_witness_2.kernel, right_proof);
@@ -1327,7 +1347,7 @@ pub(crate) mod tests {
         num_total_outputs: usize,
         num_pub_announcements: usize,
         network: Network,
-        consensus_rule_set: ConsensusRuleSet,
+        program: OperandProgram,
     ) -> MergeWitness {
         let mut test_runner = TestRunner::deterministic();
 
@@ -1355,26 +1375,17 @@ pub(crate) mod tests {
             .unwrap()
             .current();
 
-        let left_proof = produce_single_proof(
-            &coinbase_transaction,
-            TritonVmJobQueue::get_instance(),
-            TritonVmProofJobOptions::default_with_network(network),
-            consensus_rule_set,
-        )
-        .await
-        .unwrap();
-        let right_proof = produce_single_proof(
-            &tx_with_inputs,
-            TritonVmJobQueue::get_instance(),
-            TritonVmProofJobOptions::default_with_network(network),
-            consensus_rule_set,
-        )
-        .await
-        .unwrap();
+        let left_proof = prove_operand(&coinbase_transaction, &program, network).await;
+        let right_proof = prove_operand(&tx_with_inputs, &program, network).await;
 
         let left = Transaction::new_single_proof(coinbase_transaction.kernel, left_proof);
         let right = Transaction::new_single_proof(tx_with_inputs.kernel, right_proof);
 
+        // The v1 program merges as the v1 eras did.
+        let consensus_rule_set = match program {
+            OperandProgram::Era(consensus_rule_set) => consensus_rule_set,
+            OperandProgram::CurrentV1 => ConsensusRuleSet::Xnt,
+        };
         MergeWitness::for_composition(left.into(), right, shuffle_seed, consensus_rule_set)
     }
 }
