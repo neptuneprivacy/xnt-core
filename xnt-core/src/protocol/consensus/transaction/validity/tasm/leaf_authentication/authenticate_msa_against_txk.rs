@@ -237,9 +237,13 @@ mod tests {
                 authentication_structure: auth_path,
             };
 
-            assert!(mt_proof.verify(txk_digest));
-
-            Ok(vec![])
+            if mt_proof.verify(txk_digest) {
+                Ok(vec![])
+            } else {
+                Err(RustShadowError::AssertionError(
+                    MerkleVerify::ROOT_MISMATCH_ERROR_ID,
+                ))
+            }
         }
 
         fn pseudorandom_initial_state(

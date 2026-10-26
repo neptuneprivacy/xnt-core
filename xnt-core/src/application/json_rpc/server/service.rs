@@ -2228,7 +2228,8 @@ pub mod tests {
 
     #[apply(shared_tokio_runtime)]
     async fn remote_wallets_behave_correctly() {
-        let mut rpc_server = test_rpc_server().await;
+        // Only test networks fund the devnet wallet.
+        let mut rpc_server = test_rpc_server_on(Network::RegTest).await;
         let network = rpc_server.state.cli().network;
 
         // Prepare a transaction to our wallet coming from devnet wallet.

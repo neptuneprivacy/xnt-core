@@ -1981,6 +1981,7 @@ pub(crate) mod tests {
         use crate::protocol::consensus::{
             consensus_rule_set::ConsensusRuleSet,
             transaction::validity::tasm::single_proof::merge_branch::tests::deterministic_merge_witness_with_coinbase,
+            transaction::validity::tasm::single_proof::merge_branch::tests::OperandProgram,
         };
 
         use super::*;
@@ -2005,7 +2006,7 @@ pub(crate) mod tests {
             let merge_witness = deterministic_merge_witness(
                 (2, 2, 2),
                 (2, 2, 2),
-                ConsensusRuleSet::TimelockExtension,
+                OperandProgram::Era(ConsensusRuleSet::UpgradeVMv8),
                 network,
             )
             .await;
@@ -2021,7 +2022,7 @@ pub(crate) mod tests {
                 3,
                 3,
                 network,
-                ConsensusRuleSet::TimelockExtension,
+                OperandProgram::Era(ConsensusRuleSet::UpgradeVMv8),
             )
             .await;
             positive_prop(merge_witness);

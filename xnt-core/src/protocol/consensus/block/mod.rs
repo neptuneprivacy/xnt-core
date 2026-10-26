@@ -1227,7 +1227,6 @@ pub(crate) mod tests {
     use crate::application::loops::mine_loop::tests::make_coinbase_transaction_from_state;
     use crate::application::rpc::server::proof_of_work_puzzle::ProofOfWorkPuzzle;
     use crate::application::triton_vm_job_queue::vm_job_queue;
-    use crate::application::triton_vm_job_queue::TritonVmJobPriority;
     use crate::protocol::consensus::block::block_height::BLOCKS_PER_GENERATION;
     use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
     use crate::protocol::consensus::transaction::TransactionProof;
@@ -1457,10 +1456,12 @@ pub(crate) mod tests {
     fn guess_nonce_happy_path() {
         let network = Network::Main;
         let genesis = Block::genesis(network);
-        let mut invalid_block = invalid_empty_block(&genesis, network);
-        let mast_auth_paths = invalid_block.pow_mast_paths();
+        let block_without_pow = invalid_empty_block(&genesis, network);
+        let mast_auth_paths = block_without_pow.pow_mast_paths();
 
+        // Fresh block per rule set: rule sets sharing a PoW algorithm accept the previous PoW.
         for consensus_rule_set in ConsensusRuleSet::iter() {
+            let mut invalid_block = block_without_pow.clone();
             let guesser_buffer = invalid_block.guess_preprocess(None, None, consensus_rule_set);
             let target = Difficulty::from(2u32).target();
             let mut rng = rng();
@@ -1517,7 +1518,7 @@ pub(crate) mod tests {
     fn block_subsidy_generation_0() {
         let block_height_generation_0 = 199u64.into();
         assert_eq!(
-            NativeCurrencyAmount::coins(8),
+            NativeCurrencyAmount::from_nau(NativeCurrencyAmount::coins(68).to_nau() / 10),
             Block::block_subsidy(block_height_generation_0)
         );
     }
@@ -1527,13 +1528,18 @@ pub(crate) mod tests {
         let network = Network::Main;
         for fraction in [0.01, 0.1, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99, 1.0] {
             let block = invalid_empty_block1_with_guesser_fraction(network, fraction).await;
-            assert_eq!(fraction, block.relative_guesser_reward().unwrap());
+            // The guesser's share of 6.8 coins is rounded to nau.
+            let relative_guesser_reward = block.relative_guesser_reward().unwrap();
+            assert!(
+                (fraction - relative_guesser_reward).abs() < 1e-12,
+                "{fraction} vs {relative_guesser_reward}"
+            );
         }
     }
 
     #[traced_test]
     #[apply(shared_tokio_runtime)]
-    async fn total_block_subsidy_is_128_coins_regardless_of_guesser_fraction() {
+    async fn total_miner_reward_is_the_block_subsidy_regardless_of_guesser_fraction() {
         let network = Network::Main;
         let a_wallet_secret = WalletEntropy::new_random();
         let a_key = a_wallet_secret.nth_generation_spending_key_for_tests(0);
@@ -1580,7 +1586,10 @@ pub(crate) mod tests {
             );
             let total_guesser_reward = block1.body().total_guesser_reward().unwrap();
             let total_miner_reward = total_composer_reward + total_guesser_reward;
-            assert_eq!(NativeCurrencyAmount::coins(128), total_miner_reward);
+            assert_eq!(
+                Block::block_subsidy(block1.header().height),
+                total_miner_reward
+            );
 
             println!("guesser_fraction: {guesser_fraction}");
             println!(
@@ -1904,7 +1913,7 @@ pub(crate) mod tests {
             // when calculating the expected state of the new mutator set.
             // Cf., the bug fixed in 4d6b7013624e593c40e76ce93cb6b288b6b3f48b.
 
-            let network = Network::Main;
+            let network = Network::RegTest;
             let genesis_block = Block::genesis(network);
             let plus_seven_months = genesis_block.kernel.header.timestamp + Timestamp::months(7);
             let mut rng: StdRng = SeedableRng::seed_from_u64(2225550001);
@@ -2369,7 +2378,7 @@ pub(crate) mod tests {
             // private fields on `BlockBody`.
 
             let mut rng = rand::rng();
-            let network = Network::Main;
+            let network = Network::RegTest;
             let genesis_block = Block::genesis(network);
             assert!(
                 genesis_block.kernel.guesser_fee_utxos().unwrap().is_empty(),
@@ -2540,7 +2549,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn avoid_reselecting_same_input_utxos() {
         let mut rng = StdRng::seed_from_u64(893423984854);
-        let network = Network::Main;
+        let network = Network::RegTest;
         let devnet_wallet = WalletEntropy::devnet_wallet();
         let mut alice = mock_genesis_global_state(
             0,
@@ -2570,7 +2579,7 @@ pub(crate) mod tests {
                 &blocks[i - 1],
                 &alice,
                 launch_date,
-                TritonVmProofJobOptions::from((TritonVmJobPriority::Normal, None)),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();
@@ -2649,7 +2658,7 @@ pub(crate) mod tests {
                 ),
                 now,
                 job_queue.clone(),
-                TritonVmProofJobOptions::default(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();

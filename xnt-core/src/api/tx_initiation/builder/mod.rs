@@ -54,7 +54,7 @@
 //!        .spendable_inputs(
 //!            state_lock
 //!                .gs()
-//!                .wallet_spendable_inputs(timestamp)
+//!                .wallet_spendable_inputs(timestamp, 0)
 //!                .await
 //!                .into_iter()
 //!                .collect(),
