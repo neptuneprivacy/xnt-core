@@ -1,6 +1,10 @@
 pub mod block;
+pub mod bridge;
 pub mod chaintx;
 pub mod consensus_rule_set;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod program_digests;
 pub mod transaction;
 pub mod type_scripts;
 

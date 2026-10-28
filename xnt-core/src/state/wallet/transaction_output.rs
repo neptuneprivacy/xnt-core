@@ -330,7 +330,9 @@ impl TxOutput {
     /// Get receiving address if available
     pub fn receiving_address(&self) -> Option<&ReceivingAddress> {
         match &self.notification_method {
-            UtxoNotificationMethod::OnChain(addr) | UtxoNotificationMethod::OffChain(addr) => Some(addr),
+            UtxoNotificationMethod::OnChain(addr) | UtxoNotificationMethod::OffChain(addr) => {
+                Some(addr)
+            }
             UtxoNotificationMethod::None => None,
         }
     }
@@ -412,7 +414,7 @@ impl TxOutput {
     ///
     /// Does nothing if there already is a time lock coin whose release date is
     /// later than the argument.
-    pub(crate) fn with_time_lock(self, release_date: Timestamp) -> Self {
+    pub fn with_time_lock(self, release_date: Timestamp) -> Self {
         Self {
             utxo: self.utxo.with_time_lock(release_date),
             sender_randomness: self.sender_randomness,
@@ -439,7 +441,13 @@ impl TxOutput {
         );
         let utxo = self.utxo();
         let sender_randomness = self.sender_randomness();
-        ExpectedUtxo::new(utxo, sender_randomness, receiver_preimage, notifier, BFieldElement::ZERO)
+        ExpectedUtxo::new(
+            utxo,
+            sender_randomness,
+            receiver_preimage,
+            notifier,
+            BFieldElement::ZERO,
+        )
     }
 
     pub(crate) fn utxo_triple(&self) -> UtxoTriple {

@@ -16,6 +16,7 @@ use crate::application::json_rpc::core::model::wallet::mutator_set::*;
 use crate::application::json_rpc::core::model::wallet::transaction::RpcTransaction;
 use crate::application::json_rpc::core::model::wallet::transaction::RpcTransactionProof;
 use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
+use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
 
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
@@ -300,7 +301,7 @@ pub struct BlockInfoRequest {
     pub selector: RpcBlockSelector,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockInfoInput {
     pub n: usize,
@@ -337,7 +338,7 @@ pub struct BlockInfo {
     pub timestamp: Timestamp,
     pub difficulty: Difficulty,
     pub size: usize,
-    pub fee: String,
+    pub fee_nau: RpcNativeCurrencyAmount,
     pub inputs: Vec<BlockInfoInput>,
     pub outputs: Vec<BlockInfoOutput>,
 }
@@ -377,6 +378,64 @@ pub struct GetArchivalMutatorSetRequest {}
 #[serde(rename_all = "camelCase")]
 pub struct GetArchivalMutatorSetResponse {
     pub archival_mutator_set: RpcMutatorSetAccumulator,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgeStateCommitmentRequest {}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgeStateCommitmentResponse {
+    pub state_commitment: Option<Digest>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgeAuthoritySetRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgeAuthoritySetResponse {
+    /// SEC1-compressed authority pubkeys (hex); empty when unset (fail closed).
+    pub keys: Vec<String>,
+    pub threshold: Option<usize>,
+    pub generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgeRegistrationRequest {}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgeRegistrationResponse {
+    /// `None` until registered; settlements are refused until then.
+    pub registration: Option<BridgeRegistration>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgePoolRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBridgePoolResponse {
+    pub entries: Vec<RpcPoolEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPoolEntry {
+    /// The pool UTXO's canonical commitment.
+    pub commitment: Digest,
+    /// The node's key for the entry, and what a pool consolidation authorization lists.
+    pub input_digest: Digest,
+    pub lock_script_hash: Digest,
+    pub amount_nau: RpcNativeCurrencyAmount,
+    pub sender_randomness: Digest,
+    pub receiver_preimage: Digest,
+    pub aocl_leaf_index: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,16 +609,16 @@ pub struct CountSentTransactionsAtBlockResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GetBalanceRequest {}
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetBalanceResponse {
     /// Confirmed, available balance. Excludes funds at legacy-format dCTIDH
     /// locks.
-    pub balance: String,
+    pub balance_nau: RpcNativeCurrencyAmount,
     /// Confirmed funds at legacy-format dCTIDH locks, if any. These should be
     /// moved to a current-format address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_balance: Option<String>,
+    pub legacy_balance_nau: Option<RpcNativeCurrencyAmount>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -592,7 +651,7 @@ pub struct History {
 
 pub type HistoryResponse = Vec<History>;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SentTxInput {
     pub leaf_index: u64,
@@ -600,7 +659,7 @@ pub struct SentTxInput {
     pub utxo: ApiUtxo,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SentTxOutput {
     pub utxo: ApiUtxo,
@@ -614,7 +673,7 @@ pub struct SentTxOutput {
 pub struct SentTxToRespResponse {
     pub tx_inputs: Vec<SentTxInput>,
     pub tx_outputs: Vec<SentTxOutput>,
-    pub fee: String,
+    pub fee_nau: RpcNativeCurrencyAmount,
     pub timestamp: Timestamp,
     pub tip_when_sent: Digest,
 }
@@ -639,10 +698,10 @@ pub struct ValidateAmountRequest {
     pub amount_string: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidateAmountResponse {
-    pub amount: Option<String>,
+    pub amount_nau: Option<RpcNativeCurrencyAmount>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -674,12 +733,12 @@ pub struct UnspentUtxosRequest {
     pub exclude_recent_blocks: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnspentUtxo {
     pub leaf_index: u64,
     pub lock_script_hash: Digest,
-    pub amount: String,
+    pub amount_nau: RpcNativeCurrencyAmount,
     /// Whether the UTXO is held at a legacy-format dCTIDH lock. Such funds are
     /// not part of the available balance.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -688,11 +747,11 @@ pub struct UnspentUtxo {
 
 pub type UnspentUtxosResponse = Vec<UnspentUtxo>;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiUtxo {
     pub lock_script_hash: Digest,
-    pub amount: String,
+    pub amount_nau: RpcNativeCurrencyAmount,
     pub can_spend: bool,
     pub release_date: Option<Timestamp>,
     pub valid: bool,
@@ -702,7 +761,7 @@ impl ApiUtxo {
     pub fn new(utxo: &crate::protocol::consensus::transaction::utxo::Utxo) -> Self {
         Self {
             lock_script_hash: utxo.lock_script_hash(),
-            amount: utxo.get_native_currency_amount().to_string(),
+            amount_nau: utxo.get_native_currency_amount().into(),
             can_spend: utxo.can_spend_at(Timestamp::now()),
             release_date: utxo.release_date(),
             valid: utxo.all_type_script_states_are_valid(),
@@ -723,14 +782,14 @@ pub struct SendTxRequest {
     pub max_inputs: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendTxUtxo {
     pub lock_script_hash: Digest,
-    pub amount: String,
+    pub amount_nau: RpcNativeCurrencyAmount,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendTxInput {
     pub leaf_index: u64,
@@ -738,7 +797,7 @@ pub struct SendTxInput {
     pub utxo: SendTxUtxo,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendTxOutput {
     pub utxo: SendTxUtxo,
@@ -780,11 +839,23 @@ pub struct GetUtxosByReceiverRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RpcIndexedUtxo {
-    pub block_height: BlockHeight,
-    pub block_digest: Digest,
-    pub ciphertext: Vec<BFieldElement>,
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum RpcIndexedUtxo {
+    #[serde(rename_all = "camelCase")]
+    Encrypted {
+        block_height: BlockHeight,
+        block_digest: Digest,
+        ciphertext: Vec<BFieldElement>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Public {
+        block_height: BlockHeight,
+        block_digest: Digest,
+        receiver_digest: Digest,
+        lock_script_hash: Digest,
+        amount_nau: RpcNativeCurrencyAmount,
+        sender_randomness: Digest,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -802,7 +873,28 @@ pub struct GetAoclLeafIndicesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAoclLeafIndicesResponse {
+    /// The latest leaf index of each commitment.
     pub indices: Vec<Option<u64>>,
+    /// Every leaf of each commitment: identical outputs share one commitment.
+    pub leaves: Vec<Vec<RpcAoclLeaf>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAoclLeaf {
+    pub aocl_leaf_index: u64,
+    pub block_height: BlockHeight,
+    pub block_digest: Digest,
+}
+
+impl From<crate::state::utxo_indexer::AoclLeaf> for RpcAoclLeaf {
+    fn from(leaf: crate::state::utxo_indexer::AoclLeaf) -> Self {
+        Self {
+            aocl_leaf_index: leaf.aocl_leaf_index,
+            block_height: leaf.block_height,
+            block_digest: leaf.block_digest,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -831,10 +923,32 @@ pub struct NetworkOverviewResponse {
 
 impl From<crate::state::utxo_indexer::IndexedUtxo> for RpcIndexedUtxo {
     fn from(utxo: crate::state::utxo_indexer::IndexedUtxo) -> Self {
-        RpcIndexedUtxo {
-            block_height: utxo.block_height,
-            block_digest: utxo.block_digest,
-            ciphertext: utxo.ciphertext,
+        use crate::state::utxo_indexer::IndexedUtxo;
+        match utxo {
+            IndexedUtxo::EncryptedUtxo {
+                block_height,
+                block_digest,
+                ciphertext,
+            } => RpcIndexedUtxo::Encrypted {
+                block_height,
+                block_digest,
+                ciphertext,
+            },
+            IndexedUtxo::PublicUtxo {
+                block_height,
+                block_digest,
+                receiver_digest,
+                lock_script_hash,
+                amount,
+                sender_randomness,
+            } => RpcIndexedUtxo::Public {
+                block_height,
+                block_digest,
+                receiver_digest,
+                lock_script_hash,
+                amount_nau: amount.into(),
+                sender_randomness,
+            },
         }
     }
 }

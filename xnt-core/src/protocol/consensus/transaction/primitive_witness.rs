@@ -691,7 +691,7 @@ pub mod neptune_arbitrary {
             //  - timestamp
             (
                 NativeCurrencyAmount::arbitrary_non_negative(),
-                vec(arb::<Digest>(), num_inputs),
+                arb::<Digest>(),
                 vec(arb::<u64>(), num_inputs),
                 vec(arb::<Digest>(), num_outputs),
                 vec(arb::<u64>(), num_outputs),
@@ -702,7 +702,7 @@ pub mod neptune_arbitrary {
                 .prop_flat_map(
                     move |(
                         mut total_amount,
-                        input_address_seeds,
+                        input_address_seed,
                         input_dist,
                         output_address_seeds,
                         output_dist,
@@ -740,6 +740,8 @@ pub mod neptune_arbitrary {
                                     total_amount = NativeCurrencyAmount::zero();
                                 }
 
+                                // All inputs share the same lock script
+                                let input_address_seeds = vec![input_address_seed; num_inputs];
                                 let (input_utxos, input_lock_scripts_and_witnesses) =
                                     Self::transaction_inputs_from_address_seeds_and_amounts(
                                         &input_address_seeds,
@@ -832,7 +834,7 @@ pub mod neptune_arbitrary {
         }
 
         #[expect(clippy::too_many_arguments)]
-        pub(crate) fn arbitrary_primitive_witness_with_timestamp_and(
+        pub fn arbitrary_primitive_witness_with_timestamp_and(
             input_utxos: &[Utxo],
             input_lock_scripts_and_witnesses: &[LockScriptAndWitness],
             output_utxos: &[Utxo],
@@ -921,7 +923,7 @@ pub mod neptune_arbitrary {
         }
 
         #[expect(clippy::too_many_arguments)]
-        pub(crate) fn from_msa_and_records(
+        pub fn from_msa_and_records(
             msa_and_records: MsaAndRecords,
             input_utxos: Vec<Utxo>,
             input_lock_scripts_and_witnesses: Vec<LockScriptAndWitness>,
@@ -1012,7 +1014,7 @@ pub mod neptune_arbitrary {
         }
 
         // this is only used by arbitrary-impls
-        pub(crate) fn transaction_inputs_from_address_seeds_and_amounts(
+        pub fn transaction_inputs_from_address_seeds_and_amounts(
             address_seeds: &[Digest],
             input_amounts: &[NativeCurrencyAmount],
         ) -> (Vec<Utxo>, Vec<LockScriptAndWitness>) {

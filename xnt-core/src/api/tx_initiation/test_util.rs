@@ -86,13 +86,14 @@ impl TransactionInitiatorInternal {
         let kernel = witness.kernel.clone();
 
         // generate proof
-
+        let mut proof_job_options = tx_creation_config.proof_job_options();
+        proof_job_options.job_settings.network = self.global_state_lock.cli().network;
         let proof = TransactionProofBuilder::new()
             .consensus_rule_set(consensus_rule_set)
             .transaction_details(&tx_details)
             .primitive_witness(witness)
             .job_queue(tx_creation_config.job_queue())
-            .proof_job_options(tx_creation_config.proof_job_options())
+            .proof_job_options(proof_job_options)
             .build()
             .await?;
 

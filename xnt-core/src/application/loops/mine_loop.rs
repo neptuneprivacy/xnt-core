@@ -58,6 +58,8 @@ use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 #[cfg(test)]
 use crate::protocol::shared::SIZE_20MB_IN_BYTES;
+use crate::state::bridge_gate::BlockBridgeSelection;
+use crate::state::bridge_gate::BridgeGate;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::upgrade_priority::UpgradePriority;
 use crate::state::mempool::Mempool;
@@ -88,7 +90,7 @@ pub(crate) async fn compose_block_helper(
 ) -> Result<(Block, Vec<ExpectedUtxo>)> {
     let (transaction, composer_utxos) = create_block_transaction(
         &latest_block,
-        global_state_lock,
+        global_state_lock.clone(),
         coinbase_timestamp,
         job_options.clone(),
     )
@@ -505,11 +507,12 @@ pub(crate) async fn create_block_transaction(
 /// A failure to fix is not a failure to compose: it is recorded as an upgrade
 /// failure, so the link transaction is passed over until the next block, and
 /// the composer falls back to a nop.
-async fn fix_resolved_link_tx_from_mempool(
+pub(crate) async fn fix_resolved_link_tx_from_mempool(
     global_state_lock: &mut GlobalStateLock,
     predecessor_block: &Block,
     predecessor_rule_set: ConsensusRuleSet,
     consensus_rule_set: ConsensusRuleSet,
+    bridge_selection: Option<&mut BlockBridgeSelection>,
     vm_job_queue: Arc<TritonVmJobQueue>,
     proof_job_options: TritonVmProofJobOptions,
 ) -> Result<Option<Transaction>> {
@@ -535,6 +538,7 @@ async fn fix_resolved_link_tx_from_mempool(
     let max_kernel_len = consensus_rule_set.max_recommended_block_tx_kernel_size();
     if kernel.mutator_set_hash != predecessor_mutator_set_hash
         || !Mempool::fits_block_composition(kernel, consensus_rule_set, max_kernel_len)
+        || bridge_selection.is_some_and(|selection| !selection.admit(kernel))
     {
         return Ok(None);
     }
@@ -614,6 +618,31 @@ pub(crate) async fn create_block_transaction_from(
     )
     .await?;
 
+    // A block failing the bridge gates is only rejected after it was proven.
+    let mut bridge_selection = if consensus_rule_set.bav_active() {
+        let state = global_state_lock.lock_guard().await;
+        let gate = BridgeGate::as_of(state.chain.archival_state(), predecessor_block.hash()).await;
+        let pool = state
+            .chain
+            .archival_state()
+            .bridge_pool_as_of(predecessor_block.hash())
+            .await;
+        let mut selection = BlockBridgeSelection::new(gate).checking_pool(pool);
+        selection.prefer_real_settlements(
+            state
+                .mempool
+                .fee_density_iter()
+                .filter_map(|(txid, _)| state.mempool.get(txid))
+                .filter(|tx| {
+                    tx.proof.is_single_proof() && tx.kernel.mutator_set_hash == mutator_set_hash
+                })
+                .map(|tx| &tx.kernel),
+        );
+        Some(selection)
+    } else {
+        None
+    };
+
     // Get most valuable transactions from mempool.
     let max_num_mergers = global_state_lock.cli().max_num_compose_mergers.get();
     let mut transactions_to_merge = match &tx_merge_origin {
@@ -621,10 +650,15 @@ pub(crate) async fn create_block_transaction_from(
             .lock_guard()
             .await
             .mempool
-            .get_transactions_for_block_composition(
+            .get_transactions_for_block_composition_filtered(
                 consensus_rule_set,
                 block_capacity_for_transactions,
                 Some(max_num_mergers),
+                |tx| {
+                    bridge_selection
+                        .as_mut()
+                        .is_none_or(|s| s.admit(&tx.kernel))
+                },
             ),
         #[cfg(test)]
         TxMergeOrigin::ExplicitList(transactions) => transactions.to_owned(),
@@ -645,7 +679,13 @@ pub(crate) async fn create_block_transaction_from(
             .await
             .preferred_update_job_from_mempool(min_gobbling_fee, TxUpgradeFilter::match_all())
             .await;
-        let update_job = update_job.map(UpgradeJob::UpdateMutatorSetData);
+        let update_job = update_job
+            .filter(|job| {
+                bridge_selection
+                    .as_mut()
+                    .is_none_or(|s| s.admit(job.kernel()))
+            })
+            .map(UpgradeJob::UpdateMutatorSetData);
         if let Some(update_job) = update_job {
             let wallet_entropy = global_state_lock
                 .lock_guard_mut()
@@ -676,6 +716,10 @@ pub(crate) async fn create_block_transaction_from(
     // no thruputs in the mempool: fix + merge is much cheaper than nop
     // proof-collection + raise + merge, and it confirms a real transaction.
     if transactions_to_merge.is_empty() && tx_merge_origin == TxMergeOrigin::Mempool {
+        // An update job admitted above that failed to upgrade must not crowd out the link.
+        if let Some(selection) = bridge_selection.as_mut() {
+            selection.reset();
+        }
         let predecessor_rule_set =
             ConsensusRuleSet::infer_from(network, predecessor_block.header().height);
         if let Some(fixed) = fix_resolved_link_tx_from_mempool(
@@ -683,6 +727,7 @@ pub(crate) async fn create_block_transaction_from(
             predecessor_block,
             predecessor_rule_set,
             consensus_rule_set,
+            bridge_selection.as_mut(),
             vm_job_queue.clone(),
             proof_job_options.clone(),
         )
@@ -716,15 +761,23 @@ pub(crate) async fn create_block_transaction_from(
         };
 
         // Try to find a nop-tx in the mempool.  If found, use that instead.
+        if let Some(selection) = bridge_selection.as_mut() {
+            selection.reset();
+        }
         transactions_to_merge = match &tx_merge_origin {
             TxMergeOrigin::Mempool => global_state_lock
                 .lock_guard()
                 .await
                 .mempool
-                .get_transactions_for_block_composition(
+                .get_transactions_for_block_composition_filtered(
                     consensus_rule_set,
                     block_capacity_for_transactions,
                     Some(max_num_mergers),
+                    |tx| {
+                        bridge_selection
+                            .as_mut()
+                            .is_none_or(|s| s.admit(&tx.kernel))
+                    },
                 ),
             #[cfg(test)]
             TxMergeOrigin::ExplicitList(transactions) => transactions.to_owned(),
@@ -1385,7 +1438,7 @@ pub(crate) mod tests {
         // scenario: Alice has an outdated transaction in her mempool which she
         // must use to create a block transaction by first updating the
         // transaction and then merging it into the coinbase transaction.
-        let network = Network::Main;
+        let network = Network::RegTest;
         let mut alice = mock_genesis_global_state(
             2,
             WalletEntropy::devnet_wallet(),
@@ -1393,9 +1446,10 @@ pub(crate) mod tests {
         )
         .await;
 
-        // Insert transaction into mempool
+        // Insert transaction into mempool. Dated now: the mempool prunes transactions older than
+        // `MEMPOOL_TX_THRESHOLD_AGE_IN_SECS` by the wall clock, and now is past the premine timelock.
         let genesis_block = Block::genesis(network);
-        let now = genesis_block.kernel.header.timestamp + Timestamp::months(7);
+        let now = Timestamp::now();
         let amt_to_alice = NativeCurrencyAmount::coins(4);
         let tx_from_alice = make_transaction(amt_to_alice, &alice, now).await;
         alice
@@ -1500,6 +1554,7 @@ pub(crate) mod tests {
             &genesis_block,
             ConsensusRuleSet::UpgradeVMv7,
             rules,
+            None,
             vm_job_queue(),
             proof_job_options.clone(),
         )
@@ -1512,6 +1567,7 @@ pub(crate) mod tests {
             &genesis_block,
             rules,
             rules,
+            None,
             vm_job_queue(),
             proof_job_options,
         )
@@ -1590,6 +1646,7 @@ pub(crate) mod tests {
             &other_block,
             rules,
             rules,
+            None,
             vm_job_queue(),
             TritonVmProofJobOptions::default_with_network(network),
         )
@@ -1632,6 +1689,7 @@ pub(crate) mod tests {
             &genesis_block,
             rules,
             rules,
+            None,
             vm_job_queue(),
             TritonVmProofJobOptions::default_with_network(network),
         )
@@ -1673,7 +1731,7 @@ pub(crate) mod tests {
         let genesis_block = Block::genesis(network);
         let consensus_rule_set =
             ConsensusRuleSet::infer_from(network, genesis_block.header().height.next());
-        assert_eq!(ConsensusRuleSet::UpgradeVMv8, consensus_rule_set);
+        assert_eq!(ConsensusRuleSet::LeviathanSettlement, consensus_rule_set);
         assert!(consensus_rule_set.has_chain_branches());
 
         let cli = cli_args::Args {
@@ -2018,7 +2076,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn block_proposal_for_height_one_is_valid_for_various_guesser_fee_fractions() {
         // Verify that a block template made with transaction from the mempool is a valid block
-        let network = Network::Main;
+        let network = Network::Testnet(0);
         let consensus_rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
         let mut alice = mock_genesis_global_state(
             2,
@@ -2042,7 +2100,7 @@ pub(crate) mod tests {
         let amt_to_alice = NativeCurrencyAmount::coins(4);
         let tx_from_alice = make_transaction(amt_to_alice, &alice, now).await;
 
-        let mut cli = cli_args::Args::default();
+        let mut cli = cli_args::Args::default_with_network(network);
         for guesser_fee_fraction in [0f64, 0.5, 1.0] {
             // Verify constructed coinbase transaction and block template when mempool is empty
             assert!(
@@ -2084,7 +2142,8 @@ pub(crate) mod tests {
                 "Transaction proof for coinbase transaction must be valid."
             );
 
-            let num_coinbase_outputs = if guesser_fee_fraction == 1.0 { 0 } else { 2 };
+            // No timelocked half: `MINING_REWARD_TIME_LOCK_PERIOD == 0`.
+            let num_coinbase_outputs = if guesser_fee_fraction == 1.0 { 0 } else { 1 };
             assert_eq!(
                 num_coinbase_outputs,
                 transaction_empty_mempool.kernel.outputs.len(),
@@ -2099,7 +2158,7 @@ pub(crate) mod tests {
                 transaction_empty_mempool,
                 now,
                 TritonVmJobQueue::get_instance(),
-                TritonVmJobPriority::High.into(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();
@@ -2124,7 +2183,7 @@ pub(crate) mod tests {
                     &genesis_block,
                     alice.clone(),
                     now,
-                    (TritonVmJobPriority::Normal, None).into(),
+                    TritonVmProofJobOptions::default_with_network(network),
                 )
                 .await
                 .unwrap()
@@ -2149,7 +2208,7 @@ pub(crate) mod tests {
                 transaction_non_empty_mempool,
                 now,
                 TritonVmJobQueue::get_instance(),
-                TritonVmJobPriority::default().into(),
+                TritonVmProofJobOptions::default_with_network(network),
             )
             .await
             .unwrap();
@@ -2168,7 +2227,7 @@ pub(crate) mod tests {
     #[apply(shared_tokio_runtime)]
     async fn block_proposal_for_height_two_is_valid() {
         // Verify that block proposals of both height 1 and 2 are valid.
-        let network = Network::Main;
+        let network = Network::Testnet(0);
 
         // force SingleProof capability.
         let cli = cli_args::Args {
@@ -2217,7 +2276,7 @@ pub(crate) mod tests {
 
     #[apply(shared_tokio_runtime)]
     async fn block_proposal_with_custom_coinbase_distribution_is_valid() {
-        let network = Network::Main;
+        let network = Network::Testnet(0);
         let cli = cli_args::Args {
             network,
             tx_proving_capability: Some(TxProvingCapability::SingleProof),

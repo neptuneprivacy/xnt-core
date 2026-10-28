@@ -1,7 +1,11 @@
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use tasm_lib::data_type::DataType;
 use tasm_lib::field;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::*;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::traits::basic_snippet::BasicSnippet;
 use tasm_lib::triton_vm::prelude::*;
 
@@ -15,9 +19,14 @@ use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 /// Assumes the transaction kernel MAST hash is on the stack somewhere, but not
 /// necessarily immediately preceding the proof collection pointer.
 #[derive(Debug, Copy, Clone)]
-pub struct GenerateRriClaim;
+pub struct GenerateRriClaimFor<P>(pub(crate) PhantomData<P>);
 
-impl BasicSnippet for GenerateRriClaim {
+/// [`GenerateRriClaimFor`] of upstream's [`ProofCollection`].
+pub type GenerateRriClaim = GenerateRriClaimFor<ProofCollection>;
+#[allow(non_upper_case_globals)]
+pub const GenerateRriClaim: GenerateRriClaim = GenerateRriClaimFor(PhantomData);
+
+impl<P: TasmStruct + Clone + Debug + 'static> BasicSnippet for GenerateRriClaimFor<P> {
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "transaction_kernel_digest".to_owned()),
@@ -56,7 +65,7 @@ impl BasicSnippet for GenerateRriClaim {
         };
         let push_rri_program_hash = push_digest(RemovalRecordsIntegrity.program().hash());
 
-        let proof_collection_field_salted_inputs_hash = field!(ProofCollection::salted_inputs_hash);
+        let proof_collection_field_salted_inputs_hash = field!(P::salted_inputs_hash);
 
         let load_digest = triton_asm!(
             // _ *digest

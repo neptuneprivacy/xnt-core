@@ -172,6 +172,18 @@ pub enum RpcMethods {
     #[namespace(Namespace::Archival)]
     GetArchivalMutatorSet,
 
+    #[namespace(Namespace::Archival)]
+    GetBridgePool,
+
+    #[namespace(Namespace::Archival)]
+    GetBridgeStateCommitment,
+
+    #[namespace(Namespace::Archival)]
+    GetBridgeAuthoritySet,
+
+    #[namespace(Namespace::Archival)]
+    GetBridgeRegistration,
+
     #[namespace(Namespace::Networking)]
     NetworkOverview,
 }

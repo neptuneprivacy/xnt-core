@@ -280,18 +280,9 @@ pub struct Args {
     #[clap(long, default_value = "10", value_name = "BLOCKS")]
     pub(crate) fork_tx_cutoff_margin: u64,
 
-    /// On a test network, the height of the first block that follows the
-    /// `UpgradeVMv8` consensus rule set. The blocks below it follow
-    /// `UpgradeVMv7`, as main net does until its hard fork at block 97000, so
-    /// that the switch between the two eras can be exercised on a test
-    /// network, also together with nodes of the previous release, which follow
-    /// `UpgradeVMv7` there from genesis on. This node does not compose blocks
-    /// below it. The genesis block is the same with and without it.
-    ///
-    /// Only for testnet, testnet-mock and regtest, and above 0; refused on
-    /// main net, whose fork height is fixed. All nodes of a test network must
-    /// use the same value. Without it, test networks follow `UpgradeVMv8` from
-    /// genesis on.
+    /// Upstream's activation height of `UpgradeVMv8` on a test network. Refused
+    /// on every network by this build: main net's height is fixed, and test
+    /// networks follow `LeviathanSettlement` from genesis on.
     #[clap(long, value_name = "HEIGHT")]
     pub(crate) v8_activation_height: Option<u64>,
 
@@ -1755,7 +1746,7 @@ mod tests {
     /// `--v8-activation-height` is refused on main net and as 0, before
     /// anything is set; without it, nothing is set.
     #[test]
-    fn v8_activation_height_is_refused_on_main_net_and_at_genesis() {
+    fn v8_activation_height_is_refused_on_main_net_and_on_test_networks() {
         assert_eq!(None, Args::default().v8_activation_height);
         assert!(Args::default().apply_v8_activation_height().is_ok());
 
@@ -1784,6 +1775,6 @@ mod tests {
         assert!(at_genesis
             .apply_v8_activation_height()
             .unwrap_err()
-            .contains("genesis"));
+            .contains("LeviathanSettlement"));
     }
 }

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::protocol::proof_abstractions::mast_hash::HasDiscriminant;
@@ -24,6 +26,7 @@ use tasm_lib::mmr::verify_from_secret_in_leaf_index_on_stack::MmrVerifyFromSecre
 use tasm_lib::neptune::mutator_set;
 use tasm_lib::prelude::BasicSnippet;
 use tasm_lib::structure::tasm_object::TasmObject;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::structure::verify_nd_si_integrity::VerifyNdSiIntegrity;
 use tasm_lib::triton_vm::prelude::*;
 use tasm_lib::twenty_first::math::bfield_codec::BFieldCodec;
@@ -33,6 +36,9 @@ use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembership
 use tasm_lib::verifier::stark_verify::StarkVerify;
 
 use super::authenticate_link_kernel_field::AuthenticateLinkKernelField;
+use crate::protocol::consensus::bridge::has_proof_bound_tag;
+use crate::protocol::consensus::bridge::PROOF_BOUND_TAGS;
+use crate::protocol::consensus::transaction::announcement::Announcement;
 use super::link_kernel::LinkKernel;
 use super::link_kernel::LinkKernelField;
 use super::link_primitive_witness::LinkPrimitiveWitness;
@@ -42,6 +48,7 @@ use super::link_proof::link_proof_public_output;
 use super::link_proof::merge_bit_false_leaf;
 use super::link_proof::no_coinbase_leaf;
 use super::link_proof::LinkProof;
+use super::link_proof_witness::LeviathanLinkProofWitnessMemory;
 use super::link_proof_witness::LinkProofWitnessMemory;
 use super::link_proof_witness::DISCRIMINANT_FOR_FORGE;
 use super::link_tx::LinkTx;
@@ -76,12 +83,13 @@ const TOO_MANY_COINS_ERROR: i128 = 1_000_526;
 const WRONG_NUMBER_OF_TYPE_SCRIPT_PROOFS_ERROR: i128 = 1_000_527;
 const WRONG_NUMBER_OF_LOCK_SCRIPT_PROOFS_ERROR: i128 = 1_000_528;
 const FORGE_FEE_IS_NEGATIVE_OR_INVALID_AMOUNT_ERROR: i128 = 1_000_529;
+const PROOF_BOUND_ANNOUNCEMENT_ERROR: i128 = 1_000_532;
 
 /// Number of coins per UTXO must be strictly less than this. Copied, with the
 /// guard, from [`CollectTypeScriptsV2`](crate::protocol::consensus::transaction::validity::collect_type_scripts_v2).
 const MAX_NUM_COINS_PER_UTXO: usize = 100_000;
 
-/// The witness consumed by [`Forge`]: the `Forge`-facing projection of a
+/// The witness consumed by `Forge`: the `Forge`-facing projection of a
 /// [`LinkPrimitiveWitness`].
 ///
 /// Carries the input/output-integrity data plus the recursive script proofs:
@@ -144,6 +152,11 @@ pub struct ForgeWitness {
     /// `Forge` recollects the list and recursively verifies each.
     type_scripts_halt: Vec<Proof>,
 
+    /// The kernel's announcements. The `LeviathanSettlement` `Forge` authenticates them and
+    /// refuses any with one of the [`PROOF_BOUND_TAGS`]: their validity needs a ProofCollection
+    /// sub-proof (BDAV or BAAV), which `Forge` has not got.
+    announcements: Vec<Announcement>,
+
     /// The [`LinkKernel`]'s MAST leafs, in [`LinkKernelField`] order.
     ///
     /// The root `Forge` is claimed against and all five authentication paths
@@ -156,6 +169,11 @@ pub struct ForgeWitness {
 }
 
 impl ForgeWitness {
+    /// Whether this witness's `Forge` refuses the announcements that need a bridge sub-proof.
+    fn bans_proof_bound_announcements(&self) -> bool {
+        LinkProof::pairs_with_leviathan(self.single_proof_digest)
+    }
+
     /// The [`LinkKernel`]'s MAST hash: the public input of the `LinkProof`
     /// claim this witness is proven against.
     pub(super) fn kernel_mast_hash(&self) -> Digest {
@@ -246,6 +264,68 @@ impl From<&ForgeWitness> for ForgeWitnessMemory {
     }
 }
 
+/// A memory image of the `Forge` branch.
+pub(super) trait ForgeMemory:
+    TasmObject + TasmStruct + BFieldCodec + Clone + Debug + for<'a> From<&'a ForgeWitness> + 'static
+{
+    /// Whether `Forge` refuses the announcements that need a bridge sub-proof.
+    const BANS_PROOF_BOUND_ANNOUNCEMENTS: bool;
+}
+
+impl ForgeMemory for ForgeWitnessMemory {
+    const BANS_PROOF_BOUND_ANNOUNCEMENTS: bool = false;
+}
+
+pub(super) use leviathan_memory::ForgeWitnessMemory as LeviathanForgeWitnessMemory;
+
+mod leviathan_memory {
+    use super::*;
+
+    /// The image of `LeviathanSettlement`: [`ForgeWitnessMemory`](super::ForgeWitnessMemory) and
+    /// the kernel's announcements.
+    // Named `ForgeWitnessMemory`: TASM labels carry the type name, and their order fixes the
+    // program digest.
+    #[derive(Clone, Debug, BFieldCodec, TasmObject)]
+    pub(in crate::protocol::consensus::chaintx) struct ForgeWitnessMemory {
+        input_utxos: SaltedUtxos,
+        confirmed_inputs: Vec<RemovalRecord>,
+        thruputs: Vec<AdditionRecord>,
+        output_utxos: SaltedUtxos,
+        outputs: Vec<AdditionRecord>,
+        aocl: MmrAccumulator,
+        swbfi_bagged: Digest,
+        swbfa_hash: Digest,
+        fee: NativeCurrencyAmount,
+        lock_scripts_halt: Vec<Proof>,
+        type_scripts_halt: Vec<Proof>,
+        announcements: Vec<Announcement>,
+    }
+
+    impl From<&ForgeWitness> for ForgeWitnessMemory {
+        fn from(witness: &ForgeWitness) -> Self {
+            let upstream = super::ForgeWitnessMemory::from(witness);
+            Self {
+                input_utxos: upstream.input_utxos,
+                confirmed_inputs: upstream.confirmed_inputs,
+                thruputs: upstream.thruputs,
+                output_utxos: upstream.output_utxos,
+                outputs: upstream.outputs,
+                aocl: upstream.aocl,
+                swbfi_bagged: upstream.swbfi_bagged,
+                swbfa_hash: upstream.swbfa_hash,
+                fee: upstream.fee,
+                lock_scripts_halt: upstream.lock_scripts_halt,
+                type_scripts_halt: upstream.type_scripts_halt,
+                announcements: witness.announcements.clone(),
+            }
+        }
+    }
+
+    impl ForgeMemory for ForgeWitnessMemory {
+        const BANS_PROOF_BOUND_ANNOUNCEMENTS: bool = true;
+    }
+}
+
 /// Forge a [`LinkPrimitiveWitness`] into a proof-backed [`LinkTx`].
 ///
 /// The chain-pipeline analog of raising a primitive witness to a
@@ -271,14 +351,14 @@ pub async fn forge(
         )
         .await?;
         let claim = link_proof_claim(kernel.mast_hash(), single_proof_digest, consensus_rule_set);
-        LinkProof
-            .prove(
-                claim,
-                witness.nondeterminism(),
-                job_queue,
-                proof_job_options,
-            )
-            .await?
+        LinkProof::prove_paired_with(
+            single_proof_digest,
+            claim,
+            witness.nondeterminism(),
+            job_queue,
+            proof_job_options,
+        )
+        .await?
     };
 
     Ok(LinkTx {
@@ -408,6 +488,8 @@ impl ForgeWitness {
             lock_scripts_halt,
             type_scripts_halt,
 
+            announcements: kernel.kernel.announcements.clone(),
+
             mast_leafs: kernel
                 .mast_sequences()
                 .iter()
@@ -468,6 +550,9 @@ impl ForgeWitness {
             || leaf(LinkKernelField::MergeBit) != merge_bit_false_leaf()
             || leaf(LinkKernelField::Fee) != Tip5::hash(&self.fee)
             || self.fee.is_negative()
+            || (self.bans_proof_bound_announcements()
+                && (leaf(LinkKernelField::Announcements) != Tip5::hash(&self.announcements)
+                    || self.announcements.iter().any(has_proof_bound_tag)))
         {
             return false;
         }
@@ -525,7 +610,7 @@ impl ForgeWitness {
         true
     }
 
-    /// Reference predicate for [`Forge`] -- the proof-carrying analog of
+    /// Reference predicate for `Forge` -- the proof-carrying analog of
     /// [`LinkPrimitiveWitness::validate`] and sibling of
     /// [`ProofCollection::verify`](crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection).
     /// Unlike `ProofCollection`, `Forge` *inlines* removal-records- and
@@ -599,19 +684,27 @@ impl SecretWitness for ForgeWitness {
     }
 
     fn program(&self) -> Program {
-        LinkProof.program()
+        LinkProof::program_paired_with(self.single_proof_digest)
     }
 
     fn nondeterminism(&self) -> NonDeterminism {
         // `Forge` is a branch of `LinkProof`, so the memory image is the
         // *enum's*: discriminant, field size, then the payload.
-        let memory_part = LinkProofWitnessMemory::Forge(Box::new(self.into()));
         let mut memory = HashMap::default();
-        encode_to_memory(
-            &mut memory,
-            FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
-            &memory_part,
-        );
+        if self.bans_proof_bound_announcements() {
+            encode_to_memory(
+                &mut memory,
+                FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
+                &LeviathanLinkProofWitnessMemory::Forge(Box::new(self.into())),
+            );
+        } else {
+            let memory_part = LinkProofWitnessMemory::Forge(Box::new(self.into()));
+            encode_to_memory(
+                &mut memory,
+                FIRST_NON_DETERMINISTICALLY_INITIALIZED_MEMORY_ADDRESS,
+                &memory_part,
+            );
+        }
 
         // Each digest and the u64 leaf index are laid down reversed: that is
         // the orientation the tasm expects to find them in on the stack after
@@ -658,6 +751,11 @@ impl SecretWitness for ForgeWitness {
             mast_path(LinkKernelField::Coinbase),
             mast_path(LinkKernelField::MergeBit),
             mast_path(LinkKernelField::Fee),
+            if self.bans_proof_bound_announcements() {
+                mast_path(LinkKernelField::Announcements)
+            } else {
+                vec![]
+            },
             self.aocl_auth_paths
                 .iter()
                 .flat_map(|mp| mp.authentication_path.clone())
@@ -741,9 +839,19 @@ impl SecretWitness for ForgeWitness {
 ///
 /// [`RemovalRecordsIntegrity`]: crate::protocol::consensus::transaction::validity::removal_records_integrity::RemovalRecordsIntegrity
 #[derive(Debug, Copy, Clone)]
-pub struct Forge;
+pub(super) struct ForgeFor<M>(PhantomData<M>);
 
-impl BasicSnippet for Forge {
+pub(super) type Forge = ForgeFor<ForgeWitnessMemory>;
+#[allow(non_upper_case_globals)]
+pub(super) const Forge: Forge = ForgeFor(PhantomData);
+
+/// The `Forge` of `LeviathanSettlement`, which refuses the announcements that need a bridge
+/// sub-proof.
+pub(super) type LeviathanForge = ForgeFor<LeviathanForgeWitnessMemory>;
+#[allow(non_upper_case_globals)]
+pub(super) const LeviathanForge: LeviathanForge = ForgeFor(PhantomData);
+
+impl<M: ForgeMemory> BasicSnippet for ForgeFor<M> {
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![
             (DataType::Digest, "link_kernel_mast_hash".to_string()),
@@ -779,9 +887,7 @@ impl BasicSnippet for Forge {
         let hash_absolute_indices = library.import(Box::new(HashStaticSize {
             size: AbsoluteIndexSet::static_length().expect("absolute indices have a static size"),
         }));
-        let audit_preloaded_data = library.import(Box::new(VerifyNdSiIntegrity::<
-            ForgeWitnessMemory,
-        >::default()));
+        let audit_preloaded_data = library.import(Box::new(VerifyNdSiIntegrity::<M>::default()));
 
         // The confirmed-input loop's static-memory addresses must lie the same
         // way relative to each other as `RemovalRecordsIntegrity`'s (see
@@ -826,27 +932,26 @@ impl BasicSnippet for Forge {
             LinkKernelField::Outputs,
         )));
 
-        let field_aocl = field!(ForgeWitnessMemory::aocl);
-        let field_swbfi_bagged = field!(ForgeWitnessMemory::swbfi_bagged);
-        let field_swbfa_hash = field!(ForgeWitnessMemory::swbfa_hash);
+        let field_aocl = field!(M::aocl);
+        let field_swbfi_bagged = field!(M::swbfi_bagged);
+        let field_swbfa_hash = field!(M::swbfa_hash);
         let field_peaks = field!(MmrAccumulatorTip5::peaks);
         let field_mmr_num_leafs = field!(MmrAccumulatorTip5::leaf_count);
-        let field_input_utxos = field!(ForgeWitnessMemory::input_utxos);
-        let field_with_size_input_utxos = field_with_size!(ForgeWitnessMemory::input_utxos);
+        let field_input_utxos = field!(M::input_utxos);
+        let field_with_size_input_utxos = field_with_size!(M::input_utxos);
         let field_utxos = field!(SaltedUtxos::utxos);
         let field_utxos_with_size = field_with_size!(SaltedUtxos::utxos);
-        let field_confirmed_inputs = field!(ForgeWitnessMemory::confirmed_inputs);
-        let field_with_size_confirmed_inputs =
-            field_with_size!(ForgeWitnessMemory::confirmed_inputs);
-        let field_thruputs = field!(ForgeWitnessMemory::thruputs);
-        let field_with_size_thruputs = field_with_size!(ForgeWitnessMemory::thruputs);
-        let field_output_utxos = field!(ForgeWitnessMemory::output_utxos);
-        let field_with_size_output_utxos = field_with_size!(ForgeWitnessMemory::output_utxos);
-        let field_outputs = field!(ForgeWitnessMemory::outputs);
-        let field_with_size_outputs = field_with_size!(ForgeWitnessMemory::outputs);
+        let field_confirmed_inputs = field!(M::confirmed_inputs);
+        let field_with_size_confirmed_inputs = field_with_size!(M::confirmed_inputs);
+        let field_thruputs = field!(M::thruputs);
+        let field_with_size_thruputs = field_with_size!(M::thruputs);
+        let field_output_utxos = field!(M::output_utxos);
+        let field_with_size_output_utxos = field_with_size!(M::output_utxos);
+        let field_outputs = field!(M::outputs);
+        let field_with_size_outputs = field_with_size!(M::outputs);
         let field_indices = field!(RemovalRecord::absolute_indices);
-        let field_lock_scripts_halt = field!(ForgeWitnessMemory::lock_scripts_halt);
-        let field_type_scripts_halt = field!(ForgeWitnessMemory::type_scripts_halt);
+        let field_lock_scripts_halt = field!(M::lock_scripts_halt);
+        let field_type_scripts_halt = field!(M::type_scripts_halt);
         let field_lock_script_hash = field!(Utxo::lock_script_hash);
         let field_coins = field!(Utxo::coins);
         let field_type_script_hash = field!(Coin::type_script_hash);
@@ -1000,8 +1105,80 @@ impl BasicSnippet for Forge {
 
         let authenticate_fee_field =
             library.import(Box::new(AuthenticateLinkKernelField(LinkKernelField::Fee)));
+        let (assert_no_proof_bound_announcements, count_proof_bound_announcements_body) =
+            if M::BANS_PROOF_BOUND_ANNOUNCEMENTS {
+                let authenticate_announcements_field = library.import(Box::new(
+                    AuthenticateLinkKernelField(LinkKernelField::Announcements),
+                ));
+                let field_announcements = field!(M::announcements);
+                let field_with_size_announcements = field_with_size!(M::announcements);
+                let authenticate_announcements = authenticate_field(
+                    &authenticate_announcements_field,
+                    &field_with_size_announcements,
+                );
+
+                // INVARIANT: _ count *announcement[i]_si num_remaining. Counts announcements
+                // whose message is non-empty and starts with one of the `PROOF_BOUND_TAGS`.
+                let count_proof_bound_announcements =
+                    "neptune_consensus_chaintx_forge_count_proof_bound_announcements".to_string();
+                let [tag_0, tag_1, tag_2] = PROOF_BOUND_TAGS;
+                let count_proof_bound_announcements_body = triton_asm!(
+                    {count_proof_bound_announcements}:
+                        dup 0 push 0 eq skiz return
+
+                        dup 1 read_mem 1 pop 1
+                        // _ count *ann_si n encoded_len
+
+                        dup 2 addi 2 read_mem 1 pop 1
+                        push 0 eq push 0 eq
+                        // _ count *ann_si n encoded_len is_non_empty
+
+                        dup 3 addi 3 read_mem 1 pop 1
+                        dup 0 push {tag_0} eq
+                        dup 1 push {tag_1} eq add
+                        swap 1 push {tag_2} eq add
+                        mul
+                        // _ count *ann_si n encoded_len is_proof_bound
+
+                        pick 4 add place 3
+                        // _ count' *ann_si n encoded_len
+
+                        addi 1 dup 2 add swap 2 pop 1
+                        addi -1
+                        // _ count' *next_ann_si (n-1)
+
+                        recurse
+                );
+
+                // No announcement whose validity needs a BDAV or BAAV proof enters through
+                // `Forge`.
+                let assert_no_proof_bound_announcements = triton_asm!(
+                    // _ [lkmh] *witness
+                    {&authenticate_announcements}
+                    // _ [lkmh] *witness
+
+                    push 0
+                    dup 1 {&field_announcements}
+                    read_mem 1 addi 2 swap 1
+                    // _ [lkmh] *witness 0 *announcement[0]_si num_announcements
+
+                    call {count_proof_bound_announcements}
+                    pop 2
+                    // _ [lkmh] *witness count
+
+                    push 0 eq
+                    assert error_id {PROOF_BOUND_ANNOUNCEMENT_ERROR}
+                    // _ [lkmh] *witness
+                );
+                (
+                    assert_no_proof_bound_announcements,
+                    count_proof_bound_announcements_body,
+                )
+            } else {
+                (vec![], vec![])
+            };
         let lt_u128 = library.import(Box::new(tasm_lib::arithmetic::u128::lt::Lt));
-        let field_fee = field!(ForgeWitnessMemory::fee);
+        let field_fee = field!(M::fee);
         let fee_size = NativeCurrencyAmount::static_length().unwrap();
         let push_max_amount = NativeCurrencyAmount::max().push_to_stack();
 
@@ -1138,6 +1315,7 @@ impl BasicSnippet for Forge {
             {&authenticate_no_coinbase}
             {&authenticate_merge_bit_false}
             {&assert_fee_is_valid_amount}
+            {&assert_no_proof_bound_announcements}
             {&assert_cardinality}
             // _ [lkmh] *witness
 
@@ -1786,6 +1964,7 @@ impl BasicSnippet for Forge {
             {&verify_lock_scripts_loop}
             {&verify_type_scripts_loop}
             {&collect_type_script_hashes}
+            {&count_proof_bound_announcements_body}
             {&v3_remap.subroutines}
         )
     }
@@ -1804,14 +1983,17 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::application::triton_vm_job_queue::vm_job_queue;
+    use crate::protocol::consensus::chaintx::link_proof::LeviathanLinkProof;
     use crate::protocol::consensus::chaintx::tests::mock_single_proof_digest;
     use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
     use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
     use crate::protocol::consensus::transaction::utxo::Utxo;
     use crate::protocol::consensus::transaction::validity::removal_records_integrity::RemovalRecordsIntegrity;
+    use crate::protocol::consensus::transaction::validity::single_proof_v2::LeviathanSingleProofV2;
     use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
+    use tasm_lib::triton_vm::vm::VMState;
 
     impl ForgeWitness {
         /// Cheap test-only constructor: identical to
@@ -2467,6 +2649,76 @@ pub(crate) mod tests {
                 &[CARDINALITY_MISMATCH_ERROR],
             )
             .unwrap();
+    }
+
+    /// A proofless witness for the `LeviathanSettlement` `Forge`.
+    fn leviathan_without_proofs(lpw: &LinkPrimitiveWitness) -> ForgeWitness {
+        ForgeWitness::build_from_parts(lpw, LeviathanSingleProofV2.hash(), vec![], vec![])
+    }
+
+    /// Whether the `LeviathanSettlement` `LinkProof` fails on this witness with this error.
+    fn leviathan_link_proof_fails_with(witness: &ForgeWitness, error_id: i128) -> bool {
+        let mut vm_state = VMState::new(
+            LeviathanLinkProof.program(),
+            witness.standard_input(),
+            witness.nondeterminism(),
+        );
+        matches!(
+            vm_state.run(),
+            Err(InstructionError::AssertionFailed(e)) if e.id == Some(error_id)
+        )
+    }
+
+    /// The `LeviathanSettlement` `Forge` refuses a link kernel with an announcement that needs a
+    /// BDAV or BAAV proof, for each of the three tags, also behind other announcements of various
+    /// lengths. The upstream `Forge` does not look at announcements.
+    #[proptest(cases = 1)]
+    fn only_the_leviathan_forge_rejects_proof_bound_announcements(
+        #[strategy(pokeable_lpw())] lpw: LinkPrimitiveWitness,
+    ) {
+        let untagged = |len: u64| Announcement::new((1..=len).map(BFieldElement::new).collect());
+        for tag in PROOF_BOUND_TAGS {
+            let tagged = Announcement::new(vec![BFieldElement::new(tag), BFieldElement::new(7)]);
+            for announcements in [
+                vec![tagged.clone()],
+                vec![untagged(3), tagged.clone()],
+                vec![untagged(0), tagged.clone()],
+                vec![untagged(1), untagged(5), tagged.clone()],
+            ] {
+                let mut lpw = lpw.clone();
+                lpw.kernel.kernel = TransactionKernelModifier::default()
+                    .announcements(announcements)
+                    .modify(lpw.kernel.kernel.clone());
+
+                let witness = leviathan_without_proofs(&lpw);
+                prop_assert!(!witness.validate_integrity());
+                prop_assert!(leviathan_link_proof_fails_with(
+                    &witness,
+                    PROOF_BOUND_ANNOUNCEMENT_ERROR
+                ));
+
+                let upstream_witness = ForgeWitness::without_proofs(&lpw);
+                prop_assert!(upstream_witness.validate_integrity());
+            }
+        }
+    }
+
+    /// Announcements without a proof-bound tag pass the check: the run fails only later.
+    #[proptest(cases = 2)]
+    fn the_leviathan_forge_accepts_other_announcements_past_the_tag_check(
+        #[strategy(pokeable_lpw())] lpw: LinkPrimitiveWitness,
+    ) {
+        let mut lpw = lpw;
+        let untagged = Announcement::new(vec![BFieldElement::new(1), BFieldElement::new(2)]);
+        lpw.kernel.kernel = TransactionKernelModifier::default()
+            .announcements(vec![untagged])
+            .modify(lpw.kernel.kernel.clone());
+        let witness = leviathan_without_proofs(&lpw);
+        prop_assert!(witness.validate_integrity());
+        prop_assert!(
+            !leviathan_link_proof_fails_with(&witness, PROOF_BOUND_ANNOUNCEMENT_ERROR),
+            "an untagged announcement must pass the tag check"
+        );
     }
 
     /// The direct output-side inflation path: show the type scripts one set of

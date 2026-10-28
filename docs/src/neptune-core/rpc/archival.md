@@ -472,7 +472,10 @@ Gets AOCL leaf indices for multiple UTXO commitments.
 
 **Returns**
 
-`indices` - array of numbers, AOCL indices (-1 if not found)
+- `indices` - array, per commitment the latest AOCL leaf index (`null` if not found)
+- `leaves` - array, per commitment every AOCL leaf it occupies in canonical blocks, as objects
+  `{ aoclLeafIndex, blockHeight, blockDigest }`. Identical outputs (same UTXO, sender randomness
+  and receiver) share one commitment, so a commitment can have several leaves, each spendable once.
 
 ---
 

@@ -14,6 +14,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::bail;
 use anyhow::ensure;
+use anyhow::Context;
 use anyhow::Result;
 use clap::CommandFactory;
 use clap::Parser;
@@ -21,8 +22,10 @@ use clap_complete::generate;
 use clap_complete::Shell;
 use itertools::Itertools;
 use multiaddr::Multiaddr;
+use neptune_privacy::api::export::Digest;
 use neptune_privacy::api::export::TransactionKernelId;
 use neptune_privacy::api::tx_initiation::builder::tx_output_list_builder::OutputFormat;
+use neptune_privacy::api::tx_initiation::initiator::BridgeDepositAll;
 use neptune_privacy::api::tx_initiation::migrate_dctidh::MigrationDestination;
 use neptune_privacy::application::config::data_directory::DataDirectory;
 use neptune_privacy::application::config::network::Network;
@@ -33,6 +36,11 @@ use neptune_privacy::application::rpc::server::RPCClient;
 use neptune_privacy::prelude::triton_vm::prelude::BFieldElement;
 use neptune_privacy::protocol::consensus::block::block_selector::BlockSelector;
 use neptune_privacy::protocol::consensus::block::block_selector::BlockSelectorLiteral;
+use neptune_privacy::protocol::consensus::bridge::deposit_announcement::parse_leviathan_account_id;
+use neptune_privacy::protocol::consensus::bridge::deposit_announcement::parse_leviathan_address;
+use neptune_privacy::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+use neptune_privacy::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
+use neptune_privacy::protocol::consensus::bridge::faucet_registration::FaucetId;
 use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
 use neptune_privacy::protocol::proof_abstractions::timestamp::Timestamp;
 use neptune_privacy::state::wallet::address::KeyType;
@@ -181,7 +189,11 @@ enum Command {
     },
 
     /// list known coins
-    ListCoins,
+    ListCoins {
+        /// one JSON object per coin: amount_nau (nau string), confirmed and release_date (unix seconds)
+        #[clap(long)]
+        json: bool,
+    },
 
     /// retrieve count of transactions in the mempool
     MempoolTxCount,
@@ -344,6 +356,70 @@ enum Command {
         notify_self: UtxoNotificationMedium,
         notify_other: UtxoNotificationMedium,
 
+        exclude_recent_blocks: usize,
+    },
+
+    /// rotate the bridge authority set, paying the carrier tx from this node's wallet
+    BridgeRotateAuthority {
+        /// new authority pubkeys, SEC1-compressed hex, comma separated
+        #[clap(long, value_delimiter = ',', required = true)]
+        new_keys: Vec<String>,
+
+        /// signatures the new set requires
+        #[clap(long)]
+        new_threshold: usize,
+
+        /// 64-byte signatures (hex) by the current set's threshold and every new key, comma separated
+        #[clap(long, value_delimiter = ',', required = true)]
+        signatures: Vec<String>,
+
+        /// carrier transaction fee
+        #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+        fee: NativeCurrencyAmount,
+    },
+
+    /// register the bridge faucet, paying the carrier tx from this node's wallet
+    BridgeRegister {
+        /// faucet account id, 30 hex chars
+        #[clap(long)]
+        faucet_id: String,
+
+        /// the Leviathan genesis state commitment
+        #[clap(long, value_parser = HexDigest::from_str)]
+        genesis_state_commitment: HexDigest,
+
+        /// 64-byte signatures (hex) by the current set's threshold, comma separated
+        #[clap(long, value_delimiter = ',', required = true)]
+        signatures: Vec<String>,
+
+        /// carrier transaction fee
+        #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+        fee: NativeCurrencyAmount,
+    },
+
+    /// lock XNT into the bridge pool, minted as WXNT to a Leviathan account
+    BridgeDeposit {
+        /// Leviathan address of the node's network (e.g. mtst1... on testnet) or 30-hex account id
+        account_id: String,
+
+        /// amount to lock, or `max`: min(largest inputs, spendable - keep) - fee, exiting 3 when
+        /// that is below the 1 coin minimum
+        #[clap(value_parser = parse_deposit_amount)]
+        amount: DepositAmount,
+
+        /// transaction fee
+        #[clap(value_parser = NativeCurrencyAmount::coins_from_str)]
+        fee: NativeCurrencyAmount,
+
+        /// most inputs to spend; the node caps it at 8 regardless
+        #[clap(long)]
+        max_inputs: Option<usize>,
+
+        /// with `max`: coins to leave in the wallet
+        #[clap(long, value_parser = NativeCurrencyAmount::coins_from_str)]
+        keep: Option<NativeCurrencyAmount>,
+
+        #[clap(long, default_value_t = 0)]
         exclude_recent_blocks: usize,
     },
 
@@ -568,6 +644,31 @@ struct Config {
 
     #[clap(subcommand)]
     command: Command,
+}
+
+const NOTHING_TO_BRIDGE_EXIT_CODE: i32 = 3;
+
+#[derive(Debug, Clone, Copy)]
+enum DepositAmount {
+    Max,
+    Exact(NativeCurrencyAmount),
+}
+
+fn decode_hex_args(flag: &str, values: &[String]) -> Result<Vec<Vec<u8>>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| hex::decode(value).with_context(|| format!("{flag}[{i}]")))
+        .collect()
+}
+
+fn parse_deposit_amount(s: &str) -> Result<DepositAmount> {
+    if s == "max" {
+        return Ok(DepositAmount::Max);
+    }
+    Ok(DepositAmount::Exact(NativeCurrencyAmount::coins_from_str(
+        s,
+    )?))
 }
 
 #[tokio::main]
@@ -897,8 +998,7 @@ async fn main() -> Result<()> {
     let server_socket = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
     let Ok(transport) = tarpc::serde_transport::tcp::connect(server_socket, Json::default).await
     else {
-        eprintln!("This command requires a connection to `xnt-core`, but that connection could not be established. Is `xnt-core` running?");
-        return Ok(());
+        bail!("This command requires a connection to `xnt-core`, but that connection could not be established. Is `xnt-core` running?");
     };
     let client = RPCClient::new(client::Config::default(), transport).spawn();
     let ctx = context::current();
@@ -940,9 +1040,23 @@ async fn main() -> Result<()> {
         }
 
         /******** READ STATE ********/
-        Command::ListCoins => {
+        Command::ListCoins { json } => {
             let list = client.list_own_coins(ctx, token).await??;
-            println!("{}", CoinWithPossibleTimeLock::report(&list));
+            if json {
+                let coins = list
+                    .iter()
+                    .map(|coin| {
+                        serde_json::json!({
+                            "amount_nau": coin.amount.to_nau().to_string(),
+                            "confirmed": coin.confirmed.as_duration().as_secs(),
+                            "release_date": coin.release_date.map(|t| t.as_duration().as_secs()),
+                        })
+                    })
+                    .collect_vec();
+                println!("{}", serde_json::to_string(&coins)?);
+            } else {
+                println!("{}", CoinWithPossibleTimeLock::report(&list));
+            }
         }
         Command::Network => {
             // we already queries the network above.
@@ -1091,9 +1205,7 @@ async fn main() -> Result<()> {
                 eprintln!("Hint: Use 'next-receiving-address' for base address (payment_id 0).");
                 std::process::exit(1);
             }
-            let subaddress = client
-                .generate_subaddress(ctx, token, payment_id)
-                .await??;
+            let subaddress = client.generate_subaddress(ctx, token, payment_id).await??;
             println!("{subaddress}")
         }
         Command::ValidateAddress { address } => {
@@ -1563,6 +1675,117 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => eprintln!("{e}"),
             }
+        }
+        Command::BridgeRotateAuthority {
+            new_keys,
+            new_threshold,
+            signatures,
+            fee,
+        } => {
+            let new_keys = decode_hex_args("--new-keys", &new_keys)?;
+            let signatures = decode_hex_args("--signatures", &signatures)?;
+            let tx_artifacts = client
+                .bridge_submit_authority_rotation(
+                    ctx,
+                    token,
+                    new_keys,
+                    new_threshold,
+                    signatures,
+                    fee,
+                )
+                .await??;
+            println!("txid: {}", tx_artifacts.transaction().txid());
+        }
+        Command::BridgeRegister {
+            faucet_id,
+            genesis_state_commitment,
+            signatures,
+            fee,
+        } => {
+            let [suffix, prefix] = parse_leviathan_account_id(&faucet_id)?;
+            let registration = BridgeRegistration {
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(suffix),
+                    prefix: BFieldElement::new(prefix),
+                },
+                genesis_state_commitment: genesis_state_commitment.0,
+            };
+            let signatures = decode_hex_args("--signatures", &signatures)?;
+            let tx_artifacts = client
+                .bridge_submit_registration(ctx, token, registration, signatures, fee)
+                .await??;
+            println!("txid: {}", tx_artifacts.transaction().txid());
+        }
+        Command::BridgeDeposit {
+            account_id,
+            amount,
+            fee,
+            max_inputs,
+            keep,
+            exclude_recent_blocks,
+        } => {
+            let network = client.network(context::current()).await??;
+            let account_id = parse_leviathan_address(&account_id, network)?;
+            ensure!(
+                keep.is_none() || matches!(amount, DepositAmount::Max),
+                "--keep only applies to `max`"
+            );
+            let tx_artifacts = match amount {
+                DepositAmount::Exact(amount) => {
+                    client
+                        .bridge_deposit(
+                            ctx,
+                            token,
+                            account_id,
+                            amount,
+                            fee,
+                            exclude_recent_blocks,
+                            max_inputs,
+                        )
+                        .await??
+                }
+                DepositAmount::Max => match client
+                    .bridge_deposit_all(
+                        ctx,
+                        token,
+                        account_id,
+                        fee,
+                        keep.unwrap_or(NativeCurrencyAmount::coins(0)),
+                        exclude_recent_blocks,
+                        max_inputs,
+                    )
+                    .await??
+                {
+                    BridgeDepositAll::Locked(tx_artifacts) => tx_artifacts,
+                    BridgeDepositAll::NothingToBridge { available } => {
+                        eprintln!(
+                            "nothing to bridge: {available} available (largest inputs, minus \
+                             --keep), below the fee {fee} plus the 1 coin minimum"
+                        );
+                        std::process::exit(NOTHING_TO_BRIDGE_EXIT_CODE);
+                    }
+                },
+            };
+            let transaction = tx_artifacts.transaction();
+            let deposits =
+                BridgeDepositData::find_all_in_announcements(&transaction.kernel.announcements);
+            let [deposit] = deposits.as_slice() else {
+                bail!(
+                    "expected one deposit announcement, found {}",
+                    deposits.len()
+                );
+            };
+            ensure!(
+                deposit.account_id == account_id.map(BFieldElement::new),
+                "announced account id {:?} differs from the requested one",
+                deposit.account_id
+            );
+            println!("txid: {}", transaction.txid());
+            println!("amount: {}", deposit.amount);
+            println!(
+                "utxo_commitment: {}",
+                Digest::new(deposit.utxo_commitment).to_hex()
+            );
         }
         Command::SendTransparent {
             file,

@@ -330,15 +330,9 @@ where
             return None;
         }
 
-        // Update length
-        let current_length = self
-            .current_length
-            .as_mut()
-            .expect("there should be some value");
-
-        *current_length -= 1;
-
-        let new_length = *current_length;
+        // Update length, which a map's keys load only on their first write.
+        let new_length = self.len().await - 1;
+        self.current_length = Some(new_length);
         let index_key = self.get_index_key(new_length);
 
         let persist_count = {

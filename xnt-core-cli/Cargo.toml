@@ -37,6 +37,7 @@ tarpc = { version = "^0.34", features = [
 ] }
 tokio = { version = "1.41", features = ["full", "tracing"] }
 bech32 = ">=0.9, <0.10"
+hex = "0.4.3"
 
 [dev-dependencies]
 arbitrary = "1.4.2"

@@ -151,7 +151,7 @@ pub fn single_proof_v2_v7_code() -> Vec<LabelledInstruction> {
     library.import(Box::new(VersionedNewClaim {
         version: v7_claim_version(),
     }));
-    let (_, code) = SingleProofV2.assemble_into(library, false);
+    let (_, code) = SingleProofV2.assemble_into::<ProofCollection>(library, false, false);
 
     code
 }

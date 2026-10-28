@@ -1,8 +1,11 @@
+pub mod bridge_aggregated_announcement_validator;
+pub mod bridge_deposit_announcement_validator;
 pub mod collect_lock_scripts;
 pub mod collect_type_scripts;
 pub mod collect_type_scripts_v2;
 pub mod kernel_to_outputs;
 pub mod legacy_v7;
+pub mod leviathan_proof_collection;
 pub mod neptune_proof;
 pub mod proof_collection;
 pub mod removal_records_integrity;

@@ -49,6 +49,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use super::address_screen::AddressScreen;
+use super::bridge_screen::BridgeScreen;
 use super::history_screen::HistoryScreen;
 use super::mempool_screen::MempoolScreen;
 use super::overview_screen::OverviewScreen;
@@ -88,6 +89,7 @@ enum MenuItem {
     History,
     Receive,
     Send,
+    Bridge,
     Address,
     Mempool,
     Utxos,
@@ -111,10 +113,11 @@ impl From<MenuItem> for usize {
             MenuItem::History => 2,
             MenuItem::Receive => 3,
             MenuItem::Send => 4,
-            MenuItem::Address => 5,
-            MenuItem::Mempool => 6,
-            MenuItem::Utxos => 7,
-            MenuItem::Quit => 8,
+            MenuItem::Bridge => 5,
+            MenuItem::Address => 6,
+            MenuItem::Mempool => 7,
+            MenuItem::Utxos => 8,
+            MenuItem::Quit => 9,
         }
     }
 }
@@ -138,6 +141,7 @@ impl fmt::Display for MenuItem {
             MenuItem::History => write!(f, "History"),
             MenuItem::Receive => write!(f, "Receive"),
             MenuItem::Send => write!(f, "Send"),
+            MenuItem::Bridge => write!(f, "Bridge"),
             MenuItem::Address => write!(f, "Addresses"),
             MenuItem::Mempool => write!(f, "Mempool"),
             MenuItem::Utxos => write!(f, "UTXOs"),
@@ -174,6 +178,7 @@ pub struct DashboardApp {
     history_screen: Rc<RefCell<HistoryScreen>>,
     receive_screen: Rc<RefCell<ReceiveScreen>>,
     send_screen: Rc<RefCell<SendScreen>>,
+    bridge_screen: Rc<RefCell<BridgeScreen>>,
     mempool_screen: Rc<RefCell<MempoolScreen>>,
     utxos_screen: Rc<RefCell<UtxosScreen>>,
     screens: HashMap<MenuItem, Rc<RefCell<dyn Screen>>>,
@@ -231,6 +236,14 @@ impl DashboardApp {
         let send_screen_dyn = Rc::clone(&send_screen) as Rc<RefCell<dyn Screen>>;
         screens.insert(MenuItem::Send, Rc::clone(&send_screen_dyn));
 
+        let bridge_screen = Rc::new(RefCell::new(BridgeScreen::new(
+            rpc_server.clone(),
+            network,
+            token,
+        )));
+        let bridge_screen_dyn = Rc::clone(&bridge_screen) as Rc<RefCell<dyn Screen>>;
+        screens.insert(MenuItem::Bridge, Rc::clone(&bridge_screen_dyn));
+
         let address_screen = Rc::new(RefCell::new(AddressScreen::new(
             rpc_server.clone(),
             network,
@@ -256,6 +269,7 @@ impl DashboardApp {
             history_screen,
             receive_screen,
             send_screen,
+            bridge_screen,
             address_screen,
             mempool_screen,
             utxos_screen,
@@ -510,6 +524,10 @@ impl DashboardApp {
                     let mut send_screen = self.send_screen.as_ref().borrow_mut();
                     send_screen.handle(event, refresh_tx)
                 }
+                MenuItem::Bridge => {
+                    let mut bridge_screen = self.bridge_screen.as_ref().borrow_mut();
+                    bridge_screen.handle(event, refresh_tx)
+                }
                 MenuItem::Utxos => {
                     let mut utxos_screen = self.utxos_screen.as_ref().borrow_mut();
                     utxos_screen.handle(event)
@@ -635,6 +653,12 @@ impl DashboardApp {
             }
             MenuItem::Send => {
                 f.render_widget::<SendScreen>(self.send_screen.borrow().to_owned(), screen_chunk);
+            }
+            MenuItem::Bridge => {
+                f.render_widget::<BridgeScreen>(
+                    self.bridge_screen.borrow().to_owned(),
+                    screen_chunk,
+                );
             }
             MenuItem::Mempool => {
                 f.render_widget::<MempoolScreen>(
