@@ -86,6 +86,10 @@ pub enum MockError {
     UnexpectedSend,
     UnexpectedRead,
     ReadError,
+
+    /// The connection timed out, reported through an [`std::io::Error`] as
+    /// the source, like a real network stream does.
+    ConnectionTimedOut,
 }
 
 impl std::fmt::Display for MockError {
@@ -95,11 +99,21 @@ impl std::fmt::Display for MockError {
             MockError::UnexpectedSend => write!(f, "UnexpectedSend"),
             MockError::UnexpectedRead => write!(f, "UnexpectedRead"),
             MockError::ReadError => write!(f, "ReadError"),
+            MockError::ConnectionTimedOut => write!(f, "ConnectionTimedOut"),
         }
     }
 }
 
-impl std::error::Error for MockError {}
+impl std::error::Error for MockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        static TIMED_OUT: std::sync::LazyLock<std::io::Error> =
+            std::sync::LazyLock::new(|| std::io::Error::from(std::io::ErrorKind::TimedOut));
+        match self {
+            MockError::ConnectionTimedOut => Some(&*TIMED_OUT),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Action<Item> {
@@ -109,6 +123,9 @@ pub enum Action<Item> {
     /// Simulates an error when reading the peer's message. Consider adding an
     /// error type here to better simulate e.g. a deserialization error.
     ReadError,
+
+    /// Simulates the connection timing out while reading.
+    ReadConnectionTimedOut,
     // Todo: Some tests with these things
     // Wait(Duration),
     // ReadError(Option<Arc<io::Error>>),
@@ -159,6 +176,9 @@ impl<Item> stream::Stream for Mock<Item> {
         match self.actions.pop() {
             Some(Action::Read(a)) => Poll::Ready(Some(Ok(a))),
             Some(Action::ReadError) => Poll::Ready(Some(Err(MockError::ReadError))),
+            Some(Action::ReadConnectionTimedOut) => {
+                Poll::Ready(Some(Err(MockError::ConnectionTimedOut)))
+            }
             // Returning `Poll::Ready(None)` here would probably simulate better
             // a peer closing the connection. Otherwise, we have to close with a
             // `Bye` in all tests.

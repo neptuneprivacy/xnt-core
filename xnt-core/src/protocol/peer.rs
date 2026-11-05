@@ -42,6 +42,7 @@ use transfer_transaction::TransactionProofQuality;
 use transfer_transaction::TransferTransaction;
 
 use super::consensus::block::block_header::BlockHeader;
+use super::consensus::block::block_validation_error::BlockValidationError;
 use super::consensus::block::block_header::BlockHeaderWithBlockHashWitness;
 use super::consensus::block::block_height::BlockHeight;
 use super::consensus::block::difficulty_control::ProofOfWork;
@@ -58,6 +59,22 @@ pub(crate) type InstanceId = u128;
 
 pub(crate) const SYNC_CHALLENGE_POW_WITNESS_LENGTH: usize = 10;
 pub(crate) const SYNC_CHALLENGE_NUM_BLOCK_PAIRS: usize = 10;
+
+/// A sync challenge sooner than this after the previous one from the same IP
+/// address is punished and not answered, as challenges are expensive to
+/// answer.
+pub(crate) const SYNC_CHALLENGE_MIN_INTERVAL: Timestamp = Timestamp::seconds(60);
+
+/// How long to wait after sending a sync challenge, whatever its outcome,
+/// before challenging the same peer again. Exceeds
+/// [`SYNC_CHALLENGE_MIN_INTERVAL`] by a margin, as the peer times challenges
+/// by their arrival, and one may take longer underway than the next.
+pub(crate) const SYNC_CHALLENGE_RETRY_INTERVAL: Timestamp = Timestamp::seconds(90);
+
+/// How long we wait for the answer to a sync challenge before giving up on it,
+/// so that the peer can be challenged again. An answer later than the response
+/// timeout is punished as late anyway, so this must not be shorter.
+pub(crate) const SYNC_CHALLENGE_EXPIRY: Timestamp = Timestamp::seconds(45);
 
 pub(crate) trait Sanction {
     fn severity(self) -> i32;
@@ -264,7 +281,7 @@ impl Sanction for NegativePeerSanction {
             NegativePeerSanction::BlockProposalFromBlockedPeer => -10,
             NegativePeerSanction::BatchBlocksRequestEmpty => -10,
             NegativePeerSanction::InvalidSyncChallenge => -50,
-            NegativePeerSanction::InvalidSyncChallengeResponse => -500,
+            NegativePeerSanction::InvalidSyncChallengeResponse => -100,
             NegativePeerSanction::UnexpectedSyncChallengeResponse => -1,
             NegativePeerSanction::InvalidTransferBlock => -50,
             NegativePeerSanction::TimedOutSyncChallengeResponse => -50,
@@ -777,21 +794,38 @@ pub struct MutablePeerState {
     pub fork_reconciliation_blocks: Vec<Block>,
     pub(crate) sync_challenge: Option<IssuedSyncChallenge>,
 
+    /// The last sync challenge we gave up on, see [`SYNC_CHALLENGE_EXPIRY`],
+    /// so that a late answer to it is recognized as late, not as a wrong
+    /// answer to the challenge that replaced it.
+    pub(crate) expired_sync_challenge: Option<IssuedSyncChallenge>,
+
     /// Timestamp for the last successful sync challenge response.
     ///
     /// Used to prevent issuing multiple sync challenges in short succession.
     pub(crate) successful_sync_challenge_response_time: Option<Timestamp>,
 
-    /// Timestamp of the last `SyncChallenge` we received from this peer.
-    /// Used on the receiver side to mirror the sender's cooldown so compliant
-    /// peers (one challenge per `SYNC_CHALLENGE_COOLDOWN`) accrue no penalty.
-    pub(crate) last_received_sync_challenge_time: Option<Timestamp>,
+    /// Timestamp of the last `SyncChallenge` we sent to this peer, whatever
+    /// its outcome. See [`SYNC_CHALLENGE_RETRY_INTERVAL`].
+    pub(crate) last_sent_sync_challenge_time: Option<Timestamp>,
 
     /// The transactions from this peer that were verified but not taken, see
     /// [`UntakenTransaction`]. Such a transaction is verified once per tip,
     /// and ignored when it comes again. Holds the latest
     /// [`Self::MAX_UNTAKEN_TRANSACTIONS`].
     untaken_transactions: Vec<UntakenTransaction>,
+
+    /// The body MAST hashes of the block proposals announced to this peer.
+    /// A request for one of these that is no longer held is not the peer's
+    /// fault: the proposal was replaced while the request was underway. Holds
+    /// the latest [`Self::MAX_ANNOUNCED_BLOCK_PROPOSALS`].
+    announced_block_proposals: Vec<Digest>,
+
+    /// The body MAST hashes of the block proposals we requested from this
+    /// peer and have not received yet. A peer sends a proposal only when asked
+    /// for it, so an unfavorable proposal that was asked for is not the peer's
+    /// fault: our tip or proposal changed while it was underway. Holds the
+    /// latest [`Self::MAX_REQUESTED_BLOCK_PROPOSALS`].
+    requested_block_proposals: Vec<Digest>,
 }
 
 /// Why a transaction from a peer was verified but not taken.
@@ -822,15 +856,72 @@ impl MutablePeerState {
     /// The largest number of untaken transactions remembered.
     const MAX_UNTAKEN_TRANSACTIONS: usize = 64;
 
+    /// The largest number of block proposals announced to the peer that are
+    /// remembered. A few proposals are announced per block, so this covers any
+    /// realistic delay of the peer's request.
+    const MAX_ANNOUNCED_BLOCK_PROPOSALS: usize = 16;
+
+    /// The largest number of block proposals requested from the peer that are
+    /// remembered.
+    const MAX_REQUESTED_BLOCK_PROPOSALS: usize = 16;
+
     pub fn new(block_height: BlockHeight) -> Self {
         Self {
             highest_shared_block_height: block_height,
             fork_reconciliation_blocks: vec![],
             sync_challenge: None,
+            expired_sync_challenge: None,
             successful_sync_challenge_response_time: None,
-            last_received_sync_challenge_time: None,
+            last_sent_sync_challenge_time: None,
             untaken_transactions: vec![],
+            announced_block_proposals: vec![],
+            requested_block_proposals: vec![],
         }
+    }
+
+    /// Remember that the block proposal with this body MAST hash was announced
+    /// to this peer.
+    pub(crate) fn record_announced_block_proposal(&mut self, body_mast_hash: Digest) {
+        if self.announced_block_proposals.contains(&body_mast_hash) {
+            return;
+        }
+        if self.announced_block_proposals.len() >= Self::MAX_ANNOUNCED_BLOCK_PROPOSALS {
+            self.announced_block_proposals.remove(0);
+        }
+        self.announced_block_proposals.push(body_mast_hash);
+    }
+
+    /// Whether the block proposal with this body MAST hash was announced to
+    /// this peer recently.
+    pub(crate) fn has_announced_block_proposal(&self, body_mast_hash: Digest) -> bool {
+        self.announced_block_proposals.contains(&body_mast_hash)
+    }
+
+    /// Remember that the block proposal with this body MAST hash was
+    /// requested from this peer.
+    pub(crate) fn record_requested_block_proposal(&mut self, body_mast_hash: Digest) {
+        if self.requested_block_proposals.contains(&body_mast_hash) {
+            return;
+        }
+        if self.requested_block_proposals.len() >= Self::MAX_REQUESTED_BLOCK_PROPOSALS {
+            self.requested_block_proposals.remove(0);
+        }
+        self.requested_block_proposals.push(body_mast_hash);
+    }
+
+    /// Whether the block proposal with this body MAST hash was requested from
+    /// this peer and not received yet. Forgets it, as one request warrants one
+    /// proposal.
+    pub(crate) fn take_requested_block_proposal(&mut self, body_mast_hash: Digest) -> bool {
+        let Some(index) = self
+            .requested_block_proposals
+            .iter()
+            .position(|&requested| requested == body_mast_hash)
+        else {
+            return false;
+        };
+        self.requested_block_proposals.remove(index);
+        true
     }
 
     /// Whether this peer sent a transaction with this id that was verified but
@@ -988,6 +1079,32 @@ impl SyncChallenge {
     }
 }
 
+/// Why a [`SyncChallengeResponse`] was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncChallengeResponseRejection {
+    /// The membership proofs do not authenticate the blocks against the
+    /// challenged tip. An honest peer sends such proofs if its chain
+    /// reorganized away from that tip before it answered.
+    ProofsDoNotMatchTip,
+
+    /// The tip is from the future by our clock, which may be behind.
+    FutureDated,
+
+    /// A block is invalid, or lacks proof-of-work.
+    Invalid,
+}
+
+impl Display for SyncChallengeResponseRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::ProofsDoNotMatchTip => "membership proofs do not match the challenged tip",
+            Self::FutureDated => "the tip is from the future by our clock",
+            Self::Invalid => "a block is invalid",
+        };
+        write!(f, "{reason}")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SyncChallengeResponse {
     /// (parent, child) blocks. blocks are assumed to be ordered from small to
@@ -1046,48 +1163,84 @@ impl SyncChallengeResponse {
 
     /// Determine whether the proofs in `SyncChallengeResponse` are valid. Also
     /// checks proof-of-work.
-    pub(crate) async fn is_valid(&self, now: Timestamp, network: Network) -> bool {
+    ///
+    /// The membership proofs are checked first: they are cheap, and an honest
+    /// peer whose chain reorganized away from the challenged tip before it
+    /// answered fails them.
+    pub(crate) async fn validate(
+        &self,
+        now: Timestamp,
+        network: Network,
+    ) -> Result<(), SyncChallengeResponseRejection> {
         let Ok(tip_predecessor) = Block::try_from(self.tip_parent.clone()) else {
-            return false;
+            return Err(SyncChallengeResponseRejection::Invalid);
         };
         let Ok(tip) = Block::try_from(self.tip.clone()) else {
-            return false;
+            return Err(SyncChallengeResponseRejection::Invalid);
         };
-        if !tip.is_valid(&tip_predecessor, now, network).await
-            || !tip.has_proof_of_work(network, tip_predecessor.header())
-        {
-            return false;
-        }
 
+        // Two passes over the blocks, each converting one pair at a time and
+        // dropping it, so that at most one pair is held besides the response.
         let mut mmra_anchor = tip.body().block_mmr_accumulator.to_owned();
         mmra_anchor.append(tip.hash());
-        for ((parent, child), membership_proof) in
-            self.blocks.iter().zip(self.membership_proofs.iter())
+        let (anchor_peaks, anchor_num_leafs) = (mmra_anchor.peaks(), mmra_anchor.num_leafs());
+        for ((_, child), membership_proof) in self.blocks.iter().zip(self.membership_proofs.iter())
         {
             let Ok(child) = Block::try_from(child.clone()) else {
-                return false;
+                return Err(SyncChallengeResponseRejection::Invalid);
             };
             if !membership_proof.verify(
                 child.header().height.into(),
                 child.hash(),
-                &mmra_anchor.peaks(),
-                mmra_anchor.num_leafs(),
+                &anchor_peaks,
+                anchor_num_leafs,
             ) {
-                return false;
-            }
-
-            let Ok(parent) = Block::try_from(parent.clone()) else {
-                return false;
-            };
-
-            if !child.is_valid(&parent, now, network).await
-                || !child.has_proof_of_work(network, parent.header())
-            {
-                return false;
+                return Err(SyncChallengeResponseRejection::ProofsDoNotMatchTip);
             }
         }
 
-        true
+        Self::validate_block(&tip, &tip_predecessor, now, network, true).await?;
+        for (parent, child) in &self.blocks {
+            let (Ok(parent), Ok(child)) = (
+                Block::try_from(parent.clone()),
+                Block::try_from(child.clone()),
+            ) else {
+                return Err(SyncChallengeResponseRejection::Invalid);
+            };
+            Self::validate_block(&child, &parent, now, network, false).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate a block of the response, including its proof-of-work.
+    ///
+    /// Only the tip can honestly be from the future by our clock, as our clock
+    /// may be behind. The tip has been checked first, and the other blocks
+    /// precede it, so for them, being from the future is a lie.
+    async fn validate_block(
+        block: &Block,
+        parent: &Block,
+        now: Timestamp,
+        network: Network,
+        is_tip: bool,
+    ) -> Result<(), SyncChallengeResponseRejection> {
+        match block.validate(parent, now, network).await {
+            Ok(()) => {}
+            Err(BlockValidationError::FutureDating) if is_tip => {
+                return Err(SyncChallengeResponseRejection::FutureDated)
+            }
+            Err(e) => {
+                warn!("{e}");
+                return Err(SyncChallengeResponseRejection::Invalid);
+            }
+        }
+
+        if !block.has_proof_of_work(network, parent.header()) {
+            return Err(SyncChallengeResponseRejection::Invalid);
+        }
+
+        Ok(())
     }
 
     /// Determine whether the claimed evolution of the cumulative proof-of-work
@@ -1382,6 +1535,38 @@ mod tests {
                 peer_tolerance,
             }
         }
+    }
+
+    /// By a clock that is behind, a tip from the future is not a lie, so it
+    /// is merely rejected; an earlier block from the future is a lie.
+    #[apply(shared_tokio_runtime)]
+    async fn only_a_future_tip_is_rejected_as_future_dated() {
+        let network = Network::Main;
+        let [parent, block]: [Block; 2] = fake_valid_sequence_of_blocks_for_tests(
+            &Block::genesis(network),
+            Timestamp::minutes(20),
+            rng().random(),
+            network,
+        )
+        .await;
+
+        let now = block.header().timestamp;
+        let validate = async |at, is_tip| {
+            SyncChallengeResponse::validate_block(&block, &parent, at, network, is_tip).await
+        };
+        for is_tip in [true, false] {
+            assert_eq!(Ok(()), validate(now, is_tip).await);
+        }
+
+        let clock_behind = now - Timestamp::hours(1);
+        assert_eq!(
+            Err(SyncChallengeResponseRejection::FutureDated),
+            validate(clock_behind, true).await
+        );
+        assert_eq!(
+            Err(SyncChallengeResponseRejection::Invalid),
+            validate(clock_behind, false).await
+        );
     }
 
     #[apply(shared_tokio_runtime)]

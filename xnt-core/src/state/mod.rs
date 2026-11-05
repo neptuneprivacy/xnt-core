@@ -2532,6 +2532,10 @@ impl GlobalState {
         &self,
         sync_challenge: SyncChallenge,
     ) -> Result<SyncChallengeResponse> {
+        /// How far below the challenged tip our chain may branch off from the
+        /// tip's chain for us to still answer.
+        const MAX_BRANCH_LENGTH: usize = 100;
+
         async fn fetch_block_pair(
             state: &GlobalState,
             child_digest: Digest,
@@ -2577,9 +2581,6 @@ impl GlobalState {
             tip_height >= (SYNC_CHALLENGE_POW_WITNESS_LENGTH as u64).into(),
             "tip height {tip_height} is too small for sync mode",
         );
-
-        let mut block_pairs: Vec<(TransferBlock, TransferBlock)> = vec![];
-        let mut block_mmr_mps = vec![];
         for child_height in sync_challenge.challenges {
             ensure!(
                 child_height >= 2u64.into(),
@@ -2589,37 +2590,95 @@ impl GlobalState {
                 child_height < tip.header().height,
                 "challenge asks for height that's not ancestor to tip.",
             );
+        }
 
-            let Some(child_digest) = self
-                .chain
-                .archival_state()
-                .archival_block_mmr
-                .ammr()
-                .try_get_leaf(child_height.into())
-                .await
-            else {
-                bail!("could not get leaf from archival block mmr");
+        // The challenged tip is one we announced, but our chain may have
+        // reorganized away from it since. Then its chain branches off from ours
+        // below it. Collect that branch: the digests of the tip's chain above
+        // the last block it shares with ours, from low to high.
+        let archival_state = self.chain.archival_state();
+        let ammr = archival_state.archival_block_mmr.ammr();
+        let mut branch = vec![];
+        let mut digest = tip.hash();
+        let mut height = u64::from(tip_height);
+        while ammr.try_get_leaf(height).await != Some(digest) {
+            ensure!(
+                branch.len() < MAX_BRANCH_LENGTH,
+                "challenged tip branches off our chain too far down",
+            );
+            let Some(header) = archival_state.get_block_header(digest).await else {
+                bail!("could not fetch header of block on challenged tip's chain");
             };
+            branch.push(digest);
+            digest = header.prev_block_digest;
+            height -= 1;
+        }
+        branch.reverse();
+        let num_shared_leafs = u64::from(tip_height) + 1 - branch.len() as u64;
+
+        // The blocks and the membership proofs are those of the tip's chain.
+        // The proofs are relative to an MMR where the tip digest *has* been
+        // added. So they are not relative to the block MMR accumulator present
+        // in the tip block, as it only refers to its ancestors. Rather, they
+        // are relative to the block MMR accumulator present in the tip's
+        // child.
+        let mut child_digests = vec![];
+        let mut block_mmr_mps = vec![];
+        for child_height in sync_challenge.challenges {
+            let leaf_index = u64::from(child_height);
+            if leaf_index < num_shared_leafs {
+                let Some(child_digest) = ammr.try_get_leaf(leaf_index).await else {
+                    bail!("could not get leaf from archival block mmr");
+                };
+                child_digests.push(child_digest);
+                block_mmr_mps.push(Some(
+                    ammr.prove_membership_relative_to_smaller_mmr(leaf_index, num_shared_leafs)
+                        .await,
+                ));
+            } else {
+                child_digests.push(branch[(leaf_index - num_shared_leafs) as usize]);
+                block_mmr_mps.push(None);
+            }
+        }
+
+        // Grow the MMR shared with our chain by the branch, keeping the
+        // membership proofs up to date, and taking those of the branch's
+        // leafs as they are added.
+        if let Some(&first_on_branch) = branch.first() {
+            let Some(first_on_branch) = archival_state.get_block(first_on_branch).await? else {
+                bail!("could not fetch block on challenged tip's chain");
+            };
+            let mut mmra = first_on_branch.body().block_mmr_accumulator.clone();
+            debug_assert_eq!(num_shared_leafs, mmra.num_leafs());
+            for &leaf in &branch {
+                let (num_leafs_before, peaks_before) = (mmra.num_leafs(), mmra.peaks());
+                for (mp, child_height) in block_mmr_mps.iter_mut().zip(sync_challenge.challenges)
+                {
+                    if let Some(mp) = mp {
+                        mp.update_from_append(
+                            child_height.into(),
+                            num_leafs_before,
+                            leaf,
+                            &peaks_before,
+                        );
+                    }
+                }
+
+                let leaf_mp = mmra.append(leaf);
+                for (mp, child_height) in block_mmr_mps.iter_mut().zip(sync_challenge.challenges)
+                {
+                    if u64::from(child_height) == num_leafs_before {
+                        *mp = Some(leaf_mp.clone());
+                    }
+                }
+            }
+        }
+
+        let mut block_pairs: Vec<(TransferBlock, TransferBlock)> = vec![];
+        for child_digest in child_digests {
             let Some((p, c)) = fetch_block_pair(self, child_digest).await else {
                 bail!("could not fetch indicated block pair");
             };
-
-            // Notice that the MMR membership proofs are relative to an MMR
-            // where the tip digest *has* been added. So it is not relative to
-            // the block MMR accumulator present in the tip block, as it only
-            // refers to its ancestors. Rather, it's relative to the block MMR
-            // accumulator present in the tip's child.
-            block_mmr_mps.push(
-                self.chain
-                    .archival_state()
-                    .archival_block_mmr
-                    .ammr()
-                    .prove_membership_relative_to_smaller_mmr(
-                        child_height.into(),
-                        tip_height.next().into(),
-                    )
-                    .await,
-            );
             block_pairs.push((
                 p.try_into()
                     .expect("blocks from archive must be transferable"),
@@ -2627,6 +2686,10 @@ impl GlobalState {
                     .expect("blocks from archive must be transferable"),
             ));
         }
+        let block_mmr_mps = block_mmr_mps
+            .into_iter()
+            .map(|mp| mp.expect("challenged heights are below the tip, so have been added"))
+            .collect_vec();
 
         let mut pow_witnesses: Vec<BlockHeaderWithBlockHashWitness> = vec![];
         let mut block_hash = tip.hash();

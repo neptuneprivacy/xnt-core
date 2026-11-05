@@ -65,6 +65,9 @@ use crate::protocol::peer::PeerSanction;
 use crate::protocol::peer::PeerStanding;
 use crate::protocol::peer::PositivePeerSanction;
 use crate::protocol::peer::SyncChallenge;
+use crate::protocol::peer::SyncChallengeResponseRejection;
+use crate::protocol::peer::SYNC_CHALLENGE_EXPIRY;
+use crate::protocol::peer::SYNC_CHALLENGE_RETRY_INTERVAL;
 use crate::protocol::peer::UntakenReason;
 use crate::protocol::peer::UntakenTransaction;
 use crate::protocol::proof_abstractions::mast_hash::MastHash;
@@ -104,6 +107,31 @@ pub(crate) const MAX_ANNOUNCEMENT_MESSAGE_SIZE: usize = 4096;
 
 const KEEP_CONNECTION_ALIVE: bool = false;
 const DISCONNECT_CONNECTION: bool = true;
+
+/// Whether an error from a peer stream reports that the connection was lost,
+/// e.g. that it timed out or was reset, rather than that the peer sent
+/// something that could not be read.
+fn connection_lost(error: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+
+    let mut error = Some(error);
+    while let Some(current) = error {
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_error.kind(),
+                ErrorKind::TimedOut
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected
+            );
+        }
+        error = current.source();
+    }
+
+    false
+}
 
 pub type PeerStandingNumber = i32;
 
@@ -867,8 +895,14 @@ impl PeerLoopHandler {
                 let time_since_latest_successful_challenge = peer_state_info
                     .successful_sync_challenge_response_time
                     .map(|then| now - then);
+                // Wait long after a success. After any challenge, wait only as
+                // long as the peer requires, so that a failed one is retried
+                // soon.
                 let cooldown_expired = time_since_latest_successful_challenge
-                    .is_none_or(|time_passed| time_passed > SYNC_CHALLENGE_COOLDOWN);
+                    .is_none_or(|time_passed| time_passed > SYNC_CHALLENGE_COOLDOWN)
+                    && peer_state_info
+                        .last_sent_sync_challenge_time
+                        .is_none_or(|then| now - then > SYNC_CHALLENGE_RETRY_INTERVAL);
                 let exceeds_sync_mode_threshold = GlobalState::sync_mode_threshold_stateless(
                     &tip_header,
                     block_notification.height,
@@ -878,9 +912,22 @@ impl PeerLoopHandler {
                 if cooldown_expired && exceeds_sync_mode_threshold {
                     debug!("sync mode criterion satisfied.");
 
-                    if peer_state_info.sync_challenge.is_some() {
-                        warn!("Cannot launch new sync challenge because one is already on-going.");
-                        return Ok(KEEP_CONNECTION_ALIVE);
+                    if let Some(pending) = peer_state_info.sync_challenge {
+                        if now - pending.issued_at <= SYNC_CHALLENGE_EXPIRY {
+                            warn!(
+                                "Cannot launch new sync challenge because one is already on-going."
+                            );
+                            return Ok(KEEP_CONNECTION_ALIVE);
+                        }
+
+                        // Unanswered for too long: give up on it, so that the
+                        // peer can be challenged again.
+                        info!(
+                            "Giving up on unanswered sync challenge to {}",
+                            self.peer_address
+                        );
+                        peer_state_info.expired_sync_challenge = Some(pending);
+                        peer_state_info.sync_challenge = None;
                     }
 
                     info!(
@@ -896,6 +943,7 @@ impl PeerLoopHandler {
                         block_notification.cumulative_proof_of_work,
                         self.now(),
                     ));
+                    peer_state_info.last_sent_sync_challenge_time = Some(now);
 
                     debug!("sending challenge ...");
                     peer.send(PeerMessage::SyncChallenge(challenge)).await?;
@@ -937,19 +985,26 @@ impl PeerLoopHandler {
 
                     info!("Got sync challenge from {}", self.peer_address.ip());
 
-                    // Mirror the sender-side `SYNC_CHALLENGE_COOLDOWN` (10 min)
-                    // on the receiver: only punish if this peer challenges us
-                    // *again* before its own cooldown has elapsed. A compliant
-                    // peer obeying the protocol accrues zero penalty.
-                    const RX_SYNC_CHALLENGE_COOLDOWN: Timestamp = Timestamp::minutes(10);
-                    let now = self.now();
-                    let too_soon = peer_state_info
-                        .last_received_sync_challenge_time
-                        .is_some_and(|prev| now - prev < RX_SYNC_CHALLENGE_COOLDOWN);
-                    peer_state_info.last_received_sync_challenge_time = Some(now);
+                    // Answering is expensive, so a challenge sooner than
+                    // `SYNC_CHALLENGE_MIN_INTERVAL` after the last answered one
+                    // from the same IP address, whichever connection it came
+                    // over, is punished and not answered. Peers of this
+                    // release, see `SYNC_CHALLENGE_RETRY_INTERVAL`, never send
+                    // one. Older releases may, after a failed challenge, and
+                    // then wait for the answer for as long as the connection
+                    // lasts: close it, so that they reconnect without a
+                    // pending challenge.
+                    let (ip, now) = (self.peer_address.ip(), self.now());
+                    let too_soon = self
+                        .global_state_lock
+                        .lock_guard_mut()
+                        .await
+                        .net
+                        .record_received_sync_challenge(ip, now);
                     if too_soon {
                         self.punish(NegativePeerSanction::ReceivedSyncChallenge)
                             .await?;
+                        return Ok(DISCONNECT_CONNECTION);
                     }
 
                     let response = self
@@ -1003,6 +1058,22 @@ impl PeerLoopHandler {
                 // succinctness (and more specifically, recursive block
                 // validation) obviates this entire subprotocol.
 
+                // Is it a late answer to a challenge we gave up on? Then it is
+                // late, not wrong, even if another challenge is pending now.
+                let network = self.global_state_lock.cli().network;
+                if let Some(expired_challenge) = peer_state_info.expired_sync_challenge {
+                    if challenge_response.matches(network, expired_challenge) {
+                        peer_state_info.expired_sync_challenge = None;
+                        warn!(
+                            "Sync challenge response from {} came after we gave up on it.",
+                            self.peer_address
+                        );
+                        self.punish(NegativePeerSanction::TimedOutSyncChallengeResponse)
+                            .await?;
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                }
+
                 // Did we issue a challenge?
                 let Some(issued_challenge) = peer_state_info.sync_challenge else {
                     warn!("Sync challenge response was not prompted.");
@@ -1026,13 +1097,36 @@ impl PeerLoopHandler {
                 // Does response verify?
                 let claimed_tip_height = challenge_response.tip.header.height;
                 let now = self.now();
-                if !challenge_response
-                    .is_valid(now, self.global_state_lock.cli().network)
+                match challenge_response
+                    .validate(now, self.global_state_lock.cli().network)
                     .await
                 {
-                    self.punish(NegativePeerSanction::InvalidSyncChallengeResponse)
-                        .await?;
-                    return Ok(KEEP_CONNECTION_ALIVE);
+                    Ok(()) => {}
+                    // Proofs not matching the tip are rare for an honest peer,
+                    // whose chain reorganized away from the challenged tip
+                    // before it answered.
+                    Err(
+                        rejection @ (SyncChallengeResponseRejection::Invalid
+                        | SyncChallengeResponseRejection::ProofsDoNotMatchTip),
+                    ) => {
+                        warn!(
+                            "Rejecting sync challenge response from {}: {rejection}",
+                            self.peer_address
+                        );
+                        self.punish(NegativePeerSanction::InvalidSyncChallengeResponse)
+                            .await?;
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                    // Most likely our clock is behind, which would make every
+                    // peer's tip look like this.
+                    Err(SyncChallengeResponseRejection::FutureDated) => {
+                        warn!(
+                            "Ignoring sync challenge response from {}: the tip is from the \
+                             future by our clock. Is the system clock behind?",
+                            self.peer_address
+                        );
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
                 }
 
                 // Does cumulative proof-of-work evolve reasonably?
@@ -2122,8 +2216,10 @@ impl PeerLoopHandler {
 
                 match verdict {
                     Ok(_) => {
+                        let body_mast_hash = block_proposal_notification.body_mast_hash;
+                        peer_state_info.record_requested_block_proposal(body_mast_hash);
                         peer.send(PeerMessage::BlockProposalRequest(
-                            BlockProposalRequest::new(block_proposal_notification.body_mast_hash),
+                            BlockProposalRequest::new(body_mast_hash),
                         ))
                         .await?
                     }
@@ -2168,7 +2264,18 @@ impl PeerLoopHandler {
                     }
                     peer.send(PeerMessage::BlockProposal(Box::new(proposal)))
                         .await?;
+                } else if peer_state_info
+                    .has_announced_block_proposal(block_proposal_request.body_mast_hash)
+                {
+                    // We announced it but have replaced it since, with a new
+                    // tip or a better proposal, while the request was underway.
+                    // The peer is not at fault.
+                    debug!(
+                        "Peer {} requested a block proposal we announced but no longer hold",
+                        self.peer_address
+                    );
                 } else {
+                    // We never announced it to this peer.
                     self.punish(NegativePeerSanction::BlockProposalNotFound)
                         .await?;
                 }
@@ -2192,49 +2299,66 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
-                // Is the proposal valid?
-                // Lock needs to be held here because race conditions: otherwise
-                // the block proposal that was validated might not match with
-                // the one whose favorability is being computed.
-                let state = self.global_state_lock.lock_guard().await;
-                let tip = state.chain.light_state();
+                let Ok(guesser_fee) = new_proposal.body().total_guesser_reward() else {
+                    self.punish(NegativePeerSanction::InvalidBlockProposal)
+                        .await?;
+                    return Ok(KEEP_CONNECTION_ALIVE);
+                };
+
+                // Check favorability and take the tip under one lock, so both
+                // refer to the same tip. Verify the proof, which is slow, after
+                // releasing the lock. The main loop checks favorability again,
+                // against its tip then, before using the proposal.
+                let favorability = {
+                    let state = self.global_state_lock.lock_guard().await;
+                    state
+                        .favor_incoming_block_proposal(
+                            new_proposal.header().prev_block_digest,
+                            guesser_fee,
+                        )
+                        .map(|()| state.chain.light_state_clone())
+                };
+                let was_requested =
+                    peer_state_info.take_requested_block_proposal(new_proposal.body().mast_hash());
+                let tip = match favorability {
+                    Ok(tip) => tip,
+
+                    // We asked for it, so our tip or proposal changed while it
+                    // was underway. Not the peer's fault.
+                    Err(rejection_reason) if was_requested => {
+                        debug!(
+                            "Ignoring block proposal from peer {}:\n{rejection_reason}",
+                            self.peer_address
+                        );
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+
+                    // Peers send proposals only when asked.
+                    Err(rejection_reason) => {
+                        warn!(
+                            "Rejecting unrequested block proposal from peer {}:\n{rejection_reason}",
+                            self.peer_address
+                        );
+                        let sanction = match rejection_reason {
+                            BlockProposalRejectError::WrongParent { .. }
+                            | BlockProposalRejectError::WrongHeight { .. } => {
+                                NegativePeerSanction::InvalidBlockProposal
+                            }
+                            _ => NegativePeerSanction::NonFavorableBlockProposal,
+                        };
+                        self.punish(sanction).await?;
+                        return Ok(KEEP_CONNECTION_ALIVE);
+                    }
+                };
+
                 let proposal_is_valid = new_proposal
-                    .is_valid(tip, self.now(), self.global_state_lock.cli().network)
+                    .is_valid(&tip, self.now(), self.global_state_lock.cli().network)
                     .await;
                 if !proposal_is_valid {
-                    drop(state);
                     self.punish(NegativePeerSanction::InvalidBlockProposal)
                         .await?;
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
-
-                // Is block proposal favorable?
-                let is_favorable = state.favor_incoming_block_proposal(
-                    new_proposal.header().prev_block_digest,
-                    new_proposal
-                        .body()
-                        .total_guesser_reward()
-                        .expect("Block was validated"),
-                );
-                drop(state);
-
-                if let Err(rejection_reason) = is_favorable {
-                    match rejection_reason {
-                        // no need to punish and log if the fees are equal.  we just ignore the incoming proposal.
-                        BlockProposalRejectError::InsufficientFee { current, received }
-                            if Some(received) == current =>
-                        {
-                            debug!("ignoring new block proposal because the fee is equal to the present one");
-                            return Ok(KEEP_CONNECTION_ALIVE);
-                        }
-                        _ => {
-                            warn!("Rejecting new block proposal:\n{rejection_reason}");
-                            self.punish(NegativePeerSanction::NonFavorableBlockProposal)
-                                .await?;
-                            return Ok(KEEP_CONNECTION_ALIVE);
-                        }
-                    }
-                };
 
                 self.send_to_main(PeerTaskToMain::BlockProposal(new_proposal), line!())
                     .await?;
@@ -2419,6 +2543,11 @@ impl PeerLoopHandler {
                     return Ok(KEEP_CONNECTION_ALIVE);
                 }
 
+                // So that a request for it is not punished after it has been
+                // replaced; see `PeerMessage::BlockProposalRequest`.
+                peer_state_info
+                    .record_announced_block_proposal(block_proposal_notification.body_mast_hash);
+
                 debug!("Sending PeerMessage::BlockProposalNotification");
                 peer.send(PeerMessage::BlockProposalNotification(
                     block_proposal_notification,
@@ -2471,6 +2600,13 @@ impl PeerLoopHandler {
                             if let Some(oversized) = OversizedFrame::behind(&err) {
                                 warn!("Closing connection to {peer_address}: {oversized}");
                                 self.punish(NegativePeerSanction::OversizedBlock).await?;
+                                break;
+                            }
+
+                            // A lost connection, e.g. one that timed out, is
+                            // not the peer's fault, and of no further use.
+                            if connection_lost(&err) {
+                                info!("Connection to {peer_address} lost: {err}");
                                 break;
                             }
 
@@ -2817,6 +2953,40 @@ mod tests {
             NegativePeerSanction::InvalidMessage,
             peer_standing.unwrap().latest_punishment.unwrap().0
         );
+    }
+
+    /// A lost connection, e.g. one that timed out, is not the peer's fault:
+    /// it ends the peer loop without a punishment.
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn lost_connection_closes_without_punishment() {
+        // Were the loop to continue after the timeout, it would read the
+        // `Bye` too.
+        let mock = Mock::new(vec![
+            Action::ReadConnectionTimedOut,
+            Action::Read(PeerMessage::Bye),
+        ]);
+
+        let (peer_broadcast_tx, _from_main_rx_clone, to_main_tx, _to_main_rx1, state_lock, hsd) =
+            get_test_genesis_setup(Network::Main, 1, cli_args::Args::default())
+                .await
+                .unwrap();
+
+        let peer_address = get_dummy_socket_address(2);
+        let mut peer_loop_handler =
+            PeerLoopHandler::new(to_main_tx, state_lock.clone(), peer_address, hsd, true, 1);
+        peer_loop_handler
+            .run_wrapper(mock, peer_broadcast_tx.subscribe())
+            .await
+            .unwrap();
+
+        let peer_standing = state_lock
+            .lock_guard()
+            .await
+            .net
+            .get_peer_standing_from_database(peer_address.ip())
+            .await;
+        assert!(peer_standing.is_none_or(|standing| standing.latest_punishment.is_none()));
     }
 
     #[traced_test]
@@ -6247,9 +6417,248 @@ mod tests {
                 .run(mock, from_main_rx, &mut peer_state)
                 .await
                 .unwrap();
+            assert!(
+                peer_state.take_requested_block_proposal(block1.body().mast_hash()),
+                "the request must be remembered"
+            );
 
             drop(to_main_tx);
             drop(peer_broadcast_tx);
+        }
+
+        async fn standing(handler: &PeerLoopHandler) -> i32 {
+            handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .get(&handler.peer_address)
+                .unwrap()
+                .standing
+                .standing
+        }
+
+        /// Hand a block proposal to the peer loop, which must not answer it.
+        async fn receive_proposal(setup: &mut TestSetup, proposal: Block) {
+            let mut stream = Mock::new(vec![]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::BlockProposal(Box::new(proposal)),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(stream.is_done());
+        }
+
+        /// A proposal that does not build on our tip, on a parent we don't
+        /// know.
+        fn proposal_not_on_tip(setup: &TestSetup) -> Block {
+            let network = setup.peer_loop_handler.global_state_lock.cli().network;
+            let unknown_parent = invalid_empty_block(&setup.genesis_block, network);
+            invalid_empty_block(&unknown_parent, network)
+        }
+
+        /// Our own proposal, held, and another peer's.
+        async fn hold_own_proposal(setup: &mut TestSetup) -> Block {
+            use crate::state::mining::block_proposal::BlockProposal;
+
+            let mut state_lock = setup.peer_loop_handler.global_state_lock.clone();
+            let own =
+                fake_valid_block_for_tests(&state_lock, StdRng::seed_from_u64(1).random()).await;
+            let theirs =
+                fake_valid_block_for_tests(&state_lock, StdRng::seed_from_u64(2).random()).await;
+            state_lock
+                .lock_guard_mut()
+                .await
+                .mining_state
+                .block_proposal = BlockProposal::own_proposal(own, vec![]);
+
+            theirs
+        }
+
+        /// A requested proposal that does not build on our tip is ignored, not
+        /// punished: a new block changed our tip while it was underway.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn requested_proposal_not_on_tip_is_ignored_without_punishment() {
+            let mut setup = genesis_setup(cli_args::Args::default()).await;
+            let stale_proposal = proposal_not_on_tip(&setup);
+            setup
+                .peer_state
+                .record_requested_block_proposal(stale_proposal.body().mast_hash());
+
+            receive_proposal(&mut setup, stale_proposal).await;
+
+            assert_eq!(0, standing(&setup.peer_loop_handler).await);
+            assert_eq!(
+                TryRecvError::Empty,
+                setup.to_main_rx.try_recv().unwrap_err()
+            );
+        }
+
+        /// An unrequested proposal that does not build on our tip is punished,
+        /// as peers send proposals only when asked.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn unrequested_proposal_not_on_tip_is_punished() {
+            let mut setup = genesis_setup(cli_args::Args::default()).await;
+            let stale_proposal = proposal_not_on_tip(&setup);
+
+            receive_proposal(&mut setup, stale_proposal).await;
+
+            assert_eq!(
+                NegativePeerSanction::InvalidBlockProposal.severity(),
+                standing(&setup.peer_loop_handler).await
+            );
+            assert_eq!(
+                TryRecvError::Empty,
+                setup.to_main_rx.try_recv().unwrap_err()
+            );
+        }
+
+        /// A requested proposal received while we hold our own is ignored, not
+        /// punished: we built ours after requesting theirs.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn requested_proposal_while_holding_own_is_ignored_without_punishment() {
+            let composer = cli_args::Args {
+                compose: true,
+                ..Default::default()
+            };
+            let mut setup = genesis_setup(composer).await;
+            let theirs = hold_own_proposal(&mut setup).await;
+            setup
+                .peer_state
+                .record_requested_block_proposal(theirs.body().mast_hash());
+
+            receive_proposal(&mut setup, theirs).await;
+
+            assert_eq!(0, standing(&setup.peer_loop_handler).await);
+            assert_eq!(
+                TryRecvError::Empty,
+                setup.to_main_rx.try_recv().unwrap_err()
+            );
+        }
+
+        /// An unrequested proposal received while we hold our own is punished
+        /// mildly, and a requested one sent a second time too, as one request
+        /// warrants one proposal.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn unrequested_proposal_while_holding_own_is_punished_mildly() {
+            let composer = cli_args::Args {
+                compose: true,
+                ..Default::default()
+            };
+            let mut setup = genesis_setup(composer).await;
+            let theirs = hold_own_proposal(&mut setup).await;
+            setup
+                .peer_state
+                .record_requested_block_proposal(theirs.body().mast_hash());
+
+            receive_proposal(&mut setup, theirs.clone()).await;
+            assert_eq!(0, standing(&setup.peer_loop_handler).await);
+
+            receive_proposal(&mut setup, theirs).await;
+            assert_eq!(
+                NegativePeerSanction::NonFavorableBlockProposal.severity(),
+                standing(&setup.peer_loop_handler).await
+            );
+        }
+
+        /// A proposal that builds on our tip and pays more, but is invalid, is
+        /// still punished.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn invalid_proposal_on_tip_is_punished() {
+            let mut setup = genesis_setup(cli_args::Args::default()).await;
+            let state_lock = setup.peer_loop_handler.global_state_lock.clone();
+            let mut invalid =
+                fake_valid_block_for_tests(&state_lock, StdRng::seed_from_u64(3).random()).await;
+
+            // Same timestamp as its parent: violates the minimum block time.
+            let difficulty = invalid.header().difficulty;
+            invalid.set_header_timestamp_and_difficulty(
+                setup.genesis_block.header().timestamp,
+                difficulty,
+            );
+
+            receive_proposal(&mut setup, invalid).await;
+
+            assert_eq!(
+                NegativePeerSanction::InvalidBlockProposal.severity(),
+                standing(&setup.peer_loop_handler).await
+            );
+            assert_eq!(
+                TryRecvError::Empty,
+                setup.to_main_rx.try_recv().unwrap_err()
+            );
+        }
+
+        /// Hand a request for a block proposal to the peer loop, which holds
+        /// none, so must not answer it.
+        async fn receive_proposal_request(setup: &mut TestSetup, body_mast_hash: Digest) {
+            let mut stream = Mock::new(vec![]);
+            setup
+                .peer_loop_handler
+                .handle_peer_message(
+                    PeerMessage::BlockProposalRequest(BlockProposalRequest::new(body_mast_hash)),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(stream.is_done());
+        }
+
+        /// A request for a proposal we announced to the peer but have replaced
+        /// since is not punished: the request was underway when it changed.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn request_for_announced_but_replaced_proposal_is_not_punished() {
+            let mut setup = genesis_setup(cli_args::Args::default()).await;
+            let notification = BlockProposalNotification {
+                body_mast_hash: StdRng::seed_from_u64(4).random(),
+                guesser_fee: NativeCurrencyAmount::coins(1),
+                height: 1u64.into(),
+            };
+
+            let mut stream = Mock::new(vec![Action::Write(
+                PeerMessage::BlockProposalNotification(notification.clone()),
+            )]);
+            setup
+                .peer_loop_handler
+                .handle_main_task_message(
+                    MainToPeerTask::BlockProposalNotification(notification.clone()),
+                    &mut stream,
+                    &mut setup.peer_state,
+                )
+                .await
+                .unwrap();
+            assert!(stream.is_done());
+
+            // We hold no proposal: the announced one was replaced.
+            receive_proposal_request(&mut setup, notification.body_mast_hash).await;
+
+            assert_eq!(0, standing(&setup.peer_loop_handler).await);
+        }
+
+        /// A request for a proposal we never announced to the peer is punished.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn request_for_never_announced_proposal_is_punished() {
+            let mut setup = genesis_setup(cli_args::Args::default()).await;
+
+            receive_proposal_request(&mut setup, StdRng::seed_from_u64(5).random()).await;
+
+            assert_eq!(
+                NegativePeerSanction::BlockProposalNotFound.severity(),
+                standing(&setup.peer_loop_handler).await
+            );
         }
     }
 
@@ -6410,6 +6819,9 @@ mod tests {
         use itertools::Itertools;
 
         use super::*;
+        use crate::protocol::peer::SyncChallengeResponse;
+        use crate::protocol::peer::SYNC_CHALLENGE_MIN_INTERVAL;
+        use crate::protocol::peer::SYNC_CHALLENGE_NUM_BLOCK_PAIRS;
         use crate::tests::shared::blocks::fake_valid_sequence_of_blocks_for_tests_dyn;
 
         #[traced_test]
@@ -6672,6 +7084,557 @@ mod tests {
             assert_eq!(
                 expected_message_from_alice_peer_loop,
                 observed_message_from_alice_peer_loop
+            );
+
+            Ok(())
+        }
+
+        /// Bob is ahead of Alice by enough for her to challenge him. Alice
+        /// challenges Bob, who answers with his response, altered by `alter`.
+        /// Returns Bob's standing with Alice afterwards, and whether Alice's
+        /// peer loop told the main loop to consider syncing from Bob.
+        async fn challenge_with_altered_response(
+            alter: impl FnOnce(&mut SyncChallengeResponse),
+        ) -> Result<(Option<PeerStanding>, bool)> {
+            const ALICE_SYNC_MODE_THRESHOLD: usize = 10;
+
+            let mut rng = StdRng::seed_from_u64(5550002);
+            let network = Network::Main;
+
+            let alice_cli = cli_args::Args {
+                sync_mode_threshold: ALICE_SYNC_MODE_THRESHOLD,
+                ..Default::default()
+            };
+            let (
+                _alice_main_to_peer_tx,
+                alice_main_to_peer_rx,
+                alice_peer_to_main_tx,
+                mut alice_peer_to_main_rx,
+                mut alice,
+                alice_hsd,
+            ) = get_test_genesis_setup(network, 0, alice_cli).await?;
+            let (_, _, _, _, mut bob, _) =
+                get_test_genesis_setup(network, 0, cli_args::Args::default()).await?;
+            let bob_socket_address = get_dummy_socket_address(0);
+
+            let block_1 = fake_valid_block_for_tests(&alice, rng.random()).await;
+            alice.set_new_tip(block_1.clone()).await?;
+            bob.set_new_tip(block_1.clone()).await?;
+            let blocks = fake_valid_sequence_of_blocks_for_tests_dyn(
+                &block_1,
+                network.target_block_interval(),
+                (0..ALICE_SYNC_MODE_THRESHOLD + 2)
+                    .map(|_| rng.random())
+                    .collect_vec(),
+                network,
+            )
+            .await;
+            for block in &blocks {
+                bob.set_new_tip(block.clone()).await?;
+            }
+            let bob_tip = blocks.last().unwrap();
+            let block_notification_from_bob = PeerBlockNotification::from(bob_tip);
+
+            let alice_rng_seed = rng.random::<[u8; 32]>();
+            let sync_challenge_from_alice = SyncChallenge::generate(
+                &block_notification_from_bob,
+                block_1.header().height,
+                StdRng::from_seed(alice_rng_seed).random(),
+            );
+            let mut response = bob
+                .lock_guard()
+                .await
+                .response_to_sync_challenge(sync_challenge_from_alice)
+                .await?;
+            alter(&mut response);
+
+            let alice_p2p_messages = Mock::new(vec![
+                Action::Read(PeerMessage::BlockNotification(block_notification_from_bob)),
+                Action::Write(PeerMessage::SyncChallenge(sync_challenge_from_alice)),
+                Action::Read(PeerMessage::SyncChallengeResponse(Box::new(response))),
+                Action::Read(PeerMessage::Bye),
+            ]);
+            let mut alice_peer_loop_handler = PeerLoopHandler::with_mocked_time(
+                alice_peer_to_main_tx.clone(),
+                alice.clone(),
+                bob_socket_address,
+                alice_hsd,
+                false,
+                1,
+                bob_tip.header().timestamp,
+            );
+            alice_peer_loop_handler.set_rng(StdRng::from_seed(alice_rng_seed));
+            alice_peer_loop_handler
+                .run_wrapper(alice_p2p_messages, alice_main_to_peer_rx)
+                .await?;
+
+            let standing = alice
+                .lock_guard()
+                .await
+                .net
+                .get_peer_standing_from_database(bob_socket_address.ip())
+                .await;
+            let mut syncs = false;
+            while let Ok(message) = alice_peer_to_main_rx.try_recv() {
+                syncs |= matches!(message, PeerTaskToMain::AddPeerMaxBlockHeight { .. });
+            }
+
+            Ok((standing, syncs))
+        }
+
+        /// A response whose membership proofs do not match the challenged tip,
+        /// as an honest peer sends, rarely, if its chain reorganized away from
+        /// that tip before it answered, is punished and not acted upon.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn response_not_matching_tip_is_punished() -> Result<()> {
+            let (standing, syncs) = challenge_with_altered_response(|response| {
+                // Break a membership proof, as if Bob had answered for
+                // another tip.
+                response.membership_proofs[0]
+                    .authentication_path
+                    .push(Digest::default());
+            })
+            .await?;
+
+            let standing = standing.expect("Bob must have been punished");
+            assert_eq!(
+                NegativePeerSanction::InvalidSyncChallengeResponse,
+                standing.latest_punishment.unwrap().0
+            );
+            assert_eq!(
+                NegativePeerSanction::InvalidSyncChallengeResponse.severity(),
+                standing.standing
+            );
+            assert!(!syncs, "a rejected response must not lead to sync mode");
+
+            Ok(())
+        }
+
+        /// A response whose proofs match the challenged tip but whose blocks
+        /// are invalid is punished as before.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn response_with_invalid_block_is_punished() -> Result<()> {
+            let (standing, syncs) = challenge_with_altered_response(|response| {
+                // Change a parent block, which is not covered by the
+                // membership proofs, so that its child no longer points to it.
+                let parent = &mut response.blocks[0].0;
+                parent.header.timestamp += Timestamp::millis(1);
+            })
+            .await?;
+
+            let standing = standing.expect("Bob must have been punished");
+            assert_eq!(
+                NegativePeerSanction::InvalidSyncChallengeResponse,
+                standing.latest_punishment.unwrap().0
+            );
+            assert_eq!(
+                NegativePeerSanction::InvalidSyncChallengeResponse.severity(),
+                standing.standing
+            );
+            assert!(!syncs, "a rejected response must not lead to sync mode");
+
+            Ok(())
+        }
+
+        /// Bob announced a tip, then reorganized away from it. Challenged on
+        /// it, Bob answers along the tip's own chain, which proves the tip.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn response_proves_tip_reorganized_away_from() -> Result<()> {
+            let mut rng = StdRng::seed_from_u64(5550003);
+            let network = Network::Main;
+            let (_, _, _, _, mut bob, _) =
+                get_test_genesis_setup(network, 0, cli_args::Args::default()).await?;
+
+            // The announced tip has height 15, so its block MMR has 16 leafs:
+            // one peak, on which every membership proof depends.
+            let blocks = fake_valid_sequence_of_blocks_for_tests_dyn(
+                &Block::genesis(network),
+                network.target_block_interval(),
+                (0..15).map(|_| rng.random()).collect_vec(),
+                network,
+            )
+            .await;
+            for block in &blocks {
+                bob.set_new_tip(block.clone()).await?;
+            }
+            let announced_tip = blocks.last().unwrap();
+
+            // A sibling of the announced tip, and a child of it, take over.
+            let sibling_and_child = fake_valid_sequence_of_blocks_for_tests_dyn(
+                &blocks[blocks.len() - 2],
+                network.target_block_interval(),
+                (0..2).map(|_| rng.random()).collect_vec(),
+                network,
+            )
+            .await;
+            for block in &sibling_and_child {
+                bob.set_new_tip(block.clone()).await?;
+            }
+            assert!(
+                !bob.lock_guard()
+                    .await
+                    .chain
+                    .archival_state()
+                    .block_belongs_to_canonical_chain(announced_tip.hash())
+                    .await
+            );
+
+            let h = u64::from(announced_tip.header().height);
+            let challenge = SyncChallenge {
+                tip_digest: announced_tip.hash(),
+                challenges: [2, 3, 4, 5, 6, h - 5, h - 4, h - 3, h - 2, h - 1]
+                    .map(BlockHeight::from),
+            };
+            let response = bob
+                .lock_guard()
+                .await
+                .response_to_sync_challenge(challenge)
+                .await?;
+
+            let issued = IssuedSyncChallenge::new(
+                challenge,
+                announced_tip.header().cumulative_proof_of_work,
+                Timestamp::now(),
+            );
+            assert!(response.matches(network, issued));
+            let now = sibling_and_child.last().unwrap().header().timestamp;
+            assert_eq!(Ok(()), response.validate(now, network).await);
+
+            // By a clock far behind, the tip is from the future: the response
+            // is ignored rather than punished.
+            let clock_behind = announced_tip.header().timestamp - Timestamp::hours(1);
+            assert_eq!(
+                Err(SyncChallengeResponseRejection::FutureDated),
+                response.validate(clock_behind, network).await
+            );
+
+            Ok(())
+        }
+
+        /// After a challenge, whatever its outcome, the same peer is
+        /// challenged again only after `SYNC_CHALLENGE_RETRY_INTERVAL`.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn peer_is_challenged_again_only_after_retry_interval() -> Result<()> {
+            let network = Network::Main;
+            let cli = cli_args::Args {
+                sync_mode_threshold: 10,
+                ..Default::default()
+            };
+            let (_, _, to_main_tx, _to_main_rx, alice, _) =
+                get_test_genesis_setup(network, 1, cli).await?;
+            let peer_address = *alice.lock_guard().await.net.peer_map.keys().next().unwrap();
+            let genesis = Block::genesis(network);
+            let notification = PeerBlockNotification {
+                hash: Digest::default(),
+                height: 20u64.into(),
+                cumulative_proof_of_work: genesis.header().cumulative_proof_of_work
+                    + genesis.header().difficulty,
+            };
+
+            let now = genesis.header().timestamp + Timestamp::days(1);
+            let rng_seed = [7u8; 32];
+            let mut handler = PeerLoopHandler::with_mocked_time(
+                to_main_tx,
+                alice,
+                peer_address,
+                get_dummy_handshake_data_for_genesis(network),
+                true,
+                1,
+                now,
+            );
+            handler.set_rng(StdRng::from_seed(rng_seed));
+            let mut peer_state = MutablePeerState::new(genesis.header().height);
+
+            // Just too soon after the previous challenge: none is sent.
+            peer_state.last_sent_sync_challenge_time = Some(now - SYNC_CHALLENGE_RETRY_INTERVAL);
+            let mut stream = Mock::new(vec![]);
+            handler
+                .handle_peer_message(
+                    PeerMessage::BlockNotification(notification),
+                    &mut stream,
+                    &mut peer_state,
+                )
+                .await?;
+            assert!(stream.is_done());
+            assert!(peer_state.sync_challenge.is_none());
+
+            // Just long enough after it: one is sent.
+            peer_state.last_sent_sync_challenge_time =
+                Some(now - SYNC_CHALLENGE_RETRY_INTERVAL - Timestamp::seconds(1));
+            let challenge = SyncChallenge::generate(
+                &notification,
+                genesis.header().height,
+                StdRng::from_seed(rng_seed).random(),
+            );
+            let mut stream_after = Mock::new(vec![Action::Write(
+                PeerMessage::SyncChallenge(challenge),
+            )]);
+            handler
+                .handle_peer_message(
+                    PeerMessage::BlockNotification(notification),
+                    &mut stream_after,
+                    &mut peer_state,
+                )
+                .await?;
+            assert!(stream_after.is_done());
+            assert_eq!(Some(now), peer_state.last_sent_sync_challenge_time);
+
+            Ok(())
+        }
+
+        /// A challenge sooner than `SYNC_CHALLENGE_MIN_INTERVAL` after the last
+        /// answered one from the same IP address, even over a new connection,
+        /// is punished, not answered, and closes the connection, without
+        /// postponing the next answered one. One that waits as long is
+        /// answered.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn challenge_sooner_than_min_interval_is_punished() -> Result<()> {
+            let network = Network::Main;
+            let (_, _, to_main_tx, _to_main_rx, mut bob, _) =
+                get_test_genesis_setup(network, 1, cli_args::Args::default()).await?;
+            let peer_address = *bob.lock_guard().await.net.peer_map.keys().next().unwrap();
+            let blocks: [Block; 11] = fake_valid_sequence_of_blocks_for_tests(
+                &Block::genesis(network),
+                Timestamp::hours(1),
+                Default::default(),
+                network,
+            )
+            .await;
+            for block in &blocks {
+                bob.set_new_tip(block.clone()).await?;
+            }
+            let tip = blocks.last().unwrap();
+            let challenge = SyncChallenge {
+                tip_digest: tip.hash(),
+                challenges: [2u64, 3, 4, 5, 6, 7, 8, 9, 10, 10].map(BlockHeight::from),
+            };
+            let response = bob
+                .lock_guard()
+                .await
+                .response_to_sync_challenge(challenge)
+                .await?;
+
+            let now = tip.header().timestamp + Timestamp::days(1);
+            let mut handler = PeerLoopHandler::with_mocked_time(
+                to_main_tx,
+                bob.clone(),
+                peer_address,
+                get_dummy_handshake_data_for_genesis(network),
+                true,
+                1,
+                now,
+            );
+            let standing = async || {
+                bob.lock_guard().await.net.peer_map[&peer_address]
+                    .standing
+                    .standing
+            };
+
+            let ip = peer_address.ip().to_canonical();
+            let penalty = NegativePeerSanction::ReceivedSyncChallenge.severity();
+            for (since_previous, answered, expected_standing) in [
+                (SYNC_CHALLENGE_RETRY_INTERVAL, true, 0),
+                (SYNC_CHALLENGE_MIN_INTERVAL, true, 0),
+                (
+                    SYNC_CHALLENGE_MIN_INTERVAL - Timestamp::seconds(1),
+                    false,
+                    penalty,
+                ),
+            ] {
+                let last_answered = now - since_previous;
+                bob.clone()
+                    .lock_guard_mut()
+                    .await
+                    .net
+                    .last_sync_challenge_received
+                    .insert(ip, last_answered);
+
+                // A fresh connection state, as if the peer had reconnected.
+                let mut peer_state = MutablePeerState::new(BlockHeight::genesis());
+                let actions = if answered {
+                    vec![Action::Write(PeerMessage::SyncChallengeResponse(
+                        Box::new(response.clone()),
+                    ))]
+                } else {
+                    vec![]
+                };
+                let mut stream = Mock::new(actions);
+                let disconnect = handler
+                    .handle_peer_message(
+                        PeerMessage::SyncChallenge(challenge),
+                        &mut stream,
+                        &mut peer_state,
+                    )
+                    .await?;
+                assert!(stream.is_done(), "answered: {answered}");
+                assert_eq!(!answered, disconnect, "answered: {answered}");
+                assert_eq!(expected_standing, standing().await);
+
+                let recorded = bob.lock_guard().await.net.last_sync_challenge_received[&ip];
+                let expected_recorded = if answered { now } else { last_answered };
+                assert_eq!(expected_recorded, recorded, "answered: {answered}");
+            }
+
+            Ok(())
+        }
+
+        /// A challenge left unanswered for longer than `SYNC_CHALLENGE_EXPIRY`
+        /// is given up on, so that the peer can be challenged again.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn unanswered_challenge_is_given_up_and_replaced() -> Result<()> {
+            let network = Network::Main;
+            let cli = cli_args::Args {
+                sync_mode_threshold: 10,
+                ..Default::default()
+            };
+            let (_, _, to_main_tx, _to_main_rx, alice, _) =
+                get_test_genesis_setup(network, 1, cli).await?;
+            let peer_address = *alice.lock_guard().await.net.peer_map.keys().next().unwrap();
+            let genesis = Block::genesis(network);
+            let notification = PeerBlockNotification {
+                hash: Digest::default(),
+                height: 20u64.into(),
+                cumulative_proof_of_work: genesis.header().cumulative_proof_of_work
+                    + genesis.header().difficulty,
+            };
+
+            let now = genesis.header().timestamp + Timestamp::days(1);
+            let rng_seed = [9u8; 32];
+            let mut handler = PeerLoopHandler::with_mocked_time(
+                to_main_tx,
+                alice,
+                peer_address,
+                get_dummy_handshake_data_for_genesis(network),
+                true,
+                1,
+                now,
+            );
+            handler.set_rng(StdRng::from_seed(rng_seed));
+
+            let sent_at = now - SYNC_CHALLENGE_RETRY_INTERVAL - Timestamp::seconds(1);
+            let unanswered = IssuedSyncChallenge::new(
+                SyncChallenge {
+                    tip_digest: Digest::default(),
+                    challenges: [2u64; SYNC_CHALLENGE_NUM_BLOCK_PAIRS].map(BlockHeight::from),
+                },
+                notification.cumulative_proof_of_work,
+                sent_at,
+            );
+            let mut peer_state = MutablePeerState::new(genesis.header().height);
+            peer_state.sync_challenge = Some(unanswered);
+            peer_state.last_sent_sync_challenge_time = Some(sent_at);
+
+            let new_challenge = SyncChallenge::generate(
+                &notification,
+                genesis.header().height,
+                StdRng::from_seed(rng_seed).random(),
+            );
+            let mut stream = Mock::new(vec![Action::Write(PeerMessage::SyncChallenge(
+                new_challenge,
+            ))]);
+            handler
+                .handle_peer_message(
+                    PeerMessage::BlockNotification(notification),
+                    &mut stream,
+                    &mut peer_state,
+                )
+                .await?;
+
+            assert!(stream.is_done(), "a new challenge must be sent");
+            assert_eq!(
+                Some(new_challenge),
+                peer_state.sync_challenge.map(|issued| issued.challenge)
+            );
+            assert_eq!(
+                Some(unanswered.challenge),
+                peer_state
+                    .expired_sync_challenge
+                    .map(|issued| issued.challenge)
+            );
+
+            Ok(())
+        }
+
+        /// An answer to a challenge we gave up on, arriving while a newer
+        /// challenge is pending, is punished as late, not as wrong, and leaves
+        /// the newer challenge pending.
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn late_answer_to_given_up_challenge_is_punished_as_late() -> Result<()> {
+            let network = Network::Main;
+            let (_, _, to_main_tx, _to_main_rx, mut bob, _) =
+                get_test_genesis_setup(network, 1, cli_args::Args::default()).await?;
+            let peer_address = *bob.lock_guard().await.net.peer_map.keys().next().unwrap();
+            let blocks: [Block; 11] = fake_valid_sequence_of_blocks_for_tests(
+                &Block::genesis(network),
+                Timestamp::hours(1),
+                Default::default(),
+                network,
+            )
+            .await;
+            for block in &blocks {
+                bob.set_new_tip(block.clone()).await?;
+            }
+            let tip = blocks.last().unwrap();
+            let challenge_for = |heights: [u64; SYNC_CHALLENGE_NUM_BLOCK_PAIRS]| SyncChallenge {
+                tip_digest: tip.hash(),
+                challenges: heights.map(BlockHeight::from),
+            };
+            let given_up = challenge_for([2, 3, 4, 5, 6, 7, 8, 9, 10, 10]);
+            let pending = challenge_for([2, 2, 3, 3, 4, 4, 5, 5, 6, 6]);
+            let late_answer = bob
+                .lock_guard()
+                .await
+                .response_to_sync_challenge(given_up)
+                .await?;
+
+            let now = tip.header().timestamp + Timestamp::minutes(10);
+            let pow = tip.header().cumulative_proof_of_work;
+            let mut peer_state = MutablePeerState::new(BlockHeight::genesis());
+            peer_state.expired_sync_challenge = Some(IssuedSyncChallenge::new(
+                given_up,
+                pow,
+                now - Timestamp::minutes(2),
+            ));
+            peer_state.sync_challenge = Some(IssuedSyncChallenge::new(pending, pow, now));
+
+            let mut handler = PeerLoopHandler::with_mocked_time(
+                to_main_tx,
+                bob.clone(),
+                peer_address,
+                get_dummy_handshake_data_for_genesis(network),
+                true,
+                1,
+                now,
+            );
+            let mut stream = Mock::new(vec![]);
+            handler
+                .handle_peer_message(
+                    PeerMessage::SyncChallengeResponse(Box::new(late_answer)),
+                    &mut stream,
+                    &mut peer_state,
+                )
+                .await?;
+
+            let standing = bob.lock_guard().await.net.peer_map[&peer_address].standing;
+            assert_eq!(
+                NegativePeerSanction::TimedOutSyncChallengeResponse,
+                standing.latest_punishment.unwrap().0
+            );
+            assert_eq!(
+                NegativePeerSanction::TimedOutSyncChallengeResponse.severity(),
+                standing.standing
+            );
+            assert!(peer_state.expired_sync_challenge.is_none());
+            assert_eq!(
+                Some(pending),
+                peer_state.sync_challenge.map(|issued| issued.challenge)
             );
 
             Ok(())

@@ -976,11 +976,6 @@ impl MainLoopHandler {
                     return Ok(None);
                 }
 
-                if !self.global_state_lock.cli().secret_compositions {
-                    let pmsg = MainToPeerTask::BlockProposalNotification((&block).into());
-                    self.main_to_peer_broadcast(pmsg);
-                }
-
                 {
                     // Use block proposal and add expected UTXOs from this
                     // proposal.
@@ -988,6 +983,13 @@ impl MainLoopHandler {
                     state.mining_state.block_proposal =
                         BlockProposal::own_proposal(block.clone(), expected_utxos.clone());
                     state.wallet_state.add_expected_utxos(expected_utxos).await;
+                }
+
+                // Announce only once the proposal is held, so that a peer
+                // requesting it right away is served.
+                if !self.global_state_lock.cli().secret_compositions {
+                    let pmsg = MainToPeerTask::BlockProposalNotification((&block).into());
+                    self.main_to_peer_broadcast(pmsg);
                 }
 
                 // Indicate to miner that block proposal was successfully

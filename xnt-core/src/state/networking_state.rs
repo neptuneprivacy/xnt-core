@@ -16,6 +16,8 @@ use crate::protocol::consensus::block::difficulty_control::ProofOfWork;
 use crate::protocol::peer::peer_info::PeerInfo;
 use crate::protocol::peer::InstanceId;
 use crate::protocol::peer::PeerStanding;
+use crate::protocol::peer::SYNC_CHALLENGE_MIN_INTERVAL;
+use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::database::PeerDatabases;
 
 pub const BANNED_IPS_DB_NAME: &str = "banned_ips";
@@ -107,6 +109,13 @@ pub struct NetworkingState {
     /// Only the peer tasks may update this map, and the main loop and the RPC
     /// server, to lift the reconnect cooldown of an IP address.
     disconnection_times: HashMap<InstanceId, (IpAddr, SystemTime)>,
+
+    /// When we last answered a sync challenge from each IP address, by its
+    /// canonical form. Kept per IP address rather than per connection, so that
+    /// reconnecting does not reset it. Times at least
+    /// [`SYNC_CHALLENGE_MIN_INTERVAL`] ago are dropped when the next challenge
+    /// arrives.
+    pub(crate) last_sync_challenge_received: HashMap<IpAddr, Timestamp>,
 }
 
 impl NetworkingState {
@@ -118,7 +127,25 @@ impl NetworkingState {
             instance_id: rand::random(),
             freeze: false,
             disconnection_times: HashMap::new(),
+            last_sync_challenge_received: HashMap::new(),
         }
+    }
+
+    /// Whether a sync challenge from this IP address, received at `now`, came
+    /// sooner than [`SYNC_CHALLENGE_MIN_INTERVAL`] after the last one that was
+    /// answered. If not, it will be answered, so its time is recorded. A
+    /// challenge that came too soon is not, so that it does not postpone the
+    /// next one that will be answered.
+    pub(crate) fn record_received_sync_challenge(&mut self, ip: IpAddr, now: Timestamp) -> bool {
+        self.last_sync_challenge_received
+            .retain(|_, then| now - *then < SYNC_CHALLENGE_MIN_INTERVAL);
+        let ip = ip.to_canonical();
+        if self.last_sync_challenge_received.contains_key(&ip) {
+            return true;
+        }
+
+        self.last_sync_challenge_received.insert(ip, now);
+        false
     }
 
     /// Create databases for peer standings

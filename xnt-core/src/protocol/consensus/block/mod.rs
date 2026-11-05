@@ -6,7 +6,7 @@ pub mod block_info;
 pub mod block_kernel;
 pub mod block_selector;
 pub(crate) mod block_transaction;
-mod block_validation_error;
+pub(crate) mod block_validation_error;
 pub mod difficulty_control;
 pub(crate) mod guesser_receiver_data;
 pub mod mock_block_generator;
