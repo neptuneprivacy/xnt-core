@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-05
+
+No consensus change, no new peer message and no new sanction kind: v0.3.1 works with peers on v0.3.0 and earlier, and they need not upgrade.
+
+### Fixed
+
+- **Honest peers punished for block-proposal races**:
+  - A request for a block proposal this node announced but has since replaced is ignored instead of punished as `BlockProposalNotFound`.
+  - A proposal this node requested that is no longer favorable when it arrives (the tip moved, or a better proposal arrived in the meantime) is ignored instead of punished as `InvalidBlockProposal` or `NonFavorableBlockProposal`. Unrequested proposals are still punished.
+  - The node stores its own proposal before announcing it, so a peer's immediate request finds it.
+- **Sync challenge across a reorganization**: a node answering a sync challenge proves the challenged blocks against the tip it was challenged on, even when its canonical chain has since switched to a sibling branch (up to 100 blocks deep). Previously its proofs did not fit that tip and the challenger punished it with `InvalidSyncChallengeResponse`.
+- **Sync challenge timing**:
+  - An unanswered challenge is given up after 45 seconds and a failed one retried after 90 seconds (10 minutes after a successful one, as before). Previously one unanswered challenge blocked syncing from that peer for the rest of the connection. A late answer to a given-up challenge is punished as `TimedOutSyncChallengeResponse`.
+  - Received challenges are limited to one per 60 seconds per IP address, across connections (was one per 10 minutes per connection). A challenge sent too soon is still punished, but now it is not answered and the connection is closed, so an older peer waiting on it reconnects without a pending challenge.
+  - A response whose tip is ahead of the local clock is rejected without punishment, with a warning to check the system clock.
+- **Lost connections**: a connection that times out, is reset or closes mid-message ends without punishing the peer with `InvalidMessage`.
+
+### Changed
+
+- `InvalidSyncChallengeResponse` lowers standing by 100 (was 500).
+- Updated package version from 0.3.0 to 0.3.1 (workspace-wide).
+
 ## [0.3.0] - 2026-10-24
 
 ### Breaking Changes
