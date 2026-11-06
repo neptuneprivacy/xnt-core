@@ -2282,14 +2282,10 @@ impl GlobalState {
                 indexer.handle_reorg(vec![old_tip_digest]).await;
             }
 
-            let prev_aocl_len = self
-                .chain
-                .archival_state()
-                .get_tip_parent()
-                .await
-                .and_then(|parent| parent.mutator_set_accumulator_after().ok())
-                .map(|msa| msa.aocl.num_leafs())
-                .unwrap_or(0);
+            let prev_aocl_len = match self.chain.archival_state().get_tip_parent().await {
+                Some(parent) => parent.mutator_set_accumulator_after()?.aocl.num_leafs(),
+                None => 0,
+            };
 
             let indexed_count = indexer.index_block(&new_tip, prev_aocl_len).await;
             indexer.persist().await;
@@ -2739,17 +2735,11 @@ impl GlobalState {
     async fn initialize_utxo_indexer(
         data_directory: &DataDirectory,
     ) -> Result<utxo_indexer::UtxoIndexerDatabase> {
-        use crate::application::database::create_db_if_missing;
-        use crate::application::database::NeptuneLevelDb;
-
         let db_path = data_directory.utxo_indexer_database_dir_path();
-        DataDirectory::create_dir_if_not_exists(&db_path).await?;
 
         debug!("Opening UTXO indexer database at: {}", db_path.display());
 
-        let db = NeptuneLevelDb::new(&db_path, &create_db_if_missing()).await?;
-
-        let indexer = utxo_indexer::UtxoIndexerDatabase::try_connect_and_migrate(db)
+        let indexer = utxo_indexer::UtxoIndexerDatabase::open_or_recreate(&db_path)
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -2795,23 +2785,24 @@ impl GlobalState {
 
         if !current_height.is_genesis() {
             let parent_height: u64 = u64::from(current_height).saturating_sub(1);
-            if let Some(parent_digest) = self
+            let parent_digest = self
                 .chain
                 .archival_state()
                 .archival_block_mmr
                 .ammr()
                 .try_get_leaf(parent_height)
                 .await
-            {
-                if let Some(parent_block) =
-                    self.chain.archival_state().get_block(parent_digest).await?
-                {
-                    prev_aocl_len = parent_block
-                        .mutator_set_accumulator_after()
-                        .map(|msa| msa.aocl.num_leafs())
-                        .unwrap_or(0);
-                }
-            }
+                .ok_or_else(|| anyhow::anyhow!("no block at height {parent_height}"))?;
+            let parent_block = self
+                .chain
+                .archival_state()
+                .get_block(parent_digest)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("block {parent_digest} not stored"))?;
+            prev_aocl_len = parent_block
+                .mutator_set_accumulator_after()?
+                .aocl
+                .num_leafs();
         }
 
         while current_height <= tip_height {
@@ -2836,10 +2827,7 @@ impl GlobalState {
             indexer.index_block_batch(&block, prev_aocl_len).await;
 
             // Get accurate AOCL length after this block for next iteration
-            prev_aocl_len = block
-                .mutator_set_accumulator_after()
-                .map(|msa| msa.aocl.num_leafs())
-                .unwrap_or(prev_aocl_len);
+            prev_aocl_len = block.mutator_set_accumulator_after()?.aocl.num_leafs();
             blocks_indexed += 1;
             current_height = current_height.next();
 
@@ -2847,8 +2835,8 @@ impl GlobalState {
                 indexer.set_sync_height(current_height.previous().unwrap_or(current_height)).await;
                 indexer.persist().await;
                 info!(
-                    "UTXO indexer sync progress: {} / {} blocks",
-                    blocks_indexed, total_blocks
+                    "UTXO indexer sync progress: height {} / {}",
+                    block_height_u64, tip_height
                 );
             }
         }

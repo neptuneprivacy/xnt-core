@@ -1912,6 +1912,8 @@ impl MainLoopHandler {
                 "Not updating mempool txs since job queue \
                    already contains {num_queued_job} jobs"
             );
+            // No update task will release the miner from its wait for this block.
+            self.main_to_miner_tx.send(MainToMiner::Continue);
             return;
         }
 
