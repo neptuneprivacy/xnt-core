@@ -23,6 +23,17 @@ pub struct IndexedUtxo {
     pub ciphertext: Vec<u8>,
 }
 
+/// Bridge payout from sync: a public UTXO, found by its receiver identifier
+/// instead of an encrypted notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicIndexedUtxo {
+    pub block_height: u64,
+    pub block_digest: Digest,
+    pub lock_script_hash: Digest,
+    pub amount_nau: i128,
+    pub sender_randomness: Digest,
+}
+
 /// Spent status (-1 = not spent, >= 0 = spent at height)
 pub type SpentStatus = Vec<i64>;
 
@@ -265,6 +276,27 @@ pub fn fetch_utxos_with_skipped(
     from_height: u64,
     to_height: u64,
 ) -> Result<(Vec<IndexedUtxo>, usize)> {
+    fetch_indexed(client, receiver_id_hash, from_height, to_height)
+        .map(|entries| (entries.encrypted, entries.skipped))
+}
+
+/// Fetch the bridge payouts of `from_height..=to_height` from the indexer by
+/// receiver_id_hash, see [PublicIndexedUtxo].
+pub fn fetch_public_utxos(
+    client: &RpcClient,
+    receiver_id_hash: &Digest,
+    from_height: u64,
+    to_height: u64,
+) -> Result<Vec<PublicIndexedUtxo>> {
+    fetch_indexed(client, receiver_id_hash, from_height, to_height).map(|entries| entries.public)
+}
+
+fn fetch_indexed(
+    client: &RpcClient,
+    receiver_id_hash: &Digest,
+    from_height: u64,
+    to_height: u64,
+) -> Result<IndexedEntries> {
     fetch_in_block_ranges(from_height, to_height, |from, to| {
         let params = json!({
             "receiverIdHash": receiver_id_hash.to_hex(),
@@ -308,21 +340,29 @@ fn block_ranges(from_height: u64, to_height: u64) -> Vec<(u64, u64)> {
 fn fetch_in_block_ranges(
     from_height: u64,
     to_height: u64,
-    mut fetch: impl FnMut(u64, u64) -> Result<(Vec<IndexedUtxo>, usize)>,
-) -> Result<(Vec<IndexedUtxo>, usize)> {
-    let mut utxos = Vec::new();
-    let mut skipped = 0;
+    mut fetch: impl FnMut(u64, u64) -> Result<IndexedEntries>,
+) -> Result<IndexedEntries> {
+    let mut entries = IndexedEntries::default();
     for (from, to) in block_ranges(from_height, to_height) {
-        let (range_utxos, range_skipped) = fetch(from, to)?;
-        utxos.extend(range_utxos);
-        skipped += range_skipped;
+        let range = fetch(from, to)?;
+        entries.encrypted.extend(range.encrypted);
+        entries.public.extend(range.public);
+        entries.skipped += range.skipped;
     }
-    Ok((utxos, skipped))
+    Ok(entries)
+}
+
+/// The entries of one or more `archival_getUtxosByReceiver` results.
+#[derive(Default)]
+struct IndexedEntries {
+    encrypted: Vec<IndexedUtxo>,
+    public: Vec<PublicIndexedUtxo>,
+    skipped: usize,
 }
 
 /// Parse an `archival_getUtxosByReceiver` result, skipping and counting
 /// malformed entries.
-fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
+fn parse_indexed_utxos(result: &Value) -> Result<IndexedEntries> {
     let utxos = result
         .get("utxos")
         .and_then(|v| v.as_array())
@@ -337,9 +377,18 @@ fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
     }
 
     let mut indexed_utxos = Vec::with_capacity(utxos.len());
+    let mut public = Vec::new();
     let mut skipped = 0;
 
     for utxo in utxos {
+        if utxo.get("type").and_then(|v| v.as_str()) == Some("public") {
+            match public_utxo_from_json(utxo) {
+                Some(payout) => public.push(payout),
+                None => skipped += 1,
+            }
+            continue;
+        }
+
         let Some(block_height) = utxo.get("blockHeight").and_then(|v| v.as_u64()) else {
             skipped += 1;
             continue;
@@ -362,7 +411,35 @@ fn parse_indexed_utxos(result: &Value) -> Result<(Vec<IndexedUtxo>, usize)> {
         });
     }
 
-    Ok((indexed_utxos, skipped))
+    Ok(IndexedEntries {
+        encrypted: indexed_utxos,
+        public,
+        skipped,
+    })
+}
+
+fn public_utxo_from_json(value: &Value) -> Option<PublicIndexedUtxo> {
+    use neptune_privacy::application::json_rpc::core::model::message::RpcIndexedUtxo;
+    use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+
+    let RpcIndexedUtxo::Public {
+        block_height,
+        block_digest,
+        lock_script_hash,
+        amount_nau,
+        sender_randomness,
+        ..
+    } = serde_json::from_value(value.clone()).ok()?
+    else {
+        return None;
+    };
+    Some(PublicIndexedUtxo {
+        block_height: block_height.into(),
+        block_digest: Digest::from_core(block_digest),
+        lock_script_hash: Digest::from_core(lock_script_hash),
+        amount_nau: NativeCurrencyAmount::from(amount_nau).to_nau(),
+        sender_randomness: Digest::from_core(sender_randomness),
+    })
 }
 
 /// Ciphertext of an indexed entry as little-endian u64s, or `None` if it is
@@ -420,6 +497,72 @@ pub fn get_aocl_indices(client: &RpcClient, commitments: &[Digest]) -> Result<Ao
     Ok(indices.iter().map(|v| v.as_i64().unwrap_or(-1)).collect())
 }
 
+/// One AOCL leaf of a commitment, see [get_aocl_leaves].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AoclLeaf {
+    pub aocl_leaf_index: u64,
+    pub block_height: u64,
+    pub block_digest: Digest,
+}
+
+/// Every AOCL leaf of each commitment, in canonical blocks. Identical outputs (same UTXO, sender
+/// randomness and receiver) share one commitment; each of its leaves is spendable once.
+pub fn get_aocl_leaves(client: &RpcClient, commitments: &[Digest]) -> Result<Vec<Vec<AoclLeaf>>> {
+    let commitment_vec: Vec<String> = commitments.iter().map(|d| d.to_hex()).collect();
+    let params = json!({ "commitments": commitment_vec });
+
+    let result = client.call("archival_getAoclLeafIndices", params)?;
+
+    let leaves = result
+        .get("leaves")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| XntError::RpcError("missing leaves: the node predates them".to_string()))?;
+
+    leaves
+        .iter()
+        .map(|per_commitment| {
+            per_commitment
+                .as_array()
+                .and_then(|leaves| leaves.iter().map(aocl_leaf_from_json).collect())
+                .ok_or_else(|| XntError::RpcError("malformed AOCL leaves".to_string()))
+        })
+        .collect()
+}
+
+fn aocl_leaf_from_json(leaf: &Value) -> Option<AoclLeaf> {
+    Some(AoclLeaf {
+        aocl_leaf_index: leaf.get("aoclLeafIndex")?.as_u64()?,
+        block_height: leaf.get("blockHeight")?.as_u64()?,
+        block_digest: leaf
+            .get("blockDigest")?
+            .as_str()
+            .and_then(Digest::from_hex)?,
+    })
+}
+
+/// One entry per AOCL leaf of each distinct commitment. Identical outputs share a commitment and
+/// their notifications decrypt alike, so the items of a commitment after the first are dropped.
+pub fn expand_per_leaf<T: Clone>(
+    items: Vec<T>,
+    commitments: &[Digest],
+    leaves: Vec<Vec<AoclLeaf>>,
+) -> Result<Vec<(T, AoclLeaf)>> {
+    if items.len() != commitments.len() || leaves.len() != commitments.len() {
+        return Err(XntError::RpcError(
+            "AOCL leaves length mismatch".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for ((item, commitment), leaves) in items.into_iter().zip(commitments).zip(leaves) {
+        if seen.insert(commitment.bytes) {
+            entries.extend(leaves.into_iter().map(|leaf| (item.clone(), leaf)));
+        }
+    }
+    Ok(entries)
+}
+
 /// Collect spendable inputs (UTXOs + membership proofs) for a single spending key.
 ///
 /// Applies the main-net legacy cutoff, the strictest one; use
@@ -462,79 +605,77 @@ pub fn collect_spendable_inputs(
     let receiver_preimage = key.receiver_preimage();
 
     // Fetch indexed UTXOs from archival node
-    let (indexed, malformed) = fetch_utxos_with_skipped(client, &rid_hash, from_height, to_height)?;
+    let entries = fetch_indexed(client, &rid_hash, from_height, to_height)?;
     let mut stats = ScanStats {
-        malformed,
+        malformed: entries.skipped,
         ..ScanStats::default()
     };
 
-    let utxos = decrypt_indexed_utxos(key, network, indexed, &mut stats);
+    let mut utxos = decrypt_indexed_utxos(key, network, entries.encrypted, &mut stats);
+    utxos.extend(own_public_utxos(key, network, entries.public, &mut stats));
     if utxos.is_empty() {
         return Ok((Vec::new(), stats));
     }
 
-    // Compute commitments and fetch AOCL indices
+    // Compute commitments and fetch AOCL leaves
     let commits: Vec<Digest> = utxos
         .iter()
         .map(|(u, sr, _, _, _, _)| compute_commitment(&u.hash(), sr, &receiver_preimage))
         .collect();
 
-    let aocl = get_aocl_indices(client, &commits)?;
-    if aocl.is_empty() {
+    // A leaf outside the range is another scan's: each identical payment has its own notification.
+    let leaves = get_aocl_leaves(client, &commits)?
+        .into_iter()
+        .map(|leaves| {
+            leaves
+                .into_iter()
+                .filter(|leaf| (from_height..=to_height).contains(&leaf.block_height))
+                .collect()
+        })
+        .collect();
+    let entries = expand_per_leaf(utxos, &commits, leaves)?;
+    if entries.is_empty() {
         return Ok((Vec::new(), stats));
     }
 
     // Build AbsoluteIndexSet hashes and check spent status
-    let mut abs_hashes: Vec<Digest> = Vec::new();
-    let mut valid_indices: Vec<usize> = Vec::new();
-    for (i, &idx) in aocl.iter().enumerate() {
-        if idx >= 0 && i < utxos.len() {
-            let (ref u, ref sr, _, _, _, _) = utxos[i];
-            let h = compute_absolute_index_set_hash(&u.hash(), sr, &receiver_preimage, idx as u64);
-            abs_hashes.push(h);
-            valid_indices.push(i);
-        }
-    }
-
-    if abs_hashes.is_empty() {
-        return Ok((Vec::new(), stats));
-    }
+    let abs_hashes: Vec<Digest> = entries
+        .iter()
+        .map(|((u, sr, _, _, _, _), leaf)| {
+            compute_absolute_index_set_hash(&u.hash(), sr, &receiver_preimage, leaf.aocl_leaf_index)
+        })
+        .collect();
 
     let spent = check_spent(client, &abs_hashes)?;
-    if spent.len() != valid_indices.len() {
+    if spent.len() != entries.len() {
         return Err(XntError::RpcError(
             "spent status length mismatch".to_string(),
         ));
     }
 
     // Filter to unspent
-    let mut unspent_indices: Vec<(usize, u64)> = Vec::new();
-    for (j, &h) in spent.iter().enumerate() {
-        if h < 0 && j < valid_indices.len() {
-            let oi = valid_indices[j];
-            let aocl_idx = aocl[oi];
-            if aocl_idx >= 0 {
-                unspent_indices.push((oi, aocl_idx as u64));
-            }
-        }
-    }
+    let unspent: Vec<_> = entries
+        .into_iter()
+        .zip(spent)
+        .filter(|(_, spent_at)| *spent_at < 0)
+        .map(|(entry, _)| entry)
+        .collect();
 
-    if unspent_indices.is_empty() {
+    if unspent.is_empty() {
         return Ok((Vec::new(), stats));
     }
 
     // Restore membership proofs for unspent UTXOs
     use neptune_privacy::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipProofPrivacyPreserving;
 
-    let absolute_index_sets: Vec<AbsoluteIndexSet> = unspent_indices
+    let absolute_index_sets: Vec<AbsoluteIndexSet> = unspent
         .iter()
-        .map(|(oi, idx)| {
-            let (ref u, ref sr, _, _, _, _) = utxos[*oi];
+        .map(|((u, sr, _, _, _, _), leaf)| {
             AbsoluteIndexSet::compute(
                 u.hash().to_core(),
                 sr.to_core(),
                 receiver_preimage.to_core(),
-                *idx,
+                leaf.aocl_leaf_index,
             )
         })
         .collect();
@@ -549,21 +690,21 @@ pub fn collect_spendable_inputs(
         .and_then(|v| v.as_array())
         .ok_or_else(|| XntError::RpcError("missing membershipProofs".to_string()))?;
 
-    if proofs_arr.len() != unspent_indices.len() {
+    if proofs_arr.len() != unspent.len() {
         return Err(XntError::RpcError(
             "membershipProofs length mismatch".to_string(),
         ));
     }
 
-    let mut res = Vec::with_capacity(unspent_indices.len());
-    for (idx, proof_val) in proofs_arr.iter().enumerate() {
+    let mut res = Vec::with_capacity(unspent.len());
+    for (idx, (proof_val, ((u, sr, amount, _, _, payment_id), leaf))) in
+        proofs_arr.iter().zip(unspent).enumerate()
+    {
         let rpc_proof: RpcMsMembershipProofPrivacyPreserving =
             serde_json::from_value(proof_val.clone())
                 .map_err(|e| XntError::RpcError(format!("parse proof {idx} failed: {e}")))?;
 
-        let (_oi, aocl_idx) = unspent_indices[idx];
-        let (ref u, ref sr, amount, bh, bd, payment_id) = utxos[unspent_indices[idx].0];
-
+        let aocl_idx = leaf.aocl_leaf_index;
         let msmp = rpc_proof
             .extract_ms_membership_proof(aocl_idx, sr.to_core(), receiver_preimage.to_core())
             .ok_or_else(|| {
@@ -571,20 +712,58 @@ pub fn collect_spendable_inputs(
             })?;
 
         res.push(SpendableInput {
-            utxo: u.clone(),
+            utxo: u,
             spending_key: key.clone(),
             membership_proof: MembershipProof::from_core(msmp),
-            sender_randomness: sr.clone(),
+            sender_randomness: sr,
             aocl_index: aocl_idx,
             amount,
-            block_height: bh,
-            block_digest: bd.clone(),
+            block_height: leaf.block_height,
+            block_digest: leaf.block_digest,
             is_legacy: key.is_legacy(),
             payment_id,
         });
     }
 
     Ok((res, stats))
+}
+
+/// The bridge payouts this key can spend, as [decrypt_indexed_utxos] returns
+/// them, with the same lock-script and legacy-cutoff checks.
+fn own_public_utxos(
+    key: &SpendingKey,
+    network: Network,
+    public: Vec<PublicIndexedUtxo>,
+    stats: &mut ScanStats,
+) -> Vec<(Utxo, Digest, i128, u64, Digest, u64)> {
+    use neptune_privacy::protocol::consensus::transaction::utxo::Utxo as CoreUtxo;
+    use neptune_privacy::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+
+    let own_lock_script_hash = key.lock_script_hash();
+    let mut utxos = Vec::new();
+    for payout in public {
+        if payout.lock_script_hash != own_lock_script_hash {
+            stats.foreign_lock += 1;
+            continue;
+        }
+        if !key.recognizes_utxos_at(network, payout.block_height) {
+            stats.legacy_after_cutoff += 1;
+            continue;
+        }
+        let utxo = Utxo::from_core(CoreUtxo::new_native_currency(
+            payout.lock_script_hash.to_core(),
+            NativeCurrencyAmount::from_nau(payout.amount_nau),
+        ));
+        utxos.push((
+            utxo,
+            payout.sender_randomness,
+            payout.amount_nau,
+            payout.block_height,
+            payout.block_digest,
+            0,
+        ));
+    }
+    utxos
 }
 
 /// Decrypt indexed entries with `key`, skipping and counting in `stats` the
@@ -1132,6 +1311,39 @@ mod tests {
         }
     }
 
+    /// Two identical payments decrypt alike and share a commitment with two leaves: one entry per
+    /// leaf, not per notification and leaf.
+    #[test]
+    fn identical_payments_expand_to_one_entry_per_leaf() {
+        let digest = |byte: u8| Digest::from_bytes([byte; 40]);
+        let leaf = |aocl_leaf_index: u64, block_height: u64| AoclLeaf {
+            aocl_leaf_index,
+            block_height,
+            block_digest: digest(block_height as u8),
+        };
+        let shared = digest(1);
+        let other = digest(2);
+        let shared_leaves = vec![leaf(100, 286), leaf(105, 287)];
+        let other_leaves = vec![leaf(107, 287)];
+
+        let entries = expand_per_leaf(
+            vec!["payment", "payment again", "other"],
+            &[shared, shared, other],
+            vec![shared_leaves.clone(), shared_leaves, other_leaves.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            vec![
+                ("payment", leaf(100, 286)),
+                ("payment", leaf(105, 287)),
+                ("other", leaf(107, 287)),
+            ],
+            entries
+        );
+        assert!(expand_per_leaf(vec!["other"], &[other], vec![]).is_err());
+    }
+
     #[test]
     fn block_ranges_cover_the_range_within_the_indexer_limit() {
         const LIMIT: u64 = MAX_BLOCK_RANGE_PER_REQUEST;
@@ -1166,9 +1378,17 @@ mod tests {
     #[test]
     fn utxos_of_a_long_range_are_fetched_in_parts_and_merged() {
         let mut requests = Vec::new();
-        let (utxos, skipped) = fetch_in_block_ranges(0, 25_000, |from, to| {
+        let IndexedEntries {
+            encrypted: utxos,
+            skipped,
+            ..
+        } = fetch_in_block_ranges(0, 25_000, |from, to| {
             requests.push((from, to));
-            Ok((vec![indexed(from, &[1]), indexed(to, &[2])], 1))
+            Ok(IndexedEntries {
+                encrypted: vec![indexed(from, &[1]), indexed(to, &[2])],
+                public: vec![],
+                skipped: 1,
+            })
         })
         .unwrap();
 
@@ -1184,7 +1404,7 @@ mod tests {
             if from > 0 {
                 Err(XntError::RpcError("BlockRangeExceedsLimit".to_string()))
             } else {
-                Ok((vec![], 0))
+                Ok(IndexedEntries::default())
             }
         });
         assert!(result.is_err());
@@ -1247,7 +1467,11 @@ mod tests {
             good,
         ]});
 
-        let (utxos, skipped) = parse_indexed_utxos(&result).unwrap();
+        let IndexedEntries {
+            encrypted: utxos,
+            skipped,
+            ..
+        } = parse_indexed_utxos(&result).unwrap();
         assert_eq!(6, skipped);
         assert_eq!(2, utxos.len());
         for utxo in utxos {
@@ -1299,6 +1523,50 @@ mod tests {
             stats
         );
         assert_eq!(3, stats.total());
+    }
+
+    /// A bridge payout, as the node's indexer serializes it, is parsed apart
+    /// from the encrypted entries and credited only to the key it is locked to.
+    #[test]
+    fn public_payouts_are_parsed_and_credited_to_their_lock() {
+        use neptune_privacy::application::json_rpc::core::model::message::RpcIndexedUtxo;
+
+        let wallet = WalletEntropy::generate().unwrap();
+        let key = wallet.derive_spending_key(0);
+        let other = wallet.derive_spending_key(1);
+        let amount = NativeCurrencyAmount::coins(3);
+        let payout = |lock: &SpendingKey| {
+            serde_json::to_value(RpcIndexedUtxo::Public {
+                block_height: 9u64.into(),
+                block_digest: CoreDigest::default(),
+                receiver_digest: CoreDigest::default(),
+                lock_script_hash: lock.lock_script_hash().to_core(),
+                amount_nau: amount.into(),
+                sender_randomness: CoreDigest::default(),
+            })
+            .unwrap()
+        };
+        let result = json!({ "utxos": [payout(&key), payout(&other), { "type": "public" }] });
+
+        let entries = parse_indexed_utxos(&result).unwrap();
+        assert!(entries.encrypted.is_empty());
+        assert_eq!(1, entries.skipped);
+        assert_eq!(2, entries.public.len());
+        assert_eq!(amount.to_nau(), entries.public[0].amount_nau);
+        assert_eq!(9, entries.public[0].block_height);
+
+        let mut stats = ScanStats::default();
+        let utxos = own_public_utxos(&key, Network::Main, entries.public, &mut stats);
+        assert_eq!(1, utxos.len());
+        assert_eq!(key.lock_script_hash(), utxos[0].0.lock_script_hash());
+        assert_eq!(amount.to_nau(), utxos[0].2);
+        assert_eq!(
+            ScanStats {
+                foreign_lock: 1,
+                ..ScanStats::default()
+            },
+            stats
+        );
     }
 
     #[test]

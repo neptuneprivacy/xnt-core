@@ -389,11 +389,11 @@ impl RpcApi for RpcServer {
         let num_leafs = aocl.num_leafs().await;
 
         let to_leaf_index = request.to_leaf_index.unwrap_or(num_leafs).min(num_leafs);
-        let from_leaf_index = request.from_leaf_index.unwrap_or(0);
+        let mut from_leaf_index = request.from_leaf_index.unwrap_or(0);
 
         let max_range: u64 = if self.unrestricted { u64::MAX } else { 10000 };
         let range = to_leaf_index.saturating_sub(from_leaf_index).min(max_range);
-        let from_leaf_index = to_leaf_index.saturating_sub(range);
+        from_leaf_index = to_leaf_index.saturating_sub(range);
 
         match state
             .chain
@@ -559,7 +559,7 @@ impl RpcApi for RpcServer {
             timestamp: header.timestamp,
             difficulty: header.difficulty,
             size: block.size(),
-            fee: tx_kernel.fee.to_string(),
+            fee_nau: tx_kernel.fee.into(),
             inputs,
             outputs,
         }))
@@ -694,23 +694,34 @@ impl RpcApi for RpcServer {
         // The transaction must be valid under the rule set of the next block,
         // in which it is mined. Next to a hard fork, one valid on the other
         // side of it is reported as such.
-        let tip_height = self
-            .state
-            .lock_guard()
-            .await
-            .chain
-            .light_state()
-            .header()
-            .height;
+        let (tip_height, verify_options) = {
+            let state = self.state.lock_guard().await;
+            let bridge_state = state.chain.archival_state().bridge_state_commitment().await;
+            (
+                state.chain.light_state().header().height,
+                crate::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions {
+                    prev_state_commitment: bridge_state,
+                },
+            )
+        };
         let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
-        if !transaction.is_valid(network, consensus_rule_set).await {
+        // The RPC schema does not tell the collection layouts apart; the rule set does.
+        let transaction = transaction.with_proof_collection_layout_of(consensus_rule_set);
+        if !transaction
+            .is_valid_with_options(network, consensus_rule_set, verify_options)
+            .await
+        {
             let neighboring_rule_sets = [
                 ConsensusRuleSet::infer_from(network, tip_height),
                 ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
             ];
             for neighboring_rule_set in neighboring_rule_sets {
                 if neighboring_rule_set != consensus_rule_set
-                    && transaction.is_valid(network, neighboring_rule_set).await
+                    && transaction
+                        .clone()
+                        .with_proof_collection_layout_of(neighboring_rule_set)
+                        .is_valid_with_options(network, neighboring_rule_set, verify_options)
+                        .await
                 {
                     return Err(RpcError::SubmitTransaction(
                         SubmitTransactionError::OtherEra,
@@ -726,14 +737,12 @@ impl RpcApi for RpcServer {
         // Before the fork, a transaction must meet the terms on which the
         // nodes of that era relay and upgrade it, and not come too close to
         // the fork.
-        if consensus_rule_set.is_legacy_era()
-            && !legacy_era::submitted_transaction_meets_terms(
-                &transaction,
-                network,
-                tip_height,
-                self.state.cli().fork_tx_cutoff_margin,
-            )
-        {
+        if !legacy_era::submitted_transaction_meets_terms(
+            &transaction,
+            network,
+            tip_height,
+            self.state.cli().fork_tx_cutoff_margin,
+        ) {
             return Err(RpcError::SubmitTransaction(
                 SubmitTransactionError::BelowLegacyEraTerms,
             ));
@@ -770,6 +779,19 @@ impl RpcApi for RpcServer {
         if !transaction.is_confirmable_relative_to(&msa) {
             return Err(RpcError::SubmitTransaction(
                 SubmitTransactionError::NotConfirmable,
+            ));
+        }
+
+        if let Err(e) = self
+            .state
+            .lock_guard()
+            .await
+            .bridge_admission_check(&transaction.kernel)
+            .await
+        {
+            tracing::warn!("refusing submitted transaction: {e:#}");
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::FailsBridgeGate,
             ));
         }
 
@@ -983,8 +1005,8 @@ impl RpcApi for RpcServer {
         let legacy = wallet_status.legacy_confirmed();
 
         Ok(GetBalanceResponse {
-            balance: confirmed_available.to_string(),
-            legacy_balance: legacy.is_positive().then(|| legacy.to_string()),
+            balance_nau: confirmed_available.into(),
+            legacy_balance_nau: legacy.is_positive().then(|| legacy.into()),
         })
     }
 
@@ -1156,7 +1178,7 @@ impl RpcApi for RpcServer {
             sent_txs.push(SentTxToRespResponse {
                 tx_inputs,
                 tx_outputs,
-                fee: tx.fee.to_string(),
+                fee_nau: tx.fee.into(),
                 timestamp: tx.timestamp,
                 tip_when_sent: tx.tip_when_sent,
             });
@@ -1169,11 +1191,11 @@ impl RpcApi for RpcServer {
         &self,
         request: ValidateAmountRequest,
     ) -> RpcResult<ValidateAmountResponse> {
-        let amount = NativeCurrencyAmount::coins_from_str(&request.amount_string)
+        let amount_nau = NativeCurrencyAmount::coins_from_str(&request.amount_string)
             .ok()
-            .map(|amt| amt.to_string());
+            .map(Into::into);
 
-        Ok(ValidateAmountResponse { amount })
+        Ok(ValidateAmountResponse { amount_nau })
     }
 
     async fn validate_address_call(
@@ -1313,19 +1335,19 @@ impl RpcApi for RpcServer {
                 utxo_digest: input.addition_record().canonical_commitment,
                 utxo: SendTxUtxo {
                     lock_script_hash: input.utxo.lock_script_hash(),
-                    amount: input.utxo.get_native_currency_amount().to_string(),
+                    amount_nau: input.utxo.get_native_currency_amount().into(),
                 },
             })
             .collect();
 
-        let outputs: Vec<SendTxOutput> = resp
+        let output_summaries: Vec<SendTxOutput> = resp
             .details()
             .tx_outputs
             .iter()
             .map(|output| SendTxOutput {
                 utxo: SendTxUtxo {
                     lock_script_hash: output.utxo().lock_script_hash(),
-                    amount: output.utxo().get_native_currency_amount().to_string(),
+                    amount_nau: output.utxo().get_native_currency_amount().into(),
                 },
                 utxo_digest: output.addition_record().canonical_commitment,
                 sender_randomness: output.sender_randomness(),
@@ -1338,7 +1360,7 @@ impl RpcApi for RpcServer {
             timestamp,
             tip_when_sent,
             inputs,
-            outputs,
+            outputs: output_summaries,
         })
     }
 
@@ -1364,7 +1386,7 @@ impl RpcApi for RpcServer {
             .map(|input| UnspentUtxo {
                 leaf_index: input.mutator_set_mp().aocl_leaf_index,
                 lock_script_hash: input.utxo.lock_script_hash(),
-                amount: input.native_currency_amount().to_string(),
+                amount_nau: input.native_currency_amount().into(),
                 is_legacy: legacy_dctidh_locks.contains(&input.utxo.lock_script_hash()),
             })
             .collect();
@@ -1488,9 +1510,29 @@ impl RpcApi for RpcServer {
 
         let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
 
-        let indices = indexer.get_aocl_leaf_indices(&request.commitments).await;
+        // The index misses some forks' blocks: a leaf counts only if its block is canonical.
+        let block_mmr = state.chain.archival_state().archival_block_mmr.ammr();
+        let mut leaves = Vec::with_capacity(request.commitments.len());
+        for indexed in indexer.get_aocl_leaves(&request.commitments).await {
+            let mut canonical = Vec::with_capacity(indexed.len());
+            for leaf in indexed {
+                let digest_at_height = block_mmr.try_get_leaf(u64::from(leaf.block_height)).await;
+                if digest_at_height == Some(leaf.block_digest) {
+                    canonical.push(leaf);
+                }
+            }
+            leaves.push(canonical);
+        }
+        let indices = leaves
+            .iter()
+            .map(|leaves| crate::state::utxo_indexer::AoclLeaf::latest_index(leaves))
+            .collect();
+        let leaves = leaves
+            .into_iter()
+            .map(|leaves| leaves.into_iter().map(RpcAoclLeaf::from).collect())
+            .collect();
 
-        Ok(GetAoclLeafIndicesResponse { indices })
+        Ok(GetAoclLeafIndicesResponse { indices, leaves })
     }
 
     async fn get_spent_status_call(
@@ -1519,6 +1561,79 @@ impl RpcApi for RpcServer {
         Ok(GetArchivalMutatorSetResponse {
             archival_mutator_set: (&accumulator).into(),
         })
+    }
+
+    async fn get_bridge_state_commitment_call(
+        &self,
+        _: GetBridgeStateCommitmentRequest,
+    ) -> RpcResult<GetBridgeStateCommitmentResponse> {
+        let state = self.state.lock_guard().await;
+        let commitment = state.chain.archival_state().bridge_state_commitment().await;
+        Ok(GetBridgeStateCommitmentResponse {
+            state_commitment: commitment,
+        })
+    }
+
+    async fn get_bridge_authority_set_call(
+        &self,
+        _: GetBridgeAuthoritySetRequest,
+    ) -> RpcResult<GetBridgeAuthoritySetResponse> {
+        let state = self.state.lock_guard().await;
+        let set = state
+            .chain
+            .archival_state()
+            .bridge_authority_set_current()
+            .await;
+        Ok(match set {
+            Some(set) => {
+                let stored = set.to_stored();
+                GetBridgeAuthoritySetResponse {
+                    keys: stored.keys.iter().map(hex::encode).collect(),
+                    threshold: Some(stored.threshold),
+                    generation: Some(stored.generation),
+                }
+            }
+            None => GetBridgeAuthoritySetResponse {
+                keys: Vec::new(),
+                threshold: None,
+                generation: None,
+            },
+        })
+    }
+
+    async fn get_bridge_registration_call(
+        &self,
+        _: GetBridgeRegistrationRequest,
+    ) -> RpcResult<GetBridgeRegistrationResponse> {
+        let state = self.state.lock_guard().await;
+        let registration = state
+            .chain
+            .archival_state()
+            .bridge_registration_current()
+            .await;
+        Ok(GetBridgeRegistrationResponse { registration })
+    }
+
+    async fn get_bridge_pool_call(
+        &self,
+        _: GetBridgePoolRequest,
+    ) -> RpcResult<GetBridgePoolResponse> {
+        let state = self.state.lock_guard().await;
+        let archival_state = state.chain.archival_state();
+        let entries = archival_state
+            .bridge_pool_db
+            .iter()
+            .map(|(key, entry)| RpcPoolEntry {
+                commitment: entry.commitment(),
+                input_digest: key,
+                lock_script_hash: entry.utxo.lock_script_hash(),
+                amount_nau: entry.amount.into(),
+                sender_randomness: entry.sender_randomness,
+                receiver_preimage: entry.receiver_preimage,
+                aocl_leaf_index: entry.aocl_leaf_index,
+            })
+            .collect();
+        Ok(GetBridgePoolResponse { entries })
     }
 
     async fn network_overview_call(
@@ -1580,12 +1695,149 @@ pub mod tests {
     use crate::Block;
 
     pub async fn test_rpc_server() -> RpcServer {
-        let mut cli = cli_args::Args::default_with_network(Network::Main);
+        test_rpc_server_on(Network::Main).await
+    }
+
+    pub async fn test_rpc_server_on(network: Network) -> RpcServer {
+        let mut cli = cli_args::Args::default_with_network(network);
         cli.tx_proving_capability = Some(TxProvingCapability::ProofCollection);
         let global_state_lock =
             mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
 
         RpcServer::new(global_state_lock, None)
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn submit_transaction_refuses_a_settlement_failing_the_bridge_gate() {
+        use crate::application::json_rpc::core::api::rpc::SubmitTransactionError;
+        use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+        use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+        use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
+        use crate::protocol::consensus::transaction::validity::single_proof::single_proof_claim;
+        use crate::protocol::proof_abstractions::mast_hash::MastHash;
+        use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        let network = Network::RegTest;
+        let state = mock_genesis_global_state(
+            2,
+            WalletEntropy::new_random(),
+            cli_args::Args::default_with_network(network),
+        )
+        .await;
+        let rpc_server = RpcServer::new(state, None);
+        let rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis().next());
+        let tx_with = |announcements: Vec<Announcement>| {
+            let mut tx = make_mock_transaction_with_mutator_set_hash(
+                vec![],
+                vec![],
+                Block::genesis(network)
+                    .mutator_set_accumulator_after()
+                    .unwrap()
+                    .hash(),
+            );
+            tx.kernel = TransactionKernelModifier::default()
+                .announcements(announcements)
+                .modify(tx.kernel);
+            let claim = single_proof_claim(tx.kernel.mast_hash(), rule_set);
+            tx.proof = TransactionProof::SingleProof(Proof::valid_mock(claim));
+            tx
+        };
+        // No faucet is registered yet, so any settlement is refused.
+        let settlement = AggregatedAnnouncementData {
+            prev_state_commitment: Digest::default(),
+            new_state_commitment: Digest::default(),
+            exit_root: Digest::default(),
+            faucet_id: FaucetId {
+                suffix: BFieldElement::new(1),
+                prefix: BFieldElement::new(2),
+            },
+            prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+            burns: vec![],
+            change_sender_randomness: None,
+            authority_signatures: vec![],
+        }
+        .to_announcement();
+
+        assert_eq!(
+            rpc_server
+                .submit_transaction(tx_with(vec![settlement]).into())
+                .await
+                .unwrap_err(),
+            RpcError::SubmitTransaction(SubmitTransactionError::FailsBridgeGate)
+        );
+        assert!(
+            rpc_server
+                .submit_transaction(tx_with(vec![]).into())
+                .await
+                .unwrap()
+                .success
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn bridge_pool_returns_exact_amount_and_commitment() {
+        use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+        use crate::state::bridge_pool::PoolEntry;
+        use crate::util_types::mutator_set::commit;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        let mut rpc_server = test_rpc_server().await;
+        // more precision than the 8 decimals of `Display`
+        let amount = NativeCurrencyAmount::coins(27) + NativeCurrencyAmount::from_nau(123_456_789);
+        let utxo = Utxo::new_native_currency(bridge_lock_script().hash(), amount);
+        let sender_randomness = Digest::new([BFieldElement::new(7); 5]);
+        let receiver_preimage = Digest::default();
+        let commitment = commit(
+            Tip5::hash(&utxo),
+            sender_randomness,
+            receiver_preimage.hash(),
+        )
+        .canonical_commitment;
+        let pool_entry = PoolEntry {
+            utxo,
+            amount,
+            sender_randomness,
+            receiver_preimage,
+            aocl_leaf_index: 30,
+        };
+        rpc_server
+            .state
+            .lock_guard_mut()
+            .await
+            .chain
+            .archival_state_mut()
+            .bridge_pool_db
+            .put(pool_entry.key(), pool_entry.clone())
+            .await;
+
+        let key = pool_entry.key();
+        let entries = rpc_server.get_bridge_pool().await.unwrap().entries;
+        let [entry] = entries.as_slice() else {
+            panic!("expected one pool entry, got {}", entries.len());
+        };
+        assert_eq!(entry.commitment, commitment);
+        assert_eq!(entry.input_digest, key);
+        assert_eq!(NativeCurrencyAmount::from(entry.amount_nau), amount);
+
+        let rebuilt = Utxo::new_native_currency(entry.lock_script_hash, entry.amount_nau.into());
+        assert_eq!(
+            commit(
+                Tip5::hash(&rebuilt),
+                entry.sender_randomness,
+                entry.receiver_preimage.hash()
+            )
+            .canonical_commitment,
+            entry.commitment
+        );
+
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["amountNau"], amount.to_nau().to_string());
+        assert!(json.get("amount").is_none());
     }
 
     #[apply(shared_tokio_runtime)]
@@ -1976,7 +2228,8 @@ pub mod tests {
 
     #[apply(shared_tokio_runtime)]
     async fn remote_wallets_behave_correctly() {
-        let mut rpc_server = test_rpc_server().await;
+        // Only test networks fund the devnet wallet.
+        let mut rpc_server = test_rpc_server_on(Network::RegTest).await;
         let network = rpc_server.state.cli().network;
 
         // Prepare a transaction to our wallet coming from devnet wallet.

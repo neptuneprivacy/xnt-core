@@ -59,16 +59,19 @@ use crate::api::export::NeptuneProof;
 use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::consensus::transaction::primitive_witness::PrimitiveWitness;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
-use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::transaction::TransactionProof;
 use crate::protocol::peer::transfer_transaction::TransactionProofQuality;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
+use crate::state::bridge_gate::settlement_kind;
+use crate::state::bridge_gate::SettlementKind;
 use crate::state::mempool::any_tx::AnyTx;
 use crate::state::mempool::mempool_event::MempoolEvent;
 use crate::state::mempool::mempool_event::AddReason;
@@ -540,7 +543,7 @@ impl Mempool {
         &self,
         num_proofs_threshold: usize,
         tx_upgrade_filter: TxUpgradeFilter,
-    ) -> Option<(&TransactionKernel, &ProofCollection, UpgradePriority)> {
+    ) -> Option<(&TransactionKernel, &AnyProofCollection, UpgradePriority)> {
         for candidate_txid in self
             .upgrade_priority_iter()
             .map(|(txid, _)| txid)
@@ -667,6 +670,17 @@ impl Mempool {
             let TransactionProof::SingleProof(_) = &transaction.proof else {
                 continue;
             };
+
+            // A settlement's merge with its fee tx is already sized to the prover's cap.
+            if candidate
+                .transaction
+                .kernel()
+                .announcements
+                .iter()
+                .any(AggregatedAnnouncementData::is_settlement_tagged)
+            {
+                continue;
+            }
 
             // Do not attempt to merge transactions that neither have a value to
             // us nor pay a fee.
@@ -923,6 +937,32 @@ impl Mempool {
             self.tip_mutator_set_hash,
         );
         let new_tx_fee_density = new_tx.fee_density();
+        // The one settlement slot goes to a real settlement.
+        let settlement_of = |kernel: &TransactionKernel| {
+            settlement_kind(&kernel.announcements).map(|kind| {
+                let announcement =
+                    AggregatedAnnouncementData::find_in_announcements(&kernel.announcements);
+                (kind, announcement)
+            })
+        };
+        let mut displaces_consolidations = false;
+        if let Some((new_kind, new_announcement)) = settlement_of(&new_tx.kernel) {
+            let others = conflicts
+                .values()
+                .filter_map(|tx| settlement_of(tx.kernel()))
+                .filter(|(_, announcement)| *announcement != new_announcement)
+                .map(|(kind, _)| kind)
+                .collect_vec();
+            if new_kind == SettlementKind::PoolConsolidation && !others.is_empty() {
+                debug!("refusing a pool consolidation that conflicts with another settlement");
+                return vec![];
+            }
+            displaces_consolidations = !others.is_empty()
+                && others.len() == conflicts.len()
+                && others
+                    .iter()
+                    .all(|kind| *kind == SettlementKind::PoolConsolidation);
+        }
         let min_fee_of_conflicts = conflicts.values().map(|tx| tx.fee_density()).min();
         let conflicts = conflicts
             .into_iter()
@@ -935,7 +975,8 @@ impl Mempool {
             .collect_vec();
         if let Some(min_fee_of_conflicting_tx) = min_fee_of_conflicts {
             let better_fee_density = min_fee_of_conflicting_tx < new_tx_fee_density;
-            let should_replace_conflict = new_tx_has_higher_proof_quality || better_fee_density;
+            let should_replace_conflict =
+                new_tx_has_higher_proof_quality || better_fee_density || displaces_consolidations;
             if should_replace_conflict {
                 for (conflicting_txid, single_proof) in conflicts {
                     let e = self
@@ -1361,6 +1402,49 @@ impl Mempool {
         self.retain(|(_, tx)| matches!(tx, AnyTx::Standard(_)), reason)
     }
 
+    /// Remove the single-proof-backed and link transactions, returning the primitive witnesses
+    /// held for the single-proof-backed ones.
+    pub(super) fn remove_single_proofs_and_links(
+        &mut self,
+        reason: RemovalReason,
+    ) -> (Vec<MempoolEvent>, Vec<PrimitiveWitness>) {
+        let is_single_proof =
+            |tx: &AnyTx| matches!(tx, AnyTx::Standard(tx) if tx.proof.is_single_proof());
+        let witnesses = self
+            .fee_densities
+            .iter()
+            .map(|(&txid, _)| txid)
+            .filter(|&txid| self.get_any(txid).is_some_and(is_single_proof))
+            .filter_map(|txid| self.primitive_witness(txid).cloned())
+            .collect();
+        let events = self.retain(
+            |(_, tx)| matches!(tx, AnyTx::Standard(_)) && !is_single_proof(tx),
+            reason,
+        );
+        (events, witnesses)
+    }
+
+    /// Remove the proof collections that have no layout of this rule set's collections.
+    pub(super) fn remove_proof_collections_without_layout_of(
+        &mut self,
+        consensus_rule_set: ConsensusRuleSet,
+        reason: RemovalReason,
+    ) -> Vec<MempoolEvent> {
+        self.retain(
+            |(_, tx)| match tx {
+                AnyTx::Standard(tx) => match &tx.proof {
+                    TransactionProof::ProofCollection(collection) => collection
+                        .clone()
+                        .into_layout_of(consensus_rule_set, &tx.kernel)
+                        .is_some(),
+                    TransactionProof::Witness(_) | TransactionProof::SingleProof(_) => true,
+                },
+                AnyTx::Link(_) => true,
+            },
+            reason,
+        )
+    }
+
     pub(super) fn clear(&mut self) -> Vec<MempoolEvent> {
         self.clear_with_reason(RemovalReason::Explicit)
     }
@@ -1602,8 +1686,24 @@ impl Mempool {
     pub(crate) fn get_transactions_for_block_composition(
         &self,
         consensus_rule_set: ConsensusRuleSet,
+        remaining_kernel_len: usize,
+        max_num_txs: Option<usize>,
+    ) -> Vec<Transaction> {
+        self.get_transactions_for_block_composition_filtered(
+            consensus_rule_set,
+            remaining_kernel_len,
+            max_num_txs,
+            |_| true,
+        )
+    }
+
+    /// Like [`Self::get_transactions_for_block_composition`], but only takes txs `admit` accepts.
+    pub(crate) fn get_transactions_for_block_composition_filtered(
+        &self,
+        consensus_rule_set: ConsensusRuleSet,
         mut remaining_kernel_len: usize,
         max_num_txs: Option<usize>,
+        mut admit: impl FnMut(&Transaction) -> bool,
     ) -> Vec<Transaction> {
         let mut remaining_num_inputs = consensus_rule_set.max_num_inputs();
         let mut remaining_num_outputs = consensus_rule_set
@@ -1647,6 +1747,10 @@ impl Mempool {
 
                 // Current transaction is too big
                 if kernel_len > remaining_kernel_len {
+                    continue;
+                }
+
+                if !admit(&transaction_copy) {
                     continue;
                 }
 
@@ -2145,6 +2249,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn upgrader_never_pairs_a_settlement_for_merging() {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+        use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+        use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+        use crate::tests::shared::mock_tx::make_mock_transaction;
+        use crate::util_types::test_shared::mutator_set::mock_item_mp_rr_for_init_msa;
+
+        let settlement = AggregatedAnnouncementData {
+            prev_state_commitment: Digest::default(),
+            new_state_commitment: Digest::new([BFieldElement::new(8); 5]),
+            exit_root: Digest::default(),
+            faucet_id: FaucetId {
+                suffix: BFieldElement::new(1),
+                prefix: BFieldElement::new(2),
+            },
+            prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+            burns: vec![],
+            change_sender_randomness: None,
+            authority_signatures: vec![],
+        }
+        .to_announcement();
+        let fee_paying = |announcements| {
+            let tx = make_mock_transaction(vec![mock_item_mp_rr_for_init_msa().2], vec![]);
+            Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .announcements(announcements)
+                    .modify(tx.kernel),
+                proof: tx.proof,
+            }
+        };
+
+        let genesis_block = Block::genesis(Network::Main);
+        let mut mempool = Mempool::new(
+            ByteSize::gb(1),
+            TxProvingCapability::SingleProof,
+            &genesis_block,
+        );
+        mempool.tip_mutator_set_hash = Digest::default();
+        mempool.insert(
+            fee_paying(vec![]),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        mempool.insert(
+            fee_paying(vec![settlement]),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        assert!(mempool
+            .preferred_single_proof_pair(TxUpgradeFilter::match_all())
+            .is_none());
+
+        mempool.insert(
+            fee_paying(vec![]),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        assert!(mempool
+            .preferred_single_proof_pair(TxUpgradeFilter::match_all())
+            .is_some());
+    }
+
+    #[test]
+    fn settlement_slot_conflicts_favor_real_settlements_over_pool_consolidations() {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+        use crate::protocol::consensus::bridge::aggregated_announcement::StatePreimage;
+        use crate::protocol::consensus::bridge::aggregated_announcement::STATE_PREIMAGE_LEN;
+        use crate::protocol::consensus::bridge::faucet_registration::FaucetId;
+        use crate::protocol::consensus::bridge::pool_consolidation::PoolConsolidationAuthorization;
+        use crate::protocol::consensus::transaction::announcement::Announcement;
+        use crate::tests::shared::mock_tx::make_mock_transaction;
+        use crate::util_types::test_shared::mutator_set::mock_item_mp_rr_for_init_msa;
+
+        let state = Digest::new([BFieldElement::new(7); 5]);
+        let settlement = |new_state: Digest, change: u64| {
+            AggregatedAnnouncementData {
+                prev_state_commitment: state,
+                new_state_commitment: new_state,
+                exit_root: Digest::default(),
+                faucet_id: FaucetId {
+                    suffix: BFieldElement::new(1),
+                    prefix: BFieldElement::new(2),
+                },
+                prev_state_preimage: StatePreimage([BFieldElement::new(0); STATE_PREIMAGE_LEN]),
+                burns: vec![],
+                change_sender_randomness: Some(Digest::new([BFieldElement::new(change); 5])),
+                authority_signatures: vec![],
+            }
+            .to_announcement()
+        };
+        let (_, _, pool_input) = mock_item_mp_rr_for_init_msa();
+        let spending_pool = |announcement: Announcement, coins| {
+            let mut announcements = vec![announcement.clone()];
+            if AggregatedAnnouncementData::from_announcement(&announcement)
+                .is_some_and(|a| a.is_pool_consolidation())
+            {
+                announcements.push(
+                    PoolConsolidationAuthorization::new(Digest::default(), vec![])
+                        .to_announcement(),
+                );
+            }
+            let tx = make_mock_transaction(vec![pool_input.clone()], vec![]);
+            Transaction {
+                kernel: TransactionKernelModifier::default()
+                    .announcements(announcements)
+                    .fee(NativeCurrencyAmount::coins(coins))
+                    .modify(tx.kernel),
+                proof: tx.proof,
+            }
+        };
+
+        let genesis_block = Block::genesis(Network::Main);
+        let mut mempool = Mempool::new(
+            ByteSize::gb(1),
+            TxProvingCapability::SingleProof,
+            &genesis_block,
+        );
+        let first = spending_pool(settlement(state, 1), 1);
+        let rival = spending_pool(settlement(state, 2), 9);
+        let real = spending_pool(settlement(Digest::new([BFieldElement::new(8); 5]), 3), 0);
+        let late = spending_pool(settlement(state, 4), 9);
+
+        mempool.insert(
+            first.clone(),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        mempool.insert(
+            rival.clone(),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        assert!(mempool.contains(first.txid()));
+        assert!(
+            !mempool.contains(rival.txid()),
+            "a consolidation never displaces another settlement, whatever its fee"
+        );
+
+        mempool.insert(
+            real.clone(),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        assert!(mempool.contains(real.txid()), "despite its lower fee");
+        assert!(!mempool.contains(first.txid()));
+
+        mempool.insert(
+            late.clone(),
+            UpgradePriority::Irrelevant,
+            AddReason::Submitted,
+        );
+        assert!(!mempool.contains(late.txid()));
+        assert!(mempool.contains(real.txid()));
+    }
+
     #[traced_test]
     #[test]
     fn failed_upgrade_lets_the_next_upgrade_candidate_through() {
@@ -2164,7 +2429,7 @@ mod tests {
             tx.kernel = TransactionKernelModifier::default()
                 .mutator_set_hash(mutator_set_hash)
                 .modify(tx.kernel);
-            tx.proof = TransactionProof::ProofCollection(ProofCollection::invalid());
+            tx.proof = TransactionProof::ProofCollection(crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection::invalid().into());
             mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
         }
         assert_eq!(2, mempool.len(), "sanity: two distinct candidates");
@@ -2512,6 +2777,8 @@ mod tests {
     /// Returns three transactions: Two transactions that are input to the
     /// transaction-merge function, and the resulting merged transaction. Also
     /// returns the mutator set these transactions are synced against.
+    ///
+    /// The proofs are mock proofs: the callers test the mempool, not proofs.
     async fn merge_tx_triplet(
         consensus_rule_set: ConsensusRuleSet,
     ) -> (
@@ -2529,7 +2796,7 @@ mod tests {
         let left_single_proof = produce_single_proof(
             &left,
             TritonVmJobQueue::get_instance(),
-            TritonVmJobPriority::default().into(),
+            TritonVmProofJobOptions::default_with_network(Network::RegTest),
             consensus_rule_set,
         )
         .await
@@ -2537,7 +2804,7 @@ mod tests {
         let right_single_proof = produce_single_proof(
             &right,
             TritonVmJobQueue::get_instance(),
-            TritonVmJobPriority::default().into(),
+            TritonVmProofJobOptions::default_with_network(Network::RegTest),
             consensus_rule_set,
         )
         .await
@@ -2561,7 +2828,7 @@ mod tests {
             right.clone(),
             shuffle_seed,
             TritonVmJobQueue::get_instance(),
-            TritonVmJobPriority::default().into(),
+            TritonVmProofJobOptions::default_with_network(Network::RegTest),
             consensus_rule_set,
         )
         .await
@@ -2572,6 +2839,8 @@ mod tests {
 
     /// Return a tree of transactions, where the parents are defined as the
     /// merger of the children. All three layers are returned.
+    ///
+    /// The proofs are real: mempool replacement weighs fee density, which depends on proof size.
     ///
     ///       final_tx
     ///      /      \
@@ -2713,6 +2982,35 @@ mod tests {
             !mempool.is_empty(),
             "Getting transactions for composition may not empty mempool."
         )
+    }
+
+    #[traced_test]
+    #[apply(shared_tokio_runtime)]
+    async fn filtered_composition_skips_rejected_txs_without_using_a_slot() {
+        let network = Network::Main;
+        let sync_block = Block::genesis(network);
+        let mempool = setup_mock_mempool(6, &sync_block);
+        let densest = mempool.get_transactions_for_block_composition(
+            ConsensusRuleSet::default(),
+            SIZE_20MB_IN_BYTES,
+            None,
+        );
+        let rejected = densest[0].kernel.txid();
+
+        let picked = mempool.get_transactions_for_block_composition_filtered(
+            ConsensusRuleSet::default(),
+            SIZE_20MB_IN_BYTES,
+            Some(2),
+            |tx| tx.kernel.txid() != rejected,
+        );
+        let expected = densest[1..3]
+            .iter()
+            .map(|tx| tx.kernel.txid())
+            .collect_vec();
+        assert_eq!(
+            expected,
+            picked.iter().map(|tx| tx.kernel.txid()).collect_vec()
+        );
     }
 
     #[traced_test]
@@ -3149,7 +3447,7 @@ mod tests {
         // Verify that a merged transaction replaces the two transactions that
         // are the input into the merge.
         let network = Network::Main;
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
         let genesis_block = Block::genesis(network);
         let mut mempool = Mempool::new(
             ByteSize::gb(1),
@@ -3224,7 +3522,7 @@ mod tests {
     async fn mempool_insertion_is_stable_on_mergers() {
         // Ensure that the mempool state does not change once all
         // transactions in a merge tree has been seen by the mempool.
-        let consensus_rule_set = ConsensusRuleSet::Reboot;
+        let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
         let network = Network::Main;
         let mut mempool = Mempool::new(
             ByteSize::gb(1),
@@ -3318,7 +3616,7 @@ mod tests {
     async fn reorganization_clears_mempool_and_merge_input_cache() {
         let network = Network::Main;
         let genesis = Block::genesis(network);
-        let consensus_rule_set = ConsensusRuleSet::infer_from(network, BlockHeight::genesis());
+        let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
 
         let block_1a = invalid_empty_block_with_timestamp(
             &genesis,
@@ -3818,7 +4116,7 @@ mod tests {
             // merge: (a, b) -> c
             // Scenario: a is mined => b is in mempool after block update
             let network = Network::Main;
-            let consensus_rule_set = ConsensusRuleSet::Reboot;
+            let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
             let (((a, b), c), mutator_set) = merge_tx_triplet(consensus_rule_set).await;
             let block1 = invalid_block_with_kernel_and_mutator_set(b.kernel.clone(), mutator_set);
 
@@ -3854,7 +4152,7 @@ mod tests {
             // merge: (a, b) -> c
             // Scenario: c is mined => mempool is empty after block update
             let network = Network::Main;
-            let consensus_rule_set = ConsensusRuleSet::Reboot;
+            let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
             let (((a, b), c), mutator_set) = merge_tx_triplet(consensus_rule_set).await;
             let block1 = invalid_block_with_kernel_and_mutator_set(c.kernel.clone(), mutator_set);
 
@@ -3886,7 +4184,7 @@ mod tests {
         #[traced_test]
         #[apply(shared_tokio_runtime)]
         async fn nested_mergers_behave() {
-            let consensus_rule_set = ConsensusRuleSet::Reboot;
+            let consensus_rule_set = ConsensusRuleSet::UpgradeVMv8;
             let network = Network::Main;
             let (bottom, [left, right], final_tx, mutator_set) =
                 nested_mergers(consensus_rule_set).await;
@@ -4138,7 +4436,7 @@ mod tests {
         ) {
             let tx = Transaction {
                 kernel: primitive_witness.kernel,
-                proof: TransactionProof::ProofCollection(ProofCollection::invalid()),
+                proof: TransactionProof::ProofCollection(crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection::invalid().into()),
             };
             let mut mempool = Mempool::new(
                 ByteSize::gb(1),
@@ -4550,6 +4848,7 @@ mod tests {
     }
 
     mod link_tx_tests {
+
         use super::*;
         use crate::application::config::tx_upgrade_filter::TxUpgradeFilter;
         use crate::protocol::consensus::chaintx::link_kernel::LinkKernel;

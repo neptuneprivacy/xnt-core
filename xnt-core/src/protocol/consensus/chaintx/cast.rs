@@ -42,7 +42,6 @@ use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::tasm::claims::generate_single_proof_claim::GenerateSingleProofClaim;
 use crate::protocol::consensus::transaction::Transaction;
 use crate::protocol::consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 use crate::protocol::proof_abstractions::SecretWitness;
 
@@ -99,14 +98,14 @@ pub async fn cast(
     } else {
         let claim = link_proof_claim(kernel.mast_hash(), single_proof_digest, consensus_rule_set);
         let witness = LinkProofWitness::from_cast(witness);
-        LinkProof
-            .prove(
-                claim,
-                witness.nondeterminism(),
-                job_queue,
-                proof_job_options,
-            )
-            .await?
+        LinkProof::prove_paired_with(
+            single_proof_digest,
+            claim,
+            witness.nondeterminism(),
+            job_queue,
+            proof_job_options,
+        )
+        .await?
     };
 
     Ok(LinkTx {
@@ -179,7 +178,7 @@ impl SecretWitness for CastWitness {
     }
 
     fn program(&self) -> Program {
-        LinkProof.program()
+        LinkProof::program_paired_with(self.single_proof_digest)
     }
 
     fn nondeterminism(&self) -> NonDeterminism {
@@ -466,6 +465,7 @@ pub(crate) mod tests {
     use crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2;
     use crate::protocol::proof_abstractions::tasm::builtins as tasm;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
+    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
     use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
 
     /// The `Cast` branch of the `LinkProof` rust shadow, called by

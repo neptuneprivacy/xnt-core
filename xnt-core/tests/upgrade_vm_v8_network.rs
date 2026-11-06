@@ -1,7 +1,7 @@
 //! End-to-end scenarios on a connected regtest cluster under the
-//! `UpgradeVMv8` rule set, with mock proofs so that no real proving is needed.
+//! `LeviathanSettlement` rule set (the v8 rule set with the bridge), with mock proofs so that no real proving is needed.
 //!
-//! Regtest follows `UpgradeVMv8` from genesis: every block these scenarios
+//! Regtest follows `LeviathanSettlement` from genesis: every block these scenarios
 //! mine is a post-fork block, and every transaction is validated by the
 //! post-fork rules.
 
@@ -26,7 +26,7 @@ use neptune_privacy::application::config::cli_args::Args;
 use tasm_lib::prelude::Digest;
 
 /// Assert that the node's tip and the block that follows it are both under
-/// `UpgradeVMv8`, the rule set that carries transaction chaining.
+/// `LeviathanSettlement`, a rule set that carries transaction chaining.
 async fn assert_follows_upgrade_vm_v8(node: &GenesisNode) {
     let tip_height = node
         .gsl
@@ -38,7 +38,7 @@ async fn assert_follows_upgrade_vm_v8(node: &GenesisNode) {
         .height;
     for height in [tip_height, tip_height.next()] {
         let consensus_rule_set = ConsensusRuleSet::infer_from(Network::RegTest, height);
-        assert_eq!(ConsensusRuleSet::UpgradeVMv8, consensus_rule_set);
+        assert_eq!(ConsensusRuleSet::LeviathanSettlement, consensus_rule_set);
         assert!(consensus_rule_set.has_chain_branches());
     }
 }

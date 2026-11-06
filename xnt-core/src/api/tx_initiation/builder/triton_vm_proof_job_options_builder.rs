@@ -131,9 +131,10 @@ impl TritonVmProofJobOptionsBuilder {
     /// use neptune_privacy::api::tx_initiation::builder::transaction_proof_builder::TransactionProofBuilder;
     /// use neptune_privacy::api::tx_initiation::builder::triton_vm_proof_job_options_builder::TritonVmProofJobOptionsBuilder;
     /// use neptune_privacy::application::triton_vm_job_queue::vm_job_queue;
+    /// use neptune_privacy::api::export::ConsensusRuleSet;
     /// use std::time::Duration;
     ///
-    /// async fn prove_with_timeout(tx_details: TransactionDetails, timeout: Duration) -> anyhow::Result<TransactionProof> {
+    /// async fn prove_with_timeout(tx_details: TransactionDetails, consensus_rule_set: ConsensusRuleSet, timeout: Duration) -> anyhow::Result<TransactionProof> {
     ///
     ///     // create job cancellation channel
     ///     let (cancel_job_tx, cancel_job_rx) = tokio::sync::watch::channel(());
@@ -149,6 +150,7 @@ impl TritonVmProofJobOptionsBuilder {
     ///             .transaction_details(&tx_details)
     ///             .job_queue(vm_job_queue())
     ///             .proof_job_options(options)
+    ///             .consensus_rule_set(consensus_rule_set)
     ///             .build();
     ///
     ///     // start building proof and cancel job if it has not completed

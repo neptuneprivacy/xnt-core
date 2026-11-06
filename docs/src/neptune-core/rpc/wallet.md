@@ -106,7 +106,7 @@ None
 
 **Returns**
 
-`balance` - string, balance as decimal
+`balanceNau` - string, balance in nau (integer; 1 coin = 4·10^30 nau)
 
 **Example**
 
@@ -119,7 +119,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "balance": "100.5"
+    "balanceNau": "402000000000000000000000000000000"
   }
 }
 ```
@@ -148,11 +148,11 @@ Each input contains:
 - `leafIndex` - number, AOCL leaf index
 - `utxoDigest` - string, hex UTXO commitment
 - `utxo.lockScriptHash` - string, hex lock script hash
-- `utxo.amount` - string, amount
+- `utxo.amountNau` - string, amount in nau
 
 Each output contains:
 - `utxo.lockScriptHash` - string, hex lock script hash
-- `utxo.amount` - string, amount
+- `utxo.amountNau` - string, amount in nau
 - `utxoDigest` - string, hex UTXO commitment (use for tracking)
 - `senderRandomness` - string, hex randomness
 - `isOwned` - boolean, wallet owns this output
@@ -177,7 +177,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
         "utxoDigest": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
         "utxo": {
           "lockScriptHash": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
-          "amount": "50.0"
+          "amountNau": "200000000000000000000000000000000"
         }
       }
     ],
@@ -185,7 +185,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
       {
         "utxo": {
           "lockScriptHash": "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-          "amount": "10.0"
+          "amountNau": "40000000000000000000000000000000"
         },
         "utxoDigest": "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5",
         "senderRandomness": "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
@@ -209,7 +209,7 @@ Validates an amount string.
 
 **Returns**
 
-`amount` - string or null, normalized amount if valid
+`amountNau` - string or null, the amount in nau if valid
 
 **Example**
 
@@ -222,7 +222,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "amount": "10.5"
+    "amountNau": "42000000000000000000000000000000"
   }
 }
 ```
@@ -300,7 +300,7 @@ Returns all unspent UTXOs.
 Array of:
 - `leafIndex` - number, AOCL leaf index
 - `lockScriptHash` - string, hex lock script hash
-- `amount` - string, amount
+- `amountNau` - string, amount in nau
 
 **Example**
 
@@ -316,7 +316,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
     {
       "leafIndex": 12345,
       "lockScriptHash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-      "amount": "100.0"
+      "amountNau": "400000000000000000000000000000000"
     }
   ]
 }
@@ -354,7 +354,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
       {
         "leafIndex": 12345,
         "lockScriptHash": "a1b2c3d4...",
-        "amount": "100.0"
+        "amountNau": "400000000000000000000000000000000"
       }
     ],
     "totalSelectedAmount": "100.0"
@@ -450,7 +450,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
     {
       "txInputs": [...],
       "txOutputs": [...],
-      "fee": "0.1",
+      "feeNau": "400000000000000000000000000000",
       "timestamp": 1703500000000,
       "tipWhenSent": "a1b2c3d4..."
     }
@@ -475,7 +475,7 @@ Returns block info with wallet-known details.
 - `timestamp` - number, block timestamp in milliseconds
 - `difficulty` - string, block difficulty
 - `size` - number, block size in bytes
-- `fee` - string, total fees
+- `feeNau` - string, total fees in nau
 - `inputs` - array, block inputs with wallet info
 - `outputs` - array, block outputs with wallet info
 
@@ -497,7 +497,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
     "timestamp": 1703500000000,
     "difficulty": "1000000",
     "size": 4096,
-    "fee": "1.5",
+    "feeNau": "6000000000000000000000000000000",
     "inputs": [...],
     "outputs": [...]
   }

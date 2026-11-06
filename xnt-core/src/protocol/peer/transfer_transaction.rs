@@ -4,6 +4,8 @@ use serde::Serialize;
 use strum::EnumIter;
 
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::AnyProofCollection;
+use crate::protocol::consensus::transaction::validity::leviathan_proof_collection::LeviathanProofCollection;
 use crate::protocol::consensus::transaction::validity::neptune_proof::Proof;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::Transaction;
@@ -33,6 +35,8 @@ pub(crate) enum TransferTransactionProof {
     //OnlyLockScripts(OnlyLockScriptWitness) TODO: Add when Transaction supports
     ProofCollection(Box<ProofCollection>),
     SingleProof(Proof),
+    /// After the upstream variants: bincode cannot tell the two layouts apart.
+    LeviathanProofCollection(Box<LeviathanProofCollection>),
 }
 
 /// For transferring proved transactions between peers.
@@ -57,8 +61,13 @@ impl TryFrom<&Transaction> for TransferTransaction {
             TransactionProof::SingleProof(proof) => {
                 TransferTransactionProof::SingleProof(proof.to_owned())
             }
-            TransactionProof::ProofCollection(proof_collection) => {
+            TransactionProof::ProofCollection(AnyProofCollection::Upstream(proof_collection)) => {
                 TransferTransactionProof::ProofCollection(Box::new(proof_collection.to_owned()))
+            }
+            TransactionProof::ProofCollection(AnyProofCollection::Leviathan(proof_collection)) => {
+                TransferTransactionProof::LeviathanProofCollection(Box::new(
+                    proof_collection.to_owned(),
+                ))
             }
         };
 
@@ -72,7 +81,8 @@ impl TryFrom<&Transaction> for TransferTransaction {
 impl TransferTransactionProof {
     pub(crate) fn proof_quality(&self) -> TransactionProofQuality {
         match self {
-            TransferTransactionProof::ProofCollection(_) => {
+            TransferTransactionProof::ProofCollection(_)
+            | TransferTransactionProof::LeviathanProofCollection(_) => {
                 TransactionProofQuality::ProofCollection
             }
             TransferTransactionProof::SingleProof(_) => TransactionProofQuality::SingleProof,
@@ -86,7 +96,10 @@ impl From<TransferTransaction> for Transaction {
             kernel: value.kernel,
             proof: match value.proof {
                 TransferTransactionProof::ProofCollection(proof_collection) => {
-                    TransactionProof::ProofCollection(*proof_collection)
+                    TransactionProof::ProofCollection((*proof_collection).into())
+                }
+                TransferTransactionProof::LeviathanProofCollection(proof_collection) => {
+                    TransactionProof::ProofCollection((*proof_collection).into())
                 }
                 TransferTransactionProof::SingleProof(proof) => {
                     TransactionProof::SingleProof(proof)

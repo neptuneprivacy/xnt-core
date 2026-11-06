@@ -9,6 +9,8 @@ use crate::application::database::NeptuneLevelDb;
 use crate::protocol::consensus::block::block_header::BlockHeader;
 use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;
 use crate::protocol::consensus::block::block_height::BlockHeight;
+use crate::protocol::consensus::bridge::authority::StoredBridgeAuthoritySet;
+use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
 use crate::protocol::peer::PeerStanding;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 
@@ -107,6 +109,17 @@ pub enum BlockIndexKey {
     // Tip-hash could also be fetched from archival block MMR instead. Maybe
     // this key is superfluous?
     BlockTipDigest, // points to block digest of most canonical block known
+
+    /// Last accepted Leviathan aggregated proof state commitment (Tip5 digest).
+    /// Used to enforce commitment chain continuity across epochs.
+    BridgeStateCommitment,
+
+    /// Live bridge settlement authority set (N-of-M validator keys). Absent
+    /// until seeded/rotated; reads fall back to the per-network genesis seed.
+    BridgeAuthoritySet,
+
+    /// The set-once bridge registration (faucet id + genesis state commitment).
+    BridgeRegistration,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,34 +129,44 @@ pub enum BlockIndexValue {
     Height(Vec<Digest>),
     LastFile(LastFileRecord),
     BlockTipDigest(Digest),
+
+    /// The `new_state_commitment` from the last accepted aggregated proof.
+    /// `None` before the first proof is accepted.
+    BridgeStateCommitment(Option<Digest>),
+
+    /// The live bridge authority set. `None` means it was explicitly cleared;
+    /// absence of the key entirely means "never set" (use the genesis seed).
+    BridgeAuthoritySet(Option<StoredBridgeAuthoritySet>),
+
+    BridgeRegistration(BridgeRegistration),
 }
 
 impl BlockIndexValue {
     pub fn as_block_record(&self) -> BlockRecord {
         match self {
             BlockIndexValue::Block(rec) => *rec.to_owned(),
-            _ => panic!("Requested BlockTipDigest, found {:?}", self),
+            _ => panic!("Requested BlockRecord, found {:?}", self),
         }
     }
 
     pub fn as_file_record(&self) -> FileRecord {
         match self {
             BlockIndexValue::File(rec) => rec.to_owned(),
-            _ => panic!("Requested BlockTipDigest, found {:?}", self),
+            _ => panic!("Requested FileRecord, found {:?}", self),
         }
     }
 
     pub fn as_height_record(&self) -> Vec<Digest> {
         match self {
             BlockIndexValue::Height(rec) => rec.to_owned(),
-            _ => panic!("Requested BlockTipDigest, found {:?}", self),
+            _ => panic!("Requested Height, found {:?}", self),
         }
     }
 
     pub fn as_last_file_record(&self) -> LastFileRecord {
         match self {
             BlockIndexValue::LastFile(rec) => rec.to_owned(),
-            _ => panic!("Requested BlockTipDigest, found {:?}", self),
+            _ => panic!("Requested LastFile, found {:?}", self),
         }
     }
 
@@ -151,6 +174,27 @@ impl BlockIndexValue {
         match self {
             BlockIndexValue::BlockTipDigest(digest) => digest.to_owned(),
             _ => panic!("Requested BlockTipDigest, found {:?}", self),
+        }
+    }
+
+    pub fn as_bridge_state_commitment(&self) -> Option<Digest> {
+        match self {
+            BlockIndexValue::BridgeStateCommitment(c) => *c,
+            _ => panic!("Requested BridgeStateCommitment, found {:?}", self),
+        }
+    }
+
+    pub fn as_bridge_authority_set(&self) -> Option<StoredBridgeAuthoritySet> {
+        match self {
+            BlockIndexValue::BridgeAuthoritySet(a) => a.clone(),
+            _ => panic!("Requested BridgeAuthoritySet, found {:?}", self),
+        }
+    }
+
+    pub fn as_bridge_registration(&self) -> BridgeRegistration {
+        match self {
+            BlockIndexValue::BridgeRegistration(r) => *r,
+            _ => panic!("Requested BridgeRegistration, found {:?}", self),
         }
     }
 }

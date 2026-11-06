@@ -12,6 +12,7 @@ use neptune_privacy::api::export::TxOutput;
 use neptune_privacy::api::export::TxOutputList;
 use neptune_privacy::api::export::UnlockedUtxo;
 use neptune_privacy::protocol::consensus::transaction::Transaction as CoreTransaction;
+use neptune_privacy::protocol::consensus::transaction::validity::leviathan_proof_collection::VerifyOptions;
 use neptune_privacy::state::wallet::address::SpendingKey as CoreSpendingKey;
 
 use super::address::{Address, ReceivingAddress};
@@ -560,8 +561,8 @@ impl BuiltTransaction {
     /// set: UpgradeVMv8, or UpgradeVMv7 before the hard fork, whose proof
     /// collection is verified before it is returned.
     async fn prove_for(&self, consensus_rule_set: neptune_privacy::api::export::ConsensusRuleSet) -> Result<Transaction> {
+        use neptune_privacy::api::export::AnyProofCollection;
         use neptune_privacy::api::export::ConsensusRuleSet;
-        use neptune_privacy::api::export::ProofCollection;
         use neptune_privacy::api::export::TritonVmJobQueue;
         use neptune_privacy::api::export::TritonVmProofJobOptionsBuilder;
         use neptune_privacy::api::export::TxProvingCapability;
@@ -574,7 +575,7 @@ impl BuiltTransaction {
             .build();
 
         let proof_collection =
-            ProofCollection::produce_v2(&self.witness, job_queue, options, consensus_rule_set)
+            AnyProofCollection::produce_v2(&self.witness, job_queue, options, consensus_rule_set)
                 .await
                 .map_err(|e| XntError::TransactionError(format!("proving failed: {e}")))?;
 
@@ -586,7 +587,15 @@ impl BuiltTransaction {
         // Nodes of the era before the fork sanction peers that relay a proof they
         // reject, so a v7 proof is checked before it leaves the SDK.
         if consensus_rule_set == ConsensusRuleSet::UpgradeVMv7
-            && !tx.proof.verify(tx.kernel.mast_hash(), self.details.network, consensus_rule_set).await
+            && !tx
+                .proof
+                .verify(
+                    tx.kernel.mast_hash(),
+                    self.details.network,
+                    consensus_rule_set,
+                    VerifyOptions::default(),
+                )
+                .await
         {
             return Err(XntError::TransactionError(
                 "proving failed: the v7 proof collection does not verify".into(),

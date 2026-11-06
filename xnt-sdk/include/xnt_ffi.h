@@ -167,6 +167,21 @@ typedef struct XntIndexedUtxoArray {
     uintptr_t len;
 } XntIndexedUtxoArray;
 
+// Bridge payout from sync: a public UTXO, found by its receiver identifier
+typedef struct XntPublicIndexedUtxo {
+    uint64_t block_height;
+    struct XntDigest block_digest;
+    struct XntDigest lock_script_hash;
+    __int128 amount_nau;
+    struct XntDigest sender_randomness;
+} XntPublicIndexedUtxo;
+
+// Array of bridge payouts
+typedef struct XntPublicIndexedUtxoArray {
+    struct XntPublicIndexedUtxo *data;
+    uintptr_t len;
+} XntPublicIndexedUtxoArray;
+
 // Decrypted UTXO notification result
 typedef struct XntDecryptedUtxo {
     struct XntUtxoHandle *utxo;
@@ -187,6 +202,22 @@ typedef struct XntAoclIndices {
     int64_t *indices;
     uintptr_t len;
 } XntAoclIndices;
+
+// One AOCL leaf of a commitment
+typedef struct XntAoclLeaf {
+    uint64_t aocl_leaf_index;
+    uint64_t block_height;
+    struct XntDigest block_digest;
+} XntAoclLeaf;
+
+// Every AOCL leaf of each commitment: `counts[i]` leaves of commitment `i`, in order, in
+// `leaves`
+typedef struct XntAoclLeaves {
+    struct XntAoclLeaf *leaves;
+    uintptr_t num_leaves;
+    uintptr_t *counts;
+    uintptr_t num_commitments;
+} XntAoclLeaves;
 
 // Transaction input info (C-compatible)
 //
@@ -574,6 +605,15 @@ struct XntIndexedUtxoArray xnt_sync_fetch_utxos_with_skipped(const struct XntRpc
 // Free indexed UTXO array
 void xnt_sync_indexed_utxos_free(struct XntIndexedUtxoArray *arr);
 
+// Fetch bridge payouts by receiver_id_hash from indexer
+struct XntPublicIndexedUtxoArray xnt_sync_fetch_public_utxos(const struct XntRpcClientHandle *client,
+                                                             const struct XntDigest *receiver_id_hash,
+                                                             uint64_t from_height,
+                                                             uint64_t to_height);
+
+// Free bridge payout array
+void xnt_sync_public_utxos_free(struct XntPublicIndexedUtxoArray *arr);
+
 // Decrypt indexed UTXO ciphertext with spending key
 //
 // Applies the main-net legacy cutoff, the strictest one; see
@@ -607,6 +647,15 @@ struct XntAoclIndices xnt_sync_get_aocl_indices(const struct XntRpcClientHandle 
 
 // Free AOCL indices result
 void xnt_sync_aocl_indices_free(struct XntAoclIndices *result);
+
+// Get every AOCL leaf of each commitment. Identical outputs share a commitment; each leaf is
+// spendable once.
+struct XntAoclLeaves xnt_sync_get_aocl_leaves(const struct XntRpcClientHandle *client,
+                                              const struct XntDigest *commitments,
+                                              uintptr_t count);
+
+// Free AOCL leaves result
+void xnt_sync_aocl_leaves_free(struct XntAoclLeaves *result);
 
 // Get current block height from node
 int64_t xnt_sync_get_height(const struct XntRpcClientHandle *client);

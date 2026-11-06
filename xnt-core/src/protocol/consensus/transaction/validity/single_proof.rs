@@ -224,7 +224,7 @@ pub struct SingleProof;
 
 impl SingleProof {
     /// Not to be confused with SingleProofWitness::claim
-    fn claim(tx_kernel_mast_hash: Digest) -> Claim {
+    pub(crate) fn claim(tx_kernel_mast_hash: Digest) -> Claim {
         Claim::about_program(&SingleProof.program())
             .with_input(tx_kernel_mast_hash.reversed().values())
     }
@@ -261,7 +261,28 @@ impl SingleProof {
             primitive_witness.kernel.mast_hash(),
             consensus_rule_set,
         );
+        Self::produce_with_claim(
+            primitive_witness,
+            triton_vm_job_queue,
+            proof_job_options,
+            claim,
+        )
+        .await
+    }
 
+    pub(crate) async fn produce_with_claim(
+        primitive_witness: &PrimitiveWitness,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+        claim: Claim,
+    ) -> Result<Proof, CreateProofError> {
+        let proof_collection = ProofCollection::produce(
+            primitive_witness,
+            triton_vm_job_queue.clone(),
+            proof_job_options.clone(),
+        )
+        .await?;
+        let single_proof_witness = SingleProofWitness::from_collection(proof_collection);
         let nondeterminism = single_proof_witness.nondeterminism();
         info!("Start: generate single proof from proof collection");
 
@@ -309,7 +330,8 @@ pub(crate) async fn produce_single_proof(
         | ConsensusRuleSet::UpgradeVMv4
         | ConsensusRuleSet::UpgradeVMv5
         | ConsensusRuleSet::UpgradeVMv7
-        | ConsensusRuleSet::UpgradeVMv8 => {
+        | ConsensusRuleSet::UpgradeVMv8
+        | ConsensusRuleSet::LeviathanSettlement => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2
                 ::produce(
                     primitive_witness,
@@ -398,6 +420,11 @@ pub(crate) fn single_proof_claim(
         // SingleProofV2, current (v8) bytecode — recompute from the linked program.
         ConsensusRuleSet::UpgradeVMv8 => {
             crate::protocol::consensus::transaction::validity::single_proof_v2::SingleProofV2::claim(
+                tx_kernel_mast_hash,
+            )
+        }
+        ConsensusRuleSet::LeviathanSettlement => {
+            crate::protocol::consensus::transaction::validity::single_proof_v2::LeviathanSingleProofV2::claim(
                 tx_kernel_mast_hash,
             )
         }
@@ -1113,10 +1140,8 @@ pub(crate) mod tests {
     }
 
     mod merge_tests {
-        use crate::protocol::consensus::{
-            consensus_rule_set::ConsensusRuleSet,
-            transaction::validity::tasm::single_proof::merge_branch::tests::deterministic_merge_witness_with_coinbase,
-        };
+        use crate::protocol::consensus::transaction::validity::tasm::single_proof::merge_branch::tests::deterministic_merge_witness_with_coinbase;
+        use crate::protocol::consensus::transaction::validity::tasm::single_proof::merge_branch::tests::OperandProgram;
 
         use super::*;
 
@@ -1140,7 +1165,7 @@ pub(crate) mod tests {
             let merge_witness = deterministic_merge_witness(
                 (2, 2, 2),
                 (2, 2, 2),
-                ConsensusRuleSet::default(),
+                OperandProgram::CurrentV1,
                 network,
             )
             .await;
@@ -1156,7 +1181,7 @@ pub(crate) mod tests {
                 3,
                 3,
                 network,
-                ConsensusRuleSet::default(),
+                OperandProgram::CurrentV1,
             )
             .await;
             positive_prop(merge_witness);

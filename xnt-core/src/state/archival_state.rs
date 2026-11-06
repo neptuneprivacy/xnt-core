@@ -30,13 +30,28 @@ use crate::protocol::consensus::block::block_header::HeaderToBlockHashWitness;
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
 use crate::protocol::consensus::block::Block;
+use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+use crate::protocol::consensus::bridge::authority::BridgeAuthoritySet;
+use crate::protocol::consensus::bridge::authority::StoredBridgeAuthoritySet;
+use crate::protocol::consensus::bridge::authority_rotation::AuthorityRotationAnnouncement;
+use crate::protocol::consensus::bridge::faucet_registration::BridgeRegistration;
+use crate::protocol::consensus::bridge::faucet_registration::FaucetRegistrationAnnouncement;
+use crate::protocol::consensus::consensus_rule_set::leviathan_settlement_activation_height;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+use crate::state::bridge_pool::advance_pool;
+use crate::state::bridge_pool::bridge_deposit_entries;
+use crate::state::bridge_pool::bridge_unlock_effects;
+use crate::state::bridge_pool::PoolView;
+use crate::state::bridge_pool::{
+    AuthorityRollback, BridgeRegistryDelta, DeltaKey, DeltaValue, PoolEntry, PoolKey, PoolValue,
+};
 use crate::state::database::BlockFileLocation;
 use crate::state::database::BlockIndexKey;
 use crate::state::database::BlockIndexValue;
 use crate::state::database::BlockRecord;
 use crate::state::database::FileRecord;
 use crate::state::database::LastFileRecord;
+use crate::state::InvalidBridgeChange;
 use crate::util_types::mutator_set::addition_record::AdditionRecord;
 use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 use crate::util_types::mutator_set::removal_record::absolute_index_set::AbsoluteIndexSet;
@@ -81,6 +96,12 @@ pub struct ArchivalState {
     /// Archival-MMR of the block digests belonging to the canonical chain.
     pub(crate) archival_block_mmr: RustyArchivalBlockMmr,
 
+    /// Bridge pool: unspent bridge-locked UTXOs. Key = canonical commitment.
+    pub(crate) bridge_pool_db: NeptuneLevelDb<PoolKey, PoolValue>,
+
+    /// Bridge deltas per block for reorg rollback. Key = block digest.
+    pub(crate) bridge_delta_db: NeptuneLevelDb<DeltaKey, DeltaValue>,
+
     /// The network that this node is on. Used to simplify method interfaces.
     network: Network,
 }
@@ -114,6 +135,22 @@ impl ArchivalState {
         .await?;
 
         Ok(block_index)
+    }
+
+    async fn initialize_bridge_pool_db(
+        data_dir: &DataDirectory,
+    ) -> Result<NeptuneLevelDb<PoolKey, PoolValue>> {
+        let path = data_dir.bridge_pool_database_dir_path();
+        DataDirectory::create_dir_if_not_exists(&path).await?;
+        NeptuneLevelDb::<PoolKey, PoolValue>::new(&path, &create_db_if_missing()).await
+    }
+
+    async fn initialize_bridge_delta_db(
+        data_dir: &DataDirectory,
+    ) -> Result<NeptuneLevelDb<DeltaKey, DeltaValue>> {
+        let path = data_dir.bridge_pool_delta_database_dir_path();
+        DataDirectory::create_dir_if_not_exists(&path).await?;
+        NeptuneLevelDb::<DeltaKey, DeltaValue>::new(&path, &create_db_if_missing()).await
     }
 
     /// Initialize an `ArchivalMutatorSet` by opening or creating its databases.
@@ -298,15 +335,654 @@ impl ArchivalState {
             .await
             .expect("Must be able to initialize block index database");
         debug!("Got block index database");
+
+        let mut bridge_pool_db = ArchivalState::initialize_bridge_pool_db(&data_dir)
+            .await
+            .expect("Must be able to initialize bridge pool database");
+        let mut bridge_delta_db = ArchivalState::initialize_bridge_delta_db(&data_dir)
+            .await
+            .expect("Must be able to initialize bridge delta database");
+        Self::rekey_bridge_pool(&mut bridge_pool_db, &mut bridge_delta_db).await;
+        debug!("Got bridge databases");
+
         let genesis_block = Box::new(genesis_block);
-        Self {
+        let mut archival_state = Self {
             data_dir,
             block_index_db,
             genesis_block,
             archival_mutator_set,
             archival_block_mmr,
+            bridge_pool_db,
+            bridge_delta_db,
             network,
+        };
+        archival_state.drop_pre_activation_pool_entries().await;
+        archival_state
+    }
+
+    pub(crate) fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Drops the pool entries of deposits mined before the bridge activated, which versions that
+    /// tracked deposits in every era recorded.
+    async fn drop_pre_activation_pool_entries(&mut self) {
+        let activation = leviathan_settlement_activation_height(self.network);
+        if activation.is_genesis() {
+            return;
         }
+        let tip = self.get_tip().await;
+        let first_active_aocl_index = if tip.header().height < activation {
+            u64::MAX
+        } else {
+            let last_inactive_height = activation.previous().expect("activation is not genesis");
+            let last_inactive = self
+                .archival_block_mmr
+                .ammr()
+                .get_leaf_async(last_inactive_height.into())
+                .await;
+            self.get_block(last_inactive)
+                .await
+                .expect("stored block must load")
+                .expect("canonical block must be stored")
+                .mutator_set_accumulator_after()
+                .expect("stored block has a mutator set")
+                .aocl
+                .num_leafs()
+        };
+        let stale = self
+            .bridge_pool_db
+            .iter()
+            .filter(|(_, entry)| entry.aocl_leaf_index < first_active_aocl_index)
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return;
+        }
+        info!(
+            "dropping {} bridge pool entries deposited before block {activation}",
+            stale.len()
+        );
+        let mut batch = WriteBatchAsync::new();
+        for key in stale {
+            batch.op_delete(key);
+        }
+        self.bridge_pool_db.batch_write(batch).await;
+    }
+
+    /// Re-keys pool and delta entries from their commitment (the old key) to [`PoolEntry::key`];
+    /// idempotent.
+    async fn rekey_bridge_pool(
+        pool_db: &mut NeptuneLevelDb<PoolKey, PoolValue>,
+        delta_db: &mut NeptuneLevelDb<DeltaKey, DeltaValue>,
+    ) {
+        fn rekey(pairs: &mut [(PoolKey, PoolEntry)]) -> bool {
+            let mut changed = false;
+            for (key, entry) in pairs.iter_mut() {
+                let new_key = entry.key();
+                if *key != new_key {
+                    *key = new_key;
+                    changed = true;
+                }
+            }
+            changed
+        }
+
+        let entries_before = pool_db.iter().count();
+        let mut stale = pool_db
+            .iter()
+            .filter(|(key, entry)| *key != entry.key())
+            .collect::<Vec<_>>();
+        if !stale.is_empty() {
+            let mut batch = WriteBatchAsync::new();
+            for (key, _) in &stale {
+                batch.op_delete(*key);
+            }
+            rekey(&mut stale);
+            for (key, entry) in stale.iter().cloned() {
+                batch.op_write(key, entry);
+            }
+            pool_db.batch_write(batch).await;
+        }
+
+        let mut batch = WriteBatchAsync::new();
+        let mut deltas_rewritten = 0;
+        for (block, mut delta) in delta_db.iter().collect::<Vec<_>>() {
+            let added = rekey(&mut delta.pool_added);
+            let removed = rekey(&mut delta.pool_removed);
+            if added || removed {
+                batch.op_write(block, delta);
+                deltas_rewritten += 1;
+            }
+        }
+        if deltas_rewritten > 0 {
+            delta_db.batch_write(batch).await;
+        }
+
+        if stale.is_empty() && deltas_rewritten == 0 {
+            return;
+        }
+        let entries_after = pool_db.iter().count();
+        tracing::info!(
+            "re-keyed {} bridge pool entries and {deltas_rewritten} deltas",
+            stale.len()
+        );
+        if entries_after != entries_before {
+            tracing::error!(
+                "re-keying merged bridge pool entries: {entries_before} before, {entries_after} after"
+            );
+        }
+    }
+
+    /// Apply bridge deposit announcements from a block.
+    /// Persists pool entries and delta to LevelDB.
+    pub(crate) async fn apply_bridge_deposits(&mut self, block: &Block, prev_aocl_len: u64) {
+        // Before the bridge, a node's pool would depend on whether it synced from genesis.
+        if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+            self.network,
+            block.header().height,
+        )
+        .bav_active()
+        {
+            return;
+        }
+        let entries = bridge_deposit_entries(block, prev_aocl_len);
+        if entries.is_empty() {
+            return;
+        }
+        let mut delta = BridgeRegistryDelta::new(self.bridge_state_commitment().await);
+        delta.pool_added = entries.clone();
+        // The undo record goes first, so a crash before the writes below can be undone.
+        self.bridge_delta_db.put(block.hash(), delta).await;
+        for (key, entry) in entries {
+            // The pool UTXO is already in the MS as a normal transaction output.
+            self.bridge_pool_db.put(key, entry).await;
+        }
+    }
+
+    /// Revert bridge pool DB changes for a rolled-back block.
+    pub(crate) async fn revert_bridge_delta(&mut self, block_digest: Digest) {
+        let Some(delta) = self.bridge_delta_db.get(block_digest).await else {
+            return;
+        };
+
+        // Reverse pool DB changes: remove added, re-add removed.
+        for (key, _) in &delta.pool_added {
+            self.bridge_pool_db.delete(*key).await;
+        }
+        for (key, entry) in &delta.pool_removed {
+            self.bridge_pool_db.put(*key, entry.clone()).await;
+        }
+
+        // Restore state commitment.
+        self.block_index_db
+            .put(
+                BlockIndexKey::BridgeStateCommitment,
+                BlockIndexValue::BridgeStateCommitment(delta.state_commitment),
+            )
+            .await;
+
+        match &delta.authority_rollback {
+            None => {}
+            Some(AuthorityRollback::WasAbsent) => {
+                self.block_index_db
+                    .delete(BlockIndexKey::BridgeAuthoritySet)
+                    .await;
+            }
+            Some(AuthorityRollback::WasSet(prev)) => {
+                self.block_index_db
+                    .put(
+                        BlockIndexKey::BridgeAuthoritySet,
+                        BlockIndexValue::BridgeAuthoritySet(prev.clone()),
+                    )
+                    .await;
+            }
+        }
+
+        if delta.registered {
+            self.block_index_db
+                .delete(BlockIndexKey::BridgeRegistration)
+                .await;
+        }
+
+        self.bridge_delta_db.delete(block_digest).await;
+    }
+
+    /// Get the last accepted Leviathan state commitment.
+    pub(crate) async fn bridge_state_commitment(&self) -> Option<Digest> {
+        self.block_index_db
+            .get(BlockIndexKey::BridgeStateCommitment)
+            .await
+            .and_then(|v| v.as_bridge_state_commitment())
+    }
+
+    /// Reconstruct the bridge state commitment as it stood immediately after
+    /// `target`, read-only, without mutating state. Rewinds the current
+    /// commitment through the reorg deltas to the fork point, then replays any
+    /// forward settlements to `target` (covers side-branch targets too). Used to
+    /// anti-replay-check a settlement against its branch's fork point.
+    pub(crate) async fn bridge_commitment_as_of(&self, target: Digest) -> Option<Digest> {
+        let start = self.archival_mutator_set.get_sync_label();
+        if start == target {
+            return self.bridge_state_commitment().await;
+        }
+        let (backwards, _luca, forwards) = self.find_path(start, target).await;
+        let mut commitment = self.bridge_state_commitment().await;
+        for digest in backwards {
+            if let Some(delta) = self.bridge_delta_db.get(digest).await {
+                commitment = delta.state_commitment;
+            }
+        }
+        for digest in forwards {
+            let block = self
+                .get_block(digest)
+                .await
+                .expect("fetching stored block on fork path must succeed")
+                .expect("block on fork path must exist");
+            // Stay the exact inverse of apply-time, which ignores a pre-activation block's stray announcement.
+            if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+                self.network,
+                block.header().height,
+            )
+            .bav_active()
+            {
+                continue;
+            }
+            let announcements = &block.kernel.body.transaction_kernel.announcements;
+            if let Some(ann) = AggregatedAnnouncementData::find_in_announcements(announcements) {
+                commitment = Some(ann.new_state_commitment);
+            }
+            if let Some(reg) = FaucetRegistrationAnnouncement::find_in_announcements(announcements)
+            {
+                commitment = Some(reg.registration.genesis_state_commitment);
+            }
+        }
+        commitment
+    }
+
+    /// The bridge pool as of `target`, reorg-aware like [`Self::bridge_commitment_as_of`].
+    pub(crate) async fn bridge_pool_as_of(
+        &self,
+        target: Digest,
+    ) -> Result<PoolView, InvalidBridgeChange> {
+        let mut pool: PoolView = self.bridge_pool_db.iter().collect();
+        let start = self.archival_mutator_set.get_sync_label();
+        if start == target {
+            return Ok(pool);
+        }
+        let (backwards, _luca, forwards) = self.find_path(start, target).await;
+        for digest in backwards {
+            if let Some(delta) = self.bridge_delta_db.get(digest).await {
+                for (key, _) in &delta.pool_added {
+                    pool.remove(key);
+                }
+                pool.extend(delta.pool_removed);
+            }
+        }
+        for digest in forwards {
+            let block = self
+                .get_block(digest)
+                .await
+                .expect("fetching stored block on fork path must succeed")
+                .expect("block on fork path must exist");
+            let bav_active =
+                crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+                    self.network,
+                    block.header().height,
+                )
+                .bav_active();
+            advance_pool(&mut pool, &block, bav_active)?;
+        }
+        Ok(pool)
+    }
+
+    /// The set-once bridge registration; `None` until registered (settlements refused).
+    pub(crate) async fn bridge_registration_current(&self) -> Option<BridgeRegistration> {
+        self.block_index_db
+            .get(BlockIndexKey::BridgeRegistration)
+            .await
+            .map(|v| v.as_bridge_registration())
+    }
+
+    /// Registration as of `target`, reorg-aware like [`Self::bridge_authority_set_as_of`].
+    pub(crate) async fn bridge_registration_as_of(
+        &self,
+        target: Digest,
+    ) -> Option<BridgeRegistration> {
+        let mut registration = self.bridge_registration_current().await;
+        let start = self.archival_mutator_set.get_sync_label();
+        if start != target {
+            let (backwards, _luca, forwards) = self.find_path(start, target).await;
+            for digest in backwards {
+                if self
+                    .bridge_delta_db
+                    .get(digest)
+                    .await
+                    .is_some_and(|delta| delta.registered)
+                {
+                    registration = None;
+                }
+            }
+            for digest in forwards {
+                let block = self
+                    .get_block(digest)
+                    .await
+                    .expect("fetching stored block on fork path must succeed")
+                    .expect("block on fork path must exist");
+                if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+                    self.network,
+                    block.header().height,
+                )
+                .bav_active()
+                {
+                    continue;
+                }
+                if let Some(reg) = FaucetRegistrationAnnouncement::find_in_announcements(
+                    &block.kernel.body.transaction_kernel.announcements,
+                ) {
+                    registration = registration.or(Some(reg.registration));
+                }
+            }
+        }
+        registration
+    }
+
+    /// Re-verified (defense-in-depth); also anchors the commitment chain.
+    pub(crate) async fn apply_bridge_registration(
+        &mut self,
+        block: &Block,
+    ) -> Result<(), anyhow::Error> {
+        if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+            self.network,
+            block.header().height,
+        )
+        .bav_active()
+        {
+            return Ok(());
+        }
+        let Some(reg) = FaucetRegistrationAnnouncement::find_in_announcements(
+            &block.kernel.body.transaction_kernel.announcements,
+        ) else {
+            return Ok(());
+        };
+        if self.bridge_registration_current().await.is_some() {
+            anyhow::bail!("bridge registration when one is already in effect");
+        }
+        let authority = self
+            .bridge_authority_set_current()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("bridge registration with no authority set"))?;
+        let registration = reg
+            .verify(&authority, self.network)
+            .map_err(|e| anyhow::anyhow!("invalid bridge registration: {e}"))?;
+
+        let block_digest = block.hash();
+        let mut delta = match self.bridge_delta_db.get(block_digest).await {
+            Some(d) => d,
+            None => BridgeRegistryDelta::new(self.bridge_state_commitment().await),
+        };
+        delta.registered = true;
+        self.bridge_delta_db.put(block_digest, delta).await;
+
+        self.block_index_db
+            .put(
+                BlockIndexKey::BridgeRegistration,
+                BlockIndexValue::BridgeRegistration(registration),
+            )
+            .await;
+        self.block_index_db
+            .put(
+                BlockIndexKey::BridgeStateCommitment,
+                BlockIndexValue::BridgeStateCommitment(Some(registration.genesis_state_commitment)),
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Raw stored authority value as it currently stands: `None` = never set,
+    /// `Some(None)` = explicitly cleared, `Some(Some(_))` = a set.
+    async fn stored_bridge_authority(&self) -> Option<Option<StoredBridgeAuthoritySet>> {
+        self.block_index_db
+            .get(BlockIndexKey::BridgeAuthoritySet)
+            .await
+            .map(|v| v.as_bridge_authority_set())
+    }
+
+    /// Resolve the stored tri-state to a live set: never set ⇒ genesis seed;
+    /// cleared or corrupt ⇒ `None` (fail closed, corruption logged).
+    #[expect(
+        clippy::option_option,
+        reason = "never set, cleared, or set, as stored"
+    )]
+    fn resolve_bridge_authority(
+        &self,
+        stored: Option<Option<StoredBridgeAuthoritySet>>,
+    ) -> Option<BridgeAuthoritySet> {
+        match stored {
+            None => self.network.bridge_genesis_authority_set(),
+            Some(None) => None,
+            Some(Some(set)) => match BridgeAuthoritySet::from_stored(&set) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    tracing::error!("corrupt stored bridge authority set, failing closed: {e}");
+                    None
+                }
+            },
+        }
+    }
+
+    /// The live authority set at the current tip (stored ⇒ resolved; never set
+    /// ⇒ genesis seed; cleared/corrupt ⇒ `None`, fail closed).
+    pub(crate) async fn bridge_authority_set_current(&self) -> Option<BridgeAuthoritySet> {
+        self.resolve_bridge_authority(self.stored_bridge_authority().await)
+    }
+
+    /// Authority set as of `target` (a settlement/rotation block's parent).
+    /// Reorg-aware, the inverse of apply: rewind rotation deltas to the fork
+    /// point, then replay forward rotations to `target`.
+    pub(crate) async fn bridge_authority_set_as_of(
+        &self,
+        target: Digest,
+    ) -> Option<BridgeAuthoritySet> {
+        let mut stored = self.stored_bridge_authority().await;
+        let start = self.archival_mutator_set.get_sync_label();
+        if start != target {
+            let (backwards, _luca, forwards) = self.find_path(start, target).await;
+            for digest in backwards {
+                if let Some(delta) = self.bridge_delta_db.get(digest).await {
+                    match delta.authority_rollback {
+                        None => {}
+                        Some(AuthorityRollback::WasAbsent) => stored = None,
+                        Some(AuthorityRollback::WasSet(prev)) => stored = Some(prev),
+                    }
+                }
+            }
+            for digest in forwards {
+                let block = self
+                    .get_block(digest)
+                    .await
+                    .expect("fetching stored block on fork path must succeed")
+                    .expect("block on fork path must exist");
+                if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+                    self.network,
+                    block.header().height,
+                )
+                .bav_active()
+                {
+                    continue;
+                }
+                if let Some(rot) = AuthorityRotationAnnouncement::find_in_announcements(
+                    &block.kernel.body.transaction_kernel.announcements,
+                ) {
+                    // Same successor as apply, so replayed state is byte-identical.
+                    if let Some(cur) = self.resolve_bridge_authority(stored.clone()) {
+                        if let Ok(new_set) = rot.new_set_after(&cur) {
+                            stored = Some(Some(new_set.to_stored()));
+                        }
+                    }
+                }
+            }
+        }
+        self.resolve_bridge_authority(stored)
+    }
+
+    /// Rotate the stored authority set, snapshotting the previous value into
+    /// this block's delta so a reorg restores it (mirrors `state_commitment`).
+    pub(crate) async fn set_bridge_authority_set(
+        &mut self,
+        block_digest: Digest,
+        new: &StoredBridgeAuthoritySet,
+    ) {
+        let rollback = match self.stored_bridge_authority().await {
+            None => AuthorityRollback::WasAbsent,
+            Some(prev) => AuthorityRollback::WasSet(prev),
+        };
+        let mut delta = match self.bridge_delta_db.get(block_digest).await {
+            Some(d) => d,
+            None => BridgeRegistryDelta::new(self.bridge_state_commitment().await),
+        };
+        if delta.authority_rollback.is_none() {
+            delta.authority_rollback = Some(rollback);
+        }
+        self.bridge_delta_db.put(block_digest, delta).await;
+
+        self.block_index_db
+            .put(
+                BlockIndexKey::BridgeAuthoritySet,
+                BlockIndexValue::BridgeAuthoritySet(Some(new.clone())),
+            )
+            .await;
+    }
+
+    /// Verify a rotation announcement against the current set and install the
+    /// new one. Defense-in-depth: `set_new_tip_internal` already validated it.
+    pub(crate) async fn apply_bridge_authority_rotation(
+        &mut self,
+        block: &Block,
+    ) -> Result<(), anyhow::Error> {
+        if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+            self.network,
+            block.header().height,
+        )
+        .bav_active()
+        {
+            return Ok(());
+        }
+        let Some(rot) = AuthorityRotationAnnouncement::find_in_announcements(
+            &block.kernel.body.transaction_kernel.announcements,
+        ) else {
+            return Ok(());
+        };
+        let current = self
+            .resolve_bridge_authority(self.stored_bridge_authority().await)
+            .ok_or_else(|| anyhow::anyhow!("authority rotation with no current authority set"))?;
+        let new_set = rot
+            .verify_and_build(&current, self.network)
+            .map_err(|e| anyhow::anyhow!("invalid authority rotation: {e}"))?;
+        self.set_bridge_authority_set(block.hash(), &new_set.to_stored())
+            .await;
+        Ok(())
+    }
+
+    /// Update the Leviathan state commitment (when an aggregated proof is accepted).
+    /// Creates or updates the delta for this block to snapshot the current value.
+    pub(crate) async fn set_bridge_state_commitment(
+        &mut self,
+        block_digest: Digest,
+        new_commitment: Digest,
+    ) {
+        // Ensure a delta exists for this block with the current state commitment.
+        if self.bridge_delta_db.get(block_digest).await.is_none() {
+            let current = self.bridge_state_commitment().await;
+            let delta = BridgeRegistryDelta::new(current);
+            self.bridge_delta_db.put(block_digest, delta).await;
+        }
+
+        self.block_index_db
+            .put(
+                BlockIndexKey::BridgeStateCommitment,
+                BlockIndexValue::BridgeStateCommitment(Some(new_commitment)),
+            )
+            .await;
+    }
+
+    /// Update bridge pool DB and state commitment for a block's unlock.
+    /// Pool DB bookkeeping for bridge unlock transactions.
+    ///
+    /// Identifies consumed pool entries by matching the TX's removal records
+    /// against pool entries' aocl_leaf_index. If a change output exists,
+    /// reconstructs the PoolEntry using data from the announcement.
+    pub(crate) async fn apply_bridge_unlock_pool_updates(
+        &mut self,
+        block: &Block,
+        prev_aocl_len: u64,
+    ) -> Result<(), anyhow::Error> {
+        // Authority (F1) + prev_state (A0) are gated at ingest (`set_new_tip_internal`
+        // + peer_loop batch) before any block is applied, so a block reaching apply was
+        // already checked; this path re-checks only prev_state as defense-in-depth. Gate
+        // on `bav_active` so apply and validate never diverge.
+        if !crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet::infer_from(
+            self.network,
+            block.header().height,
+        )
+        .bav_active()
+        {
+            return Ok(());
+        }
+
+        let announcements = &block.kernel.body.transaction_kernel.announcements;
+        let Some(ann) = AggregatedAnnouncementData::find_in_announcements(announcements) else {
+            return Ok(());
+        };
+
+        // Validate state commitment chain
+        let current_commitment = self.bridge_state_commitment().await;
+        let expected = current_commitment
+            .ok_or_else(|| anyhow::anyhow!("bridge settlement before registration"))?;
+        if expected != ann.prev_state_commitment {
+            anyhow::bail!(
+                "Bridge state commitment mismatch: chain has {:?}, announcement claims {:?}",
+                expected,
+                ann.prev_state_commitment
+            );
+        }
+
+        let block_digest = block.hash();
+
+        // No early return for an epoch without exits: it may still consume pool inputs into change.
+        let mut delta = self
+            .bridge_delta_db
+            .get(block_digest)
+            .await
+            .unwrap_or_else(|| BridgeRegistryDelta::new(current_commitment));
+
+        let pool: PoolView = self.bridge_pool_db.iter().collect();
+        let effects = bridge_unlock_effects(&block.kernel.body.transaction_kernel, &pool)?;
+        let removed_count = effects.removed.len();
+        let change = effects.change.map(|change| change.entry(prev_aocl_len));
+        delta.pool_removed.extend(effects.removed.iter().cloned());
+        if let Some(entry) = &change {
+            delta.pool_added.push((entry.key(), entry.clone()));
+        }
+
+        // The undo record goes first, so a crash before the writes below can be undone.
+        self.bridge_delta_db.put(block_digest, delta).await;
+        for (key, _) in effects.removed {
+            self.bridge_pool_db.delete(key).await;
+        }
+        if let Some(entry) = change {
+            self.bridge_pool_db.put(entry.key(), entry).await;
+        }
+        self.set_bridge_state_commitment(block_digest, ann.new_state_commitment)
+            .await;
+
+        tracing::info!(
+            "Bridge unlock: processed {} burns, removed {} pool entries",
+            ann.burns.len(),
+            removed_count,
+        );
+
+        Ok(())
     }
 
     pub(crate) fn genesis_block(&self) -> &Block {
@@ -659,13 +1335,14 @@ impl ArchivalState {
             };
 
             // 4. deserialize directly from the validated mmap slice.
-            bincode::deserialize(&mmap).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to deserialize block from file {}. Data may be corrupt or incompatible\
-                     with current version of xnt-core. Error: {}",
-                    block_file_path.display(), e
-                )
-            })
+            bincode::deserialize::<Block>(&mmap)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to deserialize block from file {}. Data may be corrupt or incompatible\
+                         with current version of xnt-core. Error: {}",
+                        block_file_path.display(), e
+                    )
+                })
         })
         .await?
     }
@@ -1375,6 +2052,14 @@ impl ArchivalState {
                     rollback_block.header().height
                 );
             }
+
+            // Roll back bridge registry for this block
+            self.revert_bridge_delta(digest).await;
+        }
+
+        // A forward block with an undo record was half-applied when the node stopped.
+        for digest in forwards.iter().rev() {
+            self.revert_bridge_delta(*digest).await;
         }
 
         for digest in forwards {
@@ -1409,6 +2094,7 @@ impl ArchivalState {
             removals.reverse();
 
             let mut removals_mutable = removals.iter_mut().collect::<Vec<_>>();
+            let prev_aocl_len = self.archival_mutator_set.ams().aocl.num_leafs().await;
 
             // Add items, thus adding the output UTXOs to the mutator set
             while let Some(addition_record) = additions.pop() {
@@ -1430,16 +2116,34 @@ impl ArchivalState {
                 .ams_mut()
                 .batch_remove(removals)
                 .await;
+
+            // Track bridge pool deposits from this block's announcements.
+            self.apply_bridge_deposits(&apply_forward_block, prev_aocl_len)
+                .await;
+
+            // Past the first write: not typed rejections, so callers stop and `recover` undoes it.
+            // Update bridge pool DB for unlocks (pool entry removal/addition, state commitment).
+            self.apply_bridge_unlock_pool_updates(&apply_forward_block, prev_aocl_len)
+                .await
+                .map_err(|e| anyhow::anyhow!("bridge pool update failed: {e:#}"))?;
+
+            // Before rotation: both are verified against the parent's authority set.
+            self.apply_bridge_registration(&apply_forward_block)
+                .await
+                .map_err(|e| anyhow::anyhow!("bridge registration failed: {e:#}"))?;
+
+            self.apply_bridge_authority_rotation(&apply_forward_block)
+                .await
+                .map_err(|e| anyhow::anyhow!("bridge authority rotation failed: {e:#}"))?;
         }
 
-        // Sanity check that archival mutator set has been updated consistently with the new block
+        // Sanity check: archival MS = block MSA.
         debug!("sanity check: was AMS updated consistently with new block?");
         assert_eq!(
-            new_block
-                .mutator_set_accumulator_after().unwrap()
-                .hash(),
+            new_block.mutator_set_accumulator_after().unwrap().hash(),
             self.archival_mutator_set.ams().hash().await,
-            "Calculated archival mutator set commitment must match that from newly added block. Block Digest: {:?}", new_block.hash()
+            "Archival MS mismatch. Block: {:?}",
+            new_block.hash()
         );
 
         // Persist updated mutator set to disk, with sync label
@@ -1503,6 +2207,190 @@ pub(super) mod tests {
 
         let genesis_block = Block::genesis(network);
         ArchivalState::new(data_dir, genesis_block, network).await
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn rekeying_moves_commitment_keys_to_pool_entry_keys_once() {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+        use crate::protocol::consensus::transaction::utxo::Utxo;
+
+        let mut archival_state = make_test_archival_state(Network::RegTest).await;
+        let entry = |coins: u32, aocl_leaf_index: u64| {
+            let amount = NativeCurrencyAmount::coins(coins);
+            PoolEntry {
+                utxo: Utxo::new_native_currency(bridge_lock_script().hash(), amount),
+                amount,
+                sender_randomness: Digest::new([BFieldElement::new(aocl_leaf_index); 5]),
+                receiver_preimage: Digest::default(),
+                aocl_leaf_index,
+            }
+        };
+        let (kept, spent) = (entry(1, 3), entry(2, 4));
+        archival_state
+            .bridge_pool_db
+            .put(kept.commitment(), kept.clone())
+            .await;
+        let mut delta = BridgeRegistryDelta::new(None);
+        delta.pool_added.push((kept.commitment(), kept.clone()));
+        delta.pool_removed.push((spent.commitment(), spent.clone()));
+        let block = Digest::new([BFieldElement::new(9); 5]);
+        archival_state.bridge_delta_db.put(block, delta).await;
+
+        for _ in 0..2 {
+            ArchivalState::rekey_bridge_pool(
+                &mut archival_state.bridge_pool_db,
+                &mut archival_state.bridge_delta_db,
+            )
+            .await;
+            assert_eq!(
+                archival_state.bridge_pool_db.iter().collect_vec(),
+                vec![(kept.key(), kept.clone())]
+            );
+            let stored = archival_state.bridge_delta_db.get(block).await.unwrap();
+            assert_eq!(stored.pool_added, vec![(kept.key(), kept.clone())]);
+            assert_eq!(stored.pool_removed, vec![(spent.key(), spent.clone())]);
+        }
+    }
+
+    /// A deposit (announcement and its pool output) on top of `parent`.
+    fn deposit_block(parent: &Block) -> Block {
+        use tasm_lib::prelude::Tip5;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::bridge::deposit_announcement::BridgeDepositData;
+        use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::tests::shared::mock_tx::make_mock_transaction_with_mutator_set_hash;
+        use crate::util_types::mutator_set::commit;
+
+        let amount = NativeCurrencyAmount::coins(2);
+        let utxo = Utxo::new_native_currency(bridge_lock_script().hash(), amount);
+        let sender_randomness = Digest::new([BFieldElement::new(7); 5]);
+        let receiver_preimage = Digest::new([BFieldElement::new(8); 5]);
+        let output = commit(
+            Tip5::hash(&utxo),
+            sender_randomness,
+            receiver_preimage.hash(),
+        );
+        let deposit = BridgeDepositData {
+            account_id: [BFieldElement::new(3), BFieldElement::new(4)],
+            amount,
+            utxo_commitment: output.canonical_commitment.values(),
+            sender_randomness: sender_randomness.values(),
+            receiver_preimage: receiver_preimage.values(),
+        };
+        let mut tx = make_mock_transaction_with_mutator_set_hash(
+            vec![],
+            vec![output],
+            parent.mutator_set_accumulator_after().unwrap().hash(),
+        );
+        tx.kernel = TransactionKernelModifier::default()
+            .announcements(vec![deposit.to_announcement()])
+            .modify(tx.kernel);
+        invalid_block_with_transaction(parent, tx)
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn deposits_are_pooled_only_once_the_bridge_is_active() {
+        use crate::protocol::consensus::consensus_rule_set::tests::LeviathanSettlementHeightForTests;
+
+        let network = Network::RegTest;
+        let genesis = Block::genesis(network);
+        let block = deposit_block(&genesis);
+        let prev_aocl_len = genesis
+            .mutator_set_accumulator_after()
+            .unwrap()
+            .aocl
+            .num_leafs();
+
+        let mut active = make_test_archival_state(network).await;
+        active.apply_bridge_deposits(&block, prev_aocl_len).await;
+        assert_eq!(1, active.bridge_pool_db.iter().count());
+
+        let _bridge_later = LeviathanSettlementHeightForTests::set(network, 5u64.into());
+        let mut inactive = make_test_archival_state(network).await;
+        inactive.apply_bridge_deposits(&block, prev_aocl_len).await;
+        assert_eq!(0, inactive.bridge_pool_db.iter().count());
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn startup_drops_pool_entries_deposited_before_the_bridge() {
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::protocol::consensus::bridge::lock_script::bridge_lock_script;
+        use crate::protocol::consensus::consensus_rule_set::tests::LeviathanSettlementHeightForTests;
+
+        let network = Network::RegTest;
+        let _bridge_at_2 = LeviathanSettlementHeightForTests::set(network, 2u64.into());
+        let mut archival_state = make_test_archival_state(network).await;
+        let genesis = Block::genesis(network);
+        let block_1 = invalid_empty_block(&genesis, network);
+        add_block_to_archival_state(&mut archival_state, block_1.clone())
+            .await
+            .unwrap();
+        let block_2 = deposit_block(&block_1);
+        add_block_to_archival_state(&mut archival_state, block_2.clone())
+            .await
+            .unwrap();
+
+        let entry = |aocl_leaf_index: u64| {
+            let amount = NativeCurrencyAmount::coins(2);
+            PoolEntry {
+                utxo: Utxo::new_native_currency(bridge_lock_script().hash(), amount),
+                amount,
+                sender_randomness: Digest::new([BFieldElement::new(aocl_leaf_index); 5]),
+                receiver_preimage: Digest::default(),
+                aocl_leaf_index,
+            }
+        };
+        assert!(
+            block_1
+                .mutator_set_accumulator_after()
+                .unwrap()
+                .aocl
+                .num_leafs()
+                > genesis
+                    .mutator_set_accumulator_after()
+                    .unwrap()
+                    .aocl
+                    .num_leafs(),
+            "test premise: block 1 adds AOCL leaves"
+        );
+        let in_block_1 = entry(
+            block_1
+                .mutator_set_accumulator_after()
+                .unwrap()
+                .aocl
+                .num_leafs()
+                - 1,
+        );
+        let in_block_2 = entry(
+            block_2
+                .mutator_set_accumulator_after()
+                .unwrap()
+                .aocl
+                .num_leafs()
+                - 1,
+        );
+        for pool_entry in [&in_block_1, &in_block_2] {
+            archival_state
+                .bridge_pool_db
+                .put(pool_entry.key(), pool_entry.clone())
+                .await;
+        }
+
+        archival_state.drop_pre_activation_pool_entries().await;
+        assert!(archival_state
+            .bridge_pool_db
+            .get(in_block_1.key())
+            .await
+            .is_none());
+        assert_eq!(
+            Some(in_block_2.clone()),
+            archival_state.bridge_pool_db.get(in_block_2.key()).await
+        );
     }
 
     #[traced_test]

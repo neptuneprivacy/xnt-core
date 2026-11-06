@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
 
+use super::aocl_leaf::AoclLeaf;
 use super::indexed_utxo::IndexedUtxo;
 use super::utxo_indexer_tables::height_to_bucket;
 use super::utxo_indexer_tables::UtxoIndexerTables;
@@ -75,12 +76,22 @@ impl UtxoIndexerDatabase {
                 }
                 Ordering::Less => {
                     if migrate {
-                        // Future: implement migrations here
-                        // For now, just update version since no migration logic needed yet
+                        // v1 → v2: IndexedUtxo changed from struct to enum.
+                        // Old data can't deserialize. Clear all tables and re-index.
+                        tracing::warn!(
+                            "Migrating UTXO indexer v{} → v{}: clearing stale data for re-index",
+                            schema_version,
+                            UTXO_INDEXER_SCHEMA_VERSION
+                        );
+                        tables.utxos.clear().await;
+                        tables.commitment_index.clear().await;
+                        tables.removal_index.clear().await;
+                        tables.orphaned_blocks.clear().await;
+                        tables.sync_height.set(BlockHeight::genesis()).await;
                         tables.schema_version.set(UTXO_INDEXER_SCHEMA_VERSION).await;
                         storage.persist().await;
                         tracing::info!(
-                            "Updated UTXO indexer schema version to v{}",
+                            "UTXO indexer migrated to v{}. Will re-index from genesis.",
                             UTXO_INDEXER_SCHEMA_VERSION
                         );
                     } else {
@@ -119,9 +130,9 @@ impl UtxoIndexerDatabase {
             if let Some(utxos) = self.tables.utxos.get(&(*receiver_id_hash, bucket)).await {
                 for utxo in utxos {
                     // Filter by exact height range AND not orphaned
-                    if utxo.block_height >= from_height
-                        && utxo.block_height <= to_height
-                        && !orphaned.contains(&utxo.block_digest)
+                    if utxo.block_height() >= from_height
+                        && utxo.block_height() <= to_height
+                        && !orphaned.contains(&utxo.block_digest())
                     {
                         result.push(utxo);
                     }
@@ -140,7 +151,7 @@ impl UtxoIndexerDatabase {
         for bucket in 0..=max_bucket {
             if let Some(utxos) = self.tables.utxos.get(&(*receiver_id_hash, bucket)).await {
                 for utxo in utxos {
-                    if !orphaned.contains(&utxo.block_digest) {
+                    if !orphaned.contains(&utxo.block_digest()) {
                         result.push(utxo);
                     }
                 }
@@ -150,7 +161,7 @@ impl UtxoIndexerDatabase {
     }
 
     pub async fn add_utxo(&mut self, receiver_id_hash: Digest, utxo: IndexedUtxo) {
-        let bucket = height_to_bucket(utxo.block_height);
+        let bucket = height_to_bucket(utxo.block_height());
         let key = (receiver_id_hash, bucket);
 
         let mut utxos = self.tables.utxos.get(&key).await.unwrap_or_default();
@@ -166,7 +177,7 @@ impl UtxoIndexerDatabase {
         let mut by_bucket: std::collections::HashMap<u64, Vec<IndexedUtxo>> =
             std::collections::HashMap::new();
         for utxo in new_utxos {
-            let bucket = height_to_bucket(utxo.block_height);
+            let bucket = height_to_bucket(utxo.block_height());
             by_bucket.entry(bucket).or_default().push(utxo);
         }
 
@@ -192,33 +203,82 @@ impl UtxoIndexerDatabase {
             .is_some()
     }
 
-    pub async fn add_commitment(&mut self, commitment: Digest, aocl_leaf_index: u64) {
-        self.tables
+    pub async fn add_commitment(&mut self, commitment: Digest, leaf: AoclLeaf) {
+        let mut leaves = self
+            .tables
             .commitment_index
-            .insert(commitment, aocl_leaf_index)
-            .await;
+            .get(&commitment)
+            .await
+            .unwrap_or_default();
+        if !leaves.contains(&leaf) {
+            leaves.push(leaf);
+            self.tables
+                .commitment_index
+                .insert(commitment, leaves)
+                .await;
+        }
     }
 
-    pub async fn get_aocl_leaf_index(&self, commitment: &Digest) -> Option<u64> {
-        self.tables.commitment_index.get(commitment).await
-    }
-
-    pub async fn get_aocl_leaf_indices(&self, commitments: &[Digest]) -> Vec<Option<u64>> {
+    /// The AOCL leaves of each commitment, in canonical blocks only.
+    pub async fn get_aocl_leaves(&self, commitments: &[Digest]) -> Vec<Vec<AoclLeaf>> {
+        let orphaned = self.tables.get_orphaned_blocks_set().await;
         let mut results = Vec::with_capacity(commitments.len());
         for commitment in commitments {
-            results.push(self.tables.commitment_index.get(commitment).await);
+            let leaves = self
+                .tables
+                .commitment_index
+                .get(commitment)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|leaf| !orphaned.contains(&leaf.block_digest))
+                .collect();
+            results.push(leaves);
         }
         results
     }
 
-    pub async fn add_removal(&mut self, absolute_index_set_hash: Digest, height: BlockHeight, block_digest: Digest) {
-        self.tables.removal_index.insert(absolute_index_set_hash, (height, block_digest)).await;
+    /// The latest AOCL leaf index of a commitment, as before the index kept every leaf.
+    pub async fn get_aocl_leaf_index(&self, commitment: &Digest) -> Option<u64> {
+        self.get_aocl_leaf_indices(std::slice::from_ref(commitment))
+            .await
+            .pop()
+            .flatten()
+    }
+
+    /// [`Self::get_aocl_leaf_index`] of each commitment.
+    pub async fn get_aocl_leaf_indices(&self, commitments: &[Digest]) -> Vec<Option<u64>> {
+        self.get_aocl_leaves(commitments)
+            .await
+            .into_iter()
+            .map(|leaves| AoclLeaf::latest_index(&leaves))
+            .collect()
+    }
+
+    pub async fn add_removal(
+        &mut self,
+        absolute_index_set_hash: Digest,
+        height: BlockHeight,
+        block_digest: Digest,
+    ) {
+        self.tables
+            .removal_index
+            .insert(absolute_index_set_hash, (height, block_digest))
+            .await;
     }
 
     /// Returns spent_at_height if UTXO is spent (and not orphaned), None otherwise
     pub async fn get_spent_status(&self, absolute_index_set_hash: &Digest) -> Option<BlockHeight> {
-        if let Some((height, block_digest)) = self.tables.removal_index.get(absolute_index_set_hash).await {
-            if !self.tables.orphaned_blocks.get(&block_digest).await.is_some() {
+        if let Some((height, block_digest)) =
+            self.tables.removal_index.get(absolute_index_set_hash).await
+        {
+            if !self
+                .tables
+                .orphaned_blocks
+                .get(&block_digest)
+                .await
+                .is_some()
+            {
                 return Some(height);
             }
         }
@@ -263,17 +323,47 @@ impl UtxoIndexerDatabase {
         self.index_block_internal(block, prev_aocl_len, false).await
     }
 
-    async fn index_block_internal(&mut self, block: &Block, prev_aocl_len: u64, update_sync: bool) -> u64 {
+    async fn index_block_internal(
+        &mut self,
+        block: &Block,
+        prev_aocl_len: u64,
+        update_sync: bool,
+    ) -> u64 {
         let height = block.kernel.header.height;
         let block_digest = block.hash();
 
-        // Index announcements (UTXOs)
+        // Index encrypted announcements (normal UTXOs)
         for announcement in block.kernel.body.transaction_kernel.announcements.iter() {
             if let Ok(receiver_id) = receiver_identifier_from_announcement(announcement) {
                 if let Ok(ciphertext) = ciphertext_from_announcement(announcement) {
                     let receiver_id_hash = Tip5::hash_varlen(&[receiver_id]);
-                    let indexed_utxo = IndexedUtxo::new(height, block_digest, ciphertext);
+                    let indexed_utxo = IndexedUtxo::new_encrypted(height, block_digest, ciphertext);
                     self.add_utxo(receiver_id_hash, indexed_utxo).await;
+                }
+            }
+        }
+
+        // Index bridge burn UTXOs (public, non-encrypted)
+        {
+            use crate::protocol::consensus::bridge::aggregated_announcement::AggregatedAnnouncementData;
+
+            let announcements = &block.kernel.body.transaction_kernel.announcements;
+            if let Some(ann) = AggregatedAnnouncementData::find_in_announcements(announcements) {
+                for burn in &ann.burns {
+                    // An overflowing payout cannot be in a valid block.
+                    let Some(amount) = burn.payout() else {
+                        continue;
+                    };
+                    let receiver_id_hash = Tip5::hash_varlen(&[burn.receiver_identifier]);
+                    let indexed = IndexedUtxo::new_public(
+                        height,
+                        block_digest,
+                        receiver_id_hash,
+                        burn.lock_script_hash,
+                        amount,
+                        burn.sender_randomness(),
+                    );
+                    self.add_utxo(receiver_id_hash, indexed).await;
                 }
             }
         }
@@ -281,8 +371,12 @@ impl UtxoIndexerDatabase {
         // Index outputs (commitments)
         let outputs = &block.kernel.body.transaction_kernel.outputs;
         for (i, output) in outputs.iter().enumerate() {
-            let aocl_leaf_index = prev_aocl_len + i as u64;
-            self.add_commitment(output.canonical_commitment, aocl_leaf_index).await;
+            let leaf = AoclLeaf {
+                aocl_leaf_index: prev_aocl_len + i as u64,
+                block_height: height,
+                block_digest,
+            };
+            self.add_commitment(output.canonical_commitment, leaf).await;
         }
 
         // Index inputs (removal records)
@@ -351,12 +445,12 @@ mod tests {
 
         // Create test data
         let receiver_id_hash = Digest::default();
-        let utxo1 = IndexedUtxo::new(
+        let utxo1 = IndexedUtxo::new_encrypted(
             BlockHeight::from(100u64),
             Digest::default(),
             vec![BFieldElement::new(1)],
         );
-        let utxo2 = IndexedUtxo::new(
+        let utxo2 = IndexedUtxo::new_encrypted(
             BlockHeight::from(1500u64), // Different bucket (bucket 1)
             Digest::default(),
             vec![BFieldElement::new(2)],
@@ -380,18 +474,18 @@ mod tests {
             )
             .await;
         assert_eq!(range_utxos.len(), 1);
-        assert_eq!(range_utxos[0].block_height, BlockHeight::from(100u64));
+        assert_eq!(range_utxos[0].block_height(), BlockHeight::from(100u64));
 
         // Test range query - only bucket 1
-        let range_utxos = indexer
+        let bucket1_utxos = indexer
             .get_utxos_in_range(
                 &receiver_id_hash,
                 BlockHeight::from(1000u64),
                 BlockHeight::from(1999u64),
             )
             .await;
-        assert_eq!(range_utxos.len(), 1);
-        assert_eq!(range_utxos[0].block_height, BlockHeight::from(1500u64));
+        assert_eq!(bucket1_utxos.len(), 1);
+        assert_eq!(bucket1_utxos[0].block_height(), BlockHeight::from(1500u64));
 
         // Test sync height
         assert_eq!(indexer.get_sync_height(), BlockHeight::from(1500u64));
@@ -415,12 +509,12 @@ mod tests {
             BFieldElement::new(999),
         ]);
 
-        let utxo1 = IndexedUtxo::new(
+        let utxo1 = IndexedUtxo::new_encrypted(
             BlockHeight::from(100u64),
             Digest::default(), // canonical block
             vec![],
         );
-        let utxo2 = IndexedUtxo::new(
+        let utxo2 = IndexedUtxo::new_encrypted(
             BlockHeight::from(200u64),
             orphaned_block_digest, // will be orphaned
             vec![],
@@ -442,7 +536,7 @@ mod tests {
         // After reorg - only canonical UTXO visible
         let remaining = indexer.get_all_utxos(&receiver_id_hash).await;
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].block_height, BlockHeight::from(100u64));
+        assert_eq!(remaining[0].block_height(), BlockHeight::from(100u64));
 
         // Check is_block_orphaned
         assert!(indexer.is_block_orphaned(&orphaned_block_digest).await);
@@ -463,7 +557,7 @@ mod tests {
         // Add UTXOs across multiple buckets
         for i in 0..5 {
             let height = i * 500; // 0, 500, 1000, 1500, 2000
-            let utxo = IndexedUtxo::new(
+            let utxo = IndexedUtxo::new_encrypted(
                 BlockHeight::from(height),
                 Digest::default(),
                 vec![BFieldElement::new(i)], // Use ciphertext to identify
@@ -484,63 +578,113 @@ mod tests {
 
         // Should get: 500, 1000 (not 0, 1500, 2000)
         assert_eq!(range_utxos.len(), 2);
-        let heights: Vec<u64> = range_utxos.iter().map(|u| u64::from(u.block_height)).collect();
+        let heights: Vec<u64> = range_utxos
+            .iter()
+            .map(|u| u64::from(u.block_height()))
+            .collect();
         assert!(heights.contains(&500)); // height 500
         assert!(heights.contains(&1000)); // height 1000
     }
 
-    #[tokio::test]
-    async fn test_commitment_index() {
+    fn digest(value: u64) -> Digest {
+        Digest::new([BFieldElement::new(value); Digest::LEN])
+    }
+
+    fn leaf(aocl_leaf_index: u64, block_height: u64, block_digest: Digest) -> AoclLeaf {
+        AoclLeaf {
+            aocl_leaf_index,
+            block_height: BlockHeight::from(block_height),
+            block_digest,
+        }
+    }
+
+    async fn new_indexer() -> UtxoIndexerDatabase {
         let db = NeptuneLevelDb::open_new_test_database(false, None, None, None)
             .await
             .unwrap();
-        let mut indexer = UtxoIndexerDatabase::try_connect_and_migrate(db)
+        UtxoIndexerDatabase::try_connect_and_migrate(db)
             .await
-            .unwrap();
+            .unwrap()
+    }
 
-        // Create test commitments
-        let commitment1 = Digest::new([
-            BFieldElement::new(1),
-            BFieldElement::new(2),
-            BFieldElement::new(3),
-            BFieldElement::new(4),
-            BFieldElement::new(5),
-        ]);
-        let commitment2 = Digest::new([
-            BFieldElement::new(10),
-            BFieldElement::new(20),
-            BFieldElement::new(30),
-            BFieldElement::new(40),
-            BFieldElement::new(50),
-        ]);
-        let unknown_commitment = Digest::new([
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-            BFieldElement::new(99),
-        ]);
+    #[tokio::test]
+    async fn test_commitment_index() {
+        let mut indexer = new_indexer().await;
+        let commitment1 = digest(1);
+        let commitment2 = digest(2);
+        let unknown_commitment = digest(99);
 
-        // Add commitments
-        indexer.add_commitment(commitment1, 100).await;
-        indexer.add_commitment(commitment2, 200).await;
+        indexer
+            .add_commitment(commitment1, leaf(100, 1, digest(10)))
+            .await;
+        indexer
+            .add_commitment(commitment2, leaf(200, 2, digest(20)))
+            .await;
         indexer.persist().await;
 
-        // Test single lookup
         assert_eq!(indexer.get_aocl_leaf_index(&commitment1).await, Some(100));
         assert_eq!(indexer.get_aocl_leaf_index(&commitment2).await, Some(200));
-        assert_eq!(
-            indexer.get_aocl_leaf_index(&unknown_commitment).await,
-            None
-        );
+        assert_eq!(indexer.get_aocl_leaf_index(&unknown_commitment).await, None);
 
-        // Test batch lookup
         let results = indexer
             .get_aocl_leaf_indices(&[commitment1, unknown_commitment, commitment2])
             .await;
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0], Some(100));
-        assert_eq!(results[1], None);
-        assert_eq!(results[2], Some(200));
+        assert_eq!(vec![Some(100), None, Some(200)], results);
+    }
+
+    /// Identical outputs share a commitment: each of its leaves is kept, in canonical blocks only,
+    /// and indexing a block again adds nothing.
+    #[tokio::test]
+    async fn a_commitment_keeps_every_leaf() {
+        let mut indexer = new_indexer().await;
+        let commitment = digest(1);
+        let first = leaf(100, 286, digest(286));
+        let second = leaf(105, 287, digest(287));
+        let orphaned = leaf(110, 288, digest(288));
+
+        for leaf in [first, second, second, orphaned] {
+            indexer.add_commitment(commitment, leaf).await;
+        }
+        indexer.handle_reorg(vec![orphaned.block_digest]).await;
+        indexer.persist().await;
+
+        assert_eq!(
+            vec![vec![first, second], vec![]],
+            indexer.get_aocl_leaves(&[commitment, digest(99)]).await
+        );
+        assert_eq!(Some(105), indexer.get_aocl_leaf_index(&commitment).await);
+    }
+
+    /// A database of the previous schema, whose commitment index held one leaf index, is cleared
+    /// for re-indexing from genesis.
+    #[tokio::test]
+    async fn a_v2_database_is_cleared_for_reindexing() {
+        let db = NeptuneLevelDb::open_new_test_database(false, None, None, None)
+            .await
+            .unwrap();
+        let mut indexer = UtxoIndexerDatabase::try_connect_and_migrate(db.clone())
+            .await
+            .unwrap();
+        indexer
+            .add_commitment(digest(1), leaf(100, 286, digest(286)))
+            .await;
+        indexer.set_sync_height(BlockHeight::from(300u64)).await;
+        indexer.tables.schema_version.set(2).await;
+        indexer.persist().await;
+        drop(indexer);
+
+        assert!(matches!(
+            UtxoIndexerDatabase::try_connect(db.clone()).await,
+            Err(UtxoIndexerDbConnectError::SchemaVersionTooLow {
+                found: 2,
+                expected: 3
+            })
+        ));
+        let migrated = UtxoIndexerDatabase::try_connect_and_migrate(db)
+            .await
+            .unwrap();
+        assert_eq!(UTXO_INDEXER_SCHEMA_VERSION, migrated.schema_version());
+        assert_eq!(BlockHeight::genesis(), migrated.get_sync_height());
+        assert_eq!(None, migrated.get_aocl_leaf_index(&digest(1)).await);
     }
 }

@@ -41,7 +41,6 @@ use crate::protocol::consensus::chaintx::link_proof::link_proof_public_output;
 use crate::protocol::consensus::chaintx::link_proof::LinkProof;
 use crate::protocol::consensus::chaintx::link_tx::LinkTx;
 use crate::protocol::consensus::chaintx::link_tx::LinkTxProof;
-use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernel;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelField;
 use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
@@ -276,7 +275,7 @@ impl WeldWitness {
     /// `D` is `own_program_digest()` (of the SingleProof program) at run time.
     fn link_proof_claim(&self, single_proof_digest: Digest) -> Claim {
         let input = link_proof_public_input(self.link_kernel_mast_hash, single_proof_digest);
-        Claim::new(LinkProof.hash())
+        Claim::new(LinkProof::digest_paired_with(single_proof_digest))
             .with_input(input.individual_tokens)
             .with_output(link_proof_public_output(single_proof_digest))
     }
@@ -447,12 +446,19 @@ pub struct WeldBranch {
     /// so a slot this size has two addresses and every use has to pick the
     /// right one.
     single_proof_digest_alloc: StaticAllocation,
+
+    /// The digest of the era's link-proof program, which this branch verifies.
+    link_proof_digest: Digest,
 }
 
 impl WeldBranch {
-    pub(crate) fn new(single_proof_digest_alloc: StaticAllocation) -> Self {
+    pub(crate) fn new(
+        single_proof_digest_alloc: StaticAllocation,
+        link_proof_digest: Digest,
+    ) -> Self {
         Self {
             single_proof_digest_alloc,
+            link_proof_digest,
         }
     }
 }
@@ -1004,7 +1010,7 @@ impl BasicSnippet for WeldBranch {
         let verify_link_transaction = triton_asm!(
             // _ [own_program_digest] disc [txk_digest] *witness
             {&root_b(0)}
-            {&push_digest(LinkProof.hash())}
+            {&push_digest(self.link_proof_digest)}
             // _ [own_program_digest] disc [txk_digest] *witness [lkmh_b] [link_proof_digest]
 
             call {generate_link_proof_claim}
@@ -1121,6 +1127,7 @@ pub(crate) mod tests {
     use crate::protocol::proof_abstractions::tasm::program::prove_consensus_program;
     use crate::protocol::proof_abstractions::tasm::program::tests::ConsensusProgramSpecification;
     use crate::protocol::proof_abstractions::tasm::program::ConsensusError;
+    use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
     use crate::protocol::proof_abstractions::tasm::program::TritonVmProofJobOptions;
     use crate::tests::shared_tokio_runtime;
 
@@ -1344,9 +1351,10 @@ pub(crate) mod tests {
             tasm::verify_stark(Stark::default(), &single_proof_claim, &self.single_proof);
 
             let input = link_proof_public_input(b_root, single_proof_program_digest);
-            let link_proof_claim = Claim::new(LinkProof.hash())
-                .with_input(input.individual_tokens)
-                .with_output(link_proof_public_output(single_proof_program_digest));
+            let link_proof_claim =
+                Claim::new(LinkProof::digest_paired_with(single_proof_program_digest))
+                    .with_input(input.individual_tokens)
+                    .with_output(link_proof_public_output(single_proof_program_digest));
             tasm::verify_stark(Stark::default(), &link_proof_claim, &self.link_proof);
         }
     }

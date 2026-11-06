@@ -1,15 +1,28 @@
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use tasm_lib::data_type::DataType;
 use tasm_lib::field;
 use tasm_lib::prelude::BasicSnippet;
 use tasm_lib::prelude::Library;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::triton_vm::prelude::*;
 
 use super::new_claim::NewClaim;
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 
-pub(crate) struct GenerateTypeScriptClaimTemplate;
+pub(crate) struct GenerateTypeScriptClaimTemplateFor<P>(pub(crate) PhantomData<P>);
 
-impl BasicSnippet for GenerateTypeScriptClaimTemplate {
+/// [`GenerateTypeScriptClaimTemplateFor`] of upstream's [`ProofCollection`].
+pub(crate) type GenerateTypeScriptClaimTemplate =
+    GenerateTypeScriptClaimTemplateFor<ProofCollection>;
+#[allow(non_upper_case_globals)]
+pub(crate) const GenerateTypeScriptClaimTemplate: GenerateTypeScriptClaimTemplate =
+    GenerateTypeScriptClaimTemplateFor(PhantomData);
+
+impl<P: TasmStruct + Clone + Debug + 'static> BasicSnippet
+    for GenerateTypeScriptClaimTemplateFor<P>
+{
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![(DataType::VoidPointer, "*proof_collection".to_string())]
     }
@@ -48,7 +61,7 @@ impl BasicSnippet for GenerateTypeScriptClaimTemplate {
 
                 /* write txk mast hash (reversed) to input */
                 dup 4
-                {&field!(ProofCollection::kernel_mast_hash)}
+                {&field!(P::kernel_mast_hash)}
                 // _ *proof_collection *claim *program_digest *output *input *txkmh
 
                 {&load_digest}
@@ -62,7 +75,7 @@ impl BasicSnippet for GenerateTypeScriptClaimTemplate {
 
                 /* write salted inputs hash (reversed) to input */
                 dup 4
-                {&field!(ProofCollection::salted_inputs_hash)}
+                {&field!(P::salted_inputs_hash)}
                 // _ *proof_collection *claim *program_digest *output (*input+5) *salted_inputs_hash
 
                 {&load_digest}
@@ -76,7 +89,7 @@ impl BasicSnippet for GenerateTypeScriptClaimTemplate {
 
                 /* write salted outputs hash (reversed) to input */
                 pick 4
-                {&field!(ProofCollection::salted_outputs_hash)}
+                {&field!(P::salted_outputs_hash)}
                 // _ *claim *program_digest *output (*input+10) *salted_outputs_hash
 
                 {&load_digest}

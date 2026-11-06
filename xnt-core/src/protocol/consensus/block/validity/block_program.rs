@@ -92,7 +92,7 @@ impl BlockProgram {
                 Digest::try_from_hex(BLOCK_PROGRAM_UPGRADE_VM_V7_DIGEST).unwrap()
             }
             // Current (v8) bytecode — recompute from the linked program.
-            ConsensusRuleSet::UpgradeVMv8 => Self.hash(),
+            ConsensusRuleSet::UpgradeVMv8 | ConsensusRuleSet::LeviathanSettlement => Self.hash(),
         }
     }
 

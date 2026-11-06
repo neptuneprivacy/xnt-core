@@ -407,12 +407,13 @@ pub(crate) async fn mine_block_to_wallet_invalid_block_proof(
     let timestamp =
         timestamp.unwrap_or_else(|| tip_block.header().timestamp + Timestamp::minutes(10));
 
+    let network = global_state_lock.cli().network;
     let (transaction, expected_composer_utxos) =
         crate::application::loops::mine_loop::create_block_transaction(
             &tip_block,
             global_state_lock.clone(),
             timestamp,
-            Default::default(),
+            TritonVmProofJobOptions::default_with_network(network),
         )
         .await?;
 
@@ -423,7 +424,6 @@ pub(crate) async fn mine_block_to_wallet_invalid_block_proof(
         .wallet_entropy
         .guesser_fee_key();
     let guesser_address = guesser_key.to_address();
-    let network = global_state_lock.cli().network;
     let mut block =
         Block::block_template_invalid_proof(&tip_block, transaction, timestamp, None, network);
     block.set_header_guesser_address(guesser_address.into());

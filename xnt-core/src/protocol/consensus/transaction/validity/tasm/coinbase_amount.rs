@@ -166,24 +166,29 @@ mod tests {
         shadowed_function.test();
     }
 
-    #[test]
-    fn panic_on_negative_amount() {
-        fn set_up_test_stack(coinbase_ptr: BFieldElement) -> Vec<BFieldElement> {
-            let mut stack = CoinbaseAmount.init_stack_for_isolated_run();
-            push_encodable(&mut stack, &coinbase_ptr);
-            stack
-        }
-
-        let coinbase = Some(-NativeCurrencyAmount::coins(2));
+    fn assert_illegal_coinbase_amount(amount: NativeCurrencyAmount) {
         let coinbase_ptr: BFieldElement = bfe!(14);
         let mut memory = HashMap::default();
-        encode_to_memory(&mut memory, coinbase_ptr, &coinbase);
-        let stack = set_up_test_stack(coinbase_ptr);
+        encode_to_memory(&mut memory, coinbase_ptr, &Some(amount));
+        let mut stack = CoinbaseAmount.init_stack_for_isolated_run();
+        push_encodable(&mut stack, &coinbase_ptr);
 
         test_assertion_failure(
             &ShadowedFunction::new(CoinbaseAmount),
             InitVmState::with_stack_and_memory(stack, memory),
             &[CoinbaseAmount::ILLEGAL_COINBASE_AMOUNT_ERROR],
+        );
+    }
+
+    #[test]
+    fn panic_on_negative_amount() {
+        assert_illegal_coinbase_amount(-NativeCurrencyAmount::coins(2));
+    }
+
+    #[test]
+    fn panic_on_amount_above_max() {
+        assert_illegal_coinbase_amount(
+            NativeCurrencyAmount::max() + NativeCurrencyAmount::from_nau(1),
         );
     }
 
@@ -200,7 +205,7 @@ mod tests {
             let size = match memory[&coinbase_ptr].value() {
                 0 => 1,
                 1 => 5,
-                _ => panic!("Option<T> discriminant must be either 0 or 1"),
+                _ => return Err(RustShadowError::DecodingError),
             };
             let mut coinbase_encoded = vec![];
             for i in 0..size {
@@ -216,7 +221,14 @@ mod tests {
 
             let coinbase_amount = coinbase.unwrap_or_else(NativeCurrencyAmount::zero);
 
-            assert!(!coinbase_amount.is_negative());
+            // The VM compares the encoding as a u128, so negative amounts exceed the max.
+            if coinbase_amount.to_nau().cast_unsigned()
+                > NativeCurrencyAmount::max().to_nau().cast_unsigned()
+            {
+                return Err(RustShadowError::AssertionError(
+                    Self::ILLEGAL_COINBASE_AMOUNT_ERROR,
+                ));
+            }
 
             for word in coinbase_amount.encode().into_iter().rev() {
                 stack.push(word)
@@ -247,6 +259,20 @@ mod tests {
                 stack: [self.init_stack_for_isolated_run(), vec![coinbase_ptr]].concat(),
                 memory,
             }
+        }
+
+        fn corner_case_initial_states(&self) -> Vec<FunctionInitialState> {
+            let coinbase_ptr = bfe!(14);
+            let mut memory = HashMap::default();
+            encode_to_memory(
+                &mut memory,
+                coinbase_ptr,
+                &Some(NativeCurrencyAmount::max()),
+            );
+            vec![FunctionInitialState {
+                stack: [self.init_stack_for_isolated_run(), vec![coinbase_ptr]].concat(),
+                memory,
+            }]
         }
     }
 }

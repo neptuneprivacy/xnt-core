@@ -157,9 +157,13 @@ mod tests {
                 indexed_leafs: vec![(TransactionKernelField::Inputs as usize, inputs_digest)],
                 authentication_structure: auth_path,
             };
-            assert!(mt_proof.verify(txk_digest));
-
-            Ok(())
+            if mt_proof.verify(txk_digest) {
+                Ok(())
+            } else {
+                Err(RustShadowError::AssertionError(
+                    MerkleVerify::ROOT_MISMATCH_ERROR_ID,
+                ))
+            }
         }
 
         fn pseudorandom_initial_state(

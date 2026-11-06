@@ -639,6 +639,48 @@ pub struct XntFetchedUtxos {
     pub skipped: i64,
 }
 
+/// Fetch bridge payouts from indexer: public UTXOs found by their receiver
+/// identifier, see `XntPublicIndexedUtxo`.
+#[napi(catch_unwind)]
+pub fn xnt_fetch_public_utxos(
+    client: &XntRpcClient,
+    receiver_id_hash_hex: String,
+    from_height: i64,
+    to_height: i64,
+) -> Result<Vec<XntPublicIndexedUtxo>> {
+    let hash_bytes = hex::decode(&receiver_id_hash_hex)
+        .map_err(|e| Error::from_reason(format!("invalid hex: {e}")))?;
+    let hash_bytes: [u8; 40] = hash_bytes
+        .try_into()
+        .map_err(|_| Error::from_reason("receiver_id_hash must be 40 bytes"))?;
+    let hash = crate::core::Digest::from_bytes(hash_bytes);
+
+    crate::core::fetch_public_utxos(client.inner(), &hash, from_height as u64, to_height as u64)
+        .map(|payouts| {
+            payouts
+                .into_iter()
+                .map(|p| XntPublicIndexedUtxo {
+                    block_height: p.block_height as i64,
+                    block_digest_hex: hex::encode(p.block_digest.bytes),
+                    lock_script_hash_hex: hex::encode(p.lock_script_hash.bytes),
+                    amount_nau: BigInt::from(p.amount_nau),
+                    sender_randomness_hex: hex::encode(p.sender_randomness.bytes),
+                })
+                .collect()
+        })
+        .map_err(|e| Error::from_reason(format!("fetch_public_utxos: {e}")))
+}
+
+/// Bridge payout from sync: a public UTXO, found by its receiver identifier
+#[napi(object)]
+pub struct XntPublicIndexedUtxo {
+    pub block_height: i64,
+    pub block_digest_hex: String,
+    pub lock_script_hash_hex: String,
+    pub amount_nau: BigInt,
+    pub sender_randomness_hex: String,
+}
+
 /// The block height from which UTXOs at legacy-format (pre-v0.3) dCTIDH locks
 /// are no longer recognized on `network`, or null if there is no cutoff.
 #[napi(catch_unwind)]
@@ -707,6 +749,44 @@ pub fn xnt_get_aocl_indices(
 
     crate::core::get_aocl_indices(client.inner(), &hashes)
         .map_err(|e| Error::from_reason(format!("get_aocl_indices: {e}")))
+}
+
+/// One AOCL leaf of a commitment
+#[napi(object)]
+pub struct XntAoclLeaf {
+    pub aocl_leaf_index: i64,
+    pub block_height: i64,
+    pub block_digest_hex: String,
+}
+
+/// Get every AOCL leaf of each commitment. Identical outputs share a commitment; each leaf is
+/// spendable once.
+#[napi(catch_unwind)]
+pub fn xnt_get_aocl_leaves(
+    client: &XntRpcClient,
+    commitment_hashes_hex: Vec<String>,
+) -> Result<Vec<Vec<XntAoclLeaf>>> {
+    let hashes: std::result::Result<Vec<crate::core::Digest>, _> = commitment_hashes_hex
+        .iter()
+        .map(|h| crate::core::Digest::from_hex(h).ok_or_else(|| format!("invalid hash {h}")))
+        .collect();
+    let hashes = hashes.map_err(|e| Error::from_reason(e))?;
+
+    let per_commitment = crate::core::get_aocl_leaves(client.inner(), &hashes)
+        .map_err(|e| Error::from_reason(format!("get_aocl_leaves: {e}")))?;
+    Ok(per_commitment
+        .into_iter()
+        .map(|leaves| {
+            leaves
+                .into_iter()
+                .map(|leaf| XntAoclLeaf {
+                    aocl_leaf_index: leaf.aocl_leaf_index as i64,
+                    block_height: leaf.block_height as i64,
+                    block_digest_hex: leaf.block_digest.to_hex(),
+                })
+                .collect()
+        })
+        .collect())
 }
 
 /// Decrypted UTXO result

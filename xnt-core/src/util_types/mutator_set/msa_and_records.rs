@@ -17,7 +17,7 @@ pub struct MsaAndRecords {
 }
 
 impl MsaAndRecords {
-    pub(crate) fn new(
+    pub fn new(
         mutator_set_accumulator: MutatorSetAccumulator,
         unpacked_removal_records: Vec<RemovalRecord>,
         membership_proofs: Vec<MsMembershipProof>,

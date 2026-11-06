@@ -1,23 +1,39 @@
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use tasm_lib::data_type::DataType;
 use tasm_lib::field;
 use tasm_lib::field_with_size;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::*;
+use tasm_lib::structure::tasm_object::TasmStruct;
 use tasm_lib::traits::basic_snippet::BasicSnippet;
 use tasm_lib::triton_vm::prelude::*;
 
 use crate::protocol::consensus::transaction::validity::collect_type_scripts_v2::CollectTypeScriptsV2;
+#[cfg(test)]
 use crate::protocol::consensus::transaction::validity::proof_collection::ProofCollection;
 use crate::protocol::consensus::transaction::validity::tasm::claims::new_claim::NewClaim;
 use crate::protocol::proof_abstractions::tasm::program::ConsensusProgram;
 
-pub(crate) struct GenerateCollectTypeScriptsClaimV2;
+pub(crate) struct GenerateCollectTypeScriptsClaimV2For<P>(pub(crate) PhantomData<P>);
 
-impl GenerateCollectTypeScriptsClaimV2 {
+/// [`GenerateCollectTypeScriptsClaimV2For`] of upstream's [`ProofCollection`].
+#[cfg(test)]
+pub(crate) type GenerateCollectTypeScriptsClaimV2 =
+    GenerateCollectTypeScriptsClaimV2For<ProofCollection>;
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+pub(crate) const GenerateCollectTypeScriptsClaimV2: GenerateCollectTypeScriptsClaimV2 =
+    GenerateCollectTypeScriptsClaimV2For(PhantomData);
+
+impl<P> GenerateCollectTypeScriptsClaimV2For<P> {
     const BAD_SIZE_INDICATOR_TYPE_SCRIPT_HASHES: i128 = 1_000_500;
 }
 
-impl BasicSnippet for GenerateCollectTypeScriptsClaimV2 {
+impl<P: TasmStruct + Clone + Debug + 'static> BasicSnippet
+    for GenerateCollectTypeScriptsClaimV2For<P>
+{
     fn parameters(&self) -> Vec<(DataType, String)> {
         vec![(DataType::VoidPointer, "proof_collection_pointer".to_owned())]
     }
@@ -75,7 +91,7 @@ impl BasicSnippet for GenerateCollectTypeScriptsClaimV2 {
 
                 /* Prepare call to `new_claim` */
                 dup 0
-                {&field_with_size!(ProofCollection::type_script_hashes)}
+                {&field_with_size!(P::type_script_hashes)}
                 // _ *proof_collection *type_script_hashes type_script_hashes_si
 
                 {&assert_correct_size_indicator}
@@ -101,7 +117,7 @@ impl BasicSnippet for GenerateCollectTypeScriptsClaimV2 {
 
                 /* Write program input */
                 dup 5
-                {&field!(ProofCollection::salted_inputs_hash)}
+                {&field!(P::salted_inputs_hash)}
                 // _ *proof_collection *type_script_hashes tsh_si *claim *claim_output *claim_input *salted_inputs_hash
 
                 {&load_digest_reversed}
@@ -113,7 +129,7 @@ impl BasicSnippet for GenerateCollectTypeScriptsClaimV2 {
                 // _ *proof_collection *type_script_hashes tsh_si *claim *claim_output *claim_input[1]
 
                 pick 5
-                {&field!(ProofCollection::salted_outputs_hash)}
+                {&field!(P::salted_outputs_hash)}
                 {&load_digest_reversed}
                 // _ *type_script_hashes tsh_si *claim *claim_output *claim_input[1] [reversed(salted_outputs_hash)]
 

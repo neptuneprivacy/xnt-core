@@ -238,8 +238,11 @@ impl TxOutputListBuilder {
 
         // Convert outputs.  [address:amount] --> TxOutputList
         let outputs = self.outputs.into_iter().map(|output_type| {
-            let sender_randomness = wallet_entropy
-                .generate_sender_randomness(block_height, output_type.address().privacy_digest());
+            let sender_randomness = wallet_entropy.generate_sender_randomness_with_nonce(
+                block_height,
+                output_type.address().privacy_digest(),
+                rand::random(),
+            );
 
             match output_type {
                 OutputFormat::AddressAndAmount(address, amt) => {
