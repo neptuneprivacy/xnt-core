@@ -2358,7 +2358,7 @@ impl PeerLoopHandler {
                     self.punish(NegativePeerSanction::InvalidBlockProposal)
                         .await?;
                     return Ok(KEEP_CONNECTION_ALIVE);
-                }
+                };
 
                 self.send_to_main(PeerTaskToMain::BlockProposal(new_proposal), line!())
                     .await?;
@@ -6382,6 +6382,50 @@ mod tests {
                 drop(to_main_tx);
                 drop(peer_broadcast_tx);
             }
+        }
+
+        #[traced_test]
+        #[apply(shared_tokio_runtime)]
+        async fn unfavorable_proposal_is_refused_before_its_proof_is_verified() {
+            let TestSetup {
+                peer_broadcast_tx,
+                mut peer_loop_handler,
+                to_main_rx: _,
+                from_main_rx,
+                mut peer_state,
+                to_main_tx,
+                genesis_block,
+            } = genesis_setup(cli_args::Args::default()).await;
+
+            // Neither builds on the tip nor carries a valid proof.
+            let network = peer_loop_handler.global_state_lock.cli().network;
+            let block1 = invalid_empty_block(&genesis_block, network);
+            let block2 = invalid_empty_block(&block1, network);
+            let mock = Mock::new(vec![
+                Action::Read(PeerMessage::BlockProposal(Box::new(block2))),
+                Action::Read(PeerMessage::Bye),
+            ]);
+            peer_loop_handler
+                .run(mock, from_main_rx, &mut peer_state)
+                .await
+                .unwrap();
+
+            let standing = peer_loop_handler
+                .global_state_lock
+                .lock_guard()
+                .await
+                .net
+                .peer_map
+                .get(&peer_loop_handler.peer_address)
+                .unwrap()
+                .standing;
+            assert_eq!(
+                NegativePeerSanction::InvalidBlockProposal,
+                standing.latest_punishment.unwrap().0
+            );
+
+            drop(to_main_tx);
+            drop(peer_broadcast_tx);
         }
 
         #[traced_test]

@@ -728,8 +728,6 @@ async fn broadcast_transaction(
         bincode::deserialize_from(body.reader()).context("deserialize error")?;
     let tx: Transaction = tx.try_into().context("Failed to convert to transaction")?;
 
-    // Is transaction valid under the rule set of the next block, in which it
-    // is mined?
     let cli = rpcstate.state.cli();
     let network = cli.network;
     let (consensus_rule_set, tip_height) = {
@@ -739,10 +737,6 @@ async fn broadcast_transaction(
             state.chain.light_state().header().height,
         )
     };
-    if !tx.is_valid(network, consensus_rule_set).await {
-        return Err(RestError("Received transaction is not valid".to_owned()));
-    }
-
     // Before the fork, the terms of that era apply, as for every submission.
     if consensus_rule_set.is_legacy_era()
         && !legacy_era::submitted_transaction_meets_terms(
@@ -775,6 +769,12 @@ async fn broadcast_transaction(
         return Err(RestError(format!(
             "Received tx too far into the future. Got timestamp {timestamp}"
         )));
+    }
+
+    // Is transaction valid under the rule set of the next block, in which it
+    // is mined? Checked after the cheap checks, and before the write lock.
+    if !tx.is_valid(network, consensus_rule_set).await {
+        return Err(RestError("Received transaction is not valid".to_owned()));
     }
 
     // Is transaction confirmable?
@@ -918,10 +918,6 @@ async fn incentivized_proof_collection_transaction(
         kernel: tx.kernel.clone(),
         proof: TransactionProof::ProofCollection(tx.proof_collection.clone()),
     };
-    if !transaction.is_valid(network, consensus_rule_set).await {
-        return Err(RestError("Received transaction is not valid".to_owned()));
-    }
-
     if transaction.kernel.coinbase.is_some() {
         return Err(RestError(
             "Does not accept coinbase transactions".to_owned(),
@@ -933,6 +929,20 @@ async fn incentivized_proof_collection_transaction(
         return Err(RestError("Fee may not be negative, or zero".to_owned()));
     }
 
+    // Does transaction have acceptable timestamp?
+    let timestamp = transaction.kernel.timestamp;
+    let now = Timestamp::now();
+    if timestamp >= now + FUTUREDATING_LIMIT {
+        return Err(RestError(format!(
+            "Received tx too far into the future. Got timestamp {timestamp}"
+        )));
+    }
+
+    // Checked after the cheap checks, and before the write lock.
+    if !transaction.is_valid(network, consensus_rule_set).await {
+        return Err(RestError("Received transaction is not valid".to_owned()));
+    }
+
     // Is transaction confirmable?
     let mut state = rpcstate.state.lock_guard_mut().await;
     let msa = state
@@ -942,15 +952,6 @@ async fn incentivized_proof_collection_transaction(
         .expect("Tip block must have mutator set");
     if !transaction.is_confirmable_relative_to(&msa) {
         return Err(RestError("Transaction is not confirmable".to_owned()));
-    }
-
-    // Does transaction have acceptable timestamp?
-    let timestamp = transaction.kernel.timestamp;
-    let now = Timestamp::now();
-    if timestamp >= now + FUTUREDATING_LIMIT {
-        return Err(RestError(format!(
-            "Received tx too far into the future. Got timestamp {timestamp}"
-        )));
     }
 
     // All checks passed. Notify wallet of expected upgrade reward.

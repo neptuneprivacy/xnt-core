@@ -695,9 +695,6 @@ impl RpcApi for RpcServer {
         let transaction: Transaction = request.transaction.into();
         let network = self.state.cli().network;
 
-        // The transaction must be valid under the rule set of the next block,
-        // in which it is mined. Next to a hard fork, one valid on the other
-        // side of it is reported as such.
         let tip_height = self
             .state
             .lock_guard()
@@ -707,25 +704,6 @@ impl RpcApi for RpcServer {
             .header()
             .height;
         let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
-        if !transaction.is_valid(network, consensus_rule_set).await {
-            let neighboring_rule_sets = [
-                ConsensusRuleSet::infer_from(network, tip_height),
-                ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
-            ];
-            for neighboring_rule_set in neighboring_rule_sets {
-                if neighboring_rule_set != consensus_rule_set
-                    && transaction.is_valid(network, neighboring_rule_set).await
-                {
-                    return Err(RpcError::SubmitTransaction(
-                        SubmitTransactionError::OtherEra,
-                    ));
-                }
-            }
-
-            return Err(RpcError::SubmitTransaction(
-                SubmitTransactionError::InvalidTransaction,
-            ));
-        }
 
         // Before the fork, a transaction must meet the terms on which the
         // nodes of that era relay and upgrade it, and not come too close to
@@ -774,6 +752,29 @@ impl RpcApi for RpcServer {
         if !transaction.is_confirmable_relative_to(&msa) {
             return Err(RpcError::SubmitTransaction(
                 SubmitTransactionError::NotConfirmable,
+            ));
+        }
+
+        // The transaction must be valid under the rule set of the next block,
+        // in which it is mined. Next to a hard fork, one valid on the other
+        // side of it is reported as such. Checked last: it verifies proofs.
+        if !transaction.is_valid(network, consensus_rule_set).await {
+            let neighboring_rule_sets = [
+                ConsensusRuleSet::infer_from(network, tip_height),
+                ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
+            ];
+            for neighboring_rule_set in neighboring_rule_sets {
+                if neighboring_rule_set != consensus_rule_set
+                    && transaction.is_valid(network, neighboring_rule_set).await
+                {
+                    return Err(RpcError::SubmitTransaction(
+                        SubmitTransactionError::OtherEra,
+                    ));
+                }
+            }
+
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::InvalidTransaction,
             ));
         }
 
@@ -2262,6 +2263,36 @@ pub mod tests {
             .expect("submission to succeed");
 
         assert!(submit_tx_response.success);
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_coinbase_transaction_is_refused_before_its_proof_is_verified() {
+        use proptest::prelude::Strategy;
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        use crate::application::json_rpc::core::api::rpc::SubmitTransactionError;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+
+        let rpc_server = test_rpc_server().await;
+        let kernel = txkernel::with_lengths(0usize, 0usize, 0usize, true)
+            .new_tree(&mut TestRunner::deterministic())
+            .unwrap()
+            .current();
+        let transaction = Transaction {
+            kernel: TransactionKernelModifier::default()
+                .coinbase(Some(NativeCurrencyAmount::coins(1)))
+                .modify(kernel),
+            proof: TransactionProof::invalid(),
+        };
+
+        assert_eq!(
+            RpcError::SubmitTransaction(SubmitTransactionError::CoinbaseTransaction),
+            rpc_server
+                .submit_transaction(transaction.into())
+                .await
+                .unwrap_err()
+        );
     }
 
     #[apply(shared_tokio_runtime)]
