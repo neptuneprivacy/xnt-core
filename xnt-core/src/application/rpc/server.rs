@@ -2464,14 +2464,21 @@ impl NeptuneRPCServer {
     }
 
     /// Verify a pow solution and send it to main loop if it is valid.
+    ///
+    /// Also verifies block validity in general.
     async fn pow_solution_inner(&self, mut proposal: Block, pow: BlockPow) -> RpcResult<bool> {
-        // Check if solution works.
-        let latest_block_header = *self.state.lock_guard().await.chain.light_state().header();
+        let tip = self.state.lock_guard().await.chain.light_state().clone();
 
         proposal.set_header_pow(pow);
 
-        if !proposal.has_proof_of_work(self.state.cli().network, &latest_block_header) {
+        let network = self.state.cli().network;
+        if !proposal.has_proof_of_work(network, tip.header()) {
             warn!("Got claimed PoW solution but PoW solution is not valid.");
+            return Ok(false);
+        }
+
+        if !proposal.is_valid(&tip, Timestamp::now(), network).await {
+            warn!("Got claimed PoW solution for a block that is not valid");
             return Ok(false);
         }
 
@@ -3817,16 +3824,9 @@ impl RPC for NeptuneRPCServer {
         log_slow_scope!(fn_name!());
         token.auth(&self.valid_tokens)?;
 
-        // Since block comes from external source, we need to check validity.
-        let current_tip = self.state.lock_guard().await.chain.light_state().clone();
-        if !proposal
-            .is_valid(&current_tip, Timestamp::now(), self.state.cli().network)
-            .await
-        {
-            warn!("Got claimed new block that was not valid");
-            return Ok(false);
-        }
-
+        // The block comes from an external source, so it needs to be checked
+        // for validity. That happens in `pow_solution_inner`, once the
+        // solution has been inserted.
         self.pow_solution_inner(proposal, pow).await
     }
 
@@ -6969,7 +6969,7 @@ mod tests {
             let bob_token = cookie_token(&bob).await;
 
             let genesis = Block::genesis(network);
-            let mut block1 = invalid_empty_block(&genesis, network);
+            let mut block1 = fake_valid_deterministic_successor(&genesis, network).await;
             bob.state
                 .lock_mut(|x| {
                     x.mining_state.block_proposal =
