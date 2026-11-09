@@ -421,12 +421,16 @@ impl GlobalStateLock {
             .await;
 
         // insert transaction into mempool
-        gsm.mempool_insert(
-            (*transaction).clone(),
-            UpgradePriority::Critical,
-            AddReason::Submitted,
-        )
-        .await;
+        if !gsm
+            .mempool_insert(
+                (*transaction).clone(),
+                UpgradePriority::Critical,
+                AddReason::Submitted,
+            )
+            .await
+        {
+            return Err(RecordTransactionError::RefusedByMempool);
+        }
 
         tracing::debug!("flush dbs");
         gsm.flush_databases().await.expect("flushed DBs");
@@ -2973,12 +2977,14 @@ impl GlobalState {
     /// so that the composer and the proof upgrader never see them (see
     /// [`legacy_relay_pool`]). A transaction backed by a primitive witness is
     /// one of this node's there, and is proven again on every block.
+    ///
+    /// Returns false for a transaction refused because it can never fit a block.
     pub async fn mempool_insert(
         &mut self,
         transaction: Transaction,
         priority: UpgradePriority,
         add_reason: AddReason,
-    ) {
+    ) -> bool {
         let tip_height = self.chain.light_state().header().height;
 
         if self.next_block_consensus_rule_set().is_legacy_era() {
@@ -2989,14 +2995,30 @@ impl GlobalState {
             self.wallet_state
                 .handle_mempool_events(events, tip_height.next())
                 .await;
-            return;
+            return true;
+        }
+
+        let rule_set = self.next_block_consensus_rule_set();
+        let kernel = &transaction.kernel;
+        let size_check = rule_set.mempool_size_check(
+            kernel.inputs.len(),
+            kernel.outputs.len(),
+            kernel.announcements.len(),
+        );
+        if size_check.is_err() || kernel.encode().len() > rule_set.max_block_size() {
+            warn!(
+                "Not adding transaction {}: it can never fit a block",
+                kernel.txid()
+            );
+            return false;
         }
 
         let events = self.mempool.insert(transaction, priority, add_reason);
         self.mempool.log_events(&events, tip_height);
         self.wallet_state
             .handle_mempool_events(events, tip_height.next())
-            .await
+            .await;
+        true
     }
 
     /// Adds a link transaction to the mempool and notifies wallet of change.
@@ -3042,7 +3064,7 @@ impl GlobalState {
 
     /// Like [`Self::mempool_insert`], for a transaction that was verified
     /// under the given rule set: inserted only if that is still the rule set
-    /// of the next block. Returns whether it was offered to the mempool or
+    /// of the next block. Returns whether it was admitted to the mempool or
     /// the legacy relay pool.
     ///
     /// A transaction verified for one era is never held for the other, also
@@ -3064,8 +3086,7 @@ impl GlobalState {
             return false;
         }
 
-        self.mempool_insert(transaction, priority, add_reason).await;
-        true
+        self.mempool_insert(transaction, priority, add_reason).await
     }
 
     /// The transaction with this id, from the mempool or else from the legacy

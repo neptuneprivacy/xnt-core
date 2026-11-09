@@ -641,7 +641,20 @@ impl Mempool {
     pub(crate) fn preferred_single_proof_pair(
         &self,
         tx_upgrade_filter: TxUpgradeFilter,
+        consensus_rule_set: ConsensusRuleSet,
     ) -> Option<([(TransactionKernel, Proof); 2], UpgradePriority)> {
+        // A merger that cannot fit a block can never be mined.
+        let merger_fits = |left: TransactionKernelId, right: TransactionKernelId| {
+            let [Some(left), Some(right)] = [left, right].map(|txid| self.get(txid)) else {
+                return false;
+            };
+            Self::kernels_fit_block_composition(
+                &[&left.kernel, &right.kernel],
+                consensus_rule_set,
+                consensus_rule_set.max_block_size(),
+            )
+        };
+
         let mut ret = vec![];
         let mut filter_mismatches = vec![];
         let mut priority = UpgradePriority::Irrelevant;
@@ -686,6 +699,13 @@ impl Mempool {
                 continue;
             }
 
+            if ret
+                .first()
+                .is_some_and(|&first| !merger_fits(first, candidate_txid))
+            {
+                continue;
+            }
+
             priority = priority + candidate.upgrade_priority;
 
             ret.push(candidate_txid);
@@ -707,7 +727,8 @@ impl Mempool {
                 if tx_upgrade_filter.matches(TransactionKernelId::combine(
                     first_candidate,
                     second_candidate,
-                )) {
+                )) && merger_fits(first_candidate, second_candidate)
+                {
                     ret.push(second_candidate);
                     break;
                 }
@@ -1587,16 +1608,27 @@ impl Mempool {
         consensus_rule_set: ConsensusRuleSet,
         max_kernel_len: usize,
     ) -> bool {
-        kernel.inputs.len() <= consensus_rule_set.max_num_inputs()
-            && kernel.outputs.len()
+        Self::kernels_fit_block_composition(&[kernel], consensus_rule_set, max_kernel_len)
+    }
+
+    /// [`Self::fits_block_composition`] for the merger of `kernels`.
+    fn kernels_fit_block_composition(
+        kernels: &[&TransactionKernel],
+        consensus_rule_set: ConsensusRuleSet,
+        max_kernel_len: usize,
+    ) -> bool {
+        let total =
+            |len: fn(&TransactionKernel) -> usize| kernels.iter().map(|k| len(k)).sum::<usize>();
+        total(|k| k.inputs.len()) <= consensus_rule_set.max_num_inputs()
+            && total(|k| k.outputs.len())
                 <= consensus_rule_set
                     .max_num_outputs()
                     .saturating_sub(Self::COINBASE_NUM_OUTPUTS_RESERVATION)
-            && kernel.announcements.len()
+            && total(|k| k.announcements.len())
                 <= consensus_rule_set
                     .max_num_announcements()
                     .saturating_sub(Self::COINBASE_NUM_ANNOUNCEMENTS_RESERVATION)
-            && kernel.encode().len() <= max_kernel_len
+            && total(|k| k.encode().len()) <= max_kernel_len
     }
 
     pub(crate) fn get_transactions_for_block_composition(
@@ -2096,6 +2128,7 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::RngExt;
     use rand::SeedableRng;
+    use tasm_lib::triton_vm::prelude::BFieldElement;
     use tracing_test::traced_test;
 
     use super::*;
@@ -2131,6 +2164,7 @@ mod tests {
     use crate::tests::shared::mock_tx::mock_transactions_with_sized_single_proof;
     use crate::tests::shared::mock_tx::testrunning::make_mock_txs_with_primitive_witness_with_timestamp;
     use crate::tests::shared::mock_tx::testrunning::make_plenty_mock_transaction_supported_by_primitive_witness;
+    use crate::tests::shared::strategies::txkernel;
     use crate::tests::shared_tokio_runtime;
     use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 
@@ -3024,7 +3058,10 @@ mod tests {
             assert_eq!(
                 densest_txs,
                 mempool
-                    .preferred_single_proof_pair(TxUpgradeFilter::match_all())
+                    .preferred_single_proof_pair(
+                        TxUpgradeFilter::match_all(),
+                        ConsensusRuleSet::default()
+                    )
                     .unwrap()
                     .0
                     .map(|x| x.0.txid())
@@ -3143,6 +3180,84 @@ mod tests {
         );
     }
 
+    /// An invalid-single-proof transaction paying a fee, with `num_outputs` outputs unique per `seed`.
+    fn single_proof_tx_with_outputs(num_outputs: usize, seed: u64) -> Transaction {
+        let kernel = txkernel::with_lengths(0usize, 0usize, 0usize, true)
+            .new_tree(&mut TestRunner::deterministic())
+            .unwrap()
+            .current();
+        let outputs = (0..num_outputs)
+            .map(|i| {
+                AdditionRecord::new(Digest::new(
+                    [seed, i as u64, 0, 0, 0].map(BFieldElement::new),
+                ))
+            })
+            .collect_vec();
+        Transaction {
+            kernel: TransactionKernelModifier::default()
+                .outputs(outputs)
+                .fee(NativeCurrencyAmount::coins(1))
+                .modify(kernel),
+            proof: TransactionProof::invalid(),
+        }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_merger_that_cannot_fit_a_block_is_not_offered() {
+        let network = Network::Main;
+        let rule_set = ConsensusRuleSet::default();
+        let max_outputs = rule_set.max_num_outputs() - Mempool::COINBASE_NUM_OUTPUTS_RESERVATION;
+        let pair = |num_outputs: usize| {
+            let mut mempool = Mempool::new(
+                ByteSize::gb(1),
+                TxProvingCapability::SingleProof,
+                &Block::genesis(network),
+            );
+            for seed in [1, 2] {
+                let tx = single_proof_tx_with_outputs(num_outputs, seed);
+                mempool.tip_mutator_set_hash = tx.kernel.mutator_set_hash;
+                mempool.insert(tx, UpgradePriority::Irrelevant, AddReason::Submitted);
+            }
+            assert_eq!(2, mempool.len());
+            mempool
+                .preferred_single_proof_pair(TxUpgradeFilter::match_all(), rule_set)
+                .is_some()
+        };
+
+        assert!(pair(10));
+        assert!(!pair(max_outputs / 2 + 1));
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_transaction_that_cannot_fit_a_block_is_not_admitted() {
+        let network = Network::Main;
+        let cli = cli_args::Args::default_with_network(network);
+        let mut state = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let mut state = state.lock_guard_mut().await;
+        let max_outputs = state
+            .next_block_consensus_rule_set()
+            .max_num_outputs_in_mempool();
+        let too_big = single_proof_tx_with_outputs(max_outputs + 1, 1);
+        let fitting = single_proof_tx_with_outputs(10, 2);
+
+        assert!(
+            !state
+                .mempool_insert(too_big, UpgradePriority::Irrelevant, AddReason::Submitted)
+                .await
+        );
+        assert!(
+            state
+                .mempool_insert(
+                    fitting.clone(),
+                    UpgradePriority::Irrelevant,
+                    AddReason::Submitted
+                )
+                .await
+        );
+        assert_eq!(1, state.mempool.len());
+        assert!(state.mempool.contains(fitting.kernel.txid()));
+    }
+
     #[traced_test]
     #[apply(shared_tokio_runtime)]
     async fn merged_tx_removes_merge_inputs_but_keeps_them_in_cache() {
@@ -3172,7 +3287,10 @@ mod tests {
         assert_eq!(
             densest_txs,
             mempool
-                .preferred_single_proof_pair(TxUpgradeFilter::match_all())
+                .preferred_single_proof_pair(
+                    TxUpgradeFilter::match_all(),
+                    ConsensusRuleSet::default()
+                )
                 .unwrap()
                 .0
                 .map(|x| x.0.txid())
@@ -3184,7 +3302,10 @@ mod tests {
         assert_eq!(&merged, mempool.get(merged.kernel.txid()).unwrap());
 
         assert!(mempool
-            .preferred_single_proof_pair(TxUpgradeFilter::match_all())
+            .preferred_single_proof_pair(
+                TxUpgradeFilter::match_all(),
+                ConsensusRuleSet::default()
+            )
             .is_none());
 
         assert_eq!(

@@ -801,7 +801,9 @@ async fn broadcast_transaction(
         .await
     {
         return Err(RestError(
-            "The next block follows another consensus rule set now".to_owned(),
+            "Not admitted: the next block follows another consensus rule set now, or the \
+             transaction can never fit a block"
+                .to_owned(),
         ));
     }
     let _ = rpcstate

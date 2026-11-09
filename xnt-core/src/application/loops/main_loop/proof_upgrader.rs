@@ -1406,7 +1406,7 @@ pub(super) async fn get_upgrade_task_from_mempool(
         upgrade_priority,
     )) = global_state
         .mempool
-        .preferred_single_proof_pair(upgrade_filter)
+        .preferred_single_proof_pair(upgrade_filter, next_rule_set)
     {
         // Sanity check
         assert_eq!(
