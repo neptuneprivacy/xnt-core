@@ -479,6 +479,9 @@ impl TransactionInitiator {
         }
 
         let mut tx_outputs = self.generate_tx_outputs(outputs).await;
+        tx_outputs
+            .validate_recipients()
+            .map_err(|e| error::CreateTxError::InvalidRecipient(e.to_string()))?;
         let spend_amount = tx_outputs
             .total_native_coins()
             .checked_add(&fee)
@@ -972,6 +975,44 @@ mod tests {
             .await
             .addition_records();
         assert_ne!(both[0], both[1]);
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn chained_send_to_an_invalid_recipient_is_refused() {
+        use crate::state::wallet::address::dctidh_address::dCTIDHSpendingKey;
+
+        let network = Network::RegTest;
+        let cli = cli_args::Args::default_with_network(network);
+        let mut bob = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let legacy: ReceivingAddress = dCTIDHSpendingKey::legacy_from_seed(rand::random())
+            .pre_v0_3_address()
+            .into();
+        let mut sender = bob.api_mut().tx_sender_mut();
+        let chained = sender
+            .send_chained(
+                vec![(legacy.clone(), NativeCurrencyAmount::coins(1))],
+                ChangePolicy::default(),
+                NativeCurrencyAmount::coins(0),
+                Timestamp::now(),
+            )
+            .await;
+        let link = sender
+            .send_chained_link(
+                vec![(legacy, NativeCurrencyAmount::coins(1))],
+                ChangePolicy::default(),
+                NativeCurrencyAmount::coins(0),
+                Timestamp::now(),
+            )
+            .await;
+
+        for result in [chained.map(|_| ()), link.map(|_| ())] {
+            assert!(matches!(
+                result,
+                Err(error::SendError::Tx(
+                    error::CreateTxError::InvalidRecipient(_)
+                ))
+            ));
+        }
     }
 
     /// A chained send stops, and records nothing, once a predecessor leaves
