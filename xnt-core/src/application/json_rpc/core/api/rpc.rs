@@ -92,6 +92,9 @@ pub enum RpcError {
     #[error("Too many absolute index sets requested: maximum is {max}, got {got}")]
     TooManyAbsoluteIndexSets { max: usize, got: usize },
 
+    #[error("Too many commitments requested: maximum is {max}, got {got}")]
+    TooManyCommitments { max: usize, got: usize },
+
     // Common case errors
     #[error("Invalid address provided in arguments")]
     InvalidAddress,
@@ -113,6 +116,12 @@ pub const MAX_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS: usize = 1000;
 /// The limit on how many membership proofs one request may ask for, for
 /// callers that are not granted unrestricted access.
 pub const MAX_RESTRICTED_RESTORE_MEMBERSHIP_PROOF_INDEX_SETS: usize = 256;
+
+/// The limit on how many commitments one AOCL leaf request may name.
+pub const MAX_AOCL_LEAF_COMMITMENTS: usize = 1000;
+
+/// The limit on how many leaves of one commitment a page holds.
+pub const MAX_AOCL_LEAVES_PER_PAGE: usize = 1000;
 
 #[async_trait]
 pub trait RpcApi: Sync + Send {

@@ -9,6 +9,7 @@ pub(crate) mod rusty_wallet_database;
 pub(crate) mod scan_mode_configuration;
 pub mod secret_key_material;
 pub mod sent_transaction;
+pub mod tasm_bridge_payout;
 pub mod transaction_input;
 pub mod transaction_output;
 pub mod unlocked_utxo;

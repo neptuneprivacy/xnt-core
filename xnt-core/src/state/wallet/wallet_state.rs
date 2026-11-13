@@ -39,6 +39,8 @@ use super::expected_utxo::UtxoNotifier;
 use super::incoming_utxo::IncomingUtxo;
 use super::rusty_wallet_database::RustyWalletDatabase;
 use super::sent_transaction::SentTransaction;
+use super::tasm_bridge_payout::has_burns;
+use super::tasm_bridge_payout::payouts_to_keys;
 use super::unlocked_utxo::UnlockedUtxo;
 use super::wallet_configuration::WalletConfiguration;
 use super::wallet_entropy::WalletEntropy;
@@ -863,6 +865,33 @@ impl WalletState {
             })
     }
 
+    fn scan_for_bridge_payouts_to_known_keys(
+        &self,
+        tx_kernel: &TransactionKernel,
+        height: BlockHeight,
+    ) -> Vec<IncomingUtxo> {
+        if !has_burns(tx_kernel) {
+            return vec![];
+        }
+        let legacy_dctidh_keys: &[SpendingKey] = if self.legacy_dctidh_lock_recognized_at(height) {
+            &self.known_legacy_dctidh_keys
+        } else {
+            &[]
+        };
+        let keys = self
+            .known_generation_keys
+            .iter()
+            .chain(&self.known_symmetric_keys)
+            .chain(&self.known_dctidh_keys)
+            .chain(legacy_dctidh_keys)
+            .cloned()
+            .collect_vec();
+        payouts_to_keys(tx_kernel, &keys)
+            .into_iter()
+            .map(|(_, payout)| payout.into())
+            .collect()
+    }
+
     /// Scan the given transaction for announced UTXOs as recognized by *future*
     /// keys, *i.e.*, keys that will be derived by the next n derivation
     /// indices. With `with_legacy`, also by the legacy-format counterparts of
@@ -1501,19 +1530,37 @@ impl WalletState {
                 with_legacy,
             )
         {
-            if max_counters
-                .get(&key_type)
-                .is_none_or(|&current_max_derivation_index| {
-                    current_max_derivation_index < derivation_index
-                })
-            {
-                max_counters.insert(key_type, derivation_index);
-            }
-            if is_legacy {
-                max_legacy_derivation_index =
-                    max_legacy_derivation_index.max(Some(derivation_index));
-            }
+            note_recovering_key(
+                &mut max_counters,
+                &mut max_legacy_derivation_index,
+                key_type,
+                derivation_index,
+                is_legacy,
+            );
             recovered_outputs.push(incoming_utxo);
+        }
+
+        if has_burns(&new_block.body().transaction_kernel) {
+            let (future_keys, future_key_origins): (Vec<_>, Vec<_>) = self
+                .get_future_spending_keys(scan_mode_configuration.num_future_keys(), with_legacy)
+                .flat_map(|(key_type, derivation_index, key, legacy)| {
+                    std::iter::once((key, (key_type, derivation_index, false)))
+                        .chain(legacy.map(|legacy| (legacy, (key_type, derivation_index, true))))
+                })
+                .unzip();
+            for (position, payout) in
+                payouts_to_keys(&new_block.body().transaction_kernel, &future_keys)
+            {
+                let (key_type, derivation_index, is_legacy) = future_key_origins[position];
+                note_recovering_key(
+                    &mut max_counters,
+                    &mut max_legacy_derivation_index,
+                    key_type,
+                    derivation_index,
+                    is_legacy,
+                );
+                recovered_outputs.push(payout.into());
+            }
         }
 
         // try to reproduce composer fee UTXOs, assuming it was our block
@@ -1973,6 +2020,8 @@ impl WalletState {
             .scan_for_utxos_announced_to_known_keys(tx_kernel, height)
             .collect_vec();
 
+        let bridge_payouts = self.scan_for_bridge_payouts_to_known_keys(tx_kernel, height);
+
         let outputs_recovered_through_scan_mode = self.recover_by_scanning(block).await;
 
         let MutatorSetUpdate { additions, .. } = block
@@ -1998,6 +2047,7 @@ impl WalletState {
         let unrecognized_locks = self.unrecognized_legacy_dctidh_locks(height);
         let incoming = onchain_received_outputs
             .into_iter()
+            .chain(bridge_payouts)
             .chain(outputs_recovered_through_scan_mode)
             .chain(offchain_received_outputs.iter().cloned())
             .chain(guesser_fee_outputs)
@@ -2377,6 +2427,25 @@ impl WalletState {
             own_coins.push(coin);
         }
         own_coins
+    }
+}
+
+/// Tracks the highest derivation index a scan found funds at.
+fn note_recovering_key(
+    max_counters: &mut HashMap<KeyType, u64>,
+    max_legacy_derivation_index: &mut Option<u64>,
+    key_type: KeyType,
+    derivation_index: u64,
+    is_legacy: bool,
+) {
+    if max_counters
+        .get(&key_type)
+        .is_none_or(|&current_max_derivation_index| current_max_derivation_index < derivation_index)
+    {
+        max_counters.insert(key_type, derivation_index);
+    }
+    if is_legacy {
+        *max_legacy_derivation_index = (*max_legacy_derivation_index).max(Some(derivation_index));
     }
 }
 
@@ -5124,6 +5193,87 @@ pub(crate) mod tests {
             assert_eq!(own_utxo, recovered[0].utxo);
             assert_eq!(sender_randomness, recovered[0].sender_randomness);
             assert_eq!(key.privacy_preimage(), recovered[0].receiver_preimage);
+        }
+
+        fn block_with_bridge_payout(genesis: &Block, key: &SpendingKey, units: u64) -> Block {
+            use crate::state::wallet::tasm_bridge_payout::tests::burn_to;
+            use crate::state::wallet::tasm_bridge_payout::tests::kernel_with;
+            use crate::state::wallet::tasm_bridge_payout::tests::payout_output;
+            use crate::state::wallet::tasm_bridge_payout::tests::settle_announcement;
+
+            let burn = burn_to(key, units, 7);
+            let kernel = kernel_with(
+                vec![settle_announcement(std::slice::from_ref(&burn))],
+                vec![payout_output(&burn)],
+            );
+            let transaction = Transaction {
+                kernel,
+                proof: TransactionProof::invalid(),
+            };
+            invalid_block_with_transaction(genesis, transaction)
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn bridge_payout_to_known_key_becomes_spendable() {
+            let network = Network::Main;
+            let genesis = Block::genesis(network);
+            let data_dir = unit_test_data_directory(network).unwrap();
+            let cli = cli_args::Args::default_with_network(network);
+            let mut wallet_state =
+                WalletState::new_from_wallet_entropy(&data_dir, WalletEntropy::new_random(), &cli)
+                    .await;
+            let key = wallet_state
+                .get_known_spending_keys(KeyType::Generation)
+                .next()
+                .unwrap();
+            let block1 = block_with_bridge_payout(&genesis, &key, 2);
+
+            wallet_state
+                .update_wallet_state_with_new_block(
+                    &genesis.mutator_set_accumulator_after().unwrap(),
+                    &block1,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let status = wallet_state
+                .get_wallet_status(
+                    block1.hash(),
+                    &block1.mutator_set_accumulator_after().unwrap(),
+                )
+                .await;
+            assert_eq!(
+                NativeCurrencyAmount::from_nau(8_000_000_000_000_000_000_000_000),
+                status.available_confirmed(block1.header().timestamp)
+            );
+        }
+
+        #[apply(shared_tokio_runtime)]
+        async fn bridge_payout_to_future_key_is_recovered_in_scan_mode() {
+            let network = Network::Main;
+            let genesis = Block::genesis(network);
+            let data_dir = unit_test_data_directory(network).unwrap();
+            let cli = cli_args::Args {
+                scan_blocks: Some(0..=10),
+                network,
+                ..Default::default()
+            };
+            let wallet_secret = WalletEntropy::new_random();
+            let mut wallet_state =
+                WalletState::new_from_wallet_entropy(&data_dir, wallet_secret.clone(), &cli).await;
+            let future_index = wallet_state.wallet_db.get_generation_key_counter() + 3;
+            let key = SpendingKey::from(wallet_secret.nth_generation_spending_key(future_index));
+            let block1 = block_with_bridge_payout(&genesis, &key, 2);
+
+            let recovered = wallet_state.recover_by_scanning(&block1).await;
+
+            assert_eq!(1, recovered.len());
+            assert_eq!(key.privacy_preimage(), recovered[0].receiver_preimage);
+            assert_eq!(
+                future_index + 1,
+                wallet_state.wallet_db.get_generation_key_counter()
+            );
         }
 
         #[apply(shared_tokio_runtime)]

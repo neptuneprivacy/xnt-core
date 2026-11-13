@@ -87,6 +87,52 @@ impl From<anyhow::Error> for RestError {
     }
 }
 
+const MAX_ITEMS_PER_REQUEST: u64 = 1000;
+
+/// A request body of [`MAX_ITEMS_PER_REQUEST`] bincode-encoded absolute index
+/// sets: a length prefix and 196 bytes per set.
+const MEMBERSHIP_PROOF_REQUEST_MAX_BYTES: usize = 8 + MAX_ITEMS_PER_REQUEST as usize * 196;
+
+/// Fails to deserialize above [`MAX_ITEMS_PER_REQUEST`], which axum answers with HTTP 400.
+#[derive(Debug, Clone, Copy)]
+struct Count(u64);
+
+impl<'de> Deserialize<'de> for Count {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let count = u64::deserialize(deserializer)?;
+        if count > MAX_ITEMS_PER_REQUEST {
+            return Err(serde::de::Error::custom(format!(
+                "at most {MAX_ITEMS_PER_REQUEST} per request, got {count}"
+            )));
+        }
+        Ok(Self(count))
+    }
+}
+
+/// Inclusive; fails to deserialize if inverted or over [`MAX_ITEMS_PER_REQUEST`] blocks: HTTP 400.
+#[derive(Debug, Clone, Copy)]
+struct HeightRange {
+    start: u64,
+    end: u64,
+}
+
+impl<'de> Deserialize<'de> for HeightRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (start, end) = <(u64, u64)>::deserialize(deserializer)?;
+        if start > end {
+            return Err(serde::de::Error::custom(format!(
+                "start {start} is after end {end}"
+            )));
+        }
+        if end - start >= MAX_ITEMS_PER_REQUEST {
+            return Err(serde::de::Error::custom(format!(
+                "at most {MAX_ITEMS_PER_REQUEST} blocks per request"
+            )));
+        }
+        Ok(Self { start, end })
+    }
+}
+
 /// Allow caller to get the block hash without a valid proof to save bandwidth
 /// and space in the application.
 #[derive(Deserialize)]
@@ -265,7 +311,8 @@ pub(crate) async fn run_rpc_server(
             )
             .route(
                 "/rpc/generate_membership_proof",
-                axum::routing::post(restore_membership_proof_privacy_preserving),
+                axum::routing::post(restore_membership_proof_privacy_preserving)
+                    .layer(DefaultBodyLimit::max(MEMBERSHIP_PROOF_REQUEST_MAX_BYTES)),
             );
 
         routes
@@ -309,11 +356,11 @@ async fn get_block(
 
 async fn get_batch_block(
     State(rpcstate): State<NeptuneRPCServer>,
-    Path((height, batch_size)): Path<(u64, u64)>,
+    Path((height, Count(batch_size))): Path<(u64, Count)>,
     Query(params): Query<BlockQuery>,
 ) -> Result<Vec<u8>, RestError> {
     let mut blocks = Vec::with_capacity(batch_size as usize);
-    for cur_height in height..height + batch_size {
+    for cur_height in height..height.saturating_add(batch_size) {
         let block_selector = BlockSelector::Height(cur_height.into());
         let state = rpcstate.state.lock_guard().await;
         let Some(digest) = block_selector.as_digest(&state).await else {
@@ -390,14 +437,14 @@ async fn get_block_info(
 
 async fn get_mempool(
     State(rpcstate): State<NeptuneRPCServer>,
-    Path((start_index, number)): Path<(usize, usize)>,
+    Path((start_index, Count(number))): Path<(usize, Count)>,
 ) -> Result<ErasedJson, RestError> {
     let global_state = rpcstate.state.lock_guard().await;
     let mempool_txkids = global_state
         .mempool
         .fee_density_iter()
         .skip(start_index)
-        .take(number)
+        .take(number as usize)
         .map(|(txkid, _)| txkid)
         .collect_vec();
 
@@ -494,7 +541,7 @@ struct BlockTime {
 
 async fn get_blocks_time(
     State(rpcstate): State<NeptuneRPCServer>,
-    Path((start, end)): Path<(u64, u64)>,
+    Path(HeightRange { start, end }): Path<HeightRange>,
 ) -> Result<ErasedJson, RestError> {
     let mut block_time_list = Vec::with_capacity((end - start + 1) as usize);
     let state = rpcstate.state.lock_guard().await;
@@ -519,7 +566,7 @@ async fn get_blocks_time(
 
 async fn get_nonces(
     State(rpcstate): State<NeptuneRPCServer>,
-    Path(count): Path<u64>,
+    Path(Count(count)): Path<Count>,
 ) -> Result<ErasedJson, RestError> {
     let state = rpcstate.state.lock_guard().await;
     let end: u64 = state
@@ -530,9 +577,10 @@ async fn get_nonces(
         .header()
         .height
         .into();
-    let start = end - count + 1;
+    // A count beyond the chain stops at genesis.
+    let start = (end + 1).saturating_sub(count);
 
-    let mut block_time_list = Vec::with_capacity((end - start + 1) as usize);
+    let mut block_time_list = Vec::with_capacity((end + 1 - start) as usize);
     for cur_height in start..=end {
         let block_selector = BlockSelector::Height(cur_height.into());
         let Some(digest) = block_selector.as_digest(&state).await else {
@@ -561,7 +609,7 @@ struct SimpleBlock {
 
 async fn get_last_blocks(
     State(rpcstate): State<NeptuneRPCServer>,
-    Path(count): Path<u64>,
+    Path(Count(count)): Path<Count>,
 ) -> Result<ErasedJson, RestError> {
     let state = rpcstate.state.lock_guard().await;
     let end: u64 = state
@@ -572,9 +620,10 @@ async fn get_last_blocks(
         .header()
         .height
         .into();
-    let start = end - count + 1;
+    // A count beyond the chain stops at genesis.
+    let start = (end + 1).saturating_sub(count);
 
-    let mut block_time_list = Vec::with_capacity((end - start + 1) as usize);
+    let mut block_time_list = Vec::with_capacity((end + 1 - start) as usize);
     for cur_height in start..=end {
         let block_selector = BlockSelector::Height(cur_height.into());
         let Some(digest) = block_selector.as_digest(&state).await else {
@@ -679,8 +728,6 @@ async fn broadcast_transaction(
         bincode::deserialize_from(body.reader()).context("deserialize error")?;
     let tx: Transaction = tx.try_into().context("Failed to convert to transaction")?;
 
-    // Is transaction valid under the rule set of the next block, in which it
-    // is mined?
     let cli = rpcstate.state.cli();
     let network = cli.network;
     let (consensus_rule_set, tip_height) = {
@@ -690,10 +737,6 @@ async fn broadcast_transaction(
             state.chain.light_state().header().height,
         )
     };
-    if !tx.is_valid(network, consensus_rule_set).await {
-        return Err(RestError("Received transaction is not valid".to_owned()));
-    }
-
     // Before the fork, the terms of that era apply, as for every submission.
     if consensus_rule_set.is_legacy_era()
         && !legacy_era::submitted_transaction_meets_terms(
@@ -728,6 +771,12 @@ async fn broadcast_transaction(
         )));
     }
 
+    // Is transaction valid under the rule set of the next block, in which it
+    // is mined? Checked after the cheap checks, and before the write lock.
+    if !tx.is_valid(network, consensus_rule_set).await {
+        return Err(RestError("Received transaction is not valid".to_owned()));
+    }
+
     // Is transaction confirmable?
     let mut state = rpcstate.state.lock_guard_mut().await;
     let msa = state
@@ -752,7 +801,9 @@ async fn broadcast_transaction(
         .await
     {
         return Err(RestError(
-            "The next block follows another consensus rule set now".to_owned(),
+            "Not admitted: the next block follows another consensus rule set now, or the \
+             transaction can never fit a block"
+                .to_owned(),
         ));
     }
     let _ = rpcstate
@@ -869,10 +920,6 @@ async fn incentivized_proof_collection_transaction(
         kernel: tx.kernel.clone(),
         proof: TransactionProof::ProofCollection(tx.proof_collection.clone()),
     };
-    if !transaction.is_valid(network, consensus_rule_set).await {
-        return Err(RestError("Received transaction is not valid".to_owned()));
-    }
-
     if transaction.kernel.coinbase.is_some() {
         return Err(RestError(
             "Does not accept coinbase transactions".to_owned(),
@@ -884,6 +931,20 @@ async fn incentivized_proof_collection_transaction(
         return Err(RestError("Fee may not be negative, or zero".to_owned()));
     }
 
+    // Does transaction have acceptable timestamp?
+    let timestamp = transaction.kernel.timestamp;
+    let now = Timestamp::now();
+    if timestamp >= now + FUTUREDATING_LIMIT {
+        return Err(RestError(format!(
+            "Received tx too far into the future. Got timestamp {timestamp}"
+        )));
+    }
+
+    // Checked after the cheap checks, and before the write lock.
+    if !transaction.is_valid(network, consensus_rule_set).await {
+        return Err(RestError("Received transaction is not valid".to_owned()));
+    }
+
     // Is transaction confirmable?
     let mut state = rpcstate.state.lock_guard_mut().await;
     let msa = state
@@ -893,15 +954,6 @@ async fn incentivized_proof_collection_transaction(
         .expect("Tip block must have mutator set");
     if !transaction.is_confirmable_relative_to(&msa) {
         return Err(RestError("Transaction is not confirmable".to_owned()));
-    }
-
-    // Does transaction have acceptable timestamp?
-    let timestamp = transaction.kernel.timestamp;
-    let now = Timestamp::now();
-    if timestamp >= now + FUTUREDATING_LIMIT {
-        return Err(RestError(format!(
-            "Received tx too far into the future. Got timestamp {timestamp}"
-        )));
     }
 
     // All checks passed. Notify wallet of expected upgrade reward.
@@ -1076,9 +1128,109 @@ mod block_selector {
 
 #[cfg(test)]
 mod tests {
+    use macro_rules_attr::apply;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
     use crate::api::export::Network;
+    use crate::application::config::cli_args;
+    use crate::state::wallet::wallet_entropy::WalletEntropy;
     use crate::tests::shared::blocks::invalid_empty_block_with_proof_size;
+    use crate::tests::shared::files::unit_test_data_directory;
+    use crate::tests::shared::globalstate::mock_genesis_global_state;
+    use crate::tests::shared_tokio_runtime;
+
+    /// A REST server on a genesis-only chain, listening on a free local port.
+    async fn rest_server() -> SocketAddr {
+        let network = Network::Main;
+        let cli = cli_args::Args::default_with_network(network);
+        let state = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let to_main = state.rpc_server_to_main_tx();
+        let data_directory = unit_test_data_directory(network).unwrap();
+        let rpc = NeptuneRPCServer::new(state, to_main, data_directory, vec![]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(run_rpc_server(listener, rpc));
+        address
+    }
+
+    async fn request(address: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut response = vec![];
+        stream.read_to_end(&mut response).await.unwrap();
+        let status = std::str::from_utf8(&response[9..12])
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body_start = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (status, response[body_start..].to_vec())
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn counts_and_ranges_are_capped() {
+        let address = rest_server().await;
+        for path in [
+            "/rpc/getnonces/1001",
+            "/rpc/getlastblocks/1001",
+            "/rpc/getlastblocks/18446744073709551615",
+            "/rpc/batch_block/0/1001?include_proof=false",
+            "/rpc/mempool/0/1001",
+            "/rpc/blocks_time/5/4",
+            "/rpc/blocks_time/0/1000",
+        ] {
+            assert_eq!(400, request(address, "GET", path, &[]).await.0, "{path}");
+        }
+        for path in [
+            "/rpc/getnonces/1000",
+            "/rpc/batch_block/0/1000?include_proof=false",
+            "/rpc/mempool/0/1000",
+            "/rpc/blocks_time/0/999",
+        ] {
+            assert_eq!(200, request(address, "GET", path, &[]).await.0, "{path}");
+        }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn a_count_beyond_the_chain_stops_at_genesis() {
+        let address = rest_server().await;
+        let last_blocks = |count: u64| async move {
+            let (status, body) =
+                request(address, "GET", &format!("/rpc/getlastblocks/{count}"), &[]).await;
+            assert_eq!(200, status);
+            serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+                .unwrap()
+                .len()
+        };
+
+        assert_eq!(1, last_blocks(1000).await);
+        assert_eq!(1, last_blocks(1).await);
+        assert_eq!(0, last_blocks(0).await);
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn membership_proof_requests_are_capped() {
+        let address = rest_server().await;
+        let index_sets =
+            |n: usize| bincode::serialize(&vec![AbsoluteIndexSet::new_raw(0, [0; 45]); n]).unwrap();
+        let path = "/rpc/generate_membership_proof";
+
+        let at_cap = index_sets(MAX_ITEMS_PER_REQUEST as usize);
+        assert_eq!(MEMBERSHIP_PROOF_REQUEST_MAX_BYTES, at_cap.len());
+        assert_eq!(200, request(address, "POST", path, &at_cap).await.0);
+
+        // One byte over: the server must read all of it to refuse it, so the
+        // connection closes cleanly.
+        let mut over_cap = at_cap;
+        over_cap.push(0);
+        assert_eq!(413, request(address, "POST", path, &over_cap).await.0);
+    }
 
     #[test]
     fn exported_block_hash_calculation_is_consistent() {

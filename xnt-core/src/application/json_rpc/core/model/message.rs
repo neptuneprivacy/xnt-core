@@ -797,12 +797,42 @@ pub struct GetUtxosByReceiverResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GetAoclLeafIndicesRequest {
     pub commitments: Vec<Digest>,
+    /// Only leaves with a greater AOCL index.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Leaves per commitment, at most the default
+    /// [`MAX_AOCL_LEAVES_PER_PAGE`](crate::application::json_rpc::core::api::rpc::MAX_AOCL_LEAVES_PER_PAGE).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAoclLeafIndicesResponse {
+    /// The latest leaf index in each commitment's page.
     pub indices: Vec<Option<u64>>,
+    /// A page of each commitment's leaves, ascending: identical outputs share one commitment.
+    pub leaves: Vec<Vec<RpcAoclLeaf>>,
+    /// The `after` of each commitment's next page, if more leaves remain.
+    pub next: Vec<Option<u64>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAoclLeaf {
+    pub aocl_leaf_index: u64,
+    pub block_height: BlockHeight,
+    pub block_digest: Digest,
+}
+
+impl From<crate::state::utxo_indexer::AoclLeaf> for RpcAoclLeaf {
+    fn from(leaf: crate::state::utxo_indexer::AoclLeaf) -> Self {
+        Self {
+            aocl_leaf_index: leaf.aocl_leaf_index,
+            block_height: leaf.block_height,
+            block_digest: leaf.block_digest,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

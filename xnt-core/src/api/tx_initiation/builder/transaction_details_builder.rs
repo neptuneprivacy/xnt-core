@@ -356,7 +356,7 @@ impl TransactionDetailsBuilder {
         let receiver_digest = own_receiving_address.privacy_digest();
         let change_sender_randomness = wallet_state
             .wallet_entropy
-            .generate_sender_randomness(tip_height, receiver_digest);
+            .generate_sender_randomness_with_nonce(tip_height, receiver_digest, rand::random());
 
         match change_utxo_notify_method {
             UtxoNotificationMedium::OnChain => TxOutput::onchain_native_currency_as_change(

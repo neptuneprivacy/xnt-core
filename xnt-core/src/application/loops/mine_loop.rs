@@ -839,24 +839,22 @@ pub(crate) async fn mine(
         let (guesser_tx, guesser_rx) = oneshot::channel::<NewBlockFound>();
         let (composer_tx, composer_rx) = oneshot::channel::<(Block, Vec<ExpectedUtxo>)>();
 
-        let proposal_meets_threshold = global_state_lock
-            .lock_guard()
-            .await
-            .current_block_proposal_meets_threshold();
-        let should_guess = !wait_for_confirmation
-            && cli_args.guess
-            && proposal_meets_threshold
-            && !is_syncing
-            && !pause_mine;
-        let guesser_task: Option<JoinHandle<()>> = if should_guess {
-            let proposal = global_state_lock
-                .lock_guard()
-                .await
-                .mining_state
-                .block_proposal
-                .expect("Block proposal must be present when guesser threshold is met")
-                .clone();
+        let should_guess = !wait_for_confirmation && cli_args.guess && !is_syncing && !pause_mine;
 
+        // Read under one lock, so the proposal that meets the threshold is the
+        // one guessed on, even if the main loop replaces it meanwhile.
+        let proposal_to_guess = if should_guess {
+            global_state_lock
+                .lock(|s| {
+                    s.current_block_proposal_meets_threshold()
+                        .then(|| s.mining_state.block_proposal.map(Block::clone))
+                        .flatten()
+                })
+                .await
+        } else {
+            None
+        };
+        let guesser_task: Option<JoinHandle<()>> = if let Some(proposal) = proposal_to_guess {
             // Set guessing info on global state
             global_state_lock
                 .set_mining_status_to_guessing(&proposal)
@@ -1116,8 +1114,12 @@ pub(crate) async fn mine(
         }
         if stop_composing {
             if !composer_task.is_finished() {
-                cancel_compose_tx.send(())?;
-                debug!("Cancel signal sent to composer worker.");
+                // Fails only once the composer has dropped its receiver: it is done.
+                if cancel_compose_tx.send(()).is_err() {
+                    debug!("Composer finished before it could be cancelled.");
+                } else {
+                    debug!("Cancel signal sent to composer worker.");
+                }
             }
             // avoid duplicate call if stop_guessing is also true.
             if !stop_guessing {

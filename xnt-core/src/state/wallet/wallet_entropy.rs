@@ -205,6 +205,27 @@ impl WalletEntropy {
         )
     }
 
+    /// [`Self::generate_sender_randomness`] with a nonce mixed in. Payments and change take a
+    /// fresh one: two identical payments at one tip would otherwise share an addition record.
+    pub fn generate_sender_randomness_with_nonce(
+        &self,
+        block_height: BlockHeight,
+        receiver_digest: Digest,
+        nonce: [u8; 32],
+    ) -> Digest {
+        let nonce = nonce.chunks_exact(8).map(|chunk| {
+            BFieldElement::new(u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+        });
+        Tip5::hash_varlen(
+            &self
+                .generate_sender_randomness(block_height, receiver_digest)
+                .values()
+                .into_iter()
+                .chain(nonce)
+                .collect::<Vec<_>>(),
+        )
+    }
+
     /// Convert a secret seed phrase (list of 18 valid BIP-39 words) to a
     /// [`WalletEntropy`] object
     pub fn from_phrase(phrase: &[String]) -> Result<Self> {
@@ -249,6 +270,27 @@ mod tests {
                 secret_seed: SecretKeyMaterial(rand::RngExt::random(&mut rng)),
             }
         }
+    }
+
+    /// Sender randomness with a nonce depends on it, and only on it beyond the deterministic
+    /// part; the composer's deterministic randomness is unchanged.
+    #[test]
+    fn sender_randomness_with_a_nonce() {
+        let wallet = WalletEntropy::devnet_wallet();
+        let height = BlockHeight::from(286u64);
+        let receiver = Digest::default();
+        let with = |nonce| wallet.generate_sender_randomness_with_nonce(height, receiver, nonce);
+
+        assert_eq!(with([1; 32]), with([1; 32]));
+        assert_ne!(with([1; 32]), with([2; 32]));
+        assert_ne!(
+            wallet.generate_sender_randomness(height, receiver),
+            with([1; 32])
+        );
+        assert_eq!(
+            wallet.generate_sender_randomness(height, receiver),
+            wallet.generate_sender_randomness(height, receiver)
+        );
     }
 
     #[proptest(cases = 10)]

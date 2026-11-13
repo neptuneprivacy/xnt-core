@@ -520,6 +520,13 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
         consensus_rule_set: ConsensusRuleSet,
         parent_digest: Digest,
     ) -> Result<(), PowValidationError> {
+        // The threshold is cheap to check, the memory-hard leaves are not.
+        let pow_digest = auth_paths.fast_mast_hash(self);
+        let meets_threshold = pow_digest <= target;
+        if !meets_threshold {
+            return Err(PowValidationError::ThresholdNotMet);
+        }
+
         let leaf_prefix = if consensus_rule_set.pow_index_bit_reversal() {
             parent_digest
         } else {
@@ -553,12 +560,6 @@ impl<const MERKLE_TREE_HEIGHT: usize> Pow<MERKLE_TREE_HEIGHT> {
         }
         if !MTree::verify(self.root, index_b as usize, &self.path_b, leaf_b) {
             return Err(PowValidationError::PathBInvalid);
-        }
-
-        let pow_digest = auth_paths.fast_mast_hash(self);
-        let meets_threshold = pow_digest <= target;
-        if !meets_threshold {
-            return Err(PowValidationError::ThresholdNotMet);
         }
 
         Ok(())
@@ -621,6 +622,33 @@ pub(crate) mod tests {
         fn leaf(&self, index: usize) -> Digest {
             self.leafs[index]
         }
+    }
+
+    #[test]
+    fn unmet_threshold_is_refused_before_the_paths_are_checked() {
+        let mut rng = rng();
+        let auth_paths = rng.random::<PowMastPaths>();
+        let pow = rng.random::<Pow<10>>();
+        let parent_digest = rng.random();
+        let validate = |target| {
+            pow.validate(
+                auth_paths,
+                target,
+                ConsensusRuleSet::default(),
+                parent_digest,
+            )
+        };
+
+        assert_eq!(
+            Err(PowValidationError::ThresholdNotMet),
+            validate(Digest::default())
+        );
+        assert_eq!(
+            Err(PowValidationError::PathAInvalid),
+            validate(Digest::new(
+                [BFieldElement::new(BFieldElement::MAX); Digest::LEN]
+            ))
+        );
     }
 
     #[test]

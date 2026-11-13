@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use futures::StreamExt;
+use itertools::Itertools;
 use tasm_lib::prelude::Digest;
 use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::prelude::Mmr;
@@ -35,6 +38,7 @@ use crate::protocol::consensus::block::FUTUREDATING_LIMIT;
 use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 
 use crate::application::database::storage::storage_vec::traits::StorageVecStream;
+use crate::state::utxo_indexer::AoclLeaf;
 use crate::state::wallet::address::KeyType;
 use crate::state::wallet::change_policy::ChangePolicy;
 use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
@@ -691,9 +695,6 @@ impl RpcApi for RpcServer {
         let transaction: Transaction = request.transaction.into();
         let network = self.state.cli().network;
 
-        // The transaction must be valid under the rule set of the next block,
-        // in which it is mined. Next to a hard fork, one valid on the other
-        // side of it is reported as such.
         let tip_height = self
             .state
             .lock_guard()
@@ -703,25 +704,6 @@ impl RpcApi for RpcServer {
             .header()
             .height;
         let consensus_rule_set = ConsensusRuleSet::infer_for_next_block(network, tip_height);
-        if !transaction.is_valid(network, consensus_rule_set).await {
-            let neighboring_rule_sets = [
-                ConsensusRuleSet::infer_from(network, tip_height),
-                ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
-            ];
-            for neighboring_rule_set in neighboring_rule_sets {
-                if neighboring_rule_set != consensus_rule_set
-                    && transaction.is_valid(network, neighboring_rule_set).await
-                {
-                    return Err(RpcError::SubmitTransaction(
-                        SubmitTransactionError::OtherEra,
-                    ));
-                }
-            }
-
-            return Err(RpcError::SubmitTransaction(
-                SubmitTransactionError::InvalidTransaction,
-            ));
-        }
 
         // Before the fork, a transaction must meet the terms on which the
         // nodes of that era relay and upgrade it, and not come too close to
@@ -770,6 +752,29 @@ impl RpcApi for RpcServer {
         if !transaction.is_confirmable_relative_to(&msa) {
             return Err(RpcError::SubmitTransaction(
                 SubmitTransactionError::NotConfirmable,
+            ));
+        }
+
+        // The transaction must be valid under the rule set of the next block,
+        // in which it is mined. Next to a hard fork, one valid on the other
+        // side of it is reported as such. Checked last: it verifies proofs.
+        if !transaction.is_valid(network, consensus_rule_set).await {
+            let neighboring_rule_sets = [
+                ConsensusRuleSet::infer_from(network, tip_height),
+                ConsensusRuleSet::infer_for_next_block(network, tip_height.next()),
+            ];
+            for neighboring_rule_set in neighboring_rule_sets {
+                if neighboring_rule_set != consensus_rule_set
+                    && transaction.is_valid(network, neighboring_rule_set).await
+                {
+                    return Err(RpcError::SubmitTransaction(
+                        SubmitTransactionError::OtherEra,
+                    ));
+                }
+            }
+
+            return Err(RpcError::SubmitTransaction(
+                SubmitTransactionError::InvalidTransaction,
             ));
         }
 
@@ -849,19 +854,19 @@ impl RpcApi for RpcServer {
     ) -> RpcResult<SubmitBlockResponse> {
         let mut template: Block = request.template.into();
 
-        // Since block comes from external source, we need to check validity.
+        let network = self.state.cli().network;
         let tip = self.state.lock_guard().await.chain.light_state().clone();
-        if !template
-            .is_valid(&tip, Timestamp::now(), self.state.cli().network)
-            .await
-        {
-            return Err(RpcError::SubmitBlock(SubmitBlockError::InvalidBlock));
-        }
 
+        // The block comes from an external source, so it needs to be checked
+        // for validity. Both checks run *after* the pow solution is inserted.
         template.set_header_pow(request.pow.into());
 
-        if !template.has_proof_of_work(self.state.cli().network, template.header()) {
+        if !template.has_proof_of_work(network, tip.header()) {
             return Err(RpcError::SubmitBlock(SubmitBlockError::InsufficientWork));
+        }
+
+        if !template.is_valid(&tip, Timestamp::now(), network).await {
+            return Err(RpcError::SubmitBlock(SubmitBlockError::InvalidBlock));
         }
 
         // No time to waste! Inform main_loop!
@@ -1484,13 +1489,79 @@ impl RpcApi for RpcServer {
         &self,
         request: GetAoclLeafIndicesRequest,
     ) -> RpcResult<GetAoclLeafIndicesResponse> {
-        let state = self.state.lock_guard().await;
+        let got = request.commitments.len();
+        if got > MAX_AOCL_LEAF_COMMITMENTS {
+            return Err(RpcError::TooManyCommitments {
+                max: MAX_AOCL_LEAF_COMMITMENTS,
+                got,
+            });
+        }
+        let limit = request.limit.map_or(MAX_AOCL_LEAVES_PER_PAGE, |limit| {
+            limit.clamp(1, MAX_AOCL_LEAVES_PER_PAGE)
+        });
+        let unique = request.commitments.iter().copied().unique().collect_vec();
+        let indexed_leaves = {
+            let state = self.state.lock_guard().await;
+            let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
+            indexer.get_aocl_leaves(&unique).await
+        };
 
-        let indexer = state.utxo_indexer().ok_or(RpcError::UtxoIndexerDisabled)?;
+        // The index misses some forks' blocks: a leaf counts only if its block is canonical.
+        // The lock is taken per block read, so a commitment with many leaves doesn't hold it.
+        let mut digest_at_height = HashMap::new();
+        let mut pages = HashMap::new();
+        for (commitment, mut commitment_leaves) in unique.into_iter().zip(indexed_leaves) {
+            commitment_leaves.sort_by_key(|leaf| leaf.aocl_leaf_index);
+            let mut page = Vec::new();
+            let mut next = None;
+            for leaf in commitment_leaves.into_iter().filter(|leaf| {
+                request
+                    .after
+                    .is_none_or(|after| leaf.aocl_leaf_index > after)
+            }) {
+                let height = u64::from(leaf.block_height);
+                let canonical_digest = match digest_at_height.get(&height) {
+                    Some(digest) => *digest,
+                    None => {
+                        let digest = self
+                            .state
+                            .lock_guard()
+                            .await
+                            .chain
+                            .archival_state()
+                            .archival_block_mmr
+                            .ammr()
+                            .try_get_leaf(height)
+                            .await;
+                        digest_at_height.insert(height, digest);
+                        digest
+                    }
+                };
+                if canonical_digest != Some(leaf.block_digest) {
+                    continue;
+                }
+                if page.len() == limit {
+                    next = page.last().map(|last: &AoclLeaf| last.aocl_leaf_index);
+                    break;
+                }
+                page.push(leaf);
+            }
+            pages.insert(commitment, (page, next));
+        }
 
-        let indices = indexer.get_aocl_leaf_indices(&request.commitments).await;
+        let (mut indices, mut leaves, mut next) = (Vec::new(), Vec::new(), Vec::new());
+        for commitment in &request.commitments {
+            let (page, page_next) = &pages[commitment];
+            indices.push(AoclLeaf::latest_index(page));
+            leaves.push(page.iter().copied().map(RpcAoclLeaf::from).collect());
+            next.push(*page_next);
+        }
 
-        Ok(GetAoclLeafIndicesResponse { indices })
+        Ok(GetAoclLeafIndicesResponse {
+            indices,
+            leaves,
+            next,
+        })
     }
 
     async fn get_spent_status_call(
@@ -1580,7 +1651,11 @@ pub mod tests {
     use crate::Block;
 
     pub async fn test_rpc_server() -> RpcServer {
-        let mut cli = cli_args::Args::default_with_network(Network::Main);
+        test_rpc_server_on(Network::Main).await
+    }
+
+    pub async fn test_rpc_server_on(network: Network) -> RpcServer {
+        let mut cli = cli_args::Args::default_with_network(network);
         cli.tx_proving_capability = Some(TxProvingCapability::ProofCollection);
         let global_state_lock =
             mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
@@ -1975,6 +2050,106 @@ pub mod tests {
     }
 
     #[apply(shared_tokio_runtime)]
+    async fn aocl_leaves_come_in_pages() {
+        use itertools::Itertools;
+        use proptest::prelude::Strategy;
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        use tasm_lib::triton_vm::prelude::BFieldElement;
+
+        use crate::application::json_rpc::core::api::rpc::MAX_AOCL_LEAF_COMMITMENTS;
+        use crate::application::json_rpc::core::model::message::GetAoclLeafIndicesRequest;
+        use crate::application::json_rpc::core::model::message::GetAoclLeafIndicesResponse;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+        use crate::util_types::mutator_set::addition_record::AdditionRecord;
+
+        let mut cli = cli_args::Args::default_with_network(Network::Main);
+        cli.utxo_indexer = true;
+        let state = mock_genesis_global_state(2, WalletEntropy::new_random(), cli).await;
+        let mut rpc_server = RpcServer::new(state, None);
+        let first_leaf = rpc_server
+            .state
+            .lock_guard()
+            .await
+            .chain
+            .archival_state()
+            .archival_mutator_set
+            .ams()
+            .aocl
+            .num_leafs()
+            .await;
+
+        let commitment = Digest::new([BFieldElement::new(7); 5]);
+        let kernel = txkernel::with_lengths(0usize, 0usize, 0usize, true)
+            .new_tree(&mut TestRunner::deterministic())
+            .unwrap()
+            .current();
+        let kernel = TransactionKernelModifier::default()
+            .outputs(vec![AdditionRecord::new(commitment); 5])
+            .modify(kernel);
+        let transaction = Transaction {
+            kernel,
+            proof: TransactionProof::invalid(),
+        };
+        let block = invalid_block_with_transaction(&Block::genesis(Network::Main), transaction);
+        rpc_server.state.set_new_tip(block).await.unwrap();
+
+        let page = |commitments: Vec<Digest>, after, limit| {
+            rpc_server.get_aocl_leaf_indices_call(GetAoclLeafIndicesRequest {
+                commitments,
+                after,
+                limit,
+            })
+        };
+        let indices = |response: &GetAoclLeafIndicesResponse| {
+            response
+                .leaves
+                .iter()
+                .map(|leaves| leaves.iter().map(|leaf| leaf.aocl_leaf_index).collect_vec())
+                .collect_vec()
+        };
+        let all = (first_leaf..first_leaf + 5).collect_vec();
+
+        let first = page(vec![commitment], None, Some(2)).await.unwrap();
+        assert_eq!(vec![all[..2].to_vec()], indices(&first));
+        assert_eq!(vec![Some(all[1])], first.next);
+        assert_eq!(vec![Some(all[1])], first.indices);
+
+        let middle = page(vec![commitment], first.next[0], Some(2))
+            .await
+            .unwrap();
+        assert_eq!(vec![all[2..4].to_vec()], indices(&middle));
+        assert_eq!(vec![Some(all[3])], middle.next);
+
+        let last = page(vec![commitment], middle.next[0], Some(2))
+            .await
+            .unwrap();
+        assert_eq!(vec![all[4..].to_vec()], indices(&last));
+        assert_eq!(vec![None], last.next);
+
+        let exactly_full = page(vec![commitment], None, Some(5)).await.unwrap();
+        assert_eq!(vec![all.clone()], indices(&exactly_full));
+        assert_eq!(vec![None], exactly_full.next);
+
+        let unknown = Digest::new([BFieldElement::new(8); 5]);
+        let repeated = page(vec![commitment, unknown, commitment], None, None)
+            .await
+            .unwrap();
+        assert_eq!(vec![all.clone(), vec![], all], indices(&repeated));
+        assert_eq!(vec![None, None, None], repeated.next);
+
+        assert!(matches!(
+            page(vec![commitment; MAX_AOCL_LEAF_COMMITMENTS + 1], None, None).await,
+            Err(RpcError::TooManyCommitments { max, got })
+                if max == MAX_AOCL_LEAF_COMMITMENTS && got == max + 1
+        ));
+
+        let positional: GetAoclLeafIndicesRequest =
+            serde_json::from_value(serde_json::json!([[commitment]])).unwrap();
+        assert_eq!((None, None), (positional.after, positional.limit));
+    }
+
+    #[apply(shared_tokio_runtime)]
     async fn remote_wallets_behave_correctly() {
         let mut rpc_server = test_rpc_server().await;
         let network = rpc_server.state.cli().network;
@@ -2091,6 +2266,36 @@ pub mod tests {
     }
 
     #[apply(shared_tokio_runtime)]
+    async fn a_coinbase_transaction_is_refused_before_its_proof_is_verified() {
+        use proptest::prelude::Strategy;
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        use crate::application::json_rpc::core::api::rpc::SubmitTransactionError;
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelModifier;
+
+        let rpc_server = test_rpc_server().await;
+        let kernel = txkernel::with_lengths(0usize, 0usize, 0usize, true)
+            .new_tree(&mut TestRunner::deterministic())
+            .unwrap()
+            .current();
+        let transaction = Transaction {
+            kernel: TransactionKernelModifier::default()
+                .coinbase(Some(NativeCurrencyAmount::coins(1)))
+                .modify(kernel),
+            proof: TransactionProof::invalid(),
+        };
+
+        assert_eq!(
+            RpcError::SubmitTransaction(SubmitTransactionError::CoinbaseTransaction),
+            rpc_server
+                .submit_transaction(transaction.into())
+                .await
+                .unwrap_err()
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
     async fn mining_scenarios_validated_properly() {
         use crate::application::json_rpc::core::api::rpc::SubmitBlockError;
 
@@ -2139,6 +2344,9 @@ pub mod tests {
             "Node must accept valid new tip."
         );
 
+        // Stripping the proof also invalidates the solution, since the block's
+        // proof is committed to by its hash. So the proof-of-work check, which
+        // runs first, is the one that rejects this.
         let mut bad_proposal = block;
         bad_proposal.proof = None;
         assert_eq!(
@@ -2146,7 +2354,7 @@ pub mod tests {
                 .submit_block(bad_proposal.clone(), solution)
                 .await
                 .unwrap_err(),
-            RpcError::SubmitBlock(SubmitBlockError::InvalidBlock)
+            RpcError::SubmitBlock(SubmitBlockError::InsufficientWork)
         );
     }
 

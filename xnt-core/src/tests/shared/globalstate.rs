@@ -96,7 +96,19 @@ pub(crate) async fn mock_genesis_global_state_with_block(
         }
     });
 
-    let global_state = GlobalState::new(wallet_state, chain, net, cli, mempool);
+    let utxo_indexer = if cli.utxo_indexer {
+        Some(
+            crate::state::utxo_indexer::UtxoIndexerDatabase::open_or_recreate(
+                &data_dir.utxo_indexer_database_dir_path(),
+            )
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    let global_state =
+        GlobalState::new_with_indexer(wallet_state, chain, net, cli, mempool, utxo_indexer);
 
     GlobalStateLock::from_global_state(global_state, rpc_to_main_tx)
 }

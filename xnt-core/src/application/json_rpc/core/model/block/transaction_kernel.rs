@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde::Deserialize;
 use serde::Serialize;
 use tasm_lib::prelude::Digest;
@@ -20,8 +18,43 @@ use crate::util_types::mutator_set::removal_record::RemovalRecord;
 
 pub type RpcAbsoluteIndexSet = AbsoluteIndexSet;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct RpcChunkDictionary(pub BTreeMap<u64, (RpcMmrMembershipProof, Vec<u32>)>);
+/// Uses Vec to preserve the original ChunkDictionary entry ordering.
+/// BTreeMap<u64> would re-sort keys numerically, changing the BFieldCodec
+/// encoding and thus the block hash.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Default)]
+pub struct RpcChunkDictionary(pub Vec<(u64, (RpcMmrMembershipProof, Vec<u32>))>);
+
+/// Also reads upstream nodes' JSON object form, whose keys are already sorted.
+impl<'de> Deserialize<'de> for RpcChunkDictionary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        type Entry = (RpcMmrMembershipProof, Vec<u32>);
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Ordered(Vec<(u64, Entry)>),
+            // Keys stay strings: untagged buffering does not parse them as numbers.
+            Upstream(std::collections::BTreeMap<String, Entry>),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Ordered(entries) => Ok(Self(entries)),
+            Repr::Upstream(entries) => {
+                let mut entries = entries
+                    .into_iter()
+                    .map(|(index, entry)| {
+                        index
+                            .parse::<u64>()
+                            .map(|index| (index, entry))
+                            .map_err(serde::de::Error::custom)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                entries.sort_by_key(|(index, _)| *index);
+                Ok(Self(entries))
+            }
+        }
+    }
+}
 
 impl From<ChunkDictionary> for RpcChunkDictionary {
     fn from(value: ChunkDictionary) -> Self {
@@ -175,3 +208,23 @@ impl From<RpcTransactionKernel> for TransactionKernel {
 }
 
 pub type RpcTransactionKernelId = TransactionKernelId;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_dictionary_reads_its_own_and_upstreams_json() {
+        let entry = |seed: u32| (RpcMmrMembershipProof::default(), vec![seed, seed + 1]);
+        let ours = RpcChunkDictionary(vec![(1, entry(10)), (3, entry(30))]);
+        let ordered = serde_json::to_value(&ours).unwrap();
+        let upstream = serde_json::json!({
+            "3": serde_json::to_value(entry(30)).unwrap(),
+            "1": serde_json::to_value(entry(10)).unwrap(),
+        });
+
+        assert_eq!(ours, serde_json::from_value(ordered).unwrap());
+        assert_eq!(ours, serde_json::from_value(upstream).unwrap());
+    }
+}
