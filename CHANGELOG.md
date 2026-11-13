@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-13
+
+No consensus change, no new peer message and no new sanction kind: v0.3.2 works with peers on v0.3.1 and earlier, and they need not upgrade.
+
+### Fixed
+
+- **`submit_block`**: the PoW solution is inserted first, then checked against the tip's header, then the block's validity. Previously the PoW was checked against the submitted block's own header and validity before the solution was set.
+- **Chained sends**: `send_chained` and `send_chained_link` refuse a recipient that cannot receive, as a normal send does.
+- **REST parameters**: counts and ranges are capped at 1000 (HTTP 400), `getnonces`/`getlastblocks` stop at genesis instead of underflowing, and an oversized `generate_membership_proof` body gets HTTP 413.
+- **Cheap checks before proof verification**: the PoW threshold is checked before the memory-hard paths, and JSON-RPC/REST transaction submission verifies proofs after the cheap rejects.
+- **Mempool and mining**: a transaction that can never fit a block is refused, merge pairs whose merger cannot fit a block are not offered, and the mine loop no longer stops on a cleared proposal or an already finished composer.
+- **Identical payments**: payment and change sender randomness takes a fresh nonce, and the UTXO indexer keeps every AOCL leaf of a commitment instead of only the last.
+- **JSON block encoding**: a block's chunk dictionary keeps its entry order through JSON, so a block with packed inputs keeps its hash.
+
+### Added
+
+- `leaves` in the AOCL leaf index JSON-RPC response: every AOCL leaf of each commitment in canonical blocks, paged, at most 1000 commitments per request.
+- Wallet scan for TASM bridge payouts.
+- `Dockerfile` and `rust-toolchain.toml`.
+
+### Changed
+
+- UTXO indexer schema v4: an indexer database from an older version is deleted and re-indexed from genesis on first start.
+- Updated package version from 0.3.1 to 0.3.2 (workspace-wide).
+
 ## [0.3.1] - 2026-11-05
 
 No consensus change, no new peer message and no new sanction kind: v0.3.1 works with peers on v0.3.0 and earlier, and they need not upgrade.
