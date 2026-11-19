@@ -504,3 +504,48 @@ None
 **Returns**
 
 `mutatorSet` - object, bincode-serialized mutator set (hex-encoded)
+
+---
+
+## archival_getMutatorSetUpdate
+
+Returns what brings a transaction made at an older mutator set to the tip: that mutator set and the
+removals and additions of every block since. Only the tip's mutator set and those of its 100 latest
+ancestors are found.
+
+**Parameters**
+
+1. `mutatorSetHash` - string, hex digest: the transaction kernel's mutator set hash
+
+**Returns**
+
+`update` - object or `null` if not found:
+- `oldMutatorSet` - object, the mutator set with that hash
+- `removals` - array of removal records, synced to `oldMutatorSet`, applied after all the additions
+- `additions` - array of addition records, in application order
+- `tipHeight` - number, the tip the update ends at
+- `nextBlockConsensusRuleSet` - string, the rule set the updated transaction is proven and mined under,
+  as its variant name in PascalCase: `Reboot`, `HardforkAlpha`, `Xnt`, `TimelockExtension`, `UpgradeVM`,
+  `UpgradeVMv4`, `UpgradeVMv5`, `UpgradeVMv7` or `UpgradeVMv8`
+
+**Example**
+
+```
+// Request
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"archival_getMutatorSetUpdate","params":["04e19a9adfefa811f68d8de45da6412d0d73368159a119af97cfd38da6cfc55ae7c6ba403b9c8b52"],"id":1}'
+
+// Result
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "update": {
+      "oldMutatorSet": { ... },
+      "removals": [ ... ],
+      "additions": [ ... ],
+      "tipHeight": 1024,
+      "nextBlockConsensusRuleSet": "UpgradeVMv8"
+    }
+  }
+}
+```

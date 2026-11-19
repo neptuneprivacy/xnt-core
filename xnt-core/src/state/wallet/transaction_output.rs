@@ -354,11 +354,11 @@ impl TxOutput {
         )
     }
 
-    pub(crate) fn utxo(&self) -> Utxo {
+    pub fn utxo(&self) -> Utxo {
         self.utxo.clone()
     }
 
-    pub(crate) fn sender_randomness(&self) -> Digest {
+    pub fn sender_randomness(&self) -> Digest {
         self.sender_randomness
     }
 
@@ -450,7 +450,7 @@ impl TxOutput {
         }
     }
 
-    pub(crate) fn addition_record(&self) -> AdditionRecord {
+    pub fn addition_record(&self) -> AdditionRecord {
         self.utxo_triple().addition_record()
     }
 }

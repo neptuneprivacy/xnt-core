@@ -22,21 +22,21 @@ use crate::util_types::mutator_set::addition_record::AdditionRecord;
 ///    (There is one exception to this rule: for guesser fee UTXOs, the unlock
 ///    key coincides with the receiver preimage.)
 ///
-/// See [UtxoNotificationPayload], [ExpectedUtxo]
+/// See [UtxoNotificationPayload], `ExpectedUtxo`
 #[derive(Clone, Debug)]
 #[cfg_attr(any(test, feature = "arbitrary-impls"), derive(Arbitrary))]
-pub(crate) struct IncomingUtxo {
-    pub(crate) utxo: Utxo,
-    pub(crate) sender_randomness: Digest,
-    pub(crate) receiver_preimage: Digest,
+pub struct IncomingUtxo {
+    pub utxo: Utxo,
+    pub sender_randomness: Digest,
+    pub receiver_preimage: Digest,
 
     /// Whether the UTXO is a guesser fee or not. Only to be used for log
     /// messages and wallet info. Does not affect how the ability to claim the
     /// UTXO.
-    pub(crate) is_guesser_fee: bool,
+    pub is_guesser_fee: bool,
 
     /// Payment ID from subaddress announcement. Zero for base address announcements.
-    pub(crate) payment_id: BFieldElement,
+    pub payment_id: BFieldElement,
 }
 
 impl PartialEq for IncomingUtxo {

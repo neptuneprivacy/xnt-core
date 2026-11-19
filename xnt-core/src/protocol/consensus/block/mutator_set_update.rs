@@ -1,6 +1,10 @@
+use anyhow::bail;
+use anyhow::ensure;
 use anyhow::Result;
+use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
+use tasm_lib::prelude::Tip5;
 use tasm_lib::twenty_first::util_types::mmr::mmr_trait::Mmr;
 
 use crate::util_types::mutator_set::addition_record::AdditionRecord;
@@ -165,6 +169,42 @@ impl MutatorSetUpdate {
         } else {
             Err(anyhow::anyhow!("Cannot remove item from mutator set."))
         }
+    }
+
+    /// Fails unless this update, from an untrusted source, applies to
+    /// `ms_accumulator` without panicking.
+    pub(crate) fn check_applies_to(&self, ms_accumulator: &MutatorSetAccumulator) -> Result<()> {
+        // replaying the additions asserts that every chunk index is in bounds
+        let peaks = ms_accumulator.swbf_inactive.peaks();
+        let num_leafs = ms_accumulator.swbf_inactive.num_leafs();
+        for (i, removal) in self.removals.iter().enumerate() {
+            let authenticated =
+                removal
+                    .target_chunks
+                    .iter()
+                    .all(|(chunk_index, (mmr_proof, chunk))| {
+                        mmr_proof.verify(*chunk_index, Tip5::hash(chunk), &peaks, num_leafs)
+                    });
+            ensure!(authenticated, "Removal record {i} does not authenticate.");
+        }
+
+        let mut after_additions = ms_accumulator.clone();
+        let mut removals = self.removals.clone();
+        for addition_record in &self.additions {
+            RemovalRecord::batch_update_from_addition(
+                &mut removals.iter_mut().collect_vec(),
+                &after_additions,
+            );
+            after_additions.add(addition_record);
+        }
+        if let Some(i) = removals.iter().position(|r| !r.validate(&after_additions)) {
+            bail!("Removal record {i} is not valid.");
+        }
+        ensure!(
+            after_additions.can_remove_all(&removals),
+            "Removal records cannot all be removed."
+        );
+        Ok(())
     }
 
     /// Apply a mutator set update to a mutator set accumulator. Modifies the

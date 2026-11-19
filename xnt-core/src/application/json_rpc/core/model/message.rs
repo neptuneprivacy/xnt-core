@@ -19,12 +19,15 @@ use crate::application::rpc::server::network_overview_data::NetworkOverviewData;
 
 use crate::protocol::consensus::block::block_height::BlockHeight;
 use crate::protocol::consensus::block::difficulty_control::Difficulty;
+use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+use crate::protocol::consensus::consensus_rule_set::ConsensusRuleSet;
 use crate::protocol::proof_abstractions::timestamp::Timestamp;
 use crate::state::mempool::mempool_event::AddReason;
 use crate::state::mempool::mempool_event::MempoolEventBatch;
 use crate::state::mempool::mempool_event::MempoolEventInfo;
 use crate::state::mempool::mempool_event::RemovalReason;
 use crate::state::transaction::transaction_kernel_id::TransactionKernelId;
+use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
 
 #[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
 #[serde(rename_all = "camelCase")]
@@ -377,6 +380,41 @@ pub struct GetArchivalMutatorSetRequest {}
 #[serde(rename_all = "camelCase")]
 pub struct GetArchivalMutatorSetResponse {
     pub archival_mutator_set: RpcMutatorSetAccumulator,
+}
+
+#[derive(Clone, Copy, Debug, Serialize_tuple, Deserialize_tuple)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMutatorSetUpdateRequest {
+    pub mutator_set_hash: Digest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMutatorSetUpdateResponse {
+    /// `None` unless the mutator set is the tip's or one of its 100 latest ancestors'.
+    pub update: Option<RpcMutatorSetUpdateToTip>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcMutatorSetUpdateToTip {
+    pub old_mutator_set: RpcMutatorSetAccumulator,
+    pub removals: Vec<RpcRemovalRecord>,
+    pub additions: Vec<RpcAdditionRecord>,
+    pub tip_height: BlockHeight,
+    pub next_block_consensus_rule_set: ConsensusRuleSet,
+}
+
+impl From<RpcMutatorSetUpdateToTip> for (MutatorSetAccumulator, MutatorSetUpdate) {
+    fn from(update: RpcMutatorSetUpdateToTip) -> Self {
+        (
+            update.old_mutator_set.into(),
+            MutatorSetUpdate::new(
+                update.removals.into_iter().map(Into::into).collect(),
+                update.additions.into_iter().map(Into::into).collect(),
+            ),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

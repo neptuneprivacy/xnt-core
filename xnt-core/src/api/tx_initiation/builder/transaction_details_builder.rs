@@ -32,6 +32,7 @@ use crate::state::wallet::transaction_input::TxInputList;
 use crate::state::wallet::transaction_output::TxOutput;
 use crate::state::wallet::transaction_output::TxOutputList;
 use crate::state::wallet::utxo_notification::UtxoNotificationMedium;
+use crate::state::wallet::wallet_entropy::WalletEntropy;
 use crate::state::GlobalState;
 use crate::state::StateLock;
 use crate::Block;
@@ -351,12 +352,30 @@ impl TransactionDetailsBuilder {
         change_key: SpendingKey,
         change_utxo_notify_method: UtxoNotificationMedium,
     ) -> TxOutput {
+        Self::create_change_output_from_entropy(
+            &wallet_state.wallet_entropy,
+            tip_height,
+            change_amount,
+            change_key,
+            change_utxo_notify_method,
+        )
+    }
+
+    pub fn create_change_output_from_entropy(
+        wallet_entropy: &WalletEntropy,
+        tip_height: BlockHeight,
+        change_amount: NativeCurrencyAmount,
+        change_key: SpendingKey,
+        change_utxo_notify_method: UtxoNotificationMedium,
+    ) -> TxOutput {
         let own_receiving_address = change_key.to_address();
 
         let receiver_digest = own_receiving_address.privacy_digest();
-        let change_sender_randomness = wallet_state
-            .wallet_entropy
-            .generate_sender_randomness_with_nonce(tip_height, receiver_digest, rand::random());
+        let change_sender_randomness = wallet_entropy.generate_sender_randomness_with_nonce(
+            tip_height,
+            receiver_digest,
+            rand::random(),
+        );
 
         match change_utxo_notify_method {
             UtxoNotificationMedium::OnChain => TxOutput::onchain_native_currency_as_change(
@@ -370,5 +389,50 @@ impl TransactionDetailsBuilder {
                 own_receiving_address,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use num_traits::Zero;
+
+    use super::*;
+    use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+
+    #[test]
+    fn change_from_entropy_is_found_by_its_key() {
+        let entropy = WalletEntropy::new_random();
+        let key = SpendingKey::from(entropy.nth_generation_spending_key(0));
+        let change = TransactionDetailsBuilder::create_change_output_from_entropy(
+            &entropy,
+            BlockHeight::genesis(),
+            NativeCurrencyAmount::coins(3),
+            key.clone(),
+            UtxoNotificationMedium::OnChain,
+        );
+        let kernel = TransactionKernelProxy {
+            inputs: vec![],
+            outputs: vec![change.addition_record()],
+            announcements: vec![change.announcement().unwrap()],
+            fee: NativeCurrencyAmount::zero(),
+            coinbase: None,
+            timestamp: Timestamp::now(),
+            mutator_set_hash: Digest::default(),
+            merge_bit: false,
+        }
+        .into_kernel();
+
+        let found = key.scan_for_announced_utxos(&kernel);
+        assert_eq!(1, found.len());
+        assert_eq!(change.utxo(), found[0].utxo);
+        assert_eq!(change.sender_randomness(), found[0].sender_randomness);
+        assert_eq!(key.privacy_preimage(), found[0].receiver_preimage);
+        assert_eq!(change.addition_record(), found[0].addition_record());
+        assert!(change.is_change() && change.is_owned());
+
+        let other_key =
+            SpendingKey::from(WalletEntropy::new_random().nth_generation_spending_key(0));
+        assert!(other_key.scan_for_announced_utxos(&kernel).is_empty());
     }
 }

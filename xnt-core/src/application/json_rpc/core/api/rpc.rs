@@ -560,6 +560,18 @@ pub trait RpcApi: Sync + Send {
         request: GetArchivalMutatorSetRequest,
     ) -> RpcResult<GetArchivalMutatorSetResponse>;
 
+    async fn get_mutator_set_update(
+        &self,
+        mutator_set_hash: Digest,
+    ) -> RpcResult<GetMutatorSetUpdateResponse> {
+        self.get_mutator_set_update_call(GetMutatorSetUpdateRequest { mutator_set_hash })
+            .await
+    }
+    async fn get_mutator_set_update_call(
+        &self,
+        request: GetMutatorSetUpdateRequest,
+    ) -> RpcResult<GetMutatorSetUpdateResponse>;
+
     /* Networking */
 
     async fn network_overview(&self) -> RpcResult<NetworkOverviewResponse> {

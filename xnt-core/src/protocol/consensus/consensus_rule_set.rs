@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+use serde::Deserialize;
+use serde::Serialize;
 use strum_macros::EnumIter;
 
 use crate::api::export::BlockHeight;
@@ -216,7 +218,18 @@ fn set_v8_activation_height_in(
 /// Consensus logic not captured by this encapsulation lives on
 /// [`Transaction::is_valid`][super::transaction::Transaction::is_valid] and
 /// ultimately [`Block::is_valid`][super::block::Block::is_valid].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Default, strum_macros::Display)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    EnumIter,
+    Default,
+    strum_macros::Display,
+    Serialize,
+    Deserialize,
+)]
 pub enum ConsensusRuleSet {
     Reboot,
     HardforkAlpha,

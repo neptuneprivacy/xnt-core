@@ -21,7 +21,10 @@ pub mod utxo;
 pub(crate) mod utxo_triple;
 pub mod validity;
 
+use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::ensure;
+use anyhow::Context;
 use anyhow::Result;
 use get_size2::GetSize;
 use itertools::Itertools;
@@ -103,11 +106,76 @@ impl Transaction {
         new_timestamp: Option<Timestamp>,
         consensus_rule_set: ConsensusRuleSet,
     ) -> anyhow::Result<Transaction> {
+        Self::update_given_proof(
+            old_transaction_kernel,
+            previous_mutator_set_accumulator,
+            mutator_set_update,
+            old_single_proof,
+            triton_vm_job_queue,
+            proof_job_options,
+            new_timestamp,
+            consensus_rule_set,
+            false,
+        )
+        .await
+    }
+
+    /// `new_with_updated_mutator_set_records_given_proof` for a transaction and update from
+    /// outside this node: fails before proving unless the update applies and the old proof is
+    /// valid on the proof job's network.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn new_confirmable_with_updated_mutator_set_records_given_proof(
+        old_transaction_kernel: TransactionKernel,
+        previous_mutator_set_accumulator: &MutatorSetAccumulator,
+        mutator_set_update: &MutatorSetUpdate,
+        old_single_proof: Proof,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+        new_timestamp: Option<Timestamp>,
+        consensus_rule_set: ConsensusRuleSet,
+    ) -> anyhow::Result<Transaction> {
+        Self::update_given_proof(
+            old_transaction_kernel,
+            previous_mutator_set_accumulator,
+            mutator_set_update,
+            old_single_proof,
+            triton_vm_job_queue,
+            proof_job_options,
+            new_timestamp,
+            consensus_rule_set,
+            true,
+        )
+        .await
+    }
+
+    /// `untrusted`: check the transaction and update before proving.
+    #[expect(clippy::too_many_arguments)]
+    async fn update_given_proof(
+        old_transaction_kernel: TransactionKernel,
+        previous_mutator_set_accumulator: &MutatorSetAccumulator,
+        mutator_set_update: &MutatorSetUpdate,
+        old_single_proof: Proof,
+        triton_vm_job_queue: Arc<TritonVmJobQueue>,
+        proof_job_options: TritonVmProofJobOptions,
+        new_timestamp: Option<Timestamp>,
+        consensus_rule_set: ConsensusRuleSet,
+        untrusted: bool,
+    ) -> anyhow::Result<Transaction> {
         ensure!(
             old_transaction_kernel.mutator_set_hash == previous_mutator_set_accumulator.hash(),
             "Old transaction kernel's mutator set hash does not agree \
                 with supplied mutator set accumulator."
         );
+        if untrusted {
+            if let Some(i) = old_transaction_kernel
+                .inputs
+                .iter()
+                .position(|input| !input.validate(previous_mutator_set_accumulator))
+            {
+                bail!("Input {i} is not valid against the old mutator set.");
+            }
+            mutator_set_update.check_applies_to(previous_mutator_set_accumulator)?;
+        }
 
         // apply mutator set update to get new mutator set accumulator
         let addition_records = mutator_set_update.additions.clone();
@@ -119,7 +187,7 @@ impl Transaction {
                 &mut new_inputs.iter_mut().collect_vec(),
                 &mut [],
             )
-            .unwrap_or_else(|_| panic!("Could not apply mutator set update."));
+            .context("Could not apply mutator set update.")?;
 
         let aocl_successor_proof = MmrSuccessorProof::new_from_batch_append(
             &previous_mutator_set_accumulator.aocl,
@@ -137,6 +205,22 @@ impl Transaction {
             modifier = modifier.timestamp(new_timestamp);
         }
         let new_kernel = modifier.clone_modify(&old_transaction_kernel);
+        if untrusted {
+            new_kernel
+                .is_confirmable_relative_to(&calculated_new_mutator_set)
+                .map_err(|e| anyhow!("Updated transaction is not confirmable: {e:?}"))?;
+            let old_proof = TransactionProof::SingleProof(old_single_proof.clone());
+            ensure!(
+                old_proof
+                    .verify(
+                        old_transaction_kernel.mast_hash(),
+                        proof_job_options.job_settings.network,
+                        consensus_rule_set
+                    )
+                    .await,
+                "Old proof is not a valid single proof under {consensus_rule_set}."
+            );
+        }
 
         // compute updated proof through recursion
         let update_witness = UpdateWitness::from_old_transaction(
@@ -353,6 +437,140 @@ pub(crate) mod tests {
         // the correct time convention for this test to work.
         let coinbase_transaction = make_mock_transaction(vec![], vec![ar]);
         assert!(Timestamp::now() - coinbase_transaction.kernel.timestamp < Timestamp::seconds(10));
+    }
+
+    /// Each case fails before proving, so a dummy proof does.
+    async fn update_error(
+        kernel: TransactionKernel,
+        msa: &MutatorSetAccumulator,
+        update: &MutatorSetUpdate,
+    ) -> String {
+        let updated = Transaction::new_confirmable_with_updated_mutator_set_records_given_proof(
+            kernel,
+            msa,
+            update,
+            Proof::invalid(),
+            TritonVmJobQueue::get_instance(),
+            TritonVmJobPriority::default().into(),
+            None,
+            ConsensusRuleSet::default(),
+        )
+        .await;
+        format!("{:#}", updated.unwrap_err())
+    }
+
+    fn one_input_witnesses<const N: usize>() -> [PrimitiveWitness; N] {
+        let mut runner = TestRunner::deterministic();
+        std::array::from_fn(|_| {
+            PrimitiveWitness::arbitrary_with_size_numbers(Some(1), 1, 1)
+                .new_tree(&mut runner)
+                .unwrap()
+                .current()
+        })
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn update_refuses_a_spent_input() {
+        let [witness] = one_input_witnesses();
+        let spending_it = MutatorSetUpdate::new(witness.kernel.inputs.clone(), vec![]);
+
+        let error = update_error(
+            witness.kernel.clone(),
+            &witness.mutator_set_accumulator,
+            &spending_it,
+        )
+        .await;
+        assert!(error.contains("not confirmable"), "{error}");
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn update_that_does_not_apply_is_an_error() {
+        let [witness] = one_input_witnesses();
+        let input = witness.kernel.inputs[0].clone();
+        let double_removal = MutatorSetUpdate::new(vec![input.clone(), input], vec![]);
+
+        let error = update_error(
+            witness.kernel.clone(),
+            &witness.mutator_set_accumulator,
+            &double_removal,
+        )
+        .await;
+        assert!(error.contains("cannot all be removed"), "{error}");
+
+        let unchecked = Transaction::new_with_updated_mutator_set_records_given_proof(
+            witness.kernel,
+            &witness.mutator_set_accumulator,
+            &double_removal,
+            Proof::invalid(),
+            TritonVmJobQueue::get_instance(),
+            TritonVmJobPriority::default().into(),
+            None,
+            ConsensusRuleSet::default(),
+        )
+        .await;
+        let unchecked_error = format!("{:#}", unchecked.unwrap_err());
+        assert!(
+            unchecked_error.contains("Could not apply"),
+            "{unchecked_error}"
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn malformed_removals_are_an_error_not_a_panic() {
+        use tasm_lib::twenty_first::util_types::mmr::mmr_membership_proof::MmrMembershipProof;
+
+        use crate::util_types::mutator_set::removal_record::chunk::Chunk;
+
+        let [witness] = one_input_witnesses();
+        let mut future_index = witness.kernel.inputs[0].clone();
+        future_index.absolute_indices.set_minimum(1 << 60);
+        let mut forged_chunk = witness.kernel.inputs[0].clone();
+        forged_chunk
+            .target_chunks
+            .insert(0, (MmrMembershipProof::new(vec![]), Chunk::empty_chunk()));
+
+        for (removal, expected) in [
+            (future_index, "is not valid"),
+            (forged_chunk, "does not authenticate"),
+        ] {
+            let error = update_error(
+                witness.kernel.clone(),
+                &witness.mutator_set_accumulator,
+                &MutatorSetUpdate::new(vec![removal], vec![]),
+            )
+            .await;
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn update_refuses_an_invalid_old_proof() {
+        let [witness] = one_input_witnesses();
+
+        let error = update_error(
+            witness.kernel.clone(),
+            &witness.mutator_set_accumulator,
+            &MutatorSetUpdate::new(vec![], vec![]),
+        )
+        .await;
+        assert!(error.contains("not a valid single proof"), "{error}");
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn update_refuses_a_foreign_mutator_set() {
+        let [witness, other] = one_input_witnesses();
+        assert_ne!(
+            witness.mutator_set_accumulator.hash(),
+            other.mutator_set_accumulator.hash()
+        );
+
+        let error = update_error(
+            witness.kernel,
+            &other.mutator_set_accumulator,
+            &MutatorSetUpdate::new(vec![], vec![]),
+        )
+        .await;
+        assert!(error.contains("does not agree"), "{error}");
     }
 
     // `traced_test` macro inserts return type that clippy doesn't like.
