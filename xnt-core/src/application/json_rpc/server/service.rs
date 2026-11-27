@@ -31,6 +31,7 @@ use crate::application::json_rpc::core::model::mining::template::RpcBlockTemplat
 use crate::application::json_rpc::core::model::wallet::mutator_set::RpcMsMembershipSnapshot;
 use crate::application::json_rpc::server::rpc::RpcServer;
 use crate::application::loops::channel::RPCServerToMain;
+use crate::application::loops::main_loop::proof_upgrader::SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE;
 use crate::application::rpc::server::network_overview_data::request_network_overview;
 use crate::protocol::consensus::block::block_selector::BlockSelector;
 use crate::protocol::consensus::block::Block;
@@ -1592,6 +1593,32 @@ impl RpcApi for RpcServer {
         })
     }
 
+    async fn get_mutator_set_update_call(
+        &self,
+        request: GetMutatorSetUpdateRequest,
+    ) -> RpcResult<GetMutatorSetUpdateResponse> {
+        let state = self.state.lock_guard().await;
+        let tip_height = state.chain.light_state().header().height;
+        let next_block_consensus_rule_set = state.next_block_consensus_rule_set();
+        let update = state
+            .chain
+            .archival_state()
+            .old_mutator_set_and_mutator_set_update_to_tip(
+                request.mutator_set_hash,
+                SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE,
+            )
+            .await
+            .map(|(old_mutator_set, update)| RpcMutatorSetUpdateToTip {
+                old_mutator_set: (&old_mutator_set).into(),
+                removals: update.removals.into_iter().map(Into::into).collect(),
+                additions: update.additions.into_iter().map(Into::into).collect(),
+                tip_height,
+                next_block_consensus_rule_set,
+            });
+
+        Ok(GetMutatorSetUpdateResponse { update })
+    }
+
     async fn network_overview_call(
         &self,
         _: NetworkOverviewRequest,
@@ -1958,6 +1985,284 @@ pub mod tests {
         let actual: HashSet<_> = digests.into_iter().collect();
 
         assert_eq!(expected, actual);
+    }
+
+    fn block_with(
+        previous: &Block,
+        inputs: Vec<crate::util_types::mutator_set::removal_record::RemovalRecord>,
+        outputs: Vec<crate::util_types::mutator_set::addition_record::AdditionRecord>,
+    ) -> Block {
+        use crate::protocol::consensus::transaction::transaction_kernel::TransactionKernelProxy;
+
+        let kernel = TransactionKernelProxy {
+            inputs,
+            outputs,
+            announcements: vec![],
+            fee: NativeCurrencyAmount::coins(0),
+            coinbase: None,
+            timestamp: previous.header().timestamp,
+            mutator_set_hash: previous.mutator_set_accumulator_after().unwrap().hash(),
+            merge_bit: false,
+        }
+        .into_kernel();
+        let transaction = Transaction {
+            kernel,
+            proof: TransactionProof::invalid(),
+        };
+        invalid_block_with_transaction(previous, transaction)
+    }
+
+    struct NewUtxo {
+        item: Digest,
+        sender_randomness: Digest,
+        receiver_preimage: Digest,
+    }
+
+    impl NewUtxo {
+        fn random() -> Self {
+            Self {
+                item: rand::random(),
+                sender_randomness: rand::random(),
+                receiver_preimage: rand::random(),
+            }
+        }
+
+        fn addition_record(
+            &self,
+        ) -> crate::util_types::mutator_set::addition_record::AdditionRecord {
+            crate::util_types::mutator_set::commit(
+                self.item,
+                self.sender_randomness,
+                self.receiver_preimage.hash(),
+            )
+        }
+
+        async fn removal_at_tip(
+            &self,
+            rpc_server: &RpcServer,
+        ) -> crate::util_types::mutator_set::removal_record::RemovalRecord {
+            use tasm_lib::twenty_first::util_types::mmr::mmr_trait::Mmr;
+
+            let state = rpc_server.state.lock_guard().await;
+            let archival = state.chain.archival_state();
+            let num_leafs = state
+                .chain
+                .light_state()
+                .mutator_set_accumulator_after()
+                .unwrap()
+                .aocl
+                .num_leafs();
+            let (leaf, _, _) = archival
+                .find_utxo_leaf_index(self.addition_record().canonical_commitment, 0, num_leafs)
+                .await
+                .unwrap();
+            let ams = archival.archival_mutator_set.ams();
+            let proof = ams
+                .restore_membership_proof(
+                    self.item,
+                    self.sender_randomness,
+                    self.receiver_preimage,
+                    leaf,
+                )
+                .await
+                .unwrap();
+            ams.drop(self.item, &proof).await
+        }
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn mutator_set_update_brings_an_old_mutator_set_to_the_tip() {
+        use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+        use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
+
+        let network = Network::Main;
+        let mut rpc_server = test_rpc_server_on(network).await;
+        let genesis = Block::genesis(network);
+
+        // block 1 creates a UTXO that block 2 spends, so the update has removals
+        let utxo = NewUtxo::random();
+        let block1 = block_with(&genesis, vec![], vec![utxo.addition_record()]);
+        rpc_server.state.set_new_tip(block1.clone()).await.unwrap();
+        let spent = utxo.removal_at_tip(&rpc_server).await;
+        let block2 = block_with(&block1, vec![spent], vec![]);
+        rpc_server.state.set_new_tip(block2.clone()).await.unwrap();
+
+        let genesis_msa = genesis.mutator_set_accumulator_after().unwrap();
+        let update = rpc_server
+            .get_mutator_set_update(genesis_msa.hash())
+            .await
+            .unwrap()
+            .update
+            .unwrap();
+        assert_eq!(block2.header().height, update.tip_height);
+        assert_eq!(
+            rpc_server
+                .state
+                .lock_guard()
+                .await
+                .next_block_consensus_rule_set(),
+            update.next_block_consensus_rule_set
+        );
+        let (mut msa, update): (MutatorSetAccumulator, MutatorSetUpdate) = update.into();
+        assert_eq!(genesis_msa.hash(), msa.hash());
+        assert_eq!(1, update.removals.len());
+        update.check_applies_to(&msa).unwrap();
+        update.apply_to_accumulator(&mut msa).unwrap();
+        assert_eq!(
+            block2.mutator_set_accumulator_after().unwrap().hash(),
+            msa.hash()
+        );
+
+        let unknown = rpc_server.get_mutator_set_update(Digest::default()).await;
+        assert!(unknown.unwrap().update.is_none());
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn mutator_set_update_with_inactive_chunks_applies() {
+        use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+        use crate::util_types::mutator_set::addition_record::AdditionRecord;
+        use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
+        use crate::util_types::mutator_set::shared::BATCH_SIZE;
+        use crate::util_types::mutator_set::shared::CHUNK_SIZE;
+        use crate::util_types::mutator_set::shared::WINDOW_SIZE;
+
+        let network = Network::Main;
+        let mut rpc_server = test_rpc_server_on(network).await;
+        let utxo = NewUtxo::random();
+        let block1 = block_with(
+            &Block::genesis(network),
+            vec![],
+            vec![utxo.addition_record()],
+        );
+        rpc_server.state.set_new_tip(block1.clone()).await.unwrap();
+
+        // slides the window past every index of the UTXO, so spending it needs chunk entries
+        let filler = (0..BATCH_SIZE * (WINDOW_SIZE / CHUNK_SIZE + 1))
+            .map(|_| AdditionRecord::new(rand::random()))
+            .collect();
+        let block2 = block_with(&block1, vec![], filler);
+        rpc_server.state.set_new_tip(block2.clone()).await.unwrap();
+        let spent = utxo.removal_at_tip(&rpc_server).await;
+        let block3 = block_with(&block2, vec![spent], vec![]);
+        rpc_server.state.set_new_tip(block3.clone()).await.unwrap();
+
+        let block2_msa_hash = block2.mutator_set_accumulator_after().unwrap().hash();
+        let update = rpc_server
+            .get_mutator_set_update(block2_msa_hash)
+            .await
+            .unwrap()
+            .update
+            .unwrap();
+        let (mut msa, update): (MutatorSetAccumulator, MutatorSetUpdate) = update.into();
+        assert!(!update.removals[0]
+            .target_chunks
+            .all_chunk_indices()
+            .is_empty());
+        update.check_applies_to(&msa).unwrap();
+        update.apply_to_accumulator(&mut msa).unwrap();
+        assert_eq!(
+            block3.mutator_set_accumulator_after().unwrap().hash(),
+            msa.hash()
+        );
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn mutator_set_update_reaches_back_100_blocks() {
+        use crate::application::loops::main_loop::proof_upgrader::SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE;
+        use crate::tests::shared::blocks::invalid_empty_block;
+
+        let network = Network::Main;
+        let mut rpc_server = test_rpc_server_on(network).await;
+        let genesis = Block::genesis(network);
+        let mut blocks = vec![genesis.clone()];
+        for _ in 0..=SEARCH_DEPTH_FOR_BLOCKS_FOR_MS_UPDATE {
+            let block = invalid_empty_block(blocks.last().unwrap(), network);
+            rpc_server.state.set_new_tip(block.clone()).await.unwrap();
+            blocks.push(block);
+        }
+
+        let update_from = |block: &Block| {
+            let hash = block.mutator_set_accumulator_after().unwrap().hash();
+            let rpc_server = &rpc_server;
+            async move {
+                rpc_server
+                    .get_mutator_set_update(hash)
+                    .await
+                    .unwrap()
+                    .update
+            }
+        };
+        assert!(update_from(&genesis).await.is_none());
+        assert!(update_from(&blocks[1]).await.is_some());
+    }
+
+    #[apply(shared_tokio_runtime)]
+    async fn mutator_set_update_round_trips_through_the_json_router() {
+        use std::sync::Arc;
+
+        use crate::application::json_rpc::core::api::ops::Namespace;
+        use crate::application::json_rpc::core::api::ops::RpcMethods;
+        use crate::application::json_rpc::core::model::message::GetMutatorSetUpdateRequest;
+        use crate::application::json_rpc::core::model::message::GetMutatorSetUpdateResponse;
+        use crate::protocol::consensus::block::mutator_set_update::MutatorSetUpdate;
+        use crate::tests::shared::blocks::invalid_empty_block;
+        use crate::util_types::mutator_set::mutator_set_accumulator::MutatorSetAccumulator;
+
+        let network = Network::Main;
+        let mut rpc_server = test_rpc_server_on(network).await;
+        let genesis = Block::genesis(network);
+        let block1 = invalid_empty_block(&genesis, network);
+        rpc_server.state.set_new_tip(block1).await.unwrap();
+        let genesis_hash = genesis.mutator_set_accumulator_after().unwrap().hash();
+        let direct = rpc_server
+            .get_mutator_set_update(genesis_hash)
+            .await
+            .unwrap()
+            .update
+            .unwrap();
+        let router =
+            RpcMethods::new_router(Arc::new(rpc_server), HashSet::from([Namespace::Archival]));
+        let call = |mutator_set_hash| {
+            let params = serde_json::to_value(GetMutatorSetUpdateRequest { mutator_set_hash });
+            let router = &router;
+            async move {
+                router
+                    .dispatch("archival_getMutatorSetUpdate", params.unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let params = serde_json::to_value(GetMutatorSetUpdateRequest {
+            mutator_set_hash: genesis_hash,
+        })
+        .unwrap();
+        assert_eq!(1, params.as_array().unwrap().len());
+        let json = call(genesis_hash).await;
+        assert_eq!(
+            serde_json::to_value(direct.tip_height).unwrap(),
+            json["update"]["tipHeight"]
+        );
+        assert_eq!(
+            serde_json::to_value(direct.next_block_consensus_rule_set).unwrap(),
+            json["update"]["nextBlockConsensusRuleSet"]
+        );
+        let response: GetMutatorSetUpdateResponse = serde_json::from_value(json).unwrap();
+        let update = response.update.unwrap();
+        assert_eq!(direct.removals, update.removals);
+        assert_eq!(direct.additions, update.additions);
+        assert_eq!(direct.tip_height, update.tip_height);
+        assert_eq!(
+            direct.next_block_consensus_rule_set,
+            update.next_block_consensus_rule_set
+        );
+        let (old_mutator_set, _): (MutatorSetAccumulator, MutatorSetUpdate) = update.into();
+        assert_eq!(genesis_hash, old_mutator_set.hash());
+
+        assert_eq!(
+            serde_json::json!({ "update": null }),
+            call(Digest::default()).await
+        );
     }
 
     #[apply(shared_tokio_runtime)]

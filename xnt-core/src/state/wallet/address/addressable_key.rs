@@ -282,10 +282,7 @@ impl SpendingKey {
     ///
     ///  - Logs a warning for any announcement targeted at this key that cannot
     ///    be decrypted.
-    pub(crate) fn scan_for_announced_utxos(
-        &self,
-        tx_kernel: &TransactionKernel,
-    ) -> Vec<IncomingUtxo> {
+    pub fn scan_for_announced_utxos(&self, tx_kernel: &TransactionKernel) -> Vec<IncomingUtxo> {
         // pre-compute some fields, and early-abort if key cannot receive.
         let receiver_identifier = self.receiver_identifier();
         let receiver_preimage = self.privacy_preimage();
